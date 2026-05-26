@@ -1,20 +1,21 @@
 # macOS
 .DS_Store
 
-# Python
+# Python (apps/api)
 .venv/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .env
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
-
-# Node
-node_modules/
 dist/
-dist-ssr/
+*.egg-info/
+
+# Node / Bun (apps/web)
+node_modules/
 .output/
 .vinxi/
 .tanstack/
@@ -24,6 +25,9 @@ dist-ssr/
 # Wrangler / Cloudflare
 .wrangler/
 .dev.vars
+
+# Build artifacts
+dist-ssr/
 
 # Editor
 .vscode/*
@@ -42,4 +46,3 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-lerna-debug.log*

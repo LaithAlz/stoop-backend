@@ -11,25 +11,41 @@ Follow every step in order. Do not skip or reorder.
 ### 1. Branch
 
 Create a branch off `main` using the pattern `<type>/<short-description>`:
-- `feat/` for new functionality
-- `fix/` for bug fixes
-- `chore/` for setup, config, tooling
-- `ci/` for workflow changes
+- `feat/` — new functionality
+- `fix/` — bug fixes
+- `chore/` — setup, config, tooling
+- `ci/` — workflow changes
+- `docs/` — documentation only
 
-Branch name must be lowercase, hyphenated, ≤40 chars. Example: `feat/clerk-jwt-verification`.
+Branch name: lowercase, hyphenated, ≤40 chars. Example: `feat/clerk-jwt-verification`.
 
 ```
 git checkout main && git pull origin main
 git checkout -b <branch-name>
 ```
 
-### 2. Build
+### 2. Orient
 
-Implement what was asked. Read relevant existing code first — understand the patterns before adding to them. Keep changes scoped to the task. Do not refactor unrelated code.
+Before writing a line of code:
+- Identify which app the change lives in (`apps/api` or `apps/web`)
+- Read relevant existing files — understand the patterns before adding to them
+- Scope your change to exactly what was asked. No bonus refactors.
 
-### 3. Commit
+### 3. Build
 
-Commit messages are short, imperative, and direct. Subject line ≤72 chars.
+Implement the feature. Keep changes contained to their app. Do not reach across app boundaries unless the task explicitly requires it.
+
+Repo layout:
+```
+apps/api/     FastAPI backend (Python 3.12, uv, async SQLAlchemy, Alembic, Clerk)
+apps/web/     TanStack Start frontend (TypeScript, Bun, shadcn/ui, Cloudflare Workers)
+packages/     Shared code — only add here if genuinely reused across apps
+docs/plans/   Phase planning docs — read-only reference
+```
+
+### 4. Commit
+
+Short, imperative, direct. Subject line ≤72 chars. No body unless the why is genuinely non-obvious.
 
 **Good:**
 - `add Clerk JWT verification dependency`
@@ -37,77 +53,75 @@ Commit messages are short, imperative, and direct. Subject line ≤72 chars.
 - `configure ruff and mypy strict mode`
 
 **Never:**
-- No "Claude", "AI", "Co-authored", or "as requested"
+- No "Claude", "AI", "Co-authored", "as requested", "Update code to…"
 - No trailing period
-- No filler ("Update code to...", "Made changes to...")
+- No filler
 
 Stage specific files — never `git add .` blindly.
 
-### 4. Push + PR
+### 5. Push + PR
 
-Push the branch and open a PR:
-
-```
+```bash
 git push -u origin <branch-name>
 gh pr create --repo LaithAlz/stoop-backend \
-  --title "<commit-subject-style title>" \
+  --title "<imperative title>" \
   --body "<body>"
 ```
 
-PR body must include:
+PR body must follow the template (`.github/PULL_REQUEST_TEMPLATE.md`):
 - **What** — one sentence on what changed
-- **Why** — one sentence on why it was needed
-- **Test plan** — checklist of how to verify it works
+- **Why** — one sentence on why, link the issue (`Closes #N`)
+- **Test plan** — checklist of how to verify
 
-Keep it tight. No fluff.
+### 6. CI
 
-### 5. CI
+Check if workflows exist:
 
-Check if any GitHub Actions workflows exist:
-
-```
+```bash
 gh workflow list --repo LaithAlz/stoop-backend
 ```
 
-If workflows exist, poll until ALL required checks pass:
+If any exist, wait for all checks to pass:
 
-```
+```bash
 gh pr checks <PR-number> --repo LaithAlz/stoop-backend --watch
 ```
 
-If any check fails: stop, read the failure output, fix the code, push a new commit, and wait again. Do not proceed to review until CI is green.
+If a check fails: read the output, fix the code, push a new commit, wait again. Do not proceed until CI is green.
 
-If no workflows exist yet, skip this step and note it in the review.
+### 7. Review
 
-### 6. Review
+Spawn a review agent with this prompt:
 
-Spawn a review agent with this exact prompt:
-
-> You are a senior engineer reviewing a pull request for the Stoop backend (FastAPI + async SQLAlchemy + Clerk + Fly.io). 
+> You are a senior engineer reviewing a PR for the Stoop monorepo (FastAPI API + TanStack web app).
 >
-> PR: `gh pr view <PR-number> --repo LaithAlz/stoop-backend`
-> Diff: `gh pr diff <PR-number> --repo LaithAlz/stoop-backend`
+> Run these to get context:
+> ```
+> gh pr view <PR-number> --repo LaithAlz/stoop-backend
+> gh pr diff <PR-number> --repo LaithAlz/stoop-backend
+> ```
 >
-> Review for:
-> 1. Correctness — does it do what the PR says? Any logic bugs?
-> 2. Security — any auth bypasses, injection risks, secrets exposure, or PII leaks?
-> 3. Async correctness — proper session lifecycle, no sync calls in async context, no shared mutable state?
-> 4. Type safety — mypy strict compliance, no missing annotations?
-> 5. Scope creep — does it do more than asked? Flag but don't block for cosmetic issues.
+> Review across five dimensions:
+> 1. **Correctness** — does it do what the PR says? Any logic bugs or missed edge cases?
+> 2. **Security** — auth bypasses, injection risks, secrets exposure, PII leaks?
+> 3. **Async correctness** (API) — session lifecycle, no sync calls in async context, no shared mutable state?
+> 4. **Type safety** — mypy strict (API) / TypeScript strict (web), no missing annotations?
+> 5. **Scope** — does it do more than asked? Flag but don't block for cosmetic issues.
 >
-> Output: a structured report with BLOCKING issues (must fix before merge) and ADVISORY issues (nice to fix, won't block). If no blocking issues, say "LGTM — ready to merge."
+> Output a structured report:
+> - **BLOCKING** — must fix before merge
+> - **ADVISORY** — worth fixing, won't block
+> - If no blocking issues: "LGTM — ready to merge"
 
-If the review agent raises BLOCKING issues: fix them, push new commits, re-run CI, re-run the review agent. Repeat until LGTM.
+If BLOCKING issues exist: fix them, push new commits, re-run CI, re-run the review. Repeat until LGTM.
 
-### 7. Merge
+### 8. Merge
 
-Once CI is green and review says LGTM:
-
-```
+```bash
 gh pr merge <PR-number> --repo LaithAlz/stoop-backend --squash --delete-branch
 ```
 
-Confirm the merge succeeded and the branch is deleted.
+Confirm the merge succeeded and the branch is gone.
 
 ---
 
@@ -115,6 +129,6 @@ Confirm the merge succeeded and the branch is deleted.
 
 - Never commit directly to `main`
 - Never merge with a failing CI check
-- Never merge without review agent sign-off
-- Never use `git add .` — stage files explicitly
-- Never skip steps to go faster
+- Never merge without review agent LGTM
+- Never `git add .` — stage files explicitly
+- Never skip steps
