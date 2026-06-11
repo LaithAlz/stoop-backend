@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stoop — The Stoop Times</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300;12..96,500;12..96,700;12..96,800&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,600&family=Courier+Prime:wght@400;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --paper: #f4efe4;
+    --paper-2: #ece5d4;
+    --ink: #181511;
+    --ink-soft: #4a443a;
+    --red: #d7301f;
+    --blue: #1d4ed8;
+    --display: "Bricolage Grotesque", sans-serif;
+    --serif: "Newsreader", serif;
+    --mono: "Courier Prime", monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--paper); color: var(--ink); font-family: var(--serif);
+    overflow-x: hidden;
+  }
+  /* paper grain */
+  body::after {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 60; opacity: 0.5;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.04 0'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  /* ── red alert marquee ───────────────── */
+  .alert-strip {
+    background: var(--red); color: var(--paper); overflow: hidden; white-space: nowrap;
+    font-family: var(--display); font-weight: 800; font-size: 13px; letter-spacing: 0.14em;
+    text-transform: uppercase; padding: 8px 0;
+  }
+  .alert-strip .roll { display: inline-block; animation: roll 26s linear infinite; }
+  .alert-strip span { margin-right: 48px; }
+  .alert-strip span::before { content: "✶"; margin-right: 48px; }
+
+  .sheet { max-width: 1180px; margin: 0 auto; padding: 0 32px 90px; }
+
+  /* ── masthead ────────────────────────── */
+  .masthead { text-align: center; padding: 34px 0 18px; border-bottom: 4px double var(--ink); }
+  .mast-top {
+    display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.12em; color: var(--ink-soft); margin-bottom: 8px;
+    animation: fade 0.8s both;
+  }
+  .masthead h1 {
+    font-family: var(--display); font-weight: 800; letter-spacing: -0.04em;
+    font-size: clamp(64px, 11vw, 150px); line-height: 0.9;
+    animation: pressIn 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  .masthead h1 .dot { color: var(--red); }
+  .mast-sub {
+    font-family: var(--serif); font-style: italic; font-size: 16px; color: var(--ink-soft);
+    margin-top: 10px; animation: fade 0.8s 0.3s both;
+  }
+
+  /* ── front page grid ─────────────────── */
+  .front { display: grid; grid-template-columns: 1.6fr 1fr; gap: 0; border-bottom: 1px solid var(--ink); }
+  .lead { padding: 40px 40px 40px 0; border-right: 1px solid var(--ink); }
+  .kicker {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--red); font-weight: 700; animation: fade 0.7s 0.35s both;
+  }
+  .lead h2 {
+    font-family: var(--display); font-weight: 800; letter-spacing: -0.03em;
+    font-size: clamp(38px, 5vw, 64px); line-height: 1.0; margin: 14px 0 20px;
+  }
+  .lead h2 .w { display: inline-block; animation: pressIn 0.8s cubic-bezier(0.16,1,0.3,1) both; }
+  .lead h2 .strike { position: relative; white-space: nowrap; }
+  .lead h2 .strike i {
+    position: absolute; left: -2%; top: 54%; width: 104%; height: 6px; background: var(--red);
+    transform: scaleX(0) rotate(-1.5deg); transform-origin: left; font-style: normal;
+    animation: strike 0.5s 1.3s cubic-bezier(0.7,0,0.3,1) forwards;
+  }
+  .lead .deck {
+    font-size: 19px; line-height: 1.55; color: var(--ink-soft); max-width: 52ch;
+    animation: fade 0.8s 0.7s both;
+  }
+  .lead .deck b { color: var(--ink); font-weight: 600; }
+  .byline {
+    margin-top: 24px; font-family: var(--mono); font-size: 12px; text-transform: uppercase;
+    letter-spacing: 0.1em; color: var(--ink-soft); animation: fade 0.8s 0.85s both;
+  }
+  .byline b { color: var(--ink); }
+
+  /* clipping column */
+  .clippings { padding: 40px 0 40px 36px; display: flex; flex-direction: column; gap: 26px; }
+  .clip {
+    border: 1px solid var(--ink); background: var(--paper); padding: 18px 20px;
+    box-shadow: 5px 5px 0 var(--ink);
+    transition: transform 0.25s cubic-bezier(0.16,1,0.3,1), box-shadow 0.25s;
+    animation: fade 0.7s both;
+  }
+  .clip:nth-child(1) { animation-delay: 0.6s; transform: rotate(-0.6deg); }
+  .clip:nth-child(2) { animation-delay: 0.75s; transform: rotate(0.8deg); }
+  .clip:nth-child(3) { animation-delay: 0.9s; transform: rotate(-0.4deg); }
+  .clip:hover { transform: rotate(0deg) translate(-3px, -3px); box-shadow: 9px 9px 0 var(--ink); }
+  .clip .tag { font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase; }
+  .clip .tag.red { color: var(--red); } .clip .tag.blue { color: var(--blue); }
+  .clip h3 { font-family: var(--display); font-weight: 700; font-size: 19px; line-height: 1.15; margin: 8px 0 6px; letter-spacing: -0.01em; }
+  .clip p { font-size: 13.5px; line-height: 1.5; color: var(--ink-soft); }
+  .clip .num { font-family: var(--display); font-weight: 800; font-size: 44px; letter-spacing: -0.03em; line-height: 1; margin: 6px 0 2px; }
+
+  /* ── the approval desk ───────────────── */
+  .section-rule {
+    display: flex; align-items: center; gap: 18px; margin: 56px 0 30px;
+  }
+  .section-rule h4 {
+    font-family: var(--display); font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em;
+    font-size: 15px; white-space: nowrap;
+  }
+  .section-rule .line { flex: 1; border-top: 3px solid var(--ink); position: relative; top: 1px; }
+  .section-rule .folio { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); }
+
+  .desk { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: start; }
+
+  .telegram {
+    background: #fffdf6; border: 1px solid var(--ink); padding: 28px;
+    position: relative; box-shadow: 6px 6px 0 rgba(24,21,17,0.16);
+    animation: fade 0.8s 0.2s both;
+  }
+  .telegram::before {
+    content: "RECEIVED 2:12 AM"; position: absolute; top: -12px; left: 22px;
+    background: var(--ink); color: var(--paper); font-family: var(--mono); font-size: 10px;
+    letter-spacing: 0.2em; padding: 4px 12px;
+  }
+  .tg-head {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; color: var(--ink-soft);
+    border-bottom: 1px dashed var(--ink); padding-bottom: 12px; margin-bottom: 16px; line-height: 1.9;
+    text-transform: uppercase;
+  }
+  .tg-head b { color: var(--ink); }
+  .telegram .body { font-family: var(--mono); font-size: 14.5px; line-height: 1.75; }
+  .sev-stamp {
+    position: absolute; right: 18px; top: 14px;
+    font-family: var(--display); font-weight: 800; text-transform: uppercase; font-size: 15px;
+    letter-spacing: 0.12em; color: var(--red); border: 3px solid var(--red); border-radius: 4px;
+    padding: 5px 12px; transform: rotate(7deg); opacity: 0.85;
+    animation: stamp 0.4s 1.1s cubic-bezier(0.16, 1.6, 0.3, 1) both;
+    mix-blend-mode: multiply;
+  }
+
+  .draft-card { position: relative; animation: fade 0.8s 0.45s both; }
+  .draft-label {
+    display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 700;
+    letter-spacing: 0.2em; text-transform: uppercase; background: var(--ink); color: var(--paper);
+    padding: 6px 14px; margin-bottom: -1px;
+  }
+  .draft-body {
+    border: 1px solid var(--ink); background: var(--paper-2); padding: 26px 28px;
+    font-size: 18px; line-height: 1.65;
+  }
+  .draft-body .edit-mark { background: rgba(215,48,31,0.14); border-bottom: 2px solid var(--red); cursor: pointer; }
+  .draft-foot {
+    font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.12em;
+    color: var(--ink-soft); padding: 10px 2px 0; display: flex; justify-content: space-between;
+  }
+  .draft-actions { display: flex; gap: 14px; margin-top: 22px; }
+  .news-btn {
+    font-family: var(--display); font-weight: 800; font-size: 16px; text-transform: uppercase;
+    letter-spacing: 0.04em; padding: 16px 26px; cursor: pointer;
+    border: 2px solid var(--ink); background: var(--paper); color: var(--ink);
+    box-shadow: 4px 4px 0 var(--ink); transition: transform 0.12s, box-shadow 0.12s, background 0.2s;
+  }
+  .news-btn:hover { transform: translate(-2px, -2px); box-shadow: 6px 6px 0 var(--ink); }
+  .news-btn:active { transform: translate(3px, 3px); box-shadow: 1px 1px 0 var(--ink); }
+  .news-btn.go { background: var(--red); color: var(--paper); border-color: var(--ink); flex: 1; }
+
+  .approved-stamp {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center; z-index: 4;
+  }
+  .approved-stamp.show { display: flex; }
+  .approved-stamp span {
+    font-family: var(--display); font-weight: 800; font-size: 54px; text-transform: uppercase;
+    color: var(--red); border: 6px solid var(--red); padding: 10px 34px; border-radius: 8px;
+    transform: rotate(-9deg); mix-blend-mode: multiply; letter-spacing: 0.06em;
+    animation: stamp 0.35s cubic-bezier(0.16, 1.8, 0.3, 1) both;
+    background: rgba(244,239,228,0.6);
+  }
+
+  /* ── classifieds footer ──────────────── */
+  .classifieds {
+    margin-top: 64px; border-top: 4px double var(--ink); padding-top: 26px;
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 0;
+  }
+  .ad { padding: 8px 24px; border-right: 1px solid var(--ink); }
+  .ad:first-child { padding-left: 0; } .ad:last-child { border-right: 0; }
+  .ad h5 { font-family: var(--display); font-weight: 800; font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+  .ad p { font-size: 13.5px; font-style: italic; color: var(--ink-soft); line-height: 1.55; }
+  .ad p b { font-style: normal; color: var(--red); font-family: var(--mono); font-size: 12px; }
+
+  @keyframes roll { to { transform: translateX(-50%); } }
+  @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @keyframes pressIn { from { opacity: 0; transform: translateY(26px) scale(0.98); } to { opacity: 1; transform: none; } }
+  @keyframes strike { to { transform: scaleX(1) rotate(-1.5deg); } }
+  @keyframes stamp { from { opacity: 0; transform: scale(2.2) rotate(14deg); } to { opacity: 0.85; transform: scale(1) rotate(7deg); } }
+
+  @media (max-width: 920px) {
+    .front, .desk { grid-template-columns: 1fr; }
+    .lead { border-right: 0; padding-right: 0; }
+    .clippings { padding-left: 0; }
+    .classifieds { grid-template-columns: 1fr; }
+    .ad { border-right: 0; padding: 12px 0; border-bottom: 1px solid var(--ink); }
+  }
+</style>
+</head>
+<body>
+
+<div class="alert-strip">
+  <div class="roll">
+    <span>3 AM pipe burst handled while you slept</span>
+    <span>Drafted in your voice — you approve before it sends</span>
+    <span>Built for Ontario landlords</span>
+    <span>Unit 2 reports no heat — reply drafted in 28 seconds</span>
+    <span>3 AM pipe burst handled while you slept</span>
+    <span>Drafted in your voice — you approve before it sends</span>
+    <span>Built for Ontario landlords</span>
+    <span>Unit 2 reports no heat — reply drafted in 28 seconds</span>
+  </div>
+</div>
+
+<div class="sheet">
+
+  <header class="masthead">
+    <div class="mast-top">
+      <span>Vol. 1 · No. 193</span>
+      <span>The maintenance-desk daily, written by your AI</span>
+      <span>Toronto · Wednesday edition</span>
+    </div>
+    <h1>The Stoop<span class="dot">.</span> Times</h1>
+    <p class="mast-sub">“All the texts fit to triage” — every tenant message, classified, drafted &amp; held for your approval</p>
+  </header>
+
+  <section class="front">
+    <article class="lead">
+      <div class="kicker">★ Tonight's top story</div>
+      <h2>
+        <span class="w" style="animation-delay:.35s">LANDLORD</span>
+        <span class="w strike" style="animation-delay:.45s">WOKEN AT 3 AM<i></i></span>
+        <span class="w" style="animation-delay:.55s">SLEEPS</span>
+        <span class="w" style="animation-delay:.65s">THROUGH IT.</span>
+      </h2>
+      <p class="deck">
+        Maria in Unit 2 lost heat at 10 PM with an infant in the apartment. By 2:14 AM Stoop had
+        read her text, checked Ontario's heat bylaw, ranked it <b>urgent — not emergency</b>, and
+        drafted a reply in the landlord's own voice. <b>The reply waited politely until morning coffee.</b>
+      </p>
+      <div class="byline">Filed by <b>STOOP AGENT v1</b> · Reviewed by <b>YOU</b> · Approval pending below ↓</div>
+    </article>
+
+    <aside class="clippings">
+      <div class="clip">
+        <div class="tag red">Severity desk</div>
+        <h3>One true emergency this month. Your phone rang. That's the deal.</h3>
+        <p>Flood, gas, fire → instant call. Everything else waits in the morning paper.</p>
+      </div>
+      <div class="clip">
+        <div class="tag blue">By the numbers</div>
+        <div class="num">94%</div>
+        <p>of drafts approved without a single edit across your 3 properties, last 30 days.</p>
+      </div>
+      <div class="clip">
+        <div class="tag blue">Trust column</div>
+        <h3>41 Palmerston earns auto-send for routine replies</h3>
+        <p>Six weeks, zero edits. Stoop now handles the faucet drips solo — you read the recap.</p>
+      </div>
+    </aside>
+  </section>
+
+  <div class="section-rule">
+    <h4>※ The Approval Desk</h4>
+    <span class="line"></span>
+    <span class="folio">Page A2 · One item awaiting sign-off</span>
+  </div>
+
+  <section class="desk">
+    <div class="telegram">
+      <span class="sev-stamp">Urgent</span>
+      <div class="tg-head">
+        From: <b>Maria — Unit 2, 41 Palmerston Ave</b><br/>
+        Via: SMS · Classified in 28 seconds
+      </div>
+      <p class="body">“hey sorry to text so late but the heat hasn't worked since like 10pm and it's getting really cold in here. we have the baby this week… is there anything you can do tonight??”</p>
+    </div>
+
+    <div class="draft-card">
+      <div class="approved-stamp" id="apStamp"><span>Approved</span></div>
+      <span class="draft-label">Stoop's draft — your voice</span>
+      <div class="draft-body">
+        Hi Maria — so sorry, that's not okay with the little one there. Try the breaker in the hall
+        closet (panel, switch 4) and let me know in 10 minutes. If it's still cold, my
+        <span class="edit-mark" title="Tap any phrase to edit">HVAC guy will be there at 7:30 AM</span>.
+        Space heater's in basement storage if you need it tonight.
+      </div>
+      <div class="draft-foot"><span>Voice profile: warm &amp; direct</span><span>Tap underlined text to edit</span></div>
+      <div class="draft-actions">
+        <button class="news-btn" onclick="alert('Mock: opens the editor')">✎ Edit</button>
+        <button class="news-btn go" id="approveBtn">Approve &amp; Send →</button>
+      </div>
+    </div>
+  </section>
+
+  <footer class="classifieds">
+    <div class="ad">
+      <h5>Situations handled</h5>
+      <p><b>00:21</b> — Ceiling leak at 88 Dovercourt escalated, plumber dispatched, you were called once. Resolved.</p>
+    </div>
+    <div class="ad">
+      <h5>Morning queue</h5>
+      <p><b>3 ITEMS</b> — One faucet drip, one parking question, one rent receipt request. All drafted, none urgent.</p>
+    </div>
+    <div class="ad">
+      <h5>Subscribe</h5>
+      <p>Delivered every morning your buildings survive the night without you. <b>STOOP.APP</b></p>
+    </div>
+  </footer>
+</div>
+
+<script>
+  document.getElementById("approveBtn").addEventListener("click", () => {
+    document.getElementById("apStamp").classList.add("show");
+  });
+</script>
+</body>
+</html>

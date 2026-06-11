@@ -16,11 +16,11 @@ First real schema work. The `landlords` table is the root of multi-tenancy. Gett
 
 - [ ] `alembic.ini` exists and reads connection URL from settings (not hardcoded)
 - [ ] `migrations/env.py` configured for async SQLAlchemy migrations
-- [ ] Migration creates `landlords` table with all fields per `backend-spec.html` §03 (clerk_user_id, email, phone, full_name, timezone, notification_prefs, stripe_customer_id, subscription_tier, subscription_status, trial_ends_at, created_at, updated_at)
-- [ ] UNIQUE constraint on `clerk_user_id`
+- [ ] Migration creates `landlords` table with all fields per `backend-spec.html` §03 (auth_user_id, email, phone, full_name, timezone, notification_prefs, stripe_customer_id, subscription_tier, subscription_status, trial_ends_at, created_at, updated_at)
+- [ ] UNIQUE constraint on `auth_user_id`
 - [ ] UNIQUE constraint on `stripe_customer_id`
 - [ ] CHECK constraints on `subscription_tier` and `subscription_status` for valid values
-- [ ] Indexes on `clerk_user_id` and `stripe_customer_id`
+- [ ] Indexes on `auth_user_id` and `stripe_customer_id`
 - [ ] `alembic upgrade head` runs clean against the Supabase dev DB
 - [ ] `alembic downgrade -1` cleanly drops the table
 - [ ] `alembic upgrade head` re-applies cleanly (reversibility verified)
@@ -50,7 +50,7 @@ Sketch the `landlords` table:
 - **Columns.** What identity field? What profile fields? Where does notification preference data live (JSONB? structured columns? why)? What billing state fields?
 - **Types.** Postgres types matter. `text` vs `varchar`, `timestamptz` vs `timestamp`, `jsonb` vs `json`.
 - **Constraints.** NOT NULL where? CHECK constraints on which fields?
-- **Indexes.** What's the hot query path? (Hint: every authenticated request looks up by `clerk_user_id`.)
+- **Indexes.** What's the hot query path? (Hint: every authenticated request looks up by `auth_user_id`.)
 
 Then open `backend-spec.html` §03 and diff. Where your design differs from mine, decide which is better. Some of yours will be better.
 

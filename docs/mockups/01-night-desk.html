@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stoop — Night Desk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400;0,500;0,700;0,900;1,400&family=Spline+Sans+Mono:wght@300;400;500;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --void: #07090e;
+    --panel: #0d1118;
+    --panel-2: #111723;
+    --line: #1d2533;
+    --line-bright: #2a3550;
+    --text: #e8edf5;
+    --text-dim: #8b97ab;
+    --text-faint: #4d586c;
+    --amber: #ffb454;
+    --amber-dim: #8a5a1e;
+    --red: #ff4d4d;
+    --red-glow: rgba(255, 77, 77, 0.35);
+    --mint: #5dd9a7;
+    --blue: #6aa7ff;
+    --mono: "Spline Sans Mono", monospace;
+    --grot: "Schibsted Grotesk", sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--void);
+    color: var(--text);
+    font-family: var(--grot);
+    overflow-x: hidden;
+  }
+  /* ambient atmosphere */
+  body::before {
+    content: "";
+    position: fixed; inset: 0;
+    background:
+      radial-gradient(900px 500px at 75% -10%, rgba(106,167,255,0.07), transparent 60%),
+      radial-gradient(700px 600px at 0% 110%, rgba(255,180,84,0.05), transparent 60%);
+    pointer-events: none; z-index: 0;
+  }
+  /* scanlines */
+  body::after {
+    content: "";
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(0deg, rgba(255,255,255,0.018) 0 1px, transparent 1px 3px);
+    pointer-events: none; z-index: 50;
+  }
+
+  .shell { position: relative; z-index: 1; max-width: 1320px; margin: 0 auto; padding: 0 28px 80px; }
+
+  /* ── Top bar ─────────────────────────── */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 0; border-bottom: 1px solid var(--line);
+    animation: dropIn 0.7s cubic-bezier(0.2, 0.9, 0.25, 1) both;
+  }
+  .wordmark { display: flex; align-items: baseline; gap: 14px; }
+  .wordmark h1 { font-weight: 900; font-size: 26px; letter-spacing: -0.02em; }
+  .wordmark h1 .dot { color: var(--amber); }
+  .desk-tag {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em;
+    color: var(--amber); border: 1px solid var(--amber-dim);
+    padding: 4px 10px; border-radius: 3px; text-transform: uppercase;
+    box-shadow: 0 0 18px rgba(255,180,84,0.12) inset;
+  }
+  .topbar-right { display: flex; align-items: center; gap: 26px; font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+  .live { display: flex; align-items: center; gap: 8px; }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 12px var(--mint); animation: breathe 2.4s ease-in-out infinite; }
+  #clock { color: var(--text); font-weight: 500; font-size: 13px; min-width: 86px; }
+
+  /* ── Status ticker ───────────────────── */
+  .ticker-wrap {
+    border-bottom: 1px solid var(--line);
+    overflow: hidden; white-space: nowrap;
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em;
+    color: var(--text-faint); text-transform: uppercase;
+    padding: 9px 0;
+    animation: dropIn 0.7s 0.1s cubic-bezier(0.2, 0.9, 0.25, 1) both;
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent);
+            mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent);
+  }
+  .ticker { display: inline-block; animation: scroll 38s linear infinite; }
+  .ticker span { margin-right: 56px; }
+  .ticker b { color: var(--text-dim); font-weight: 500; }
+  .tk-red { color: var(--red); } .tk-amber { color: var(--amber); } .tk-mint { color: var(--mint); }
+
+  /* ── Hero strip ──────────────────────── */
+  .hero {
+    display: grid; grid-template-columns: 1.5fr 1fr; gap: 40px; align-items: end;
+    padding: 54px 0 40px;
+  }
+  .hero h2 {
+    font-size: clamp(40px, 5.4vw, 72px); font-weight: 900; line-height: 0.98; letter-spacing: -0.035em;
+  }
+  .hero h2 .l { display: block; overflow: hidden; }
+  .hero h2 .l > span { display: inline-block; animation: riseUp 0.9s cubic-bezier(0.16, 1, 0.3, 1) both; }
+  .hero h2 .l:nth-child(2) > span { animation-delay: 0.12s; color: var(--text-dim); }
+  .hero h2 .l:nth-child(3) > span { animation-delay: 0.24s; }
+  .hero h2 em { font-style: normal; color: var(--amber); position: relative; }
+  .hero h2 em::after {
+    content: ""; position: absolute; left: 0; bottom: 4px; height: 3px; width: 100%;
+    background: var(--amber); transform: scaleX(0); transform-origin: left;
+    animation: drawLine 0.8s 1s cubic-bezier(0.16,1,0.3,1) forwards;
+  }
+  .hero-sub {
+    font-size: 15px; color: var(--text-dim); line-height: 1.65; max-width: 360px;
+    animation: fadeUp 0.8s 0.45s both;
+    border-left: 2px solid var(--line-bright); padding-left: 18px;
+  }
+  .hero-sub b { color: var(--text); font-weight: 700; }
+
+  /* ── Console grid ────────────────────── */
+  .console { display: grid; grid-template-columns: 300px 1fr 280px; gap: 18px; align-items: start; }
+
+  .panel {
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line); border-radius: 10px;
+    animation: fadeUp 0.8s both;
+  }
+  .panel:nth-child(1) { animation-delay: 0.5s; }
+  .panel:nth-child(2) { animation-delay: 0.62s; }
+  .panel:nth-child(3) { animation-delay: 0.74s; }
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--text-faint);
+  }
+  .panel-head .count { color: var(--amber); }
+
+  /* queue */
+  .queue-item {
+    display: grid; grid-template-columns: 10px 1fr auto; gap: 12px; align-items: center;
+    padding: 14px 16px; border-bottom: 1px solid var(--line);
+    cursor: pointer; transition: background 0.25s, transform 0.25s;
+  }
+  .queue-item:last-child { border-bottom: 0; }
+  .queue-item:hover { background: rgba(255,255,255,0.025); transform: translateX(3px); }
+  .queue-item.active { background: rgba(255,180,84,0.05); box-shadow: inset 2px 0 0 var(--amber); }
+  .q-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .q-dot.red { background: var(--red); box-shadow: 0 0 0 0 var(--red-glow); animation: ping 1.6s cubic-bezier(0,0,0.2,1) infinite; }
+  .q-dot.amber { background: var(--amber); }
+  .q-dot.blue { background: var(--blue); }
+  .q-unit { font-weight: 700; font-size: 13.5px; }
+  .q-meta { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); margin-top: 2px; }
+  .q-time { font-family: var(--mono); font-size: 10.5px; color: var(--text-dim); }
+
+  /* transcript / approval card */
+  .transcript { padding: 22px 24px 18px; }
+  .case-line {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 20px;
+    font-family: var(--mono); font-size: 11px; color: var(--text-faint); letter-spacing: 0.08em;
+  }
+  .sev {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase;
+    padding: 4px 10px; border-radius: 3px; font-weight: 700;
+  }
+  .sev.urgent { color: var(--amber); border: 1px solid var(--amber-dim); background: rgba(255,180,84,0.07); animation: sevGlow 2.2s ease-in-out infinite; }
+  .case-id { color: var(--text-dim); }
+  .case-line .rule { flex: 1; height: 1px; background: var(--line); }
+
+  .msg { max-width: 88%; margin-bottom: 18px; animation: fadeUp 0.6s both; }
+  .msg-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--text-faint); margin-bottom: 7px; display: flex; gap: 8px; align-items: center; }
+  .msg-label .tick { color: var(--mint); }
+  .msg-body {
+    padding: 14px 16px; border-radius: 8px; font-size: 14.5px; line-height: 1.6;
+  }
+  .msg.tenant { animation-delay: 0.8s; }
+  .msg.tenant .msg-body { background: var(--panel-2); border: 1px solid var(--line); color: var(--text); }
+  .msg.draft { margin-left: auto; animation-delay: 1s; }
+  .msg.draft .msg-label { justify-content: flex-end; color: var(--amber); }
+  .msg.draft .msg-body {
+    border: 1px solid var(--amber-dim);
+    background: linear-gradient(180deg, rgba(255,180,84,0.08), rgba(255,180,84,0.03));
+    box-shadow: 0 0 30px rgba(255,180,84,0.06);
+  }
+  .typing-caret { display: inline-block; width: 8px; height: 15px; background: var(--amber); vertical-align: -2px; margin-left: 3px; animation: blink 1s steps(1) infinite; }
+
+  .reasoning {
+    margin: 4px 0 20px; padding: 12px 16px; border-radius: 8px;
+    background: rgba(106,167,255,0.04); border: 1px dashed var(--line-bright);
+    font-family: var(--mono); font-size: 11px; line-height: 1.8; color: var(--text-dim);
+    animation: fadeUp 0.6s 1.15s both;
+  }
+  .reasoning b { color: var(--blue); font-weight: 500; }
+
+  .actions { display: flex; gap: 12px; padding: 16px 24px 22px; border-top: 1px solid var(--line); animation: fadeUp 0.6s 1.25s both; }
+  .btn {
+    flex: 1; padding: 16px; border-radius: 8px; font-family: var(--grot); font-size: 15px; font-weight: 700;
+    cursor: pointer; transition: transform 0.15s, box-shadow 0.3s, background 0.3s;
+    border: 1px solid var(--line-bright); background: transparent; color: var(--text-dim);
+  }
+  .btn:hover { transform: translateY(-2px); color: var(--text); }
+  .btn:active { transform: translateY(0) scale(0.98); }
+  .btn.primary {
+    background: var(--amber); color: #14100a; border-color: var(--amber);
+    box-shadow: 0 0 0 rgba(255,180,84,0);
+  }
+  .btn.primary:hover { box-shadow: 0 6px 32px rgba(255,180,84,0.35); }
+  .btn .kbd {
+    font-family: var(--mono); font-size: 10px; opacity: 0.6; margin-left: 8px;
+    border: 1px solid currentColor; border-radius: 3px; padding: 1px 5px; vertical-align: 1px;
+  }
+
+  .sent-stamp {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    flex-direction: column; gap: 10px; background: rgba(7,9,14,0.85); backdrop-filter: blur(4px);
+    border-radius: 10px; z-index: 5;
+  }
+  .sent-stamp.show { display: flex; }
+  .sent-stamp .big {
+    font-family: var(--mono); font-size: 30px; font-weight: 700; letter-spacing: 0.3em; color: var(--mint);
+    border: 2px solid var(--mint); padding: 12px 28px 12px 36px; border-radius: 6px;
+    box-shadow: 0 0 40px rgba(93,217,167,0.25);
+    animation: stampIn 0.45s cubic-bezier(0.16, 1.4, 0.3, 1) both;
+  }
+  .sent-stamp .sub { font-family: var(--mono); font-size: 11px; color: var(--text-dim); letter-spacing: 0.15em; animation: fadeUp 0.4s 0.2s both; }
+  .card-host { position: relative; }
+
+  /* stats column */
+  .stat { padding: 18px 16px; border-bottom: 1px solid var(--line); }
+  .stat:last-child { border-bottom: 0; }
+  .stat-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--text-faint); margin-bottom: 8px; }
+  .stat-value { font-size: 32px; font-weight: 900; letter-spacing: -0.02em; line-height: 1; }
+  .stat-value small { font-size: 13px; font-weight: 500; color: var(--text-dim); margin-left: 4px; }
+  .stat-delta { font-family: var(--mono); font-size: 10.5px; margin-top: 6px; }
+  .up { color: var(--mint); } .down { color: var(--red); }
+
+  .spark { display: flex; align-items: flex-end; gap: 3px; height: 38px; margin-top: 12px; }
+  .spark i {
+    flex: 1; background: linear-gradient(180deg, var(--amber), rgba(255,180,84,0.15));
+    border-radius: 2px 2px 0 0; transform: scaleY(0); transform-origin: bottom;
+    animation: grow 0.7s cubic-bezier(0.16,1,0.3,1) forwards;
+  }
+
+  .shield {
+    margin: 16px; padding: 14px 16px; border-radius: 8px;
+    border: 1px solid rgba(93,217,167,0.25); background: rgba(93,217,167,0.05);
+    font-size: 12.5px; line-height: 1.6; color: var(--text-dim);
+  }
+  .shield b { color: var(--mint); font-weight: 700; display: block; margin-bottom: 3px; font-size: 12px; }
+
+  /* keyframes */
+  @keyframes dropIn { from { opacity: 0; transform: translateY(-16px); } to { opacity: 1; transform: none; } }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+  @keyframes riseUp { from { transform: translateY(110%); } to { transform: none; } }
+  @keyframes drawLine { to { transform: scaleX(1); } }
+  @keyframes scroll { to { transform: translateX(-50%); } }
+  @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  @keyframes blink { 50% { opacity: 0; } }
+  @keyframes ping { 0% { box-shadow: 0 0 0 0 var(--red-glow); } 80%,100% { box-shadow: 0 0 0 9px transparent; } }
+  @keyframes sevGlow { 0%,100% { box-shadow: 0 0 14px rgba(255,180,84,0.12); } 50% { box-shadow: 0 0 26px rgba(255,180,84,0.3); } }
+  @keyframes grow { to { transform: scaleY(1); } }
+  @keyframes stampIn { from { opacity: 0; transform: scale(1.6) rotate(-8deg); } to { opacity: 1; transform: scale(1) rotate(-3deg); } }
+  @keyframes slideOut { to { opacity: 0; transform: translateX(40px); } }
+
+  @media (max-width: 1080px) {
+    .console { grid-template-columns: 1fr; }
+    .hero { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="topbar">
+    <div class="wordmark">
+      <h1>Stoop<span class="dot">.</span></h1>
+      <span class="desk-tag">Night Desk</span>
+    </div>
+    <div class="topbar-right">
+      <div class="live"><span class="live-dot"></span> AGENT ON DUTY</div>
+      <span>YYZ · EST</span>
+      <span id="clock">02:14:09</span>
+    </div>
+  </header>
+
+  <div class="ticker-wrap">
+    <div class="ticker" id="ticker">
+      <span><b class="tk-amber">02:14</b> UNIT 2 · 41 PALMERSTON — <b>NO HEAT, BABY IN UNIT</b> → CLASSIFIED URGENT, DRAFT READY</span>
+      <span><b class="tk-mint">01:47</b> UNIT 1B · 12 OSSINGTON — DRIPPING FAUCET → ROUTINE, AUTO-QUEUED FOR MORNING</span>
+      <span><b class="tk-red">23:58</b> UNIT 3 · 88 DOVERCOURT — WATER AT CEILING LIGHT → <b>EMERGENCY PROTOCOL FIRED, YOU WERE CALLED</b></span>
+      <span><b class="tk-mint">22:30</b> TRUST SCORE 41 PALMERSTON → 94% — 6 WEEKS WITHOUT AN EDIT</span>
+      <span><b class="tk-amber">02:14</b> UNIT 2 · 41 PALMERSTON — <b>NO HEAT, BABY IN UNIT</b> → CLASSIFIED URGENT, DRAFT READY</span>
+      <span><b class="tk-mint">01:47</b> UNIT 1B · 12 OSSINGTON — DRIPPING FAUCET → ROUTINE, AUTO-QUEUED FOR MORNING</span>
+      <span><b class="tk-red">23:58</b> UNIT 3 · 88 DOVERCOURT — WATER AT CEILING LIGHT → <b>EMERGENCY PROTOCOL FIRED, YOU WERE CALLED</b></span>
+      <span><b class="tk-mint">22:30</b> TRUST SCORE 41 PALMERSTON → 94% — 6 WEEKS WITHOUT AN EDIT</span>
+    </div>
+  </div>
+
+  <section class="hero">
+    <h2>
+      <span class="l"><span>Your buildings</span></span>
+      <span class="l"><span>don't sleep.</span></span>
+      <span class="l"><span>Now <em>you</em> can.</span></span>
+    </h2>
+    <p class="hero-sub">
+      Every tenant text lands here first. Stoop reads it, ranks it, and drafts your reply —
+      <b>nothing sends until you say so.</b> Tonight it handled 3 messages while you were in bed.
+    </p>
+  </section>
+
+  <section class="console">
+
+    <!-- queue -->
+    <div class="panel">
+      <div class="panel-head"><span>Incoming queue</span><span class="count">3 OPEN</span></div>
+      <div class="queue-item active">
+        <span class="q-dot amber"></span>
+        <div><div class="q-unit">Unit 2 · 41 Palmerston</div><div class="q-meta">NO HEAT · URGENT</div></div>
+        <span class="q-time">2m</span>
+      </div>
+      <div class="queue-item">
+        <span class="q-dot red"></span>
+        <div><div class="q-unit">Unit 3 · 88 Dovercourt</div><div class="q-meta">LEAK @ FIXTURE · EMERGENCY</div></div>
+        <span class="q-time">2h</span>
+      </div>
+      <div class="queue-item">
+        <span class="q-dot blue"></span>
+        <div><div class="q-unit">Unit 1B · 12 Ossington</div><div class="q-meta">FAUCET DRIP · ROUTINE</div></div>
+        <span class="q-time">27m</span>
+      </div>
+      <div class="shield">
+        <b>SHADOW MODE · OFF</b>
+        Stoop has earned send-rights for routine messages at 41 Palmerston. Urgent &amp; emergency still wait for you.
+      </div>
+    </div>
+
+    <!-- approval card -->
+    <div class="card-host">
+      <div class="panel" id="approvalCard">
+        <div class="panel-head"><span>Awaiting your approval</span><span>CASE 0193</span></div>
+        <div class="transcript">
+          <div class="case-line">
+            <span class="sev urgent">Urgent</span>
+            <span class="case-id">UNIT 2 · 41 PALMERSTON AVE · RECEIVED 02:12 EST</span>
+            <span class="rule"></span>
+          </div>
+
+          <div class="msg tenant">
+            <div class="msg-label">TENANT · MARIA</div>
+            <div class="msg-body">hey sorry to text so late but the heat hasn't worked since like 10pm and it's getting really cold in here. we have the baby this week… is there anything you can do tonight??</div>
+          </div>
+
+          <div class="reasoning">
+            <b>AGENT REASONING</b> — keywords: <b>no heat</b> + <b>overnight</b> + <b>infant present</b> · Ontario VFC bylaw: heat req. ≥ 21°C until Jun 1 ·
+            severity → <b>URGENT</b> (not emergency: no flood/gas/fire) · drafted in your voice profile <b>“warm, direct”</b>
+          </div>
+
+          <div class="msg draft">
+            <div class="msg-label"><span class="tick">●</span> STOOP DRAFT · YOUR VOICE</div>
+            <div class="msg-body">Hi Maria — so sorry, that's not okay with the little one there. Try the thermostat breaker in the hall closet (panel, switch 4) and let me know in 10 min. If it's still cold I'll have my HVAC guy there first thing — 7:30 AM. Space heater is in the basement storage if you need it tonight.<span class="typing-caret"></span></div>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn" onclick="alert('Mock: opens inline editor')">Edit draft <span class="kbd">E</span></button>
+          <button class="btn primary" id="approveBtn">Approve &amp; send <span class="kbd">⏎</span></button>
+        </div>
+      </div>
+      <div class="sent-stamp" id="stamp">
+        <div class="big">SENT</div>
+        <div class="sub">02:14:31 EST · MARIA NOTIFIED · CASE 0193 LOGGED</div>
+      </div>
+    </div>
+
+    <!-- stats -->
+    <div class="panel">
+      <div class="panel-head"><span>Tonight</span><span>SHIFT 22:00–07:00</span></div>
+      <div class="stat">
+        <div class="stat-label">Messages triaged</div>
+        <div class="stat-value">3</div>
+        <div class="stat-delta up">▲ all classified &lt; 30s</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Times you were woken</div>
+        <div class="stat-value">0<small>/ 1 true emergency</small></div>
+        <div class="stat-delta">emergency rang your phone — resolved 00:21</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Approval rate · 30d</div>
+        <div class="stat-value">94<small>%</small></div>
+        <div class="spark">
+          <i style="height:40%;animation-delay:.9s"></i><i style="height:55%;animation-delay:.96s"></i>
+          <i style="height:48%;animation-delay:1.02s"></i><i style="height:62%;animation-delay:1.08s"></i>
+          <i style="height:70%;animation-delay:1.14s"></i><i style="height:66%;animation-delay:1.2s"></i>
+          <i style="height:78%;animation-delay:1.26s"></i><i style="height:84%;animation-delay:1.32s"></i>
+          <i style="height:80%;animation-delay:1.38s"></i><i style="height:94%;animation-delay:1.44s"></i>
+        </div>
+      </div>
+    </div>
+
+  </section>
+</div>
+
+<script>
+  // live clock
+  const clock = document.getElementById("clock");
+  function tick() {
+    const d = new Date();
+    clock.textContent = [d.getHours(), d.getMinutes(), d.getSeconds()]
+      .map(n => String(n).padStart(2, "0")).join(":");
+  }
+  tick(); setInterval(tick, 1000);
+
+  // approve interaction
+  document.getElementById("approveBtn").addEventListener("click", () => {
+    document.getElementById("stamp").classList.add("show");
+    setTimeout(() => {
+      const card = document.getElementById("approvalCard");
+      card.style.animation = "slideOut 0.5s 1.2s cubic-bezier(0.4,0,1,1) forwards";
+      document.getElementById("stamp").style.animation = "slideOut 0.5s 1.2s cubic-bezier(0.4,0,1,1) forwards";
+    }, 400);
+  });
+</script>
+</body>
+</html>

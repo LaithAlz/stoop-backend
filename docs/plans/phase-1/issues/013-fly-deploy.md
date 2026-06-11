@@ -6,7 +6,7 @@ milestone: "Phase 1: Backend Foundation"
 
 ## Goal
 
-Deploy the backend to Fly.io in the Toronto (`yyz`) region. Verify `GET /v1/me` works against the production deployment with a real Clerk JWT.
+Deploy the backend to Fly.io in the Toronto (`yyz`) region. Verify `GET /v1/me` works against the production deployment with a real Supabase access token.
 
 **This closes the Phase 1 gate** along with #11 and #14.
 
@@ -18,7 +18,7 @@ A deployed, authenticated endpoint hit from a real client is the milestone you c
 
 - [ ] Fly app `stoop-dev` exists in region `yyz`
 - [ ] `fly.toml` committed with multi-process config (web only for Phase 1; worker added in Phase 4)
-- [ ] All secrets set via `fly secrets set ...` (database URL, Clerk secret, Sentry DSN)
+- [ ] All secrets set via `fly secrets set ...` (database URL, Supabase service-role key, Sentry DSN)
 - [ ] No secrets committed in `fly.toml` — all in `fly secrets`
 - [ ] Health checks configured: `/healthz` for liveness, `/readyz` for readiness
 - [ ] Deploy succeeds: `fly deploy` exits 0
@@ -68,7 +68,7 @@ A deployed, authenticated endpoint hit from a real client is the milestone you c
 - The `[processes]` table in `fly.toml` defines what runs. For Phase 1: `web = "uvicorn app.main:app --host 0.0.0.0 --port 8080"`
 - For HTTP service config: `[[services]]` with `internal_port = 8080`, `[[services.ports]]` with port 443 and handlers `["tls", "http"]`
 - Health checks: `[[services.http_checks]]` with `path = "/readyz"`, `interval = "15s"`, `timeout = "5s"`
-- Set secrets: `fly secrets set DATABASE_URL=... CLERK_SECRET_KEY=... -a stoop-dev`
+- Set secrets: `fly secrets set DATABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... -a stoop-dev`
 - Verify what's set: `fly secrets list -a stoop-dev` (shows names, not values)
 - Auto-stop: `auto_stop_machines = "stop"` and `auto_start_machines = true` under `[http_service]` or `[[services]]`
 - View logs: `fly logs -a stoop-dev`

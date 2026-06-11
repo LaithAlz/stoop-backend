@@ -1,42 +1,46 @@
 ---
 title: "feat(backend): GET /v1/me endpoint with get-or-create landlord"
 labels: ["phase-1", "type-implementation", "auth", "size-s", "gate"]
-milestone: "Phase 1: Backend Foundation"
+milestone: "Milestone 1: Walking skeleton"
 ---
+
+> **Updated 2026-06-11** — Clerk references swapped for Supabase Auth
+> (ADR-1). The pattern is unchanged.
 
 ## Goal
 
-`GET /v1/me` returns the authenticated landlord's profile. First call lazily creates the landlord record from Clerk claims; subsequent calls return the same record.
+`GET /v1/me` returns the authenticated landlord's profile. First call lazily
+creates the landlord record from the verified JWT claims; subsequent calls
+return the same record.
 
-**This is the Phase 1 gate.** When this works in production (after #13), Phase 1 is done.
+**This is the deployment gate for the backend foundation.** When this works
+in production (after #13), the foundation slice of Milestone 1 is done.
 
 ## Why this matters
 
-The seam between Clerk (identity) and our database (application state). Every future authenticated endpoint will follow this pattern: verify JWT → look up local user → do business logic.
+The seam between Supabase Auth (identity) and our application tables. Every
+future authenticated endpoint follows this pattern: verify JWT → load local
+landlord → set RLS session variable (Milestone 2) → business logic.
 
 ## Acceptance criteria
 
-- [ ] `GET /v1/me` returns the landlord profile when called with a valid Clerk JWT
-- [ ] First call for a new Clerk user → creates a `landlords` row → returns profile
-- [ ] Subsequent calls → return the same `landlords.id` (no duplicates created)
-- [ ] If the user's email in Clerk changes, the local record is refreshed on next read (lazy sync)
-- [ ] Response is typed via Pydantic — fields include `id`, `email`, `full_name`, `timezone`, `subscription_tier`, `subscription_status`, `trial_ends_at`, `created_at`
-- [ ] No `Authorization` header → 401 (handled by the dep from #10)
-- [ ] Race condition handled: concurrent first-time requests don't both insert (no duplicate-key error to the user)
-- [ ] Test: with a real Clerk JWT, calling `/v1/me` twice returns the same id
-- [ ] Test: without auth, returns 401
+- [ ] `GET /v1/me` returns the landlord profile with a valid Supabase access token
+- [ ] First call for a new auth user → creates a `landlords` row keyed by `auth_user_id` (the JWT `sub` UUID) → returns profile
+- [ ] Subsequent calls → same `landlords.id`, no duplicates
+- [ ] Email changed in Supabase Auth → local record refreshed on next read (lazy sync)
+- [ ] Typed Pydantic response: `id`, `email`, `full_name`, `timezone`, `subscription_tier`, `subscription_status`, `trial_ends_at`, `created_at`
+- [ ] No `Authorization` header → 401 (from #10's dependency)
+- [ ] Race-safe: concurrent first-time requests don't surface a duplicate-key error (upsert)
+- [ ] Test: real token, two calls, same id · Test: no auth → 401
 
 ## Out of scope
 
-- No `PATCH /v1/me` for profile editing — Phase 5
-- No subscription management — Phase 5
-- No avatar upload — Phase 7+
-- No notification preferences update — Phase 5
+- `PATCH /v1/me`, subscription management, avatar, notification prefs — later milestones
 
 ## Effort & dependencies
 
-- **Effort:** S (3-4 hours)
-- **Blocks:** Closes Phase 1 EPIC when deployed (after #13)
+- **Effort:** S (3–4 hours)
+- **Blocks:** closes the foundation gate when deployed (after #13)
 - **Blocked by:** #8, #9, #10
 
 ---
@@ -44,54 +48,49 @@ The seam between Clerk (identity) and our database (application state). Every fu
 <details>
 <summary><b>Design questions to think through first</b></summary>
 
-1. **Get-or-create pattern.** First call lazily creates the row. No separate "sign up" endpoint — sign-up is implicit (Clerk handles auth; we just need a row).
-
-2. **Race condition.** Two concurrent first-time requests both check "exists?" both see no, both INSERT, second one fails on UNIQUE. Two ways to handle:
-   - Catch IntegrityError → re-select
-   - Use Postgres upsert: `INSERT ... ON CONFLICT (clerk_user_id) DO UPDATE SET ... RETURNING *`
-
-   Upsert is cleaner — one query, atomic. Sketch it.
-
-3. **What to return.** What does the mobile app need? Don't dump everything. Design the response schema.
-
-4. **Email sync.** If Clerk's email differs from local, update local on read. Why? User changes their email in Clerk → app reflects without webhook. Simple lazy sync. Webhook-based sync comes in #15 (stretch).
+1. **Get-or-create**: no separate sign-up endpoint — Supabase handles auth,
+   we just need a row. (#15's DB trigger makes this proactive later; lazy
+   upsert stays as the safety net.)
+2. **Race condition**: two concurrent first calls both INSERT → use Postgres
+   upsert: `INSERT … ON CONFLICT (auth_user_id) DO UPDATE … RETURNING *`.
+3. **Response design**: what does the dashboard need? Don't dump the row.
+4. **Email sync**: refresh local email from the verified claim on read.
 
 </details>
 
 <details>
 <summary><b>Hints</b></summary>
 
-- The upsert pattern: `INSERT INTO landlords (...) VALUES (...) ON CONFLICT (clerk_user_id) DO UPDATE SET email = EXCLUDED.email, full_name = COALESCE(EXCLUDED.full_name, landlords.full_name), updated_at = now() RETURNING *`
-- Use `session.execute(text(...))` with `result.mappings().one()` to get a dict-style row when you don't have ORM models yet
-- `response_model=MeResponse` on the route decorator gives you automatic Pydantic validation of the response
-- Use `Depends(require_clerk_user)` and `Depends(get_session)` together — FastAPI handles the order
-- structlog: `bind_contextvars(clerk_user_id=user.user_id)` at the top of the handler so all logs in this request get tagged
+- `INSERT INTO landlords (auth_user_id, email, full_name) VALUES (…) ON CONFLICT (auth_user_id) DO UPDATE SET email = EXCLUDED.email, full_name = COALESCE(EXCLUDED.full_name, landlords.full_name), updated_at = now() RETURNING *`
+- `full_name` comes from `user_metadata` — user-writable, display-only.
+- `response_model=MeResponse` for response validation.
+- structlog: `bind_contextvars(auth_user_id=user.user_id)` — but see gotchas on PII.
 
 </details>
 
 <details>
 <summary><b>Common gotchas</b></summary>
 
-- Don't try to do the get-or-create in two queries (`SELECT` then `INSERT`). Race condition. Use upsert.
-- `COALESCE(EXCLUDED.full_name, landlords.full_name)` preserves an existing full_name if Clerk sends a null. The other direction (Clerk sends a name, we want to update) is `EXCLUDED.full_name`.
-- A GET with side effects (lazy create) is debatably REST-correct, but it's the cleanest UX. Document it. Don't overthink — Stripe, GitHub, and most modern APIs do this for "current user" endpoints.
-- Don't return Clerk-specific fields (clerk_user_id) — keep that an internal detail.
-- The audit log doesn't exist yet (Phase 5 adds it). Don't try to write to it.
+- SELECT-then-INSERT is a race. Upsert.
+- A GET with a lazy-create side effect is fine — document it; Stripe/GitHub do the same for "current user".
+- Don't expose `auth_user_id` in the response — internal detail.
+- Don't log emails; the `auth_user_id` UUID is enough correlation.
+- The audit log exists from Milestone 1 in the new plan — but `/v1/me` reads don't belong in it; it's for agent/landlord actions on conversations.
 
 </details>
 
 <details>
 <summary><b>Review prompts for Claude Code</b></summary>
 
-> Review my `/v1/me` endpoint in `app/routers/me.py`:
-> 1. Is the upsert pattern correct for handling concurrent first-time requests?
-> 2. Am I leaking PII in logs (I log clerk_user_id and email — too much)?
-> 3. Should I use SQLAlchemy ORM objects vs raw SQL with result.mappings()?
-> 4. Is the Pydantic response schema strict enough? Anything I should hide from the client?
-> 5. Should this be 200 or 201 on first-call create? (I returned 200 — discuss tradeoffs.)
+> Review `app/routers/me.py`:
+> 1. Is the upsert race-safe and idempotent?
+> 2. PII in logs?
+> 3. Response schema: anything leaking that the client doesn't need?
+> 4. 200 vs 201 on first-call create — defensible either way; did I document the choice?
 
 </details>
 
 ---
 
-**When this issue is closed AND the app is deployed to Fly (#13), Phase 1 is functionally complete.** Take a screencast of the working endpoint. Recruiting artifact.
+**When this is closed AND deployed to Fly (#13), the foundation gate is
+passed.** Screencast it — recruiting artifact.

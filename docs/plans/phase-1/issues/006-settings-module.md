@@ -45,7 +45,7 @@ By hand, list every env var your Phase 1 app needs. For each:
 - Sensitive (Fly secret) or non-sensitive (regular env var)?
 - Type — `str`, `int`, `bool`, `Literal[...]`, `list[str]`?
 
-Phase 1 vars: environment, log_level, database_url, clerk_secret_key, clerk_publishable_key, clerk_jwks_url, sentry_dsn (optional).
+Phase 1 vars: environment, log_level, database_url, supabase_url, supabase_jwks_url, supabase_jwt_issuer, supabase_service_role_key, sentry_dsn (optional).
 
 </details>
 

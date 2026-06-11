@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stoop — Tenant maintenance, handled before it wakes you up</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400;0,500;0,700;0,900;1,400&family=Spline+Sans+Mono:wght@300;400;500;700&family=Newsreader:ital,opsz,wght@1,6..72,400;1,6..72,500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --grot: "Schibsted Grotesk", sans-serif;
+    --mono: "Spline Sans Mono", monospace;
+    --serif: "Newsreader", serif;
+    --spring: cubic-bezier(0.34, 1.45, 0.64, 1);
+    --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  [data-theme="dark"] {
+    --void: #131009; --panel: #1b1710; --panel-2: #221d14;
+    --line: #322a1d; --line-bright: #54462f;
+    --text: #f2ead9; --text-dim: #b3a68e; --text-faint: #91836b;
+    --accent: #ffb454; --accent-border: #a06a24; --accent-bg: rgba(255,180,84,0.09); --on-accent: #221603;
+    --terra: #e0673f; --mint: #7fdcab; --blue: #9fc2ec; --red: #ff6d5e;
+    --red-border: rgba(255,109,94,0.5); --red-bg: rgba(255,109,94,0.09);
+    --blue-border: rgba(159,194,236,0.35); --blue-bg: rgba(159,194,236,0.08);
+    --mint-border: rgba(127,220,171,0.35); --mint-bg: rgba(127,220,171,0.08);
+    --shadow: rgba(0,0,0,0.38); --glow-amber: rgba(255,180,84,0.07); --glow-terra: rgba(224,103,63,0.06);
+    --nav-bg: rgba(27,23,16,0.88);
+  }
+  [data-theme="light"] {
+    --void: #f7efdf; --panel: #fffaf0; --panel-2: #f3ead8;
+    --line: #e2d6bd; --line-bright: #c4b394;
+    --text: #28200f; --text-dim: #5d513b; --text-faint: #6f6349;
+    --accent: #95611a; --accent-border: #b98a3e; --accent-bg: rgba(149,97,26,0.10); --on-accent: #fff8ec;
+    --terra: #b54a26; --mint: #1c7a4c; --blue: #2c64a8; --red: #b3331d;
+    --red-border: rgba(179,51,29,0.45); --red-bg: rgba(179,51,29,0.08);
+    --blue-border: rgba(44,100,168,0.35); --blue-bg: rgba(44,100,168,0.07);
+    --mint-border: rgba(28,122,76,0.35); --mint-bg: rgba(28,122,76,0.07);
+    --shadow: rgba(90,70,40,0.16); --glow-amber: rgba(224,150,50,0.10); --glow-terra: rgba(224,103,63,0.07);
+    --nav-bg: rgba(255,250,240,0.88);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { background: var(--void); color: var(--text); font-family: var(--grot); overflow-x: hidden; transition: background 0.4s, color 0.4s; }
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(1100px 560px at 78% -10%, var(--glow-amber), transparent 60%),
+      radial-gradient(900px 640px at -8% 50%, var(--glow-terra), transparent 60%);
+  }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+  .skip {
+    position: absolute; left: 16px; top: -60px; z-index: 100;
+    background: var(--accent); color: var(--on-accent); font-weight: 800; font-size: 14px;
+    padding: 12px 20px; border-radius: 999px; text-decoration: none; transition: top 0.2s;
+  }
+  .skip:focus-visible { top: 16px; }
+
+  .wrap { position: relative; z-index: 1; max-width: 1240px; margin: 0 auto; padding: 22px clamp(16px, 3vw, 28px) 0; }
+  .ico { width: 18px; height: 18px; flex: none; }
+
+  .rv { opacity: 0; transform: translateY(26px); transition: opacity 0.8s var(--ease), transform 0.8s var(--ease); }
+  .rv.in { opacity: 1; transform: none; }
+
+  /* ── nav ─────────────────────────────── */
+  nav {
+    position: sticky; top: 16px; z-index: 40;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    background: var(--nav-bg); backdrop-filter: blur(14px);
+    border: 1px solid var(--line); border-radius: 999px; padding: 10px 12px 10px 24px;
+    box-shadow: 0 10px 30px var(--shadow);
+    animation: popDown 0.7s var(--spring) both;
+  }
+  .logo { font-weight: 900; font-size: 22px; letter-spacing: -0.02em; }
+  .logo .dot { color: var(--accent); }
+  .nav-links { display: flex; gap: 2px; }
+  .nav-links a {
+    font-weight: 700; font-size: 14px; color: var(--text-dim); text-decoration: none;
+    padding: 10px 16px; min-height: 44px; display: inline-flex; align-items: center;
+    border-radius: 999px; transition: color 0.2s, background 0.25s;
+  }
+  .nav-links a:hover { color: var(--text); background: var(--accent-bg); }
+  .nav-right { display: flex; align-items: center; gap: 10px; }
+  .cta-sm {
+    font-weight: 800; font-size: 14px; text-decoration: none; color: var(--on-accent);
+    background: var(--accent); padding: 12px 22px; min-height: 44px; display: inline-flex; align-items: center;
+    border-radius: 999px; transition: transform 0.2s var(--spring), box-shadow 0.3s;
+  }
+  .cta-sm:hover { transform: translateY(-2px); box-shadow: 0 8px 26px var(--glow-amber); }
+  .icon-btn {
+    width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--line-bright);
+    background: transparent; color: var(--text-dim); cursor: pointer; display: grid; place-items: center;
+    transition: transform 0.2s var(--spring), color 0.2s, border-color 0.2s;
+  }
+  .icon-btn:hover { transform: translateY(-2px); color: var(--text); border-color: var(--accent-border); }
+  .icon-btn svg { width: 19px; height: 19px; }
+  [data-theme="dark"] .sun { display: block; } [data-theme="dark"] .moon { display: none; }
+  [data-theme="light"] .sun { display: none; } [data-theme="light"] .moon { display: block; }
+  .menu-btn { display: none; }
+  .mobile-menu {
+    display: none; position: fixed; top: 84px; left: 16px; right: 16px; z-index: 45;
+    background: var(--nav-bg); backdrop-filter: blur(14px); border: 1px solid var(--line);
+    border-radius: 22px; padding: 10px; box-shadow: 0 18px 50px var(--shadow);
+  }
+  .mobile-menu.open { display: block; }
+  .mobile-menu a {
+    display: flex; align-items: center; min-height: 48px; padding: 0 18px;
+    font-weight: 700; font-size: 16px; color: var(--text-dim); text-decoration: none; border-radius: 14px;
+  }
+  .mobile-menu a:hover { background: var(--accent-bg); color: var(--text); }
+
+  /* ── hero ────────────────────────────── */
+  .hero { display: grid; grid-template-columns: 1.05fr 1fr; gap: 56px; align-items: center; padding: 80px 0 60px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 9px;
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); border: 1px solid var(--accent-border); border-radius: 999px; padding: 7px 15px;
+    animation: fadeUp 0.7s 0.15s both; font-weight: 500;
+  }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 9px var(--mint); animation: breathe 2.4s infinite; }
+  .hero h1 { font-size: clamp(40px, 5vw, 70px); font-weight: 900; letter-spacing: -0.035em; line-height: 1.0; margin: 22px 0; }
+  .hero h1 .row { display: block; overflow: hidden; padding-bottom: 0.08em; }
+  .hero h1 .row span { display: inline-block; animation: riseUp 0.85s var(--ease) both; }
+  .hero h1 .row:nth-child(2) span { animation-delay: 0.1s; }
+  .hero h1 .row:nth-child(3) span { animation-delay: 0.2s; }
+  .hero h1 em { font-family: var(--serif); font-style: italic; font-weight: 400; color: var(--accent); }
+  .hero .sub { font-size: 17.5px; line-height: 1.7; color: var(--text-dim); max-width: 46ch; animation: fadeUp 0.8s 0.4s both; }
+  .hero .sub b { color: var(--text); font-weight: 700; }
+  .hero-ctas { display: flex; gap: 14px; margin-top: 32px; flex-wrap: wrap; animation: fadeUp 0.8s 0.55s both; }
+  .btn {
+    font-family: var(--grot); font-weight: 800; font-size: 16px; padding: 16px 28px; min-height: 52px;
+    border-radius: 999px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 8px;
+    transition: transform 0.2s var(--spring), box-shadow 0.3s, color 0.2s;
+  }
+  .btn.primary { background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); }
+  .btn.primary:hover { transform: translateY(-3px); box-shadow: 0 10px 34px var(--glow-amber); }
+  .btn.ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--line-bright); }
+  .btn.ghost:hover { color: var(--text); transform: translateY(-3px); }
+  .hero-proof { display: flex; gap: 26px; margin-top: 36px; font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); flex-wrap: wrap; animation: fadeUp 0.8s 0.7s both; font-weight: 500; }
+  .hero-proof b { color: var(--text-dim); }
+
+  /* ── demo console ────────────────────── */
+  .demo {
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line); border-radius: 22px; overflow: hidden;
+    box-shadow: 0 30px 80px var(--shadow);
+    animation: fadeUp 0.9s 0.45s both;
+  }
+  .demo-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-faint); font-weight: 500;
+  }
+  .demo-head .lights { display: flex; gap: 6px; }
+  .demo-head .lights i { width: 9px; height: 9px; border-radius: 50%; background: var(--line-bright); }
+  .demo-head .lights i:first-child { background: var(--terra); }
+  .scenarios { display: flex; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .scn {
+    display: inline-flex; align-items: center; gap: 8px; min-height: 44px;
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.04em; font-weight: 500;
+    color: var(--text-dim); background: transparent; border: 1px solid var(--line-bright);
+    border-radius: 999px; padding: 9px 16px; cursor: pointer;
+    transition: all 0.25s var(--spring);
+  }
+  .scn svg { width: 15px; height: 15px; }
+  .scn:hover { color: var(--text); transform: translateY(-1px); }
+  .scn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 700; }
+  .demo-stage { padding: 20px; min-height: 360px; display: flex; flex-direction: column; gap: 12px; }
+
+  .d-bubble { border-radius: 14px; padding: 12px 15px; font-size: 14px; line-height: 1.6; max-width: 90%; opacity: 0; transform: translateY(12px); transition: opacity 0.5s var(--ease), transform 0.5s var(--spring); }
+  .d-bubble.show { opacity: 1; transform: none; }
+  .d-bubble .who { font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-faint); margin-bottom: 6px; font-weight: 500; }
+  .d-bubble.tenant { background: var(--panel-2); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+  .d-bubble.draft { margin-left: auto; border-bottom-right-radius: 4px; border: 1px solid var(--accent-border); background: var(--accent-bg); }
+  .d-bubble.draft .who { color: var(--accent); }
+  .d-think {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; color: var(--text-dim);
+    border: 1px dashed var(--line-bright); border-radius: 10px; padding: 10px 14px; line-height: 1.8;
+    background: var(--blue-bg);
+    opacity: 0; transform: translateY(12px); transition: opacity 0.5s, transform 0.5s var(--spring);
+  }
+  .d-think.show { opacity: 1; transform: none; }
+  .d-think b { color: var(--blue); font-weight: 500; }
+  .d-think .scan { display: inline-block; animation: blink 0.9s steps(1) infinite; color: var(--blue); }
+  .d-verdict { display: flex; align-items: center; gap: 10px; opacity: 0; transform: scale(0.92); transition: opacity 0.4s, transform 0.45s var(--spring); }
+  .d-verdict.show { opacity: 1; transform: none; }
+  .d-chip {
+    font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: 0.14em;
+    text-transform: uppercase; padding: 6px 14px; border-radius: 999px; border: 1px solid;
+  }
+  .d-chip.urgent { color: var(--accent); border-color: var(--accent-border); background: var(--accent-bg); }
+  .d-chip.emergency { color: var(--red); border-color: var(--red-border); background: var(--red-bg); animation: pulse 1.4s infinite; }
+  .d-chip.routine { color: var(--blue); border-color: var(--blue-border); background: var(--blue-bg); }
+  .d-verdict small { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; color: var(--text-faint); text-transform: uppercase; font-weight: 500; }
+  .d-foot { margin-top: auto; display: flex; gap: 10px; align-items: center; opacity: 0; transform: translateY(10px); transition: opacity 0.5s, transform 0.5s var(--spring); }
+  .d-foot.show { opacity: 1; transform: none; }
+  .d-foot .hold {
+    flex: 1; text-align: center; font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
+    text-transform: uppercase; padding: 14px; border-radius: 999px; font-weight: 500;
+  }
+  .hold.wait { color: var(--accent); border: 1px dashed var(--accent-border); }
+  .hold.call { color: var(--red); border: 1px solid var(--red-border); animation: pulse 1.4s infinite; }
+  .hold.auto { color: var(--mint); border: 1px dashed var(--mint-border); }
+
+  /* ── ticker ──────────────────────────── */
+  .ticker-band { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin-top: 30px; display: flex; align-items: center; }
+  .ticker-clip {
+    flex: 1; overflow: hidden; white-space: nowrap; padding: 11px 0;
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint);
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 5%, #000 95%, transparent);
+            mask-image: linear-gradient(90deg, transparent, #000 5%, #000 95%, transparent);
+  }
+  .ticker-clip .roll { display: inline-block; animation: scroll 42s linear infinite; }
+  .ticker-clip:hover .roll, .roll.paused { animation-play-state: paused; }
+  .ticker-band span { margin-right: 52px; }
+  .tk-a { color: var(--accent); } .tk-m { color: var(--mint); } .tk-r { color: var(--red); }
+  .pause-btn {
+    width: 38px; height: 38px; margin: 0 14px; border-radius: 50%; border: 1px solid var(--line);
+    background: transparent; color: var(--text-faint); cursor: pointer; display: grid; place-items: center; flex: none;
+  }
+  .pause-btn:hover { color: var(--text); border-color: var(--line-bright); }
+  .pause-btn svg { width: 13px; height: 13px; }
+
+  /* ── sections ────────────────────────── */
+  section.block { padding: 96px 0 0; }
+  .kicker { font-family: var(--mono); font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent); font-weight: 500; }
+  .block h2 { font-size: clamp(30px, 3.8vw, 52px); font-weight: 900; letter-spacing: -0.03em; line-height: 1.05; margin: 16px 0 14px; max-width: 22ch; }
+  .block h2 em { font-family: var(--serif); font-style: italic; font-weight: 400; color: var(--text-dim); }
+  .block .lede { color: var(--text-dim); font-size: 16.5px; line-height: 1.7; max-width: 58ch; }
+
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 44px; }
+  .step {
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line); border-radius: 18px; padding: 24px 22px 26px;
+    transition: transform 0.3s var(--spring), border-color 0.3s; position: relative;
+  }
+  .step:hover { transform: translateY(-5px); border-color: var(--line-bright); }
+  .step .n { font-family: var(--mono); font-size: 11.5px; color: var(--accent); letter-spacing: 0.16em; display: block; margin-bottom: 34px; font-weight: 500; }
+  .step h3 { font-size: 18.5px; font-weight: 800; letter-spacing: -0.01em; margin-bottom: 8px; }
+  .step p { font-size: 14px; line-height: 1.65; color: var(--text-dim); }
+  .step .glyph {
+    position: absolute; top: 20px; right: 20px; width: 36px; height: 36px;
+    display: grid; place-items: center; border-radius: 12px;
+    background: var(--accent-bg); border: 1px solid var(--accent-border); color: var(--accent);
+  }
+  .step .glyph svg { width: 18px; height: 18px; }
+
+  .tiers { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 44px; }
+  .tier {
+    border-radius: 18px; padding: 26px 24px; border: 1px solid var(--line);
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    transition: transform 0.3s var(--spring), box-shadow 0.3s;
+  }
+  .tier:hover { transform: translateY(-5px); box-shadow: 0 16px 50px var(--shadow); }
+  .tier.t-em { border-color: var(--red-border); }
+  .tier.t-ur { border-color: var(--accent-border); }
+  .tier .d-chip { display: inline-block; margin-bottom: 18px; }
+  .tier h3 { font-size: 21px; font-weight: 900; letter-spacing: -0.02em; margin-bottom: 8px; }
+  .tier p { font-size: 14px; line-height: 1.65; color: var(--text-dim); }
+  .tier ul { list-style: none; margin-top: 16px; }
+  .tier li { font-family: var(--mono); font-size: 12px; color: var(--text-faint); padding: 8px 0; border-top: 1px solid var(--line); letter-spacing: 0.04em; }
+  .tier li b { color: var(--text-dim); font-weight: 500; }
+
+  .ladder-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: center; margin-top: 44px; }
+  .rungs { display: flex; flex-direction: column; gap: 12px; }
+  .rung {
+    display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center;
+    border: 1px solid var(--line); border-radius: 14px; padding: 17px 20px;
+    background: var(--panel); transition: transform 0.3s var(--spring), border-color 0.3s;
+  }
+  .rung:hover { transform: translateX(6px); border-color: var(--line-bright); }
+  .rung .lv { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; color: var(--text-faint); font-weight: 500; }
+  .rung b { font-size: 15.5px; font-weight: 800; display: block; }
+  .rung small { font-size: 13px; color: var(--text-dim); }
+  .rung .st { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 500; }
+  .rung.active { border-color: var(--accent-border); background: linear-gradient(180deg, var(--accent-bg), var(--panel)); }
+  .rung.active .st { color: var(--accent); }
+  .rung.locked .st { color: var(--text-faint); }
+  .rung.passed .st { color: var(--mint); }
+  .ladder-copy p { color: var(--text-dim); font-size: 16px; line-height: 1.75; margin-top: 14px; }
+  .ladder-copy p b { color: var(--text); }
+
+  .plans { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 44px; max-width: 760px; }
+  .plan {
+    border: 1px solid var(--line); border-radius: 20px; padding: 30px 28px;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    transition: transform 0.3s var(--spring), box-shadow 0.3s;
+  }
+  .plan:hover { transform: translateY(-5px); }
+  .plan.featured { border-color: var(--accent-border); position: relative; overflow: hidden; }
+  .plan.featured::before {
+    content: "MOST LANDLORDS"; position: absolute; top: 18px; right: -34px;
+    background: var(--accent); color: var(--on-accent); font-family: var(--mono); font-size: 9.5px;
+    font-weight: 700; letter-spacing: 0.12em; padding: 5px 40px; transform: rotate(36deg);
+  }
+  .plan h3 { font-weight: 900; font-size: 19px; }
+  .plan .price { font-size: 46px; font-weight: 900; letter-spacing: -0.03em; margin: 14px 0 2px; }
+  .plan .price small { font-size: 14px; color: var(--text-dim); font-weight: 500; }
+  .plan .per { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); font-weight: 500; }
+  .plan ul { list-style: none; margin-top: 20px; }
+  .plan li { font-size: 14px; color: var(--text-dim); padding: 9px 0; border-top: 1px solid var(--line); }
+  .plan li b { color: var(--text); font-weight: 700; }
+
+  .final {
+    margin: 110px 0 0; border: 1px solid var(--accent-border); border-radius: 26px;
+    padding: 70px 40px; text-align: center; position: relative; overflow: hidden;
+    background:
+      radial-gradient(600px 300px at 50% -40%, var(--glow-amber), transparent 70%),
+      linear-gradient(180deg, var(--panel-2), var(--panel));
+  }
+  .final h2 { margin: 14px auto; }
+  .final .lede { margin: 0 auto 32px; }
+
+  footer {
+    margin-top: 90px; border-top: 1px solid var(--line); padding: 36px 0 46px;
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 18px;
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); font-weight: 500;
+  }
+
+  @keyframes popDown { from { opacity: 0; transform: translateY(-22px); } to { opacity: 1; transform: none; } }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+  @keyframes riseUp { from { transform: translateY(115%); } to { transform: none; } }
+  @keyframes scroll { to { transform: translateX(-50%); } }
+  @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  @keyframes blink { 50% { opacity: 0; } }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 var(--red-bg); } 60% { box-shadow: 0 0 0 8px transparent; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+    .roll { animation: none; }
+    .rv { opacity: 1; transform: none; }
+  }
+
+  @media (max-width: 1000px) {
+    .hero, .ladder-grid { grid-template-columns: 1fr; gap: 40px; }
+    .steps { grid-template-columns: 1fr 1fr; }
+    .tiers, .plans { grid-template-columns: 1fr; }
+    .nav-links { display: none; }
+    .menu-btn { display: grid; }
+    .hero { padding-top: 56px; }
+  }
+  @media (max-width: 560px) {
+    .steps { grid-template-columns: 1fr; }
+    .cta-sm { display: none; }
+    .final { padding: 50px 24px; }
+  }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="wrap">
+
+  <nav aria-label="Primary">
+    <div class="logo">Stoop<span class="dot">.</span></div>
+    <div class="nav-links">
+      <a href="#how">How it works</a>
+      <a href="#severity">Severity</a>
+      <a href="#trust">Trust</a>
+      <a href="#pricing">Pricing</a>
+    </div>
+    <div class="nav-right">
+      <button class="icon-btn" id="themeBtn" aria-label="Switch to daylight theme">
+        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+      <button class="icon-btn menu-btn" id="menuBtn" aria-label="Open menu" aria-expanded="false" aria-controls="mobileMenu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <a class="cta-sm" href="#pricing">Get Stoop →</a>
+    </div>
+  </nav>
+  <div class="mobile-menu" id="mobileMenu">
+    <a href="#how">How it works</a>
+    <a href="#severity">Severity</a>
+    <a href="#trust">Trust</a>
+    <a href="#pricing">Pricing</a>
+  </div>
+
+  <!-- HERO + LIVE DEMO -->
+  <header class="hero" id="main">
+    <div>
+      <span class="pill"><span class="dot" aria-hidden="true"></span>Agent on duty · built for Ontario landlords</span>
+      <h1>
+        <span class="row"><span>Tenant texts,</span></span>
+        <span class="row"><span>handled <em>before</em></span></span>
+        <span class="row"><span>they wake you.</span></span>
+      </h1>
+      <p class="sub">
+        Tenants text one number. Stoop reads every message, ranks how bad it really is,
+        and drafts a reply <b>in your voice</b> — held for your approval.
+        <b>Only a true emergency rings your phone.</b>
+      </p>
+      <div class="hero-ctas">
+        <a class="btn primary" href="#pricing">Start free — 1 property</a>
+        <a class="btn ghost" href="#demo">Watch it triage ↓</a>
+      </div>
+      <div class="hero-proof">
+        <span><b>28/30</b> quiet nights</span>
+        <span><b>94%</b> drafts unedited</span>
+        <span><b>&lt;30s</b> to classify</span>
+      </div>
+    </div>
+
+    <!-- interactive demo -->
+    <div class="demo" id="demo">
+      <div class="demo-head">
+        <div class="lights" aria-hidden="true"><i></i><i></i><i></i></div>
+        <span>LIVE TRIAGE · TRY A SCENARIO</span>
+        <span id="demoClock">02:12</span>
+      </div>
+      <div class="scenarios" role="group" aria-label="Demo scenarios">
+        <button class="scn" data-s="urgent" aria-pressed="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2v20M4 6l16 12M20 6L4 18M2 12h20M7 3.5l10 17M17 3.5l-10 17"/></svg>
+          No heat, 2 AM
+        </button>
+        <button class="scn" data-s="emergency" aria-pressed="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3s6 6.3 6 11a6 6 0 0 1-12 0c0-4.7 6-11 6-11z"/></svg>
+          Water through ceiling
+        </button>
+        <button class="scn" data-s="routine" aria-pressed="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 11l2-5h10l2 5M5 11h14v6H5zM7 17v2M17 17v2"/><circle cx="8.5" cy="14" r="0.5"/><circle cx="15.5" cy="14" r="0.5"/></svg>
+          Parking question
+        </button>
+      </div>
+      <div class="demo-stage" id="stage" aria-live="polite"></div>
+    </div>
+  </header>
+</div>
+
+<div class="ticker-band">
+  <div class="ticker-clip" aria-hidden="true">
+    <div class="roll" id="roll">
+      <span><b class="tk-a">02:14</b> NO HEAT → URGENT · DRAFT HELD FOR MORNING</span>
+      <span><b class="tk-r">00:21</b> CEILING LEAK → EMERGENCY · LANDLORD CALLED IN 40s</span>
+      <span><b class="tk-m">09:02</b> RENT RECEIPT → ROUTINE · AUTO-DRAFTED</span>
+      <span><b class="tk-m">TRUST</b> 41 PALMERSTON → 94% · SIX WEEKS WITHOUT AN EDIT</span>
+      <span><b class="tk-a">02:14</b> NO HEAT → URGENT · DRAFT HELD FOR MORNING</span>
+      <span><b class="tk-r">00:21</b> CEILING LEAK → EMERGENCY · LANDLORD CALLED IN 40s</span>
+      <span><b class="tk-m">09:02</b> RENT RECEIPT → ROUTINE · AUTO-DRAFTED</span>
+      <span><b class="tk-m">TRUST</b> 41 PALMERSTON → 94% · SIX WEEKS WITHOUT AN EDIT</span>
+    </div>
+  </div>
+  <button class="pause-btn" id="pauseBtn" aria-label="Pause ticker" aria-pressed="false">
+    <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
+  </button>
+</div>
+
+<div class="wrap">
+
+  <!-- HOW IT WORKS -->
+  <section class="block" id="how">
+    <div class="rv">
+      <span class="kicker">※ How it works</span>
+      <h2>Four steps between a 2 AM text <em>and your eight hours.</em></h2>
+      <p class="lede">No app for tenants to download, no portal to forget the password to. They text the same way they always have — Stoop sits in the middle.</p>
+    </div>
+    <div class="steps">
+      <div class="step rv">
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.6 8.6 0 0 1-3.5-.7L3 21l1.8-5.5A8.4 8.4 0 1 1 21 11.5z"/></svg></span>
+        <span class="n">STEP 01</span><h3>Tenant texts</h3>
+        <p>One phone number per property. SMS, photos, broken English, panic typos — all of it lands with Stoop first.</p>
+      </div>
+      <div class="step rv">
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
+        <span class="n">STEP 02</span><h3>Stoop classifies</h3>
+        <p>Emergency, urgent, or routine — judged against real criteria and Ontario's maintenance bylaws, with its reasoning shown.</p>
+      </div>
+      <div class="step rv">
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg></span>
+        <span class="n">STEP 03</span><h3>Drafts in your voice</h3>
+        <p>A reply written the way you'd write it — your tone, your tradespeople, your house rules. Held, never auto-sent.</p>
+      </div>
+      <div class="step rv">
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></span>
+        <span class="n">STEP 04</span><h3>You approve</h3>
+        <p>One tap to send — with a 5-second undo. Every decision teaches Stoop and builds toward hands-off routine replies.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- SEVERITY -->
+  <section class="block" id="severity">
+    <div class="rv">
+      <span class="kicker">※ The severity contract</span>
+      <h2>You wake up for floods. <em>Not faucets.</em></h2>
+      <p class="lede">The entire product is one promise: your phone only makes noise when the building genuinely needs you. Everything else waits politely for daylight.</p>
+    </div>
+    <div class="tiers">
+      <div class="tier t-em rv">
+        <span class="d-chip emergency">Emergency</span>
+        <h3>Your phone rings. Now.</h3>
+        <p>Active water, gas smell, fire, no heat in a deep freeze. Stoop calls you, texts the tenant safety steps, and starts a timeline.</p>
+        <ul>
+          <li><b>40s</b> · median time to your phone</li>
+          <li><b>2/mo</b> · how often this actually happens</li>
+        </ul>
+      </div>
+      <div class="tier t-ur rv">
+        <span class="d-chip urgent">Urgent</span>
+        <h3>Drafted now, sent at dawn.</h3>
+        <p>No heat overnight, fridge died, lockout. A reply is drafted immediately and waits at the top of your morning queue.</p>
+        <ul>
+          <li><b>&lt;30s</b> · to classify and draft</li>
+          <li><b>7:00 AM</b> · waiting with your coffee</li>
+        </ul>
+      </div>
+      <div class="tier t-ro rv">
+        <span class="d-chip routine">Routine</span>
+        <h3>Handled. You read a recap.</h3>
+        <p>Drips, parking, receipts, "is the gym open" — drafted from your house rules. Earn enough trust and these send themselves.</p>
+        <ul>
+          <li><b>80%</b> · of all tenant messages</li>
+          <li><b>0</b> · notifications they cost you</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- TRUST LADDER -->
+  <section class="block" id="trust">
+    <div class="ladder-grid">
+      <div class="ladder-copy rv">
+        <span class="kicker">※ Earned autonomy</span>
+        <h2>It earns the keys <em>one approval at a time.</em></h2>
+        <p>Stoop starts with training wheels: every single reply waits for you. As your approval rate climbs and edits go to zero, it unlocks autonomy — <b>per property, per severity, always reversible.</b></p>
+        <p>You can see exactly why every message was classified the way it was. No black box — the reasoning is printed right on the card.</p>
+      </div>
+      <div class="rungs rv">
+        <div class="rung passed">
+          <span class="lv">LV 1</span>
+          <span><b>Shadow mode</b><small>Everything held for approval. Day one.</small></span>
+          <span class="st">✓ PASSED</span>
+        </div>
+        <div class="rung active">
+          <span class="lv">LV 2</span>
+          <span><b>Routine auto-send</b><small>Faucets &amp; FAQs send themselves. You get recaps.</small></span>
+          <span class="st">94% · 6 TO GO</span>
+        </div>
+        <div class="rung locked">
+          <span class="lv">LV 3</span>
+          <span><b>Scheduling trades</b><small>Books your plumber from your contact list.</small></span>
+          <span class="st">LOCKED</span>
+        </div>
+        <div class="rung locked">
+          <span class="lv">LV 4</span>
+          <span><b>Full night shift</b><small>Urgent handled solo. Only emergencies ring.</small></span>
+          <span class="st">LOCKED</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PRICING -->
+  <section class="block" id="pricing">
+    <div class="rv">
+      <span class="kicker">※ Pricing</span>
+      <h2>Cheaper than one night <em>of bad sleep.</em></h2>
+      <p class="lede">Per door, per month. No tenant fees, no setup, cancel whenever.</p>
+    </div>
+    <div class="plans">
+      <div class="plan rv">
+        <h3>First door</h3>
+        <div class="price">$0<small>/mo</small></div>
+        <span class="per">YOUR FIRST PROPERTY · FOREVER</span>
+        <ul>
+          <li><b>Full triage</b> + severity classification</li>
+          <li>Drafts in your voice, approve to send</li>
+          <li>Emergency phone calls included</li>
+        </ul>
+      </div>
+      <div class="plan featured rv">
+        <h3>Portfolio</h3>
+        <div class="price">$19<small>/door/mo</small></div>
+        <span class="per">EVERY DOOR AFTER THE FIRST</span>
+        <ul>
+          <li>Everything in First door</li>
+          <li><b>Earned autonomy</b> — routine auto-send</li>
+          <li>Trade scheduling + audit timeline</li>
+          <li>Trust dashboard across properties</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- FINAL CTA -->
+  <section class="final rv">
+    <span class="kicker">※ Tonight could be quiet</span>
+    <h2>Put the building <em>on night shift.</em></h2>
+    <p class="lede">Set up takes ten minutes: forward your tenant line, paste your house rules, approve your first draft.</p>
+    <a class="btn primary" href="#">Start free with one property →</a>
+  </section>
+
+  <footer>
+    <span>STOOP. — TENANT MAINTENANCE, HANDLED · TORONTO</span>
+    <span>MOCKUP 05 · BROWNSTONE LANDING · V2</span>
+  </footer>
+</div>
+
+<script>
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* theme */
+  const themeBtn = document.getElementById("themeBtn");
+  const saved = localStorage.getItem("stoop-theme");
+  if (saved) document.documentElement.dataset.theme = saved;
+  function syncThemeLabel() {
+    const dark = document.documentElement.dataset.theme === "dark";
+    themeBtn.setAttribute("aria-label", dark ? "Switch to daylight theme" : "Switch to night theme");
+  }
+  themeBtn.addEventListener("click", () => {
+    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem("stoop-theme", next);
+    syncThemeLabel();
+  });
+  syncThemeLabel();
+
+  /* mobile menu */
+  const menuBtn = document.getElementById("menuBtn");
+  const mobileMenu = document.getElementById("mobileMenu");
+  menuBtn.addEventListener("click", () => {
+    const open = mobileMenu.classList.toggle("open");
+    menuBtn.setAttribute("aria-expanded", open);
+    menuBtn.setAttribute("aria-label", open ? "Close menu" : "Open menu");
+  });
+  mobileMenu.querySelectorAll("a").forEach(a => a.addEventListener("click", () => {
+    mobileMenu.classList.remove("open");
+    menuBtn.setAttribute("aria-expanded", "false");
+  }));
+
+  /* ticker pause */
+  const pauseBtn = document.getElementById("pauseBtn");
+  const roll = document.getElementById("roll");
+  pauseBtn.addEventListener("click", () => {
+    const paused = roll.classList.toggle("paused");
+    pauseBtn.setAttribute("aria-pressed", paused);
+    pauseBtn.setAttribute("aria-label", paused ? "Resume ticker" : "Pause ticker");
+  });
+
+  /* scroll reveal */
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } });
+  }, { threshold: 0.12 });
+  document.querySelectorAll(".rv").forEach(el => io.observe(el));
+  document.querySelectorAll(".steps, .tiers").forEach(grid => {
+    [...grid.children].forEach((c, i) => c.style.transitionDelay = (i * 0.09) + "s");
+  });
+
+  /* demo */
+  const stage = document.getElementById("stage");
+  const demoClock = document.getElementById("demoClock");
+  const SCENARIOS = {
+    urgent: {
+      time: "02:12",
+      tenant: { who: "TENANT · MARIA · UNIT 2", text: "hey sorry to text so late but the heat hasn't worked since 10pm and it's getting really cold… we have the baby this week. anything you can do tonight??" },
+      think: "no heat + overnight + <b>infant present</b> · Ontario bylaw: ≥21°C required · no flood / gas / fire →",
+      chip: ["urgent", "URGENT"], verdictNote: "CLASSIFIED IN 22s",
+      draft: { who: "STOOP DRAFT · YOUR VOICE", text: "Hi Maria — so sorry, that's not okay with the little one there. Try the breaker in the hall closet (switch 4) and text me in 10 min. Still cold? HVAC guy at 7:30 AM. Space heater's in basement storage tonight." },
+      foot: ["wait", "HELD FOR YOUR APPROVAL — WAITING IN YOUR MORNING QUEUE"]
+    },
+    emergency: {
+      time: "00:21",
+      tenant: { who: "TENANT · DEV · UNIT 3", text: "WATER IS COMING THROUGH THE CEILING LIGHT IN THE LIVING ROOM. it's getting worse. what do I do??" },
+      think: "active water + <b>electrical fixture</b> · spread risk to unit below · matches emergency criteria →",
+      chip: ["emergency", "EMERGENCY"], verdictNote: "PROTOCOL FIRED IN 18s",
+      draft: { who: "STOOP — SENT IMMEDIATELY (SAFETY)", text: "Dev — shut off the breaker for the living room now (panel, top-left). Move things clear and don't touch the fixture. I've called your landlord — help is moving. Reply here with a photo if you can." },
+      foot: ["call", "CALLING YOUR PHONE NOW — THIS ONE CAN'T WAIT"]
+    },
+    routine: {
+      time: "09:02",
+      tenant: { who: "TENANT · SAM · UNIT 1B", text: "hey! my sister is visiting this weekend — is there visitor parking or should she find street parking?" },
+      think: "no maintenance issue · answer exists in <b>your house rules §4</b> · zero risk →",
+      chip: ["routine", "ROUTINE"], verdictNote: "TRUST LV2 · AUTO-SENT",
+      draft: { who: "STOOP — SENT FOR YOU · RECAP LOGGED", text: "Hey Sam! There's one visitor spot behind the building (sign says P2) — first come, first served, max 48h. Street parking is fine after 6 too. Have a great weekend with your sister!" },
+      foot: ["auto", "HANDLED SOLO — YOU'LL SEE IT IN TONIGHT'S RECAP"]
+    }
+  };
+
+  let timers = [];
+  function clearTimers() { timers.forEach(t => clearTimeout(t)); timers = []; }
+  function later(fn, ms) { timers.push(setTimeout(fn, reduceMotion ? 0 : ms)); }
+
+  function play(key) {
+    clearTimers();
+    const s = SCENARIOS[key];
+    demoClock.textContent = s.time;
+    stage.innerHTML = `
+      <div class="d-bubble tenant"><div class="who">${s.tenant.who}</div>${s.tenant.text}</div>
+      <div class="d-think"><b>AGENT</b> <span class="scan" aria-hidden="true">▮</span> ${s.think}</div>
+      <div class="d-verdict"><span class="d-chip ${s.chip[0]}">${s.chip[1]}</span><small>${s.verdictNote}</small></div>
+      <div class="d-bubble draft"><div class="who">${s.draft.who}</div>${s.draft.text}</div>
+      <div class="d-foot"><span class="hold ${s.foot[0]}">${s.foot[1]}</span></div>`;
+    const [tenant, think, verdict, draft, foot] = stage.children;
+    later(() => tenant.classList.add("show"), 150);
+    later(() => think.classList.add("show"), 1000);
+    later(() => verdict.classList.add("show"), 2300);
+    later(() => draft.classList.add("show"), 3100);
+    later(() => foot.classList.add("show"), 4100);
+  }
+
+  document.querySelectorAll(".scn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".scn").forEach(b => b.setAttribute("aria-pressed", "false"));
+      btn.setAttribute("aria-pressed", "true");
+      play(btn.dataset.s);
+    });
+  });
+
+  play("urgent");
+</script>
+</body>
+</html>

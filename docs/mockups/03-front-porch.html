@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stoop — Front Porch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Gabarito:wght@500;700;800;900&family=Hanken+Grotesk:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --cream: #fff4e4;
+    --cream-2: #ffe9cf;
+    --terra: #e0633f;
+    --terra-deep: #c24e2e;
+    --dusk: #28405c;
+    --dusk-soft: #5b7392;
+    --butter: #ffc94d;
+    --leaf: #4c9a70;
+    --sky: #aacde8;
+    --card: #fffaf2;
+    --shadow: rgba(40, 64, 92, 0.16);
+    --display: "Gabarito", sans-serif;
+    --body: "Hanken Grotesk", sans-serif;
+    --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--cream); color: var(--dusk); font-family: var(--body); overflow-x: hidden; }
+
+  /* floating ambient blobs */
+  .blob { position: fixed; border-radius: 50%; filter: blur(70px); opacity: 0.5; z-index: 0; pointer-events: none; }
+  .blob.b1 { width: 480px; height: 480px; background: var(--cream-2); top: -120px; right: -100px; animation: drift 16s ease-in-out infinite; }
+  .blob.b2 { width: 380px; height: 380px; background: #fbd9c8; bottom: -120px; left: -80px; animation: drift 19s ease-in-out -6s infinite reverse; }
+
+  .wrap { position: relative; z-index: 1; max-width: 1200px; margin: 0 auto; padding: 24px 28px 90px; }
+
+  /* ── nav ─────────────────────────────── */
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--card); border: 2px solid var(--dusk); border-radius: 999px;
+    padding: 12px 22px; box-shadow: 0 6px 0 var(--shadow);
+    animation: popDown 0.7s var(--spring) both;
+  }
+  .logo { font-family: var(--display); font-weight: 900; font-size: 24px; letter-spacing: -0.02em; }
+  .logo .dot { color: var(--terra); }
+  .nav-links { display: flex; gap: 4px; }
+  .nav-links a {
+    font-weight: 700; font-size: 14px; color: var(--dusk); text-decoration: none;
+    padding: 8px 16px; border-radius: 999px; transition: background 0.2s, transform 0.2s var(--spring);
+  }
+  .nav-links a:hover { background: var(--cream-2); transform: translateY(-2px) rotate(-1deg); }
+  .nav-links a.on { background: var(--dusk); color: var(--cream); }
+  .avatar {
+    width: 38px; height: 38px; border-radius: 50%; background: var(--butter);
+    border: 2px solid var(--dusk); display: grid; place-items: center;
+    font-family: var(--display); font-weight: 800; font-size: 15px;
+  }
+
+  /* ── greeting ────────────────────────── */
+  .greeting { padding: 52px 6px 36px; display: flex; align-items: flex-end; justify-content: space-between; gap: 30px; flex-wrap: wrap; }
+  .greeting h1 {
+    font-family: var(--display); font-weight: 900; letter-spacing: -0.03em;
+    font-size: clamp(40px, 5.5vw, 66px); line-height: 1.02;
+  }
+  .greeting h1 .row { display: block; overflow: hidden; }
+  .greeting h1 .row span { display: inline-block; animation: riseUp 0.8s var(--spring) both; }
+  .greeting h1 .row:nth-child(2) span { animation-delay: 0.1s; }
+  .greeting h1 .hl { color: var(--terra); position: relative; }
+  .wave { display: inline-block; transform-origin: 70% 70%; animation: wave 2.2s 0.8s ease-in-out 2; }
+  .night-recap {
+    background: var(--dusk); color: var(--cream); border-radius: 22px; padding: 18px 22px;
+    max-width: 330px; font-size: 14.5px; line-height: 1.6; position: relative;
+    transform: rotate(1.5deg); animation: popDown 0.8s 0.3s var(--spring) both;
+    box-shadow: 0 8px 0 var(--shadow);
+  }
+  .night-recap::before {
+    content: "🌙 while you slept"; display: block; font-family: var(--display); font-weight: 800;
+    text-transform: uppercase; font-size: 11px; letter-spacing: 0.14em; color: var(--butter); margin-bottom: 6px;
+  }
+  .night-recap b { color: var(--butter); }
+
+  /* ── bento grid ──────────────────────── */
+  .bento { display: grid; grid-template-columns: repeat(12, 1fr); gap: 18px; }
+  .tile {
+    background: var(--card); border: 2px solid var(--dusk); border-radius: 26px;
+    padding: 24px; box-shadow: 0 7px 0 var(--shadow);
+    transition: transform 0.3s var(--spring), box-shadow 0.3s var(--spring);
+    animation: popUp 0.7s var(--spring) both;
+  }
+  .tile:hover { transform: translateY(-5px) rotate(-0.4deg); box-shadow: 0 13px 0 var(--shadow); }
+  .t-approve { grid-column: span 7; grid-row: span 2; animation-delay: 0.35s; }
+  .t-score  { grid-column: span 5; background: var(--butter); animation-delay: 0.45s; }
+  .t-queue  { grid-column: span 5; animation-delay: 0.55s; }
+  .t-props  { grid-column: span 7; animation-delay: 0.65s; }
+  .t-quiet  { grid-column: span 5; background: var(--dusk); color: var(--cream); animation-delay: 0.75s; }
+
+  .tile-tag {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--display); font-weight: 800; font-size: 11px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--dusk-soft); margin-bottom: 14px;
+  }
+  .t-quiet .tile-tag { color: var(--sky); }
+  .t-score .tile-tag { color: var(--terra-deep); }
+
+  /* sticker chips */
+  .chip {
+    display: inline-block; font-family: var(--display); font-weight: 800; font-size: 12px;
+    text-transform: uppercase; letter-spacing: 0.06em; padding: 6px 13px; border-radius: 999px;
+    border: 2px solid var(--dusk); transform: rotate(-2deg);
+  }
+  .chip.urgent { background: var(--butter); animation: wiggle 3s ease-in-out infinite; }
+  .chip.routine { background: var(--sky); transform: rotate(1.5deg); }
+  .chip.emergency { background: var(--terra); color: var(--cream); }
+
+  /* approval tile */
+  .bubble { border-radius: 20px; padding: 15px 18px; font-size: 15px; line-height: 1.6; margin-bottom: 14px; max-width: 92%; position: relative; }
+  .bubble.tenant { background: var(--cream-2); border: 2px solid var(--dusk); border-bottom-left-radius: 6px; animation: popUp 0.6s 0.7s var(--spring) both; }
+  .bubble.draft {
+    background: var(--card); border: 2px dashed var(--terra); border-bottom-right-radius: 6px;
+    margin-left: auto; animation: popUp 0.6s 0.95s var(--spring) both;
+  }
+  .bubble .who {
+    font-family: var(--display); font-weight: 800; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.12em; margin-bottom: 6px; color: var(--dusk-soft);
+  }
+  .bubble.draft .who { color: var(--terra-deep); display: flex; align-items: center; gap: 6px; }
+  .pen { display: inline-block; animation: scribble 1.6s ease-in-out infinite; }
+
+  .approve-row { display: flex; gap: 12px; margin-top: 18px; animation: popUp 0.6s 1.15s var(--spring) both; }
+  .squish {
+    font-family: var(--display); font-weight: 800; font-size: 16px; padding: 15px 22px;
+    border-radius: 999px; border: 2px solid var(--dusk); cursor: pointer;
+    transition: transform 0.18s var(--spring), box-shadow 0.18s;
+    background: var(--card); color: var(--dusk); box-shadow: 0 5px 0 var(--shadow);
+  }
+  .squish:hover { transform: translateY(-3px); box-shadow: 0 8px 0 var(--shadow); }
+  .squish:active { transform: translateY(2px) scale(0.96); box-shadow: 0 2px 0 var(--shadow); }
+  .squish.yes { flex: 1; background: var(--terra); color: var(--cream); }
+  .squish.yes:hover { background: var(--terra-deep); }
+
+  /* trust tile */
+  .big-score { font-family: var(--display); font-weight: 900; font-size: 64px; line-height: 1; letter-spacing: -0.03em; color: var(--dusk); }
+  .score-note { font-size: 13.5px; font-weight: 600; color: var(--dusk); margin-top: 6px; line-height: 1.5; }
+  .meter { height: 14px; border-radius: 999px; border: 2px solid var(--dusk); background: var(--card); margin-top: 14px; overflow: hidden; }
+  .meter i {
+    display: block; height: 100%; width: 94%; border-radius: 999px;
+    background: repeating-linear-gradient(-45deg, var(--terra) 0 10px, var(--terra-deep) 10px 20px);
+    background-size: 200% 100%;
+    transform: scaleX(0); transform-origin: left;
+    animation: fill 1.2s 0.9s var(--spring) forwards, candy 14s linear 2.1s infinite;
+  }
+
+  /* queue tile */
+  .q-row { display: flex; align-items: center; gap: 12px; padding: 11px 0; border-bottom: 2px dotted var(--cream-2); }
+  .q-row:last-child { border-bottom: 0; }
+  .q-emoji { width: 38px; height: 38px; border-radius: 14px; border: 2px solid var(--dusk); display: grid; place-items: center; font-size: 17px; background: var(--cream-2); }
+  .q-row .txt { flex: 1; }
+  .q-row .txt b { display: block; font-size: 14.5px; font-family: var(--display); font-weight: 700; }
+  .q-row .txt small { color: var(--dusk-soft); font-size: 12.5px; font-weight: 600; }
+
+  /* properties tile */
+  .houses { display: flex; gap: 14px; }
+  .house {
+    flex: 1; border: 2px solid var(--dusk); border-radius: 18px; padding: 16px;
+    background: var(--cream-2); transition: transform 0.25s var(--spring), background 0.25s; cursor: pointer;
+  }
+  .house:hover { transform: translateY(-4px) rotate(0.6deg); background: var(--card); }
+  .house .roof { font-size: 22px; }
+  .house b { display: block; font-family: var(--display); font-weight: 800; font-size: 14.5px; margin: 8px 0 2px; }
+  .house small { font-size: 12px; font-weight: 600; color: var(--dusk-soft); }
+  .house .ok { display: inline-block; margin-top: 8px; font-size: 11px; font-weight: 800; font-family: var(--display); text-transform: uppercase; letter-spacing: 0.08em; color: var(--leaf); }
+
+  /* quiet tile */
+  .zzz { font-family: var(--display); font-weight: 900; font-size: 46px; letter-spacing: -0.02em; line-height: 1.05; }
+  .zzz em { font-style: normal; color: var(--butter); }
+  .t-quiet p { margin-top: 10px; font-size: 14px; line-height: 1.6; color: var(--sky); }
+  .moon { float: right; font-size: 34px; animation: drift 6s ease-in-out infinite; }
+
+  /* confetti */
+  .confetti {
+    position: fixed; width: 10px; height: 14px; top: -20px; z-index: 90; border-radius: 2px;
+    animation: confetti 1.6s ease-in forwards;
+  }
+  @keyframes confetti { to { transform: translateY(105vh) rotate(720deg); opacity: 0.8; } }
+
+  @keyframes popDown { from { opacity: 0; transform: translateY(-26px); } to { opacity: 1; transform: none; } }
+  @keyframes popUp { from { opacity: 0; transform: translateY(26px) scale(0.96); } to { opacity: 1; transform: none; } }
+  @keyframes riseUp { from { transform: translateY(110%); } to { transform: none; } }
+  @keyframes wave { 0%,100% { transform: rotate(0); } 25% { transform: rotate(16deg); } 60% { transform: rotate(-8deg); } }
+  @keyframes drift { 0%,100% { transform: translate(0,0); } 50% { transform: translate(14px,-16px); } }
+  @keyframes wiggle { 0%,100% { transform: rotate(-2deg); } 50% { transform: rotate(2deg); } }
+  @keyframes scribble { 0%,100% { transform: translateX(0) rotate(0); } 30% { transform: translateX(2px) rotate(8deg); } 60% { transform: translateX(-1px) rotate(-6deg); } }
+  @keyframes fill { to { transform: scaleX(1); } }
+  @keyframes candy { to { background-position: -200% 0; } }
+
+  @media (max-width: 980px) {
+    .t-approve, .t-score, .t-queue, .t-props, .t-quiet { grid-column: span 12; }
+  }
+</style>
+</head>
+<body>
+<div class="blob b1"></div>
+<div class="blob b2"></div>
+
+<div class="wrap">
+
+  <nav>
+    <div class="logo">Stoop<span class="dot">.</span></div>
+    <div class="nav-links">
+      <a class="on" href="#">Today</a>
+      <a href="#">Properties</a>
+      <a href="#">Conversations</a>
+      <a href="#">Trust</a>
+    </div>
+    <div class="avatar">L</div>
+  </nav>
+
+  <header class="greeting">
+    <h1>
+      <span class="row"><span>Morning, Laith <i class="wave">👋</i></span></span>
+      <span class="row"><span>The buildings <span class="hl">behaved.</span></span></span>
+    </h1>
+    <aside class="night-recap">
+      <b>3 tenant texts</b> came in overnight. Stoop triaged all of them, drafted replies in your voice, and
+      <b>didn't wake you once</b> — nothing was a true emergency.
+    </aside>
+  </header>
+
+  <main class="bento">
+
+    <!-- approval -->
+    <section class="tile t-approve">
+      <div class="tile-tag">✉️ Needs your okay · <span class="chip urgent">Urgent</span></div>
+      <div class="bubble tenant">
+        <div class="who">Maria · Unit 2 · 41 Palmerston · 2:12 AM</div>
+        hey sorry to text so late but the heat hasn't worked since like 10pm and it's getting really cold in here. we have the baby this week… anything you can do tonight??
+      </div>
+      <div class="bubble draft">
+        <div class="who"><span class="pen">✏️</span> Stoop drafted — in your voice</div>
+        Hi Maria — so sorry, that's not okay with the little one there. Try the breaker in the hall closet (switch 4) and let me know in 10 min. Still cold? My HVAC guy will be there 7:30 AM sharp. Space heater's in basement storage tonight if you need it.
+      </div>
+      <div class="approve-row">
+        <button class="squish" onclick="alert('Mock: opens the editor')">Tweak it</button>
+        <button class="squish yes" id="sendBtn">Looks good — send it 🎉</button>
+      </div>
+    </section>
+
+    <!-- trust score -->
+    <section class="tile t-score">
+      <div class="tile-tag">🤝 Trust score</div>
+      <div class="big-score">94%</div>
+      <p class="score-note">of drafts sent without edits. Six more approvals and routine messages at <b>41 Palmerston</b> go fully hands-off.</p>
+      <div class="meter"><i></i></div>
+    </section>
+
+    <!-- queue -->
+    <section class="tile t-queue">
+      <div class="tile-tag">📥 This morning's pile</div>
+      <div class="q-row">
+        <span class="q-emoji">🚿</span>
+        <span class="txt"><b>Faucet drip — Unit 1B</b><small>Drafted · plumber suggested for Thursday</small></span>
+        <span class="chip routine">Routine</span>
+      </div>
+      <div class="q-row">
+        <span class="q-emoji">🚗</span>
+        <span class="txt"><b>Visitor parking question</b><small>Drafted · pulled answer from your house rules</small></span>
+        <span class="chip routine">Routine</span>
+      </div>
+      <div class="q-row">
+        <span class="q-emoji">🧾</span>
+        <span class="txt"><b>Rent receipt request</b><small>Drafted · receipt attached automatically</small></span>
+        <span class="chip routine">Routine</span>
+      </div>
+    </section>
+
+    <!-- properties -->
+    <section class="tile t-props">
+      <div class="tile-tag">🏠 Your three doors</div>
+      <div class="houses">
+        <div class="house">
+          <span class="roof">🏘️</span>
+          <b>41 Palmerston</b><small>2 units · Maria, Dev</small>
+          <span class="ok">● 1 open item</span>
+        </div>
+        <div class="house">
+          <span class="roof">🏡</span>
+          <b>88 Dovercourt</b><small>3 units · full</small>
+          <span class="ok" style="color:var(--terra-deep)">● leak resolved 12:21 AM</span>
+        </div>
+        <div class="house">
+          <span class="roof">🏚️</span>
+          <b>12 Ossington</b><small>1 unit · Sam</small>
+          <span class="ok">● all quiet</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- quiet nights -->
+    <section class="tile t-quiet">
+      <span class="moon">🌙</span>
+      <div class="tile-tag">Nights protected</div>
+      <div class="zzz">28 of 30<br/><em>quiet nights</em></div>
+      <p>Two emergencies all month. Both called you instantly. Everything else waited for daylight — as it should.</p>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  // confetti on approve
+  const colors = ["#e0633f", "#ffc94d", "#28405c", "#4c9a70", "#aacde8"];
+  document.getElementById("sendBtn").addEventListener("click", (e) => {
+    e.target.textContent = "Sent! Maria's been told 💌";
+    e.target.style.background = "#4c9a70";
+    for (let i = 0; i < 50; i++) {
+      const c = document.createElement("div");
+      c.className = "confetti";
+      c.style.left = Math.random() * 100 + "vw";
+      c.style.background = colors[Math.floor(Math.random() * colors.length)];
+      c.style.animationDelay = Math.random() * 0.5 + "s";
+      c.style.animationDuration = 1.2 + Math.random() * 0.9 + "s";
+      document.body.appendChild(c);
+      setTimeout(() => c.remove(), 2600);
+    }
+  });
+</script>
+</body>
+</html>

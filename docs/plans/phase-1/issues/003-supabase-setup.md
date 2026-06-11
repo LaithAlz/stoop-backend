@@ -28,7 +28,7 @@ Need a real Postgres before any migration or query work. Supabase gives managed 
 - Don't run any migrations yet — issue #8
 - Don't set up Supabase Storage — Phase 4
 - Don't create staging or prod project — issue #13 / Phase 9
-- Don't use Supabase Auth — we're using Clerk
+- Supabase Auth IS our auth (ADR-1, replaced Clerk) — but configuring it is #4, not this issue
 
 ## Effort & dependencies
 
@@ -44,7 +44,7 @@ Need a real Postgres before any migration or query work. Supabase gives managed 
 - The pooler connection string lives under: Project → Settings → Database → Connection pooling. Mode: Transaction. The URL uses port 6543.
 - API keys live under: Project → Settings → API. The "anon" key is for client SDKs (mobile/web); the "service_role" key bypasses RLS and is backend-only.
 - `gen_random_uuid()` is built into Postgres 13+, no extension needed
-- Save the JWT secret too (Settings → API → JWT Settings) in case you need it later, even though we're using Clerk not Supabase Auth
+- Ignore the legacy JWT secret (Settings → API → JWT Settings) — #4 enables asymmetric signing keys; the backend verifies via JWKS, never the shared secret
 
 </details>
 

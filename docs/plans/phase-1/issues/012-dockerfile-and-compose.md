@@ -68,7 +68,7 @@ Fly.io needs a Dockerfile to deploy. Local docker-compose with a local Postgres 
 
 - Don't `COPY . .` early in the Dockerfile — invalidates layer cache on every code change. Copy deps first, sync, then copy code.
 - Don't run as root in production. Add a non-root user.
-- Don't bake secrets into the image (no `ENV CLERK_SECRET_KEY=...`). Secrets come from Fly secrets at runtime.
+- Don't bake secrets into the image (no `ENV SUPABASE_SERVICE_ROLE_KEY=...`). Secrets come from Fly secrets at runtime.
 - `--frozen` on `uv sync` is important — without it, uv may re-resolve deps and break reproducibility
 - `python:3.12-slim` vs `python:3.12-alpine` — slim (Debian-based) is more compatible; alpine breaks some Python wheels with musl libc. Stick with slim.
 - Port 8080 vs 8000: Fly's default expectation is 8080. Override in code OR in `fly.toml` — but pick one and stick.

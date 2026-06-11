@@ -42,7 +42,7 @@ Strict tooling from day one prevents the slow drift toward "we'll clean it up la
 <summary><b>Hints</b></summary>
 
 - The ruff rule sets you want: errors (`E`), Pyflakes (`F`), import sorting (`I`), naming (`N`), bugbear (`B`), pyupgrade (`UP`), async (`ASYNC`), security (`S`). Allow `assert` in tests via per-file-ignore for `S101`.
-- mypy `strict = true` enables everything good. Add the Pydantic plugin (`plugins = ["pydantic.mypy"]`) and ignore-missing-imports for libs without type stubs (`clerk_backend_api`, `inngest`).
+- mypy `strict = true` enables everything good. Add the Pydantic plugin (`plugins = ["pydantic.mypy"]`) and ignore-missing-imports for libs without type stubs (e.g. `twilio`).
 - Pre-commit's mypy hook needs `pass_filenames: false` so it sees the whole app folder, not just changed files
 - For secret scanning, gitleaks is faster and quieter than detect-secrets
 - `asyncio_mode = "auto"` in pytest means you don't need `@pytest.mark.asyncio` on every test

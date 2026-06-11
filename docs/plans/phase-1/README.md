@@ -52,18 +52,18 @@ If you want to run it yourself, use `scripts/create-issues.sh` (included). Requi
 1. [001](./issues/001-init-python-project.md) — Initialize Python backend with uv
 2. [002](./issues/002-dev-tooling.md) — Configure ruff, mypy, pre-commit
 3. [003](./issues/003-supabase-setup.md) — Create Supabase project
-4. [004](./issues/004-clerk-setup.md) — Create Clerk application
+4. [004](./issues/004-supabase-auth-setup.md) — Configure Supabase Auth
 5. [005](./issues/005-fastapi-app-factory.md) — FastAPI app factory + health endpoints
 6. [006](./issues/006-settings-module.md) — Settings module with pydantic-settings
 7. [007](./issues/007-logging-and-sentry.md) — Structured logging + Sentry + request_id
 8. [008](./issues/008-alembic-and-landlords.md) — Alembic + landlords table migration
 9. [009](./issues/009-async-sqlalchemy-session.md) — Async SQLAlchemy session management
-10. [010](./issues/010-clerk-jwt-dependency.md) — Clerk JWT verification dependency
+10. [010](./issues/010-supabase-jwt-dependency.md) — Supabase JWT verification dependency
 11. [011](./issues/011-me-endpoint.md) — GET /v1/me endpoint
 12. [012](./issues/012-dockerfile-and-compose.md) — Dockerfile + docker-compose
 13. [013](./issues/013-fly-deploy.md) — Fly.io deploy
 14. [014](./issues/014-github-actions-ci.md) — GitHub Actions CI
-15. [015](./issues/015-clerk-user-lifecycle.md) — Clerk webhook (stretch)
+15. [015](./issues/015-auth-user-lifecycle.md) — auth.users → landlords trigger sync (stretch)
 
 ## Sequencing
 

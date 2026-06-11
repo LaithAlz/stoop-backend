@@ -10,7 +10,7 @@ A deployed, authenticated FastAPI app on Fly.io with Postgres, ready for the age
 
 ## Goal
 
-By the end of Phase 1: `GET /v1/me` returns the authenticated landlord's profile, called from a real Clerk session, against a production Fly.io deployment, with CI passing on every PR.
+By the end of Phase 1: `GET /v1/me` returns the authenticated landlord's profile, called from a real Supabase Auth session, against a production Fly.io deployment, with CI passing on every PR.
 
 ## Why this phase exists separately
 
@@ -18,13 +18,13 @@ Foundation work is procedural and error-prone if rushed. Doing it as its own pha
 
 ## Scope
 
-**In scope:** Python 3.12 backend, FastAPI, async SQLAlchemy, Pydantic v2, Supabase Postgres, first migration (`landlords` table), Clerk JWT auth, first authenticated endpoint, Docker + Fly.io deploy, GitHub Actions CI, structured logging + Sentry.
+**In scope:** Python 3.12 backend, FastAPI, async SQLAlchemy, Pydantic v2, Supabase Postgres, first migration (`landlords` table), Supabase Auth JWT verification, first authenticated endpoint, Docker + Fly.io deploy, GitHub Actions CI, structured logging + Sentry.
 
 **Out of scope:** Agent / LangGraph (Phase 2-3), other tables (Phase 2), RLS policies (Phase 2/5), Inngest workers (Phase 4), Twilio / Anthropic / Stripe (Phase 4-5), mobile or web frontend (Phase 7-8).
 
 ## Acceptance criteria
 
-- [ ] `GET /v1/me` returns the landlord profile when called with a real Clerk JWT
+- [ ] `GET /v1/me` returns the landlord profile when called with a real Supabase access token
 - [ ] First call lazily creates a `landlords` row; second call returns the same id (no duplicates)
 - [ ] Deployed to `stoop-dev.fly.dev` in the `yyz` region
 - [ ] `/healthz` returns 200, `/readyz` returns 503 when DB is down
@@ -41,18 +41,18 @@ Foundation work is procedural and error-prone if rushed. Doing it as its own pha
 - [ ] #1 — Initialize Python backend with uv
 - [ ] #2 — Configure ruff, mypy, pre-commit
 - [ ] #3 — Create Supabase project
-- [ ] #4 — Create Clerk application
+- [ ] #4 — Configure Supabase Auth (rewritten 2026-06-11, ADR-1)
 - [ ] #5 — FastAPI app factory + health endpoints
 - [ ] #6 — Settings module with pydantic-settings
 - [ ] #7 — Structured logging + Sentry + request_id
 - [ ] #8 — Alembic + landlords table migration
 - [ ] #9 — Async SQLAlchemy session management
-- [ ] #10 — Clerk JWT verification dependency
+- [ ] #10 — Supabase JWT verification dependency (rewritten 2026-06-11)
 - [ ] #11 — GET /v1/me endpoint ← Phase 1 gate
 - [ ] #12 — Dockerfile + docker-compose
 - [ ] #13 — Fly.io deploy
 - [ ] #14 — GitHub Actions CI
-- [ ] #15 — Clerk webhook for user lifecycle (stretch)
+- [ ] #15 — auth.users → landlords trigger sync (stretch, rewritten 2026-06-11)
 
 (Update issue numbers after creation.)
 
@@ -61,7 +61,7 @@ Foundation work is procedural and error-prone if rushed. Doing it as its own pha
 <details>
 <summary>Known footguns to watch for</summary>
 
-- **Clerk JWT verification.** Use JWKS public-key verification, not the secret key. The Python SDK has docs but the verification flow is easy to get wrong. Issue #10 details.
+- **Supabase JWT verification.** Use JWKS asymmetric verification (enable signing keys in project settings), never the legacy shared HS256 secret. Issue #10 details.
 - **Supabase pooler vs direct connection.** Use the transaction-mode pooler on port 6543, not the direct connection on 5432. Direct connections exhaust the pool fast under any scaling.
 - **Fly.io secrets vs env vars.** Secrets are encrypted and invisible after setting; env vars in `fly.toml` are committed. Anything sensitive → secrets.
 - **Free-tier sleep.** Supabase pauses after 1 week of inactivity. Set a reminder or upgrade to Pro when you're using it daily.

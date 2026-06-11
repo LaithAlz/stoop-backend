@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stoop — Design Directions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400&family=Schibsted+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #121311;
+    --text: #f0ede6;
+    --dim: #9b988f;
+    --line: #2c2d29;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: "Schibsted Grotesk", sans-serif; min-height: 100vh; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 70px 28px; }
+  h1 { font-family: "Fraunces", serif; font-weight: 600; font-size: clamp(34px, 5vw, 54px); letter-spacing: -0.02em; animation: up 0.8s both; }
+  h1 em { font-style: italic; color: var(--dim); }
+  .sub { color: var(--dim); margin: 14px 0 50px; font-size: 15px; line-height: 1.6; max-width: 60ch; animation: up 0.8s 0.1s both; }
+  .cards { display: grid; gap: 20px; }
+  a.card {
+    display: grid; grid-template-columns: 110px 1fr auto; gap: 26px; align-items: center;
+    text-decoration: none; color: inherit; border: 1px solid var(--line); border-radius: 16px;
+    padding: 26px 30px; transition: transform 0.3s cubic-bezier(0.16,1,0.3,1), border-color 0.3s, background 0.3s;
+    animation: up 0.8s both;
+  }
+  a.card:nth-child(1) { animation-delay: 0.2s; } a.card:nth-child(2) { animation-delay: 0.32s; } a.card:nth-child(3) { animation-delay: 0.44s; }
+  a.card:hover { transform: translateX(8px); border-color: #4a4b45; background: #17181530; }
+  .swatch { display: flex; height: 64px; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); }
+  .swatch i { flex: 1; }
+  .card h2 { font-family: "Fraunces", serif; font-weight: 600; font-size: 24px; letter-spacing: -0.01em; }
+  .card .no { font-size: 12px; color: var(--dim); letter-spacing: 0.2em; margin-bottom: 6px; }
+  .card p { color: var(--dim); font-size: 14px; line-height: 1.6; margin-top: 6px; max-width: 56ch; }
+  .arrow { font-size: 22px; color: var(--dim); transition: transform 0.3s cubic-bezier(0.16,1,0.3,1), color 0.3s; }
+  a.card:hover .arrow { transform: translateX(6px); color: var(--text); }
+  .foot { margin-top: 50px; color: var(--dim); font-size: 13px; animation: up 0.8s 0.55s both; }
+  @keyframes up { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+  @media (max-width: 700px) { a.card { grid-template-columns: 1fr; } .arrow { display: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Stoop. — three new design directions<br/><em>pick a vibe, mix and match</em></h1>
+  <p class="sub">Each mockup is the same product moment — Maria's 2 AM no-heat text, triaged and drafted, waiting for your approval — told in three completely different visual languages. All are live HTML with animations: open them, hover around, hit the approve buttons.</p>
+
+  <div class="cards">
+    <a class="card" href="05-brownstone-landing.html" style="border-color:#4a4b45">
+      <span class="swatch"><i style="background:#131009"></i><i style="background:#1b1710"></i><i style="background:#ffb454"></i><i style="background:#79d9a7"></i></span>
+      <span>
+        <span class="no">DIRECTION 04B · THE BLEND, MARKETING ★</span>
+        <h2>Brownstone — Landing page</h2>
+        <p>The public-facing landing page in the blended style, with an interactive triage demo in the hero — pick "no heat", "ceiling leak", or "parking question" and watch Stoop classify, reason, and draft live. Plus how-it-works, severity contract, trust ladder, and pricing.</p>
+      </span>
+      <span class="arrow">→</span>
+    </a>
+
+    <a class="card" href="04-brownstone.html" style="border-color:#4a4b45">
+      <span class="swatch"><i style="background:#131009"></i><i style="background:#221d14"></i><i style="background:#ffb454"></i><i style="background:#e0673f"></i></span>
+      <span>
+        <span class="no">DIRECTION 04 · THE BLEND ★</span>
+        <h2>Brownstone</h2>
+        <p>Night Desk's dark console + Front Porch's warm bento and springy physics, minus the cartoon. Warm charcoal, amber and terracotta; pill nav, reasoning trace, ticker, night-grid calendar, and a rotated SENT stamp borrowed from the Times.</p>
+      </span>
+      <span class="arrow">→</span>
+    </a>
+
+    <a class="card" href="01-night-desk.html">
+      <span class="swatch"><i style="background:#07090e"></i><i style="background:#111723"></i><i style="background:#ffb454"></i><i style="background:#5dd9a7"></i></span>
+      <span>
+        <span class="no">DIRECTION 01</span>
+        <h2>Night Desk</h2>
+        <p>A premium dispatch console. Dark phosphor-amber terminal energy — live ticker, agent reasoning trace, pulsing severity dots, a "SENT" stamp on approve. Sells the "it works while you sleep" promise hard.</p>
+      </span>
+      <span class="arrow">→</span>
+    </a>
+
+    <a class="card" href="02-stoop-times.html">
+      <span class="swatch"><i style="background:#f4efe4"></i><i style="background:#181511"></i><i style="background:#d7301f"></i><i style="background:#ece5d4"></i></span>
+      <span>
+        <span class="no">DIRECTION 02</span>
+        <h2>The Stoop Times</h2>
+        <p>Editorial brutalism — your night, printed as a morning newspaper. Giant masthead, red marquee, telegram-style tenant messages, rubber-stamp "APPROVED" animation. Unforgettable and very shareable.</p>
+      </span>
+      <span class="arrow">→</span>
+    </a>
+
+    <a class="card" href="03-front-porch.html">
+      <span class="swatch"><i style="background:#fff4e4"></i><i style="background:#e0633f"></i><i style="background:#28405c"></i><i style="background:#ffc94d"></i></span>
+      <span>
+        <span class="no">DIRECTION 03</span>
+        <h2>Front Porch</h2>
+        <p>Warm neighbourhood bento — terracotta, butter and dusk blue with springy hover physics, sticker severity chips, a candy-stripe trust meter, and confetti when you approve. Friendly where the others are intense.</p>
+      </span>
+      <span class="arrow">→</span>
+    </a>
+  </div>
+
+  <p class="foot">docs/mockups · self-contained HTML, no build step — open any file directly in a browser.</p>
+</div>
+</body>
+</html>

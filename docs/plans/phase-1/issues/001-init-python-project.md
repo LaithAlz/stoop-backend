@@ -16,7 +16,7 @@ Every other Phase 1 issue depends on a working Python project skeleton. Locked d
 
 - [ ] `backend/pyproject.toml` exists with project metadata
 - [ ] Python 3.12 pinned (`.python-version` file)
-- [ ] Production deps installed: FastAPI, Uvicorn, Pydantic v2, pydantic-settings, SQLAlchemy 2.0, asyncpg, Alembic, httpx, structlog, Clerk SDK, Sentry SDK
+- [ ] Production deps installed: FastAPI, Uvicorn, Pydantic v2, pydantic-settings, SQLAlchemy 2.0, asyncpg, Alembic, httpx, structlog, PyJWT[crypto], Sentry SDK
 - [ ] Dev deps installed in their own group: pytest, pytest-asyncio, respx, ruff, mypy
 - [ ] `uv sync` runs clean
 - [ ] `uv.lock` committed
