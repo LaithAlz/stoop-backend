@@ -18,21 +18,13 @@ import { AppTabBar } from "@/components/stoop/AppTabBar";
 import { SeverityBadge } from "@/components/stoop/SeverityBadge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { getConversation, queue } from "@/lib/mock-app";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/conversations/$id")({
   head: ({ params }) => ({
-    meta: [
-      { title: "Conversation — Stoop." },
-      { name: "robots", content: "noindex" },
-    ],
+    meta: [{ title: "Conversation — Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/conversations/${params.id}` }],
   }),
   loader: ({ params }) => {
@@ -121,7 +113,11 @@ function ConversationPage() {
 
           <div className="space-y-4">
             <Tenant text={item.tenantMessage} time="9:42 AM" name={item.tenantFirst} />
-            <Agent text="Thanks — can you send a photo so I can see what's happening?" time="9:43 AM" sent />
+            <Agent
+              text="Thanks — can you send a photo so I can see what's happening?"
+              time="9:43 AM"
+              sent
+            />
             {item.hasPhoto && <TenantPhoto time="9:46 AM" />}
             <Tenant
               text="Here you go. Cabinet underneath is soaked."
@@ -174,12 +170,7 @@ function ConversationPage() {
             )}
 
             {mode === "sent" && (
-              <Agent
-                text={draftText}
-                time="just now"
-                sent
-                edited={draftText !== item.draftReply}
-              />
+              <Agent text={draftText} time="just now" sent edited={draftText !== item.draftReply} />
             )}
 
             {mode === "rejected" && (
@@ -269,9 +260,7 @@ function TenantPhoto({ time }: { time: string }) {
         <ImageIcon className="size-8" aria-hidden="true" />
         <span className="sr-only">Photo from tenant</span>
       </div>
-      <span className="ml-1 font-mono text-[10px] font-medium text-ink-muted">
-        Photo · {time}
-      </span>
+      <span className="ml-1 font-mono text-[10px] font-medium text-ink-muted">Photo · {time}</span>
     </div>
   );
 }
@@ -311,9 +300,7 @@ function ReasoningPanel() {
   return (
     <div className="space-y-3 rounded-2xl border border-border bg-canvas p-4">
       <div>
-        <p className="text-[10px] font-bold uppercase tracking-widest text-ink-muted">
-          Severity
-        </p>
+        <p className="text-[10px] font-bold uppercase tracking-widest text-ink-muted">Severity</p>
         <p className="mt-1 text-sm leading-relaxed text-ink">
           <span className="font-bold text-urgent">Urgent.</span> Water damage risk, not active
           flooding. Cabinet wetting can compound within 24h.
@@ -363,7 +350,10 @@ function DraftCard({
         <span>
           Tone: <span className="font-semibold text-ink">Calm + practical</span>
         </span>
-        <button onClick={onEdit} className="font-semibold text-brand underline-offset-4 hover:underline">
+        <button
+          onClick={onEdit}
+          className="font-semibold text-brand underline-offset-4 hover:underline"
+        >
           Edit instead
         </button>
       </div>

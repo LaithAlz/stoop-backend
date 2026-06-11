@@ -69,7 +69,7 @@ const plans: Plan[] = [
       "Replies drafted in your voice, ready to send",
       "You approve everything — with a 5-second undo",
       "Routine replies go hands-off once Stoop earns your trust",
-      "Knows your plumber, your electrician, your handyman — and suggests the right one",
+      "Lines up your own plumber, electrician, or handyman — you approve every text",
       "Full message history for every property",
     ],
     cta: { label: "Get early access", to: "/early-access" },

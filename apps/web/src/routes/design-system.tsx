@@ -95,8 +95,8 @@ function DesignSystemPage() {
             Heritage utility. The visual language of <Wordmark size="xl" />
           </h1>
           <p className="max-w-2xl text-lg leading-relaxed text-ink-muted">
-            A serif-led, forest-and-canvas system for a trusted operator tool. Every surface in
-            the Stoop. marketing site and mobile app inherits from this page.
+            A serif-led, forest-and-canvas system for a trusted operator tool. Every surface in the
+            Stoop. marketing site and mobile app inherits from this page.
           </p>
         </div>
       </header>
@@ -173,8 +173,8 @@ function DesignSystemPage() {
                   Body · Plus Jakarta 400 · 16
                 </span>
                 <p className="max-w-xl text-base leading-relaxed">
-                  Tenants text a property phone number. Stoop classifies severity, asks
-                  clarifying questions, gathers photos, and drafts a reply in your voice.
+                  Tenants text a property phone number. Stoop classifies severity, asks clarifying
+                  questions, gathers photos, and drafts a reply in your voice.
                 </p>
               </div>
               <div>
@@ -189,9 +189,7 @@ function DesignSystemPage() {
                 <span className="text-[10px] font-bold uppercase tracking-widest text-ink-muted">
                   Label · uppercase 10
                 </span>
-                <p className="text-[10px] font-bold uppercase tracking-[0.18em]">
-                  Approve & send
-                </p>
+                <p className="text-[10px] font-bold uppercase tracking-[0.18em]">Approve & send</p>
               </div>
             </div>
 
@@ -352,9 +350,7 @@ function DesignSystemPage() {
                         key={chip}
                         type="button"
                         onClick={() =>
-                          setChips((c) =>
-                            active ? c.filter((x) => x !== chip) : [...c, chip],
-                          )
+                          setChips((c) => (active ? c.filter((x) => x !== chip) : [...c, chip]))
                         }
                         className={cn(
                           "inline-flex min-h-11 items-center gap-1.5 rounded-full border px-4 py-2 text-sm font-semibold transition-colors",
@@ -414,9 +410,7 @@ function DesignSystemPage() {
         >
           <div className="grid gap-6 lg:grid-cols-3">
             <Card className="p-6">
-              <p className="text-xs font-bold uppercase tracking-widest text-ink-muted">
-                Default
-              </p>
+              <p className="text-xs font-bold uppercase tracking-widest text-ink-muted">Default</p>
               <p className="mt-2 font-display text-2xl font-bold">128 Wythe Ave</p>
               <p className="text-sm text-ink-muted">4 units · 2 active threads</p>
             </Card>
@@ -464,9 +458,7 @@ function DesignSystemPage() {
 
             <Card className="border-routine/30 bg-routine-soft p-6">
               <SeverityBadge severity="routine" />
-              <p className="mt-3 font-display text-2xl font-bold text-routine">
-                Trash schedule
-              </p>
+              <p className="mt-3 font-display text-2xl font-bold text-routine">Trash schedule</p>
               <p className="text-sm text-ink">Resolved · agent answered in under 1 minute</p>
             </Card>
           </div>
@@ -574,8 +566,8 @@ function DesignSystemPage() {
             <div className="overflow-hidden rounded-3xl border border-border bg-canvas">
               <MarketingNav />
               <div className="px-6 py-10 text-sm text-ink-muted">
-                Top nav uses the Stoop. wordmark on the left, plain-English links in the middle,
-                and trial CTA on the right.
+                Top nav uses the Stoop. wordmark on the left, plain-English links in the middle, and
+                trial CTA on the right.
               </div>
             </div>
 

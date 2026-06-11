@@ -1,12 +1,5 @@
 import { createFileRoute, Link, notFound } from "@tanstack/react-router";
-import {
-  ArrowLeft,
-  Settings,
-  TrendingUp,
-  MessageSquare,
-  ChevronRight,
-  Phone,
-} from "lucide-react";
+import { ArrowLeft, Settings, TrendingUp, MessageSquare, ChevronRight, Phone } from "lucide-react";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
 import { AppTabBar } from "@/components/stoop/AppTabBar";
 import { SeverityBadge } from "@/components/stoop/SeverityBadge";
@@ -15,10 +8,7 @@ import { autonomyModes, getPropertyConfig, propertyConfigs } from "@/lib/mock-pr
 
 export const Route = createFileRoute("/app/properties/$id")({
   head: ({ params }) => ({
-    meta: [
-      { title: "Property — Stoop." },
-      { name: "robots", content: "noindex" },
-    ],
+    meta: [{ title: "Property — Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/properties/${params.id}` }],
   }),
   loader: ({ params }) => {
@@ -153,11 +143,7 @@ function HubLink({
   id: string;
 }) {
   return (
-    <Link
-      to={to}
-      params={{ id }}
-      className="flex min-h-14 items-center gap-3 px-4 py-3"
-    >
+    <Link to={to} params={{ id }} className="flex min-h-14 items-center gap-3 px-4 py-3">
       <div className="flex size-9 items-center justify-center rounded-lg bg-brand-muted text-brand">
         <Icon className="size-4" />
       </div>

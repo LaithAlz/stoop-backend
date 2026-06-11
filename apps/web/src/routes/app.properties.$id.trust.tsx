@@ -21,10 +21,7 @@ import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/properties/$id/trust")({
   head: ({ params }) => ({
-    meta: [
-      { title: "Trust dashboard — Stoop." },
-      { name: "robots", content: "noindex" },
-    ],
+    meta: [{ title: "Trust dashboard — Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/properties/${params.id}/trust` }],
   }),
   loader: ({ params }) => {
@@ -57,8 +54,7 @@ function TrustDashboard() {
       ...s,
       approvedUnchanged: s.approvedUnchanged + 1,
       unchangedRate: Math.round(
-        ((s.approvedUnchanged + 1) /
-          (s.approvedUnchanged + 1 + s.edited)) * 100,
+        ((s.approvedUnchanged + 1) / (s.approvedUnchanged + 1 + s.edited)) * 100,
       ),
     }));
     toast("Mock approval recorded", { duration: 1500 });
@@ -95,7 +91,8 @@ function TrustDashboard() {
               You've approved 10 drafts without changing a thing.
             </h2>
             <p className="mt-2 text-[14px] leading-relaxed text-ink-muted">
-              Let the agent send routine replies on its own? You'll still approve urgent and emergency drafts. Reversible any time in settings.
+              Let the agent send routine replies on its own? You'll still approve urgent and
+              emergency drafts. Reversible any time in settings.
             </p>
             <div className="mt-4 flex gap-2">
               <Button
@@ -237,9 +234,7 @@ function TrustDashboard() {
       <Sheet open={!!futureMode} onOpenChange={(o) => !o && setFutureMode(null)}>
         <SheetContent side="bottom" className="rounded-t-3xl border-t border-border">
           <SheetHeader className="text-left">
-            <SheetTitle className="font-display text-[22px]">
-              {futureMode?.label}
-            </SheetTitle>
+            <SheetTitle className="font-display text-[22px]">{futureMode?.label}</SheetTitle>
             <SheetDescription>{futureMode?.description}</SheetDescription>
           </SheetHeader>
           <div className="mt-4 rounded-xl border border-border bg-card p-4">

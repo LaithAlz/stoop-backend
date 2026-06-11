@@ -9,10 +9,7 @@ import { autonomyModes } from "@/lib/mock-property";
 
 export const Route = createFileRoute("/app/properties")({
   head: () => ({
-    meta: [
-      { title: "Properties — Stoop." },
-      { name: "robots", content: "noindex" },
-    ],
+    meta: [{ title: "Properties — Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: PropertiesPage,
 });
@@ -68,9 +65,7 @@ function PropertiesPage() {
                       <div className="font-display text-[17px] leading-tight text-ink">
                         {p.nickname}
                       </div>
-                      <div className="mt-0.5 truncate text-[13px] text-ink-muted">
-                        {p.address}
-                      </div>
+                      <div className="mt-0.5 truncate text-[13px] text-ink-muted">{p.address}</div>
                       <div className="mt-2 flex flex-wrap items-center gap-2">
                         <span className="rounded-full bg-brand-muted px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-widest text-brand">
                           {mode?.label ?? "Shadow"}

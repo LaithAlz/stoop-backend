@@ -35,8 +35,7 @@ export const Route = createFileRoute("/onboarding")({
       { name: "robots", content: "noindex" },
       {
         name: "description",
-        content:
-          "Set up your first property on Stoop. Five short screens, under five minutes.",
+        content: "Set up your first property on Stoop. Five short screens, under five minutes.",
       },
     ],
   }),
@@ -62,13 +61,7 @@ function PhoneFrame({ children }: { children: React.ReactNode }) {
 
 /* ---------------- State + persistence ---------------- */
 
-type Screen =
-  | "signup"
-  | "step-1"
-  | "step-2"
-  | "step-3"
-  | "step-4"
-  | "step-5";
+type Screen = "signup" | "step-1" | "step-2" | "step-3" | "step-4" | "step-5";
 
 interface FormState {
   address: string;
@@ -185,9 +178,7 @@ function OnboardingPage() {
           onNext={() => setScreen("step-5")}
         />
       )}
-      {screen === "step-5" && (
-        <Step5 form={form} onBack={() => setScreen("step-4")} />
-      )}
+      {screen === "step-5" && <Step5 form={form} onBack={() => setScreen("step-4")} />}
     </PhoneFrame>
   );
 }
@@ -209,8 +200,7 @@ function SignUpScreen({ onContinue }: { onContinue: () => void }) {
           Let's get your first property on board.
         </h1>
         <p className="mt-3 text-sm leading-relaxed text-ink-muted">
-          Five short screens. Under five minutes. You'll have a working tenant number at the
-          end.
+          Five short screens. Under five minutes. You'll have a working tenant number at the end.
         </p>
       </div>
 
@@ -305,10 +295,7 @@ function StepChrome({
           ))}
         </div>
         {skip ? (
-          <button
-            onClick={skip}
-            className="text-xs font-semibold text-ink-muted hover:text-brand"
-          >
+          <button onClick={skip} className="text-xs font-semibold text-ink-muted hover:text-brand">
             Skip
           </button>
         ) : (
@@ -482,19 +469,13 @@ function Step1({ form, update, onBack, onNext }: StepProps) {
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {[
-              "Detached",
-              "Semi",
-              "Townhouse",
-              "Condo",
-              "Basement apt",
-              "Duplex",
-              "Other",
-            ].map((t) => (
-              <SelectItem key={t} value={t}>
-                {t}
-              </SelectItem>
-            ))}
+            {["Detached", "Semi", "Townhouse", "Condo", "Basement apt", "Duplex", "Other"].map(
+              (t) => (
+                <SelectItem key={t} value={t}>
+                  {t}
+                </SelectItem>
+              ),
+            )}
           </SelectContent>
         </Select>
       </Field>
@@ -521,11 +502,7 @@ function Step2({ form, update, onBack, onNext }: StepProps) {
       }}
       nextDisabled={submitted && !valid}
     >
-      <Field
-        label="Monthly rent (CAD)"
-        htmlFor="rent"
-        error={submitted ? errRent : undefined}
-      >
+      <Field label="Monthly rent (CAD)" htmlFor="rent" error={submitted ? errRent : undefined}>
         <div className="relative">
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-base font-semibold text-ink-muted">
             $
@@ -580,10 +557,7 @@ function Step2({ form, update, onBack, onNext }: StepProps) {
             <p className="text-sm font-semibold text-ink">Month-to-month</p>
             <p className="text-xs text-ink-muted">No fixed end date.</p>
           </div>
-          <Switch
-            checked={form.monthToMonth}
-            onCheckedChange={(v) => update("monthToMonth", v)}
-          />
+          <Switch checked={form.monthToMonth} onCheckedChange={(v) => update("monthToMonth", v)} />
         </div>
         {!form.monthToMonth && (
           <div className="mt-4">
@@ -677,8 +651,7 @@ function Step4({ form, update, onBack, onNext }: StepProps) {
   const [submitted, setSubmitted] = useState(false);
   const errName = !form.vendorName.trim() ? "Vendor name needed." : "";
   const phoneDigits = form.vendorPhone.replace(/\D/g, "");
-  const errPhone =
-    form.vendorPhone && phoneDigits.length < 10 ? "Use a 10-digit phone." : "";
+  const errPhone = form.vendorPhone && phoneDigits.length < 10 ? "Use a 10-digit phone." : "";
   const valid = !errName && !errPhone && form.vendorPhone.trim();
 
   return (
@@ -709,11 +682,7 @@ function Step4({ form, update, onBack, onNext }: StepProps) {
         </Select>
       </Field>
 
-      <Field
-        label="Vendor name"
-        htmlFor="vname"
-        error={submitted ? errName : undefined}
-      >
+      <Field label="Vendor name" htmlFor="vname" error={submitted ? errName : undefined}>
         <Input
           id="vname"
           value={form.vendorName}
@@ -726,7 +695,9 @@ function Step4({ form, update, onBack, onNext }: StepProps) {
       <Field
         label="Vendor phone"
         htmlFor="vphone"
-        error={submitted ? errPhone || (!form.vendorPhone.trim() ? "Phone needed." : "") : undefined}
+        error={
+          submitted ? errPhone || (!form.vendorPhone.trim() ? "Phone needed." : "") : undefined
+        }
       >
         <Input
           id="vphone"
@@ -791,10 +762,7 @@ function Step5({ form, onBack }: { form: FormState; onBack: () => void }) {
           {[1, 2, 3, 4, 5].map((n) => (
             <span
               key={n}
-              className={cn(
-                "h-2 rounded-full",
-                n === 5 ? "w-6 bg-brand" : "w-2 bg-brand",
-              )}
+              className={cn("h-2 rounded-full", n === 5 ? "w-6 bg-brand" : "w-2 bg-brand")}
             />
           ))}
         </div>
@@ -862,8 +830,7 @@ function Step5({ form, onBack }: { form: FormState; onBack: () => void }) {
               <ShieldCheck className="mt-0.5 size-4 shrink-0 text-brand" aria-hidden="true" />
               <p className="text-xs leading-relaxed text-ink-muted">
                 You're in <span className="font-semibold text-ink">Shadow Mode</span>. The agent
-                will draft every reply and wait for your approval — until you choose to graduate
-                it.
+                will draft every reply and wait for your approval — until you choose to graduate it.
               </p>
             </div>
           </>

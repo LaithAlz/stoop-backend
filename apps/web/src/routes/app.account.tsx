@@ -1,15 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { toast } from "sonner";
-import {
-  ChevronRight,
-  CreditCard,
-  Bell,
-  Shield,
-  HelpCircle,
-  LogOut,
-  Sparkles,
-} from "lucide-react";
+import { ChevronRight, CreditCard, Bell, Shield, HelpCircle, LogOut, Sparkles } from "lucide-react";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
 import { AppTabBar } from "@/components/stoop/AppTabBar";
 import { Button } from "@/components/ui/button";
@@ -29,10 +21,7 @@ import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/account")({
   head: () => ({
-    meta: [
-      { title: "Account — Stoop." },
-      { name: "robots", content: "noindex" },
-    ],
+    meta: [{ title: "Account — Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: AccountPage,
 });
@@ -73,9 +62,7 @@ function AccountPage() {
             <div className="flex items-center gap-2 font-mono text-[10px] font-bold uppercase tracking-widest text-brand">
               <Sparkles className="size-3.5" /> Pro · annual
             </div>
-            <p className="mt-2 font-display text-[20px] text-ink">
-              $39 / mo · billed yearly
-            </p>
+            <p className="mt-2 font-display text-[20px] text-ink">$39 / mo · billed yearly</p>
             <p className="mt-1 text-[13px] text-ink-muted">
               Up to 5 properties. Renews August 14, 2026.
             </p>
@@ -86,7 +73,11 @@ function AccountPage() {
               >
                 <Link to="/plans">Change plan</Link>
               </Button>
-              <Button variant="outline" className="h-11 border-border" onClick={() => toast("Receipts emailed", { duration: 1500 })}>
+              <Button
+                variant="outline"
+                className="h-11 border-border"
+                onClick={() => toast("Receipts emailed", { duration: 1500 })}
+              >
                 Receipts
               </Button>
             </div>
@@ -143,9 +134,19 @@ function AccountPage() {
         {/* Security */}
         <Section title="Security">
           <Card>
-            <Row icon={Shield} label="Change password" onClick={() => toast("Password flow (mock)")} />
+            <Row
+              icon={Shield}
+              label="Change password"
+              onClick={() => toast("Password flow (mock)")}
+            />
             <Divider />
-            <Row icon={Shield} label="Two-factor auth" value="Off" onClick={() => toast("2FA setup (mock)")} last />
+            <Row
+              icon={Shield}
+              label="Two-factor auth"
+              value="Off"
+              onClick={() => toast("2FA setup (mock)")}
+              last
+            />
           </Card>
         </Section>
 
@@ -154,7 +155,13 @@ function AccountPage() {
           <Card>
             <Row icon={HelpCircle} label="Help center" onClick={() => toast("Help (mock)")} />
             <Divider />
-            <Row icon={HelpCircle} label="Email us" value="hello@stoop.co" onClick={() => (window.location.href = "mailto:hello@stoop.co")} last />
+            <Row
+              icon={HelpCircle}
+              label="Email us"
+              value="hello@stoop.co"
+              onClick={() => (window.location.href = "mailto:hello@stoop.co")}
+              last
+            />
           </Card>
         </Section>
 
@@ -194,7 +201,8 @@ function AccountPage() {
           <AlertDialogHeader>
             <AlertDialogTitle className="font-display">Sign out?</AlertDialogTitle>
             <AlertDialogDescription>
-              Your agent keeps working while you're signed out. You'll just stop getting alerts on this device.
+              Your agent keeps working while you're signed out. You'll just stop getting alerts on
+              this device.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -287,7 +295,15 @@ function Row({
   );
 }
 
-function LinkRow({ label, to, last }: { label: string; to: "/privacy" | "/terms"; last?: boolean }) {
+function LinkRow({
+  label,
+  to,
+  last,
+}: {
+  label: string;
+  to: "/privacy" | "/terms";
+  last?: boolean;
+}) {
   return (
     <>
       <Link to={to} className="flex min-h-14 w-full items-center justify-between gap-4 px-4 py-3">

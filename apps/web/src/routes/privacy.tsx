@@ -35,21 +35,25 @@ function PrivacyPage() {
         </h1>
         <p className="mt-4 text-base leading-relaxed text-ink-muted">
           Plain English version. The long form lives in our Terms. If anything here is unclear,
-          email <a href="mailto:hello@stoop.co" className="underline">hello@stoop.co</a>.
+          email{" "}
+          <a href="mailto:hello@stoop.co" className="underline">
+            hello@stoop.co
+          </a>
+          .
         </p>
 
         <Section title="What we collect">
           <p>
-            <strong>From landlords:</strong> name, email, phone, property addresses, lease facts you enter,
-            vendor contact info, the messages you approve or edit.
+            <strong>From landlords:</strong> name, email, phone, property addresses, lease facts you
+            enter, vendor contact info, the messages you approve or edit.
           </p>
           <p>
-            <strong>From tenants:</strong> the SMS messages they send to the dedicated property number,
-            plus the phone number itself. We do <em>not</em> create tenant accounts.
+            <strong>From tenants:</strong> the SMS messages they send to the dedicated property
+            number, plus the phone number itself. We do <em>not</em> create tenant accounts.
           </p>
           <p>
-            <strong>Technical:</strong> standard server logs, device type, app version. We do not use
-            third-party advertising trackers.
+            <strong>Technical:</strong> standard server logs, device type, app version. We do not
+            use third-party advertising trackers.
           </p>
         </Section>
 
@@ -63,12 +67,12 @@ function PrivacyPage() {
 
         <Section title="How we use it">
           <p>
-            To run the service — receive tenant messages, draft replies, route emergencies to you, and
-            keep a record of the conversation.
+            To run the service — receive tenant messages, draft replies, route emergencies to you,
+            and keep a record of the conversation.
           </p>
           <p>
-            We use a large language model from a sub-processor to draft replies. Messages sent to that
-            sub-processor are not used to train their public models.
+            We use a large language model from a sub-processor to draft replies. Messages sent to
+            that sub-processor are not used to train their public models.
           </p>
         </Section>
 
@@ -82,35 +86,39 @@ function PrivacyPage() {
 
         <Section title="Your rights">
           <p>
-            Export your data, delete your account, or request a copy of what we hold at any time. Email{" "}
-            <a href="mailto:privacy@stoop.co" className="underline">privacy@stoop.co</a>. We respond within
-            7 days.
+            Export your data, delete your account, or request a copy of what we hold at any time.
+            Email{" "}
+            <a href="mailto:privacy@stoop.co" className="underline">
+              privacy@stoop.co
+            </a>
+            . We respond within 7 days.
           </p>
           <p>
-            Under PIPEDA (Canada) and GDPR (EU), you can ask us to correct, delete, or restrict use of your
-            personal information.
+            Under PIPEDA (Canada) and GDPR (EU), you can ask us to correct, delete, or restrict use
+            of your personal information.
           </p>
         </Section>
 
         <Section title="Retention">
           <p>
-            We keep conversation history for as long as your property is active. If you delete a property,
-            its conversations are removed within 30 days. Account closure deletes everything within 30 days,
-            except records we're legally required to retain (e.g., billing).
+            We keep conversation history for as long as your property is active. If you delete a
+            property, its conversations are removed within 30 days. Account closure deletes
+            everything within 30 days, except records we're legally required to retain (e.g.,
+            billing).
           </p>
         </Section>
 
         <Section title="Security">
           <p>
-            Data is encrypted in transit (TLS) and at rest. Access is limited to engineers who need it for
-            support. We notify affected users within 72 hours of a confirmed breach.
+            Data is encrypted in transit (TLS) and at rest. Access is limited to engineers who need
+            it for support. We notify affected users within 72 hours of a confirmed breach.
           </p>
         </Section>
 
         <Section title="Changes">
           <p>
-            Material changes are emailed to active accounts at least 14 days before they take effect.
-            Non-material edits update the "Last updated" date.
+            Material changes are emailed to active accounts at least 14 days before they take
+            effect. Non-material edits update the "Last updated" date.
           </p>
         </Section>
       </main>

@@ -50,6 +50,9 @@ RLS, no strangers.
   process), outbound send, **A2P 10DLC / CASL registration filed in week 1**
 - Dashboard: approval queue wired to the real API (Brownstone design,
   `docs/mockups/04`) — approve with 5-second undo, edit, reasoning trace
+- **Vendor coordination (#115, moved into v1):** vendors table, "Ask your
+  plumber" drafts through the same approval queue, time brokering on the
+  case timeline. Approval-first; vendor auto-send stays trust LV3+
 - Cost metering: tokens + cost recorded per message from message one
 
 ### Out

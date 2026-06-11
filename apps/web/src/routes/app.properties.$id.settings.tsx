@@ -50,10 +50,7 @@ import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/properties/$id/settings")({
   head: ({ params }) => ({
-    meta: [
-      { title: "Property settings — Stoop." },
-      { name: "robots", content: "noindex" },
-    ],
+    meta: [{ title: "Property settings — Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/properties/${params.id}/settings` }],
   }),
   loader: ({ params }) => {
@@ -63,8 +60,7 @@ export const Route = createFileRoute("/app/properties/$id/settings")({
   component: PropertySettings,
 });
 
-const modeLabel = (m: AutonomyMode) =>
-  autonomyModes.find((x) => x.key === m)?.label ?? m;
+const modeLabel = (m: AutonomyMode) => autonomyModes.find((x) => x.key === m)?.label ?? m;
 
 function PropertySettings() {
   const { id } = Route.useParams();
@@ -148,9 +144,7 @@ function PropertySettings() {
                   style={{ width: `${progressPct}%` }}
                 />
               </div>
-              <p className="mt-2 text-[12px] text-ink-muted">
-                approve-without-edit streak
-              </p>
+              <p className="mt-2 text-[12px] text-ink-muted">approve-without-edit streak</p>
             </div>
 
             <div className="mt-4 flex gap-2">
@@ -160,11 +154,7 @@ function PropertySettings() {
               >
                 Change autonomy mode
               </Button>
-              <Button
-                asChild
-                variant="outline"
-                className="h-12 border-brand/30 text-brand"
-              >
+              <Button asChild variant="outline" className="h-12 border-brand/30 text-brand">
                 <Link to="/app/properties/$id/trust" params={{ id }}>
                   <TrendingUp className="size-4" />
                 </Link>
@@ -216,24 +206,53 @@ function PropertySettings() {
         {/* House Rules */}
         <Section title="House Rules">
           <SettingsCard>
-            <ValueRow label="Pets" value={config.rules.pets} onEdit={() => inlineConfirm("Edit pets")} />
-            <ValueRow label="Smoking" value={config.rules.smoking} onEdit={() => inlineConfirm("Edit smoking")} />
-            <ValueRow label="Parking spot" value={config.rules.parking} onEdit={() => inlineConfirm("Edit parking")} />
+            <ValueRow
+              label="Pets"
+              value={config.rules.pets}
+              onEdit={() => inlineConfirm("Edit pets")}
+            />
+            <ValueRow
+              label="Smoking"
+              value={config.rules.smoking}
+              onEdit={() => inlineConfirm("Edit smoking")}
+            />
+            <ValueRow
+              label="Parking spot"
+              value={config.rules.parking}
+              onEdit={() => inlineConfirm("Edit parking")}
+            />
             <ValueRow
               label="Quiet hours for tenants"
               value={`${config.rules.quietHours.start} – ${config.rules.quietHours.end}`}
               onEdit={() => inlineConfirm("Edit quiet hours")}
             />
-            <ValueRow label="Guests" value={config.rules.guests} onEdit={() => inlineConfirm("Edit guests")} last />
+            <ValueRow
+              label="Guests"
+              value={config.rules.guests}
+              onEdit={() => inlineConfirm("Edit guests")}
+              last
+            />
           </SettingsCard>
         </Section>
 
         {/* Lease Facts */}
         <Section title="Lease Facts">
           <SettingsCard>
-            <ValueRow label="Monthly rent" value={config.lease.rent} onEdit={() => inlineConfirm("Edit rent")} />
-            <ValueRow label="Rent due day" value={config.lease.dueDay} onEdit={() => inlineConfirm("Edit due day")} />
-            <ValueRow label="Security deposit" value={config.lease.deposit} onEdit={() => inlineConfirm("Edit deposit")} />
+            <ValueRow
+              label="Monthly rent"
+              value={config.lease.rent}
+              onEdit={() => inlineConfirm("Edit rent")}
+            />
+            <ValueRow
+              label="Rent due day"
+              value={config.lease.dueDay}
+              onEdit={() => inlineConfirm("Edit due day")}
+            />
+            <ValueRow
+              label="Security deposit"
+              value={config.lease.deposit}
+              onEdit={() => inlineConfirm("Edit deposit")}
+            />
             <ValueRow
               label="Lease end"
               value={
@@ -349,7 +368,9 @@ function PropertySettings() {
             <div className="flex min-h-14 items-center justify-between gap-4 px-4 py-3">
               <div className="min-w-0">
                 <p className="text-[14px] text-ink-muted">Pause the agent for this property</p>
-                <p className="text-[12px] text-ink-muted/80">Incoming texts queue until you resume.</p>
+                <p className="text-[12px] text-ink-muted/80">
+                  Incoming texts queue until you resume.
+                </p>
               </div>
               <Switch
                 checked={paused}
@@ -478,7 +499,8 @@ function PropertySettings() {
           <AlertDialogHeader>
             <AlertDialogTitle className="font-display">Delete this property?</AlertDialogTitle>
             <AlertDialogDescription>
-              This releases the dedicated number and removes all conversation history. This can't be undone.
+              This releases the dedicated number and removes all conversation history. This can't be
+              undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -522,13 +544,7 @@ function Section({
   );
 }
 
-function SettingsCard({
-  children,
-  muted,
-}: {
-  children: React.ReactNode;
-  muted?: boolean;
-}) {
+function SettingsCard({ children, muted }: { children: React.ReactNode; muted?: boolean }) {
   return (
     <div
       className={cn(

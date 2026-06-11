@@ -12,10 +12,7 @@ import { queue } from "@/lib/mock-app";
 
 export const Route = createFileRoute("/app/conversations/$id/emergency")({
   head: () => ({
-    meta: [
-      { title: "Emergency — Stoop." },
-      { name: "robots", content: "noindex" },
-    ],
+    meta: [{ title: "Emergency — Stoop." }, { name: "robots", content: "noindex" }],
   }),
   loader: ({ params }) => {
     const item = queue.find((q) => q.id === params.id);
@@ -103,9 +100,7 @@ function EmergencyPage() {
 
         {/* Body */}
         <main className="flex-1 overflow-y-auto px-5 py-6">
-          <p className="text-[11px] font-bold uppercase tracking-widest text-white/60">
-            Situation
-          </p>
+          <p className="text-[11px] font-bold uppercase tracking-widest text-white/60">Situation</p>
           <p className="mt-2 font-display text-2xl font-bold leading-snug text-white">
             Active ceiling flood above the bedroom. Tenant is awake and unhurt. Water is reaching
             the bed.
@@ -115,9 +110,7 @@ function EmergencyPage() {
             <p className="text-[10px] font-bold uppercase tracking-widest text-white/60">
               From {item.tenantFirst} · {item.receivedAgo}
             </p>
-            <p className="mt-2 text-[17px] leading-relaxed text-white">
-              “{item.tenantMessage}”
-            </p>
+            <p className="mt-2 text-[17px] leading-relaxed text-white">“{item.tenantMessage}”</p>
           </div>
 
           {/* Photo */}
@@ -137,9 +130,8 @@ function EmergencyPage() {
               Stoop already replied
             </p>
             <p className="mt-2 text-sm leading-relaxed text-white/90">
-              “This is an emergency — I'm contacting your landlord right now. If anyone is in
-              danger or it's gas/fire, call 911. Move valuables and turn off the water main if
-              you can.”
+              “This is an emergency — I'm contacting your landlord right now. If anyone is in danger
+              or it's gas/fire, call 911. Move valuables and turn off the water main if you can.”
             </p>
           </div>
         </main>

@@ -88,8 +88,8 @@ function Hero() {
 
           <p className="max-w-xl text-lg leading-relaxed text-ink-muted md:text-xl">
             Stoop is a quiet AI agent that sits between you and your tenants. It reads and sorts
-            every message, drafts the reply in your voice, and only asks for your approval when it's
-            ready.
+            every message, drafts the reply in your voice, lines up your own plumber or electrician,
+            and only asks for your approval when it's ready.
           </p>
 
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -207,8 +207,8 @@ function HowItWorksSection() {
     {
       icon: Bell,
       eyebrow: "Step 3",
-      title: "You get one notification with a draft",
-      body: "Open the app, read the draft, tap Approve & send. Edit first if you want. The whole thing takes 15 seconds.",
+      title: "You approve every message",
+      body: "The reply to your tenant, the text lining up your plumber for Thursday — each one is a draft until you tap Approve. Edit first if you want. Fifteen seconds.",
     },
     {
       icon: TrendingUp,
@@ -394,35 +394,39 @@ function PersonasSection() {
 function PlansPreview() {
   const tiers = [
     {
-      id: "solo",
-      name: "Solo",
-      price: "$19",
-      cap: "1 property",
+      id: "free",
+      name: "Emergency Line",
+      price: "$0",
+      cap: "Free, for good",
       featured: false,
-      bullets: ["Every text read and sorted", "Draft & approve from your phone", "Email support"],
-    },
-    {
-      id: "standard",
-      name: "Standard",
-      price: "$49",
-      cap: "Up to 5 properties",
-      featured: true,
       bullets: [
-        "Everything in Solo",
-        "Autonomy ladder — graduate to Auto-Routine",
-        "Vendor directory & on-call rotation",
+        "Every text read and sorted",
+        "Emergencies ring your phone immediately",
+        "One tidy inbox for the rest",
       ],
     },
     {
-      id: "pro",
-      name: "Pro",
-      price: "$129",
-      cap: "Up to 15 properties",
+      id: "full",
+      name: "Full Plan",
+      price: "$10",
+      cap: "Up to 10 properties · $5/month with early access, locked in for life",
+      featured: true,
+      bullets: [
+        "Replies drafted in your voice — you approve",
+        "Lines up your own plumber, electrician, handyman",
+        "Routine replies go hands-off as trust builds",
+      ],
+    },
+    {
+      id: "pm",
+      name: "Property Managers",
+      price: "$1.50",
+      cap: "Per door · 20+ doors",
       featured: false,
       bullets: [
-        "Everything in Standard",
-        "Custom severity overrides",
-        "Priority support, GTA hours",
+        "After-hours coverage for your whole portfolio",
+        "Emergencies routed to on-call staff",
+        "Works with your existing software",
       ],
     },
   ] as const;
@@ -440,7 +444,7 @@ function PlansPreview() {
               Pick a plan. Cancel anytime.
             </h2>
             <p className="mt-3 max-w-xl text-base text-ink-muted">
-              All prices in CAD. Annual billing saves two months. 14-day free trial on every tier.
+              All prices in CAD. No credit card to start. Cancel anytime.
             </p>
           </div>
           <Link to="/plans" className="text-sm font-semibold text-brand hover:underline">

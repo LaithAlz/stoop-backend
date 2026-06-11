@@ -56,17 +56,17 @@ function TermsPage() {
 
         <Section title="Your account">
           <p>
-            You're responsible for keeping your sign-in credentials secure and for the accuracy of the
-            information you enter (lease facts, vendor contacts, house rules). The agent's replies are
-            only as accurate as what you give it.
+            You're responsible for keeping your sign-in credentials secure and for the accuracy of
+            the information you enter (lease facts, vendor contacts, house rules). The agent's
+            replies are only as accurate as what you give it.
           </p>
         </Section>
 
         <Section title="Tenant communications">
           <p>
-            By giving the dedicated property number to a tenant, you confirm you have a reasonable basis
-            to communicate with them about the property. Stoop sends a one-time disclosure message on
-            first contact explaining how the assistant works.
+            By giving the dedicated property number to a tenant, you confirm you have a reasonable
+            basis to communicate with them about the property. Stoop sends a one-time disclosure
+            message on first contact explaining how the assistant works.
           </p>
           <p>
             You're responsible for compliance with Ontario's RTA and the CRTC's SMS rules in your
@@ -76,34 +76,34 @@ function TermsPage() {
 
         <Section title="Billing">
           <p>
-            Plans are billed monthly or annually in CAD. The 14-day free trial does not require a card.
-            After the trial, you can cancel anytime; cancellations stop the next renewal but don't refund
-            the current period.
+            Plans are billed monthly or annually in CAD. The 14-day free trial does not require a
+            card. After the trial, you can cancel anytime; cancellations stop the next renewal but
+            don't refund the current period.
           </p>
           <p>
-            Annual plans are non-refundable after 30 days. Pro-rated refunds for service outages over 24
-            hours are available on request.
+            Annual plans are non-refundable after 30 days. Pro-rated refunds for service outages
+            over 24 hours are available on request.
           </p>
         </Section>
 
         <Section title="Acceptable use">
           <p>
-            Don't use Stoop to harass, threaten, or deceive tenants. Don't use it to impersonate a human
-            in jurisdictions that prohibit AI agents from doing so without disclosure. Don't try to break
-            our infrastructure.
+            Don't use Stoop to harass, threaten, or deceive tenants. Don't use it to impersonate a
+            human in jurisdictions that prohibit AI agents from doing so without disclosure. Don't
+            try to break our infrastructure.
           </p>
           <p>We may suspend accounts that violate these rules. We'll tell you why.</p>
         </Section>
 
         <Section title="Liability">
           <p>
-            Stoop is provided "as is." We're a small company and our liability is capped at the amount
-            you've paid us in the prior 12 months. We're not liable for downstream damages from a missed
-            message, an incorrect draft, or a tenant dispute.
+            Stoop is provided "as is." We're a small company and our liability is capped at the
+            amount you've paid us in the prior 12 months. We're not liable for downstream damages
+            from a missed message, an incorrect draft, or a tenant dispute.
           </p>
           <p>
-            For emergencies, the agent always advises 911 first. We design for safety, but you remain
-            the landlord of record.
+            For emergencies, the agent always advises 911 first. We design for safety, but you
+            remain the landlord of record.
           </p>
         </Section>
 
@@ -113,7 +113,11 @@ function TermsPage() {
             governed by the laws of Ontario, Canada.
           </p>
           <p>
-            Questions? <a href="mailto:hello@stoop.co" className="underline">hello@stoop.co</a>.
+            Questions?{" "}
+            <a href="mailto:hello@stoop.co" className="underline">
+              hello@stoop.co
+            </a>
+            .
           </p>
         </Section>
       </main>

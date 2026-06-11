@@ -68,7 +68,8 @@ function SignInPage() {
           </div>
 
           <div className="my-6 flex items-center gap-3 text-xs font-bold uppercase tracking-widest text-ink-muted">
-            <span className="h-px flex-1 bg-border" /> or email <span className="h-px flex-1 bg-border" />
+            <span className="h-px flex-1 bg-border" /> or email{" "}
+            <span className="h-px flex-1 bg-border" />
           </div>
 
           {sent ? (
@@ -88,7 +89,10 @@ function SignInPage() {
               className="flex flex-col gap-3"
             >
               <div>
-                <Label htmlFor="email" className="text-xs font-bold uppercase tracking-widest text-ink-muted">
+                <Label
+                  htmlFor="email"
+                  className="text-xs font-bold uppercase tracking-widest text-ink-muted"
+                >
                   Email
                 </Label>
                 <Input
@@ -102,7 +106,10 @@ function SignInPage() {
                   className="mt-1 h-12"
                 />
               </div>
-              <Button type="submit" className="h-12 justify-center bg-brand text-brand-foreground hover:bg-brand/90">
+              <Button
+                type="submit"
+                className="h-12 justify-center bg-brand text-brand-foreground hover:bg-brand/90"
+              >
                 Email me a sign-in link <ArrowRight className="size-4" />
               </Button>
             </form>
@@ -118,8 +125,14 @@ function SignInPage() {
 
         <p className="mt-2 text-center text-xs text-ink-muted">
           By signing in, you agree to our{" "}
-          <Link to="/terms" className="underline">Terms</Link> and{" "}
-          <Link to="/privacy" className="underline">Privacy Policy</Link>.
+          <Link to="/terms" className="underline">
+            Terms
+          </Link>{" "}
+          and{" "}
+          <Link to="/privacy" className="underline">
+            Privacy Policy
+          </Link>
+          .
         </p>
       </main>
 

@@ -16,22 +16,13 @@ import { AppTabBar } from "@/components/stoop/AppTabBar";
 import { Wordmark } from "@/components/stoop/Wordmark";
 import { SeverityBadge, type Severity } from "@/components/stoop/SeverityBadge";
 import { Button } from "@/components/ui/button";
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger,
-} from "@/components/ui/sheet";
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { properties, queue, type QueueItem } from "@/lib/mock-app";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app")({
   head: () => ({
-    meta: [
-      { title: "Queue — Stoop." },
-      { name: "robots", content: "noindex" },
-    ],
+    meta: [{ title: "Queue — Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: AppQueuePage,
 });
@@ -43,8 +34,7 @@ function AppQueuePage() {
   const [filter, setFilter] = useState<Filter>("pending");
 
   const scoped = useMemo(
-    () =>
-      propertyId === "all" ? queue : queue.filter((q) => q.propertyId === propertyId),
+    () => (propertyId === "all" ? queue : queue.filter((q) => q.propertyId === propertyId)),
     [propertyId],
   );
 
@@ -66,7 +56,7 @@ function AppQueuePage() {
   const propertyLabel =
     propertyId === "all"
       ? `All ${properties.length} properties`
-      : properties.find((p) => p.id === propertyId)?.nickname ?? "Property";
+      : (properties.find((p) => p.id === propertyId)?.nickname ?? "Property");
 
   return (
     <PhoneFrame>
@@ -160,9 +150,7 @@ function AppQueuePage() {
           ) : (
             <>
               <div className="mb-3 flex items-baseline justify-between px-1">
-                <h1 className="font-display text-lg font-bold tracking-tight">
-                  Needs you now
-                </h1>
+                <h1 className="font-display text-lg font-bold tracking-tight">Needs you now</h1>
                 <span className="text-xs font-bold uppercase tracking-widest text-ink-muted">
                   {visible.length} pending
                 </span>
@@ -195,9 +183,7 @@ function IconLabelButton({ icon, label }: { icon: React.ReactNode; label: string
       className="inline-flex min-h-11 min-w-11 flex-col items-center justify-center gap-0.5 rounded-xl px-2 text-ink hover:bg-brand-muted"
     >
       {icon}
-      <span className="text-[9px] font-bold uppercase tracking-widest text-ink-muted">
-        {label}
-      </span>
+      <span className="text-[9px] font-bold uppercase tracking-widest text-ink-muted">{label}</span>
     </button>
   );
 }
@@ -299,9 +285,7 @@ function QueueRow({ item }: { item: QueueItem }) {
             <span className="inline-flex size-2 animate-pulse rounded-full bg-emergency motion-reduce:animate-none" />
           )}
         </div>
-        <span className="font-mono text-[11px] font-medium text-ink-muted">
-          {item.receivedAgo}
-        </span>
+        <span className="font-mono text-[11px] font-medium text-ink-muted">{item.receivedAgo}</span>
       </header>
 
       <div className="px-4 pb-3 pt-2">
@@ -378,9 +362,7 @@ function EmptyState() {
       <div className="flex size-16 items-center justify-center rounded-2xl bg-brand-muted text-brand">
         <Inbox className="size-7" aria-hidden="true" />
       </div>
-      <h2 className="mt-6 font-display text-2xl font-bold tracking-tight">
-        You're caught up.
-      </h2>
+      <h2 className="mt-6 font-display text-2xl font-bold tracking-tight">You're caught up.</h2>
       <p className="mt-2 text-sm text-ink-muted">Last activity 14 min ago.</p>
       <p className="mt-1 text-sm text-ink-muted">Next digest: today at 6:00 PM.</p>
     </div>

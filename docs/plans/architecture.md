@@ -139,6 +139,10 @@ session (RLS) → handler runs. Stateless; no sessions server-side.
      checkpoint) → draft surfaces in the dashboard approval queue.
 4. Landlord approves (or edits) → graph resumes from checkpoint → SMS sent →
    `trust_metrics` updated → audit entries written.
+5. The same approval queue carries **vendor messages** (v1, issue #115):
+   "Ask your plumber" drafts an SMS to the landlord's own tradesperson,
+   approval-first, with replies threading onto the case. Stoop relays —
+   the vendor never sees the tenant's number.
 
 The approve action implements **undo-with-delay** (5 s) before the actual
 Twilio send, matching the dashboard design — sending SMS to a tenant is

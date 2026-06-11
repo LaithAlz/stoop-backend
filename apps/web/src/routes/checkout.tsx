@@ -10,10 +10,7 @@ const searchSchema = z.object({
 export const Route = createFileRoute("/checkout")({
   validateSearch: (s) => searchSchema.parse(s),
   head: () => ({
-    meta: [
-      { title: "Checkout — Stoop." },
-      { name: "robots", content: "noindex" },
-    ],
+    meta: [{ title: "Checkout — Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: CheckoutPage,
 });

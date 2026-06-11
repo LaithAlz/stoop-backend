@@ -257,8 +257,9 @@ function FoundingPage() {
               </h1>
 
               <p className="max-w-xl text-lg leading-relaxed text-ink-muted md:text-xl">
-                Stoop reads every tenant message, drafts the reply in your voice, and only rings
-                your phone for a true emergency. Every landlord is onboarded personally.
+                Stoop reads every tenant message, drafts the reply in your voice, lines up your own
+                tradespeople, and only rings your phone for a true emergency. Every landlord is
+                onboarded personally.
               </p>
 
               <CaptureForm />
