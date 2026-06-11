@@ -1,4 +1,4 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, redirect } from "@tanstack/react-router";
 import {
   MessageSquareText,
   Brain,
@@ -25,6 +25,11 @@ import { SeverityBadge } from "@/components/stoop/SeverityBadge";
 import { Wordmark } from "@/components/stoop/Wordmark";
 
 export const Route = createFileRoute("/")({
+  // Pre-launch: the old Heritage-design marketing site clashes with /founding.
+  // Send everyone to the founding page until the Brownstone port (#112) lands.
+  beforeLoad: () => {
+    throw redirect({ to: "/founding" });
+  },
   head: () => ({
     meta: [
       { title: "Stoop. — Tenant maintenance, handled before it wakes you up" },
@@ -83,8 +88,7 @@ function Hero() {
           <h1 className="text-balance font-display text-5xl font-bold leading-[0.95] tracking-tight md:text-6xl lg:text-7xl">
             Your tenant's 2am text,
             <br />
-            <span className="italic font-semibold text-brand">handled before it wakes you up</span>
-            .
+            <span className="italic font-semibold text-brand">handled before it wakes you up</span>.
           </h1>
 
           <p className="max-w-xl text-lg leading-relaxed text-ink-muted md:text-xl">
@@ -172,16 +176,13 @@ function ProblemSection() {
           You didn't sign up to be on call.
         </h2>
         <p className="mt-4 max-w-2xl text-lg text-ink-muted">
-          Most landlord days are fine. It's the few minutes scattered across each week that wear
-          you down.
+          Most landlord days are fine. It's the few minutes scattered across each week that wear you
+          down.
         </p>
 
         <div className="mt-12 grid gap-6 md:grid-cols-3">
           {items.map((item) => (
-            <div
-              key={item.title}
-              className="rounded-2xl border border-border bg-card p-6"
-            >
+            <div key={item.title} className="rounded-2xl border border-border bg-card p-6">
               <h3 className="font-display text-xl font-bold text-ink">{item.title}</h3>
               <p className="mt-3 text-[15px] leading-relaxed text-ink-muted">{item.body}</p>
             </div>
@@ -242,9 +243,7 @@ function HowItWorksSection() {
                   <div className="inline-flex size-12 items-center justify-center rounded-2xl bg-brand-muted text-brand">
                     <Icon className="size-6" aria-hidden="true" />
                   </div>
-                  <span className="font-display text-4xl font-bold text-brand/20">
-                    0{i + 1}
-                  </span>
+                  <span className="font-display text-4xl font-bold text-brand/20">0{i + 1}</span>
                 </div>
                 <div className="space-y-2">
                   <p className="text-[11px] font-bold uppercase tracking-widest text-ink-muted">
@@ -259,7 +258,9 @@ function HowItWorksSection() {
         </ol>
 
         <div className="mt-10 flex flex-wrap items-center gap-3">
-          <span className="text-sm font-semibold text-ink-muted">Severity, always with a label:</span>
+          <span className="text-sm font-semibold text-ink-muted">
+            Severity, always with a label:
+          </span>
           <SeverityBadge severity="emergency" />
           <SeverityBadge severity="urgent" />
           <SeverityBadge severity="routine" />
@@ -303,9 +304,7 @@ function NotWhatSection() {
           </ul>
         </div>
         <div className="rounded-3xl border border-brand bg-brand text-brand-foreground p-8">
-          <p className="text-xs font-bold uppercase tracking-[0.2em] opacity-80">
-            What Stoop is
-          </p>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] opacity-80">What Stoop is</p>
           <ul className="mt-6 space-y-4">
             {isIt.map((line) => (
               <li key={line} className="flex items-start gap-3 text-[15px] font-medium">
@@ -438,7 +437,10 @@ function PlansPreview() {
   ] as const;
 
   return (
-    <section id="plans" className="scroll-mt-20 border-b border-border bg-surface/40 px-6 py-20 lg:py-28">
+    <section
+      id="plans"
+      className="scroll-mt-20 border-b border-border bg-surface/40 px-6 py-20 lg:py-28"
+    >
       <div className="mx-auto max-w-6xl">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
@@ -450,10 +452,7 @@ function PlansPreview() {
               All prices in CAD. Annual billing saves two months. 14-day free trial on every tier.
             </p>
           </div>
-          <Link
-            to="/plans"
-            className="text-sm font-semibold text-brand hover:underline"
-          >
+          <Link to="/plans" className="text-sm font-semibold text-brand hover:underline">
             Compare all features →
           </Link>
         </div>
