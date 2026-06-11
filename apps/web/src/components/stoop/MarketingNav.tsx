@@ -78,9 +78,7 @@ export function MarketingNav() {
 
         <div className="hidden md:block">
           <Button asChild className="h-11 px-5 font-semibold">
-            <a href={APP_STORE_URL} rel="noopener">
-              Get the app
-            </a>
+            <Link to="/founding">Get early access</Link>
           </Button>
         </div>
 
@@ -125,7 +123,11 @@ export function MarketingNav() {
               </li>
             ))}
             <li className="pt-3">
-              <GetTheAppButtons stacked />
+              <Button asChild className="h-11 w-full font-semibold">
+                <Link to="/founding" onClick={() => setOpen(false)}>
+                  Get early access
+                </Link>
+              </Button>
             </li>
           </ul>
         </div>

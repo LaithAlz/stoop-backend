@@ -1,4 +1,4 @@
-import { createFileRoute, Link, redirect } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import {
   MessageSquareText,
   Brain,
@@ -18,18 +18,13 @@ import {
 } from "@/components/ui/accordion";
 import { Button } from "@/components/ui/button";
 
-import { MarketingNav, GetTheAppButtons, APP_STORE_URL } from "@/components/stoop/MarketingNav";
+import { MarketingNav } from "@/components/stoop/MarketingNav";
 import { SiteFooter } from "@/components/stoop/SiteFooter";
 import { ApprovalCard } from "@/components/stoop/ApprovalCard";
 import { SeverityBadge } from "@/components/stoop/SeverityBadge";
 import { Wordmark } from "@/components/stoop/Wordmark";
 
 export const Route = createFileRoute("/")({
-  // Pre-launch: the old Heritage-design marketing site clashes with /founding.
-  // Send everyone to the founding page until the Brownstone port (#112) lands.
-  beforeLoad: () => {
-    throw redirect({ to: "/founding" });
-  },
   head: () => ({
     meta: [
       { title: "Stoop. — Tenant maintenance, handled before it wakes you up" },
@@ -99,10 +94,10 @@ function Hero() {
 
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <Button asChild className="h-14 px-6 text-base font-bold">
-              <a href={APP_STORE_URL} rel="noopener">
-                Get the app
+              <Link to="/founding">
+                Join the founding cohort
                 <ArrowRight className="size-4" aria-hidden="true" />
-              </a>
+              </Link>
             </Button>
             <Link
               to="/plans"
@@ -113,7 +108,7 @@ function Hero() {
           </div>
 
           <p className="text-xs font-medium uppercase tracking-widest text-ink-muted">
-            Free 14-day trial · No credit card · Set up in 5 minutes
+            Founding cohort: $5/month flat, locked for life · Emergency triage free forever
           </p>
         </div>
 
@@ -594,13 +589,19 @@ function FinalCTA() {
           Get your evenings back this week.
         </h2>
         <p className="mx-auto mt-4 max-w-xl text-lg text-ink-muted">
-          Five-minute setup. Fourteen days free. Cancel any time without a phone call.
+          Five-minute setup. Founding cohort: $5/month flat, locked for life. Cancel any time
+          without a phone call.
         </p>
         <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
-          <GetTheAppButtons />
+          <Button asChild className="h-14 px-7 text-base font-bold">
+            <Link to="/founding">
+              Get early access
+              <ArrowRight className="size-4" aria-hidden="true" />
+            </Link>
+          </Button>
         </div>
         <p className="mt-5 text-xs font-medium uppercase tracking-widest text-ink-muted">
-          No credit card required
+          10 spots · Ontario landlords
         </p>
       </div>
     </section>
