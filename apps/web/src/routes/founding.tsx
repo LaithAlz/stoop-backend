@@ -97,8 +97,8 @@ function Example() {
       </div>
       <div className={`fnd-bubble draft ${stage >= 3 ? "show" : ""}`}>
         <div className="who">STOOP'S DRAFT · WAITING FOR YOUR OK AT 7 AM</div>
-        Hi Maria — so sorry. Try the breaker in the hall closet and text me in 10 min. Still
-        cold? My HVAC guy will be there at 7:30.
+        Hi Maria — so sorry. Try the breaker in the hall closet and text me in 10 min. Still cold?
+        My HVAC guy will be there at 7:30.
       </div>
     </figure>
   );
@@ -197,8 +197,8 @@ function FoundingPage() {
         </h1>
 
         <p className="fnd-sub">
-          Stoop reads every tenant message, drafts the reply in your voice, and only rings
-          your phone for a true emergency.
+          Stoop reads every tenant message, drafts the reply in your voice, and only rings your
+          phone for a true emergency.
         </p>
 
         <CaptureForm />
