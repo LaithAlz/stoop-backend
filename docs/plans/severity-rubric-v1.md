@@ -1,6 +1,6 @@
 # Severity Rubric — v1
 
-> **Status:** Draft for founder review, 2026-06-11.
+> **Status:** **v1.0 — approved & frozen 2026-06-11.** Any change is a new version + full eval run.
 > **Destination:** embedded **verbatim** in every `classify_severity` prompt
 > (`app/agent/rubric.py`, issue #28). Per `architecture.md` §5: no
 > paraphrasing, no drift. A change to this text is a new version + full eval
@@ -8,9 +8,9 @@
 > **Companion:** `eval-scenarios-v1.md` — every rule below is exercised by at
 > least one scenario.
 
-## Judgment calls awaiting founder sign-off
+## Judgment calls (signed off by founder, 2026-06-11)
 
-These are decisions I made that you should explicitly confirm or change:
+These six decisions were explicitly reviewed and approved:
 
 1. **Fire / medical / crime → 911 first.** Stoop always instructs the tenant
    to call 911 *before* anything else, then treats it as EMERGENCY. Stoop is

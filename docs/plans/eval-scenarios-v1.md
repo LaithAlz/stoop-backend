@@ -1,6 +1,6 @@
 # Eval Scenarios — v1
 
-> **Status:** Draft for founder review, 2026-06-11.
+> **Status:** **v1.0 — approved 2026-06-11.** Grows via the production-misclassification rule only.
 > **Destination:** `apps/api/evals/scenarios/*.yaml` (issues #35–37). Each
 > block below lifts directly into one YAML file. Run with `pytest -m eval`
 > against the real Anthropic API — never mocked.
