@@ -28,7 +28,7 @@ bundled away by someone else's platform.
 
 ### Segment A — self-managing landlords (1–10 doors) · the beachhead
 
-| | **Free — "First Door"** | **Pro — $29/door/mo** ($290/yr) |
+| | **Free — "Safety Net"** | **Founding rate — $5/door/mo** (target $10–15 for later cohorts) |
 |---|---|---|
 | Triage + severity classification | ✔ | ✔ |
 | Emergency call + escalation chain | ✔ (the safety promise is never paywalled) | ✔ |
@@ -37,19 +37,25 @@ bundled away by someone else's platform.
 | Trust ladder / routine auto-send | — | ✔ |
 | Audit trail export ("LTB pack") | — | ✔ |
 | History | 30 days | Unlimited |
-| Doors | 1 | Unlimited at $29 each |
+| Doors | 1 | Unlimited at $5 each (founding rate) |
 
 Rationale:
 - Resolves the free-first-door flaw (the single-door majority converts on
   *convenience*, not safety): free tier still delivers the emergency
   promise — which is the word-of-mouth engine — but drafting, auto-send,
   and the LTB pack are the product.
-- **$29 not $19**: Hemlane charges up to $58/unit with humans attached;
-  a PM costs $150+/door. $29 reads cheap against both anchors. Pilots
-  test $29 (issue #102's would-you-pay question updated accordingly).
+- **Penetration pricing (founder decision 2026-06-11):** launch at
+  $5/door — roughly COGS+$1–2.50 — accepting thin early margin to
+  maximize adoption. The escape hatch is **grandfathering**: founding
+  landlords keep $5/door for life; later cohorts pay the target price
+  ($10–15, validated by Van Westendorp in pilot retros, #102). Prices
+  ratchet up by cohort, never down. "Founding landlord rate" framing
+  signals the real price is higher — it reads as early access, not as
+  cheap.
 - Free-tier COGS ≈ $2–4/door/mo (LLM classification + number rental) —
   a real but acceptable CAC, cheaper than ads.
-- Volume break at 11+ doors: $19/door (bridges toward the PM tier).
+- Stripe-fee note: at $5 charges, fees eat ~9%. Nudge annual ($50/door/yr)
+  at checkout to cut both fees and churn.
 
 ### Segment B — property managers (50–5,000 doors) · the second act
 
@@ -62,12 +68,13 @@ decisions are deliberate:
   work orders into their existing PM software (Buildium/AppFolio/Rent
   Manager integrations, their app marketplaces are the distribution
   channel).
-- **Pricing, the Latchel lesson:** make Stoop revenue-positive for the
-  PM. Platform fee $6–10/door/mo, with an optional **resident-benefit
-  model**: the PM offers tenants a $10–15/mo benefit package (instant
-  24/7 response SLA, status tracking) and keeps the margin — Stoop
-  becomes a profit center, which is how Latchel made "free for PMs"
-  print +$48/door/yr for its buyers.
+- **Pricing, the Latchel lesson (founder-confirmed):** platform fee
+  $1.50–2/door/mo — matching Latchel's actual basic pricing ($25 +
+  $0.80/unit) because PMs price-shop software ruthlessly — with the
+  **resident-benefit model** as the real revenue: the PM offers tenants
+  a $10–15/mo benefit package (instant 24/7 response SLA, status
+  tracking) and keeps the margin. Stoop becomes a profit center, which
+  is how Latchel made "free for PMs" print +$48/door/yr for its buyers.
 - **What it requires (why it's later):** team seats/roles, SLAs,
   integrations, SOC 2 (already a scaling trigger in architecture.md §11),
   multi-assignee escalation chains.
@@ -78,10 +85,10 @@ decisions are deliberate:
 
 | Tier | Who | Price |
 |---|---|---|
-| First Door (free) | 1-door landlords | $0 — triage + emergency, forever |
-| Pro | 1–10 doors | $29/door/mo or $290/door/yr |
-| Portfolio | 11–50 doors | $19/door/mo |
-| Stoop Desk (future) | PMs 50+ doors | $6–10/door/mo + resident-benefit revenue option |
+| Safety Net (free) | any landlord | $0 — triage + emergency calls, forever |
+| Founding rate | pilot + early cohorts | $5/door/mo or $50/door/yr — grandfathered for life |
+| Standard (later cohorts) | 1–50 doors | $10–15/door/mo, set from pilot Van Westendorp data |
+| Stoop Desk (future) | PMs 20+ doors | $1.50–2/door/mo platform fee + resident-benefit revenue (the Latchel model — margin lives in the benefit package, not the platform fee) |
 
 ## 3. Traction playbook (stolen from the winners, localized)
 
@@ -108,12 +115,13 @@ decisions are deliberate:
 
 ## 4. Decisions this locks (pending founder sign-off)
 
-1. Free tier = capability-gated (triage+emergency), not door-count-only.
-2. $29/door Pro anchor, tested in pilot retros (#102).
-3. PM segment deferred to post-PMF, but waitlist link ships with the
-   landing page (#112 AC addition).
-4. Issues #52/#58 pricing ACs update from "$0 first door / $19" to this
-   table once 1–2 are confirmed.
+1. ✅ Free tier = capability-gated (triage+emergency), not door-count-only.
+2. ✅ **$5/door founding rate** (founder decision 2026-06-11: penetration
+   pricing, thin early margin accepted, grandfathered for life; target
+   $10–15 for later cohorts, validated via #102 Van Westendorp).
+3. ✅ PM segment deferred to post-PMF at $1.50–2/door + resident benefit;
+   waitlist link ships with the landing page (#112).
+4. ✅ Issues #52/#58/#102/#112 ACs updated to this table (2026-06-11).
 
 ## Sources
 
