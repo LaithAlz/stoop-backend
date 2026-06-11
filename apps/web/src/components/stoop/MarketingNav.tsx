@@ -78,7 +78,7 @@ export function MarketingNav() {
 
         <div className="hidden md:block">
           <Button asChild className="h-11 px-5 font-semibold">
-            <Link to="/founding">Get early access</Link>
+            <Link to="/early-access">Get early access</Link>
           </Button>
         </div>
 
@@ -124,7 +124,7 @@ export function MarketingNav() {
             ))}
             <li className="pt-3">
               <Button asChild className="h-11 w-full font-semibold">
-                <Link to="/founding" onClick={() => setOpen(false)}>
+                <Link to="/early-access" onClick={() => setOpen(false)}>
                   Get early access
                 </Link>
               </Button>

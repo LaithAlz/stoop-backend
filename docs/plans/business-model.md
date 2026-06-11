@@ -28,7 +28,7 @@ bundled away by someone else's platform.
 
 ### Segment A — self-managing landlords (1–10 doors) · the beachhead
 
-| | **Free — "Safety Net"** | **Founding rate — $5/month flat** (per landlord, up to 10 doors; later cohorts $10–15/mo) |
+| | **Free — "Safety Net"** | **Early-access rate — $5/month flat** (per landlord, up to 10 doors; standard price $10/mo) |
 |---|---|---|
 | Triage + severity classification | ✔ | ✔ |
 | Emergency call + escalation chain | ✔ (the safety promise is never paywalled) | ✔ |
@@ -48,8 +48,8 @@ Rationale:
   $5/month flat (per landlord, ≤10 doors) — accepting thin early margin to
   maximize adoption. The escape hatch is **grandfathering**: founding
   landlords keep $5/month for life; later cohorts pay the target price
-  ($10–15, validated by Van Westendorp in pilot retros, #102). Prices
-  ratchet up by cohort, never down. "Founding landlord rate" framing
+  ($10 flat — founder decision 2026-06-11 — sanity-checked by Van Westendorp in pilot retros, #102). Prices
+  ratchet up by cohort, never down. "Early-access rate" framing (customer-facing language never says "founding"/"cohort" — it signals small scale; founder decision 2026-06-11)
   signals the real price is higher — it reads as early access, not as
   cheap.
 - Free-tier COGS ≈ $2–4/door/mo (LLM classification + number rental) —
@@ -86,8 +86,8 @@ decisions are deliberate:
 | Tier | Who | Price |
 |---|---|---|
 | Safety Net (free) | any landlord | $0 — triage + emergency calls, forever |
-| Founding rate | pilot + early cohorts | $5/month flat (≤10 doors), $50/yr — grandfathered for life |
-| Standard (later cohorts) | 1–50 doors | $10–15/mo, flat-vs-per-door structure set from pilot Van Westendorp data |
+| Early-access rate | pilot + early customers | $5/month flat (≤10 doors), $50/yr — grandfathered for life |
+| Standard | 1–10 doors | **$10/month flat** (founder-set 2026-06-11); structure revisited with pilot data |
 | Stoop Desk (future) | PMs 20+ doors | $1.50–2/door/mo platform fee + resident-benefit revenue (the Latchel model — margin lives in the benefit package, not the platform fee) |
 
 ## 3. Traction playbook (stolen from the winners, localized)
@@ -116,7 +116,7 @@ decisions are deliberate:
 ## 4. Decisions this locks (pending founder sign-off)
 
 1. ✅ Free tier = capability-gated (triage+emergency), not door-count-only.
-2. ✅ **$5/month FLAT founding rate** (founder decisions 2026-06-11: penetration
+2. ✅ **$5/month FLAT early-access rate, $10 standard** (founder decisions 2026-06-11: penetration
    pricing, thin early margin accepted, grandfathered for life; target
    $10–15 for later cohorts, validated via #102 Van Westendorp).
 3. ✅ PM segment deferred to post-PMF at $1.50–2/door + resident benefit;

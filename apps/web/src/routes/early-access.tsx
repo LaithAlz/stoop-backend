@@ -9,7 +9,7 @@ import { SiteFooter } from "@/components/stoop/SiteFooter";
 import { cn } from "@/lib/utils";
 
 /* ──────────────────────────────────────────────────────────────────
- * Founding-cohort page (issue #114).
+ * Early-access page (issue #114).
  * A real page of the marketing site: same nav, footer, and hero
  * anatomy as "/", with email capture instead of app-store CTAs.
  * ────────────────────────────────────────────────────────────────── */
@@ -48,7 +48,7 @@ const joinWaitlist = createServerFn({ method: "POST" }).handler(
     await db
       .prepare(
         `INSERT INTO waitlist (name, email, is_pm, source)
-         VALUES ('', ?, ?, 'founding-page')
+         VALUES ('', ?, ?, 'early-access-page')
          ON CONFLICT(email) DO NOTHING`,
       )
       .bind(email.toLowerCase(), isPm ? 1 : 0)
@@ -57,14 +57,14 @@ const joinWaitlist = createServerFn({ method: "POST" }).handler(
   },
 );
 
-export const Route = createFileRoute("/founding")({
+export const Route = createFileRoute("/early-access")({
   head: () => ({
     meta: [
       { title: "Get early access — Stoop." },
       {
         name: "description",
         content:
-          "Join the founding cohort: 10 Ontario landlords at $5/month flat, locked for life. Stoop triages every tenant text and only rings your phone for a true emergency.",
+          "Early access for Ontario landlords: $5/month, locked in for life. Stoop reads every tenant text, drafts your replies, and only rings your phone for a true emergency.",
       },
     ],
   }),
@@ -121,7 +121,7 @@ function OvernightCard() {
             reveal(2),
           )}
         >
-          Classified urgent — not an emergency. Your phone stayed silent.
+          Marked urgent — not an emergency. Your phone stayed silent.
         </p>
 
         <div
@@ -247,7 +247,7 @@ function FoundingPage() {
             <div className="space-y-7">
               <div className="inline-flex items-center gap-2 rounded-full bg-brand-muted px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-brand">
                 <ShieldCheck className="size-3.5" aria-hidden="true" />
-                Founding cohort · 10 spots · Ontario
+                Early access · Ontario
               </div>
 
               <h1 className="text-balance font-display text-5xl font-bold leading-[0.95] tracking-tight md:text-6xl lg:text-7xl">
@@ -258,15 +258,14 @@ function FoundingPage() {
 
               <p className="max-w-xl text-lg leading-relaxed text-ink-muted md:text-xl">
                 Stoop reads every tenant message, drafts the reply in your voice, and only rings
-                your phone for a true emergency. We're onboarding the first ten Ontario landlords
-                personally.
+                your phone for a true emergency. Every landlord is onboarded personally.
               </p>
 
               <CaptureForm />
 
               <p className="text-xs font-medium uppercase tracking-widest text-ink-muted">
-                $5/month flat, locked for life · Emergency triage free forever · Property managers:
-                $1.50/door
+                $5/month early-access rate, locked in for life · Emergency line always free ·
+                Property managers: $1.50/door
               </p>
             </div>
 

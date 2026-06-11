@@ -31,7 +31,7 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "An AI triage layer for small landlords. Tenants text. Stoop classifies, asks, drafts a reply in your voice — you approve before it sends.",
+          "Tenants text one number. Stoop reads every message, drafts a reply in your voice — you approve before it sends.",
       },
       { property: "og:title", content: "Stoop. — Tenant maintenance, handled" },
       {
@@ -87,15 +87,15 @@ function Hero() {
           </h1>
 
           <p className="max-w-xl text-lg leading-relaxed text-ink-muted md:text-xl">
-            Stoop is a quiet AI agent that sits between you and your tenants. It triages every
-            message, drafts the reply in your voice, and only asks for your approval when it's
+            Stoop is a quiet AI agent that sits between you and your tenants. It reads and sorts
+            every message, drafts the reply in your voice, and only asks for your approval when it's
             ready.
           </p>
 
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <Button asChild className="h-14 px-6 text-base font-bold">
-              <Link to="/founding">
-                Join the founding cohort
+              <Link to="/early-access">
+                Get early access
                 <ArrowRight className="size-4" aria-hidden="true" />
               </Link>
             </Button>
@@ -108,7 +108,7 @@ function Hero() {
           </div>
 
           <p className="text-xs font-medium uppercase tracking-widest text-ink-muted">
-            Founding cohort: $5/month flat, locked for life · Emergency triage free forever
+            Early access: $5/month, locked in for life · Emergency help always free
           </p>
         </div>
 
@@ -201,7 +201,7 @@ function HowItWorksSection() {
     {
       icon: Brain,
       eyebrow: "Step 2",
-      title: "Stoop triages the message",
+      title: "Stoop sorts the message",
       body: "Asks clarifying questions, requests photos when useful, and classifies severity — Emergency, Urgent, or Routine.",
     },
     {
@@ -268,13 +268,9 @@ function HowItWorksSection() {
 /* ------------------------ What it's not ------------------------ */
 
 function NotWhatSection() {
-  const isNot = [
-    "Property management software",
-    "A chatbot replacing your judgment",
-    "A legal advisor on tenancy law",
-  ];
+  const isNot = ["Property management software", "A chatbot replacing your judgment"];
   const isIt = [
-    "A triage layer for tenant text messages",
+    "A smart filter for tenant text messages",
     "A draft-and-approve assistant in your voice",
     "A trust ladder you control — Shadow to Full Auto",
   ];
@@ -403,7 +399,7 @@ function PlansPreview() {
       price: "$19",
       cap: "1 property",
       featured: false,
-      bullets: ["AI triage on every text", "Draft & approve from your phone", "Email support"],
+      bullets: ["Every text read and sorted", "Draft & approve from your phone", "Email support"],
     },
     {
       id: "standard",
@@ -509,7 +505,6 @@ function PlansPreview() {
 function TrustStrip() {
   const items = [
     "You approve every message before it sends — until you decide otherwise.",
-    "We never give legal advice on tenancy law.",
     "Cancel anytime. Your data exports in one click.",
   ];
 
@@ -533,7 +528,7 @@ function FAQSection() {
   const faqs = [
     {
       q: "Will the AI say something that gets me in trouble?",
-      a: "Every message is a draft by default. Nothing sends without your tap. Stoop is also tuned to refuse legal interpretation — if a tenant asks about RTA rights, it tells them to talk to a paralegal and flags it for you.",
+      a: "Every message is a draft by default. Nothing sends without your tap, and anything sensitive gets handed straight back to you.",
     },
     {
       q: "Can I edit a draft before it goes out?",
@@ -541,7 +536,7 @@ function FAQSection() {
     },
     {
       q: "What about Ontario tenant law?",
-      a: "Stoop doesn't give legal advice. It handles maintenance triage and operational comms (parking, garbage, rent reminders). For anything tenancy-law adjacent, it routes the conversation back to you with context.",
+      a: "Stoop handles maintenance and everyday questions — parking, garbage, rent reminders. Anything beyond that, it hands the conversation back to you with context.",
     },
     {
       q: "Can I pause my subscription?",
@@ -589,19 +584,19 @@ function FinalCTA() {
           Get your evenings back this week.
         </h2>
         <p className="mx-auto mt-4 max-w-xl text-lg text-ink-muted">
-          Five-minute setup. Founding cohort: $5/month flat, locked for life. Cancel any time
-          without a phone call.
+          Five-minute setup. Early access: $5/month, locked in for life. Cancel any time without a
+          phone call.
         </p>
         <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
           <Button asChild className="h-14 px-7 text-base font-bold">
-            <Link to="/founding">
+            <Link to="/early-access">
               Get early access
               <ArrowRight className="size-4" aria-hidden="true" />
             </Link>
           </Button>
         </div>
         <p className="mt-5 text-xs font-medium uppercase tracking-widest text-ink-muted">
-          10 spots · Ontario landlords
+          Ontario landlords · No credit card
         </p>
       </div>
     </section>

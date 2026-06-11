@@ -14,7 +14,7 @@ import { Route as SignInRouteImport } from './routes/sign-in'
 import { Route as PrivacyRouteImport } from './routes/privacy'
 import { Route as PlansRouteImport } from './routes/plans'
 import { Route as OnboardingRouteImport } from './routes/onboarding'
-import { Route as FoundingRouteImport } from './routes/founding'
+import { Route as EarlyAccessRouteImport } from './routes/early-access'
 import { Route as DesignSystemRouteImport } from './routes/design-system'
 import { Route as CheckoutRouteImport } from './routes/checkout'
 import { Route as AppRouteImport } from './routes/app'
@@ -53,9 +53,9 @@ const OnboardingRoute = OnboardingRouteImport.update({
   path: '/onboarding',
   getParentRoute: () => rootRouteImport,
 } as any)
-const FoundingRoute = FoundingRouteImport.update({
-  id: '/founding',
-  path: '/founding',
+const EarlyAccessRoute = EarlyAccessRouteImport.update({
+  id: '/early-access',
+  path: '/early-access',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DesignSystemRoute = DesignSystemRouteImport.update({
@@ -125,7 +125,7 @@ export interface FileRoutesByFullPath {
   '/app': typeof AppRouteWithChildren
   '/checkout': typeof CheckoutRoute
   '/design-system': typeof DesignSystemRoute
-  '/founding': typeof FoundingRoute
+  '/early-access': typeof EarlyAccessRoute
   '/onboarding': typeof OnboardingRoute
   '/plans': typeof PlansRoute
   '/privacy': typeof PrivacyRoute
@@ -145,7 +145,7 @@ export interface FileRoutesByTo {
   '/app': typeof AppRouteWithChildren
   '/checkout': typeof CheckoutRoute
   '/design-system': typeof DesignSystemRoute
-  '/founding': typeof FoundingRoute
+  '/early-access': typeof EarlyAccessRoute
   '/onboarding': typeof OnboardingRoute
   '/plans': typeof PlansRoute
   '/privacy': typeof PrivacyRoute
@@ -166,7 +166,7 @@ export interface FileRoutesById {
   '/app': typeof AppRouteWithChildren
   '/checkout': typeof CheckoutRoute
   '/design-system': typeof DesignSystemRoute
-  '/founding': typeof FoundingRoute
+  '/early-access': typeof EarlyAccessRoute
   '/onboarding': typeof OnboardingRoute
   '/plans': typeof PlansRoute
   '/privacy': typeof PrivacyRoute
@@ -188,7 +188,7 @@ export interface FileRouteTypes {
     | '/app'
     | '/checkout'
     | '/design-system'
-    | '/founding'
+    | '/early-access'
     | '/onboarding'
     | '/plans'
     | '/privacy'
@@ -208,7 +208,7 @@ export interface FileRouteTypes {
     | '/app'
     | '/checkout'
     | '/design-system'
-    | '/founding'
+    | '/early-access'
     | '/onboarding'
     | '/plans'
     | '/privacy'
@@ -228,7 +228,7 @@ export interface FileRouteTypes {
     | '/app'
     | '/checkout'
     | '/design-system'
-    | '/founding'
+    | '/early-access'
     | '/onboarding'
     | '/plans'
     | '/privacy'
@@ -249,7 +249,7 @@ export interface RootRouteChildren {
   AppRoute: typeof AppRouteWithChildren
   CheckoutRoute: typeof CheckoutRoute
   DesignSystemRoute: typeof DesignSystemRoute
-  FoundingRoute: typeof FoundingRoute
+  EarlyAccessRoute: typeof EarlyAccessRoute
   OnboardingRoute: typeof OnboardingRoute
   PlansRoute: typeof PlansRoute
   PrivacyRoute: typeof PrivacyRoute
@@ -294,11 +294,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OnboardingRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/founding': {
-      id: '/founding'
-      path: '/founding'
-      fullPath: '/founding'
-      preLoaderRoute: typeof FoundingRouteImport
+    '/early-access': {
+      id: '/early-access'
+      path: '/early-access'
+      fullPath: '/early-access'
+      preLoaderRoute: typeof EarlyAccessRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/design-system': {
@@ -446,7 +446,7 @@ const rootRouteChildren: RootRouteChildren = {
   AppRoute: AppRouteWithChildren,
   CheckoutRoute: CheckoutRoute,
   DesignSystemRoute: DesignSystemRoute,
-  FoundingRoute: FoundingRoute,
+  EarlyAccessRoute: EarlyAccessRoute,
   OnboardingRoute: OnboardingRoute,
   PlansRoute: PlansRoute,
   PrivacyRoute: PrivacyRoute,
