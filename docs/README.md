@@ -27,6 +27,7 @@ strategy → product → engineering → roadmap → go-to-market → legal.
 | [`eval-scenarios-v1.md`](02-product/eval-scenarios-v1.md) | The 10 test cases the AI must pass (3 emergency / 3 urgent / 2 routine / 2 refusal) + scoring rules; E/F failures block releases |
 | [`conversation-model.md`](02-product/conversation-model.md) | Channel vs case, case lifecycle (open→resolved→reopen), the one-pending-draft rule, message routing |
 | [`emergency-prefilter.md`](02-product/emergency-prefilter.md) | The non-AI safety net: keyword Tier-0, degraded mode when the AI is down, the call-escalation chain when you don't answer |
+| [`plain-language-rules.md`](02-product/plain-language-rules.md) | Every message assumes a panicked/ESL/half-asleep reader: grade-5 level, one instruction at a time, length budgets; landlord approve-by-SMS |
 
 ## 03-engineering/ — how it's built
 
