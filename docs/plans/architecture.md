@@ -62,8 +62,9 @@ doesn't serve it before milestone 3 is cut or deferred.
                                        └─────────────────┘
 ```
 
-Two deployables. One database. Five external services (Supabase, Twilio,
-Anthropic, LangSmith, Sentry). Stripe joins at milestone 3.
+Two deployables. One database. Seven external services (Supabase, Twilio,
+Anthropic, LangSmith, Sentry, PostHog, Plausible). Stripe joins with
+billing (Train 2).
 
 ---
 
@@ -81,6 +82,8 @@ Anthropic, LangSmith, Sentry). Stripe joins at milestone 3.
 | Frontend | TanStack Start + shadcn/ui on Cloudflare Workers | Already built and deployed. Cloudflare here is invisible plumbing (`bun run deploy`); not a learning burden. Design direction: "Brownstone" (`docs/mockups/04`, `05`). |
 | SMS | Twilio | Industry default. **A2P 10DLC / CASL registration is a milestone-1 task, not an afterthought** — unregistered traffic gets carrier-filtered exactly when growth starts. |
 | Errors | Sentry (api + web) | As specced. |
+| Product analytics + flags | **PostHog** (free tier) | Four tools, one vendor: behavioral analytics, feature flags, experiments, surveys. Session replay **off** (the dashboard displays tenant PII). Identify by landlord uuid only. See ADR-5. |
+| Marketing analytics | **Plausible** | Anonymous, no consent banner, custom events on waitlist submit; pairs with the D1 `source` column for channel attribution. |
 | Payments | Stripe, milestone 3 only | Nothing billing-related is built before there's something worth paying for. |
 
 ---
@@ -276,6 +279,37 @@ These are architecture-level guarantees, enforced in code and tested in evals:
   ($19/door vs. LLM cost per door) must be a query, not a guess.
 - **Sentry** for both apps; structured JSON logs with `request_id` on Fly.
 
+### Analytics & feature flags (ADR-5)
+
+Three layers, each owning different questions:
+
+1. **Postgres owns business truth** — approval latency, edit rates,
+   emergency acknowledgment time, retention, cost per door. These are
+   domain queries on tables we already write (audit_log, trust_metrics,
+   messages); never outsourced to a vendor.
+2. **PostHog owns behavioral questions** (dashboard only): sessions,
+   exits, drop-off, feature usage — plus **feature flags, experiments,
+   and surveys**. v1 event spec: `session_start/end`,
+   `onboarding_step_completed`, `queue_viewed`,
+   `draft_approved|edited|rejected` (with UI timing), `undo_used`,
+   `case_opened_from_push`, `settings_changed`. Server-side SDK (Python)
+   evaluates flags where decisions live (e.g. pricing cohort — prices are
+   chosen server-side, never client-supplied).
+3. **Plausible owns the marketing site**: pageviews, referrers,
+   `waitlist_submitted` events.
+
+Hard rules:
+- **PII:** identify users by landlord uuid only — never email, name, or
+  phone. No message bodies, tenant names, or phone numbers in event
+  properties. Session replay stays off until there is a reviewed,
+  mask-everything configuration and a reason.
+- **Flags gate product features, never safety behavior.** The emergency
+  path, the rubric, and approval-first sending are governed by code,
+  trust-ladder data, and eval-gated releases. If PostHog is down,
+  unreachable, or misconfigured, the severity contract must be unchanged
+  — SDKs run with local evaluation and safe fallbacks.
+- Events proxied through our own domain (adblocker signal loss).
+
 ---
 
 ## 10. Security, privacy, compliance
@@ -342,6 +376,15 @@ path), is equally fluent in both languages (no fluency win), and explicitly
 wants to learn LangGraph/LangSmith (motivation and skill compounding).
 Two-deployable cost is accepted; the web app's Cloudflare hosting requires no
 ongoing platform knowledge.
+
+**ADR-5 — PostHog + Plausible for analytics; flags never gate safety** (2026-06-12)
+Firebase/GA4 rejected (consent burden, adblocker signal loss ~30%, weak
+product-analytics on web, ecosystem mismatch with Supabase/Fly/Cloudflare).
+Mixpanel/Amplitude dominated by PostHog's free tier + flags/experiments/
+surveys in one vendor. Session replay off — the dashboard renders tenant
+PII. Marketing stays anonymous on Plausible. Boundary rule: feature flags
+may gate rollouts, pricing cohorts, and experiments; they may never alter
+the emergency path, rubric behavior, or approval requirements.
 
 **ADR-4 — 9 phases compressed to 3 milestones** (2026-06-11)
 Original phases optimized for completeness; milestones optimize for

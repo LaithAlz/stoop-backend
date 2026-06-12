@@ -31,7 +31,7 @@ app/
               prompts/v1.py, nodes/{identify_property, load_context,
               identify_case, classify_intent, classify_severity,
               draft_response, emergency_protocol}
-  integrations/  supabase_auth.py, twilio.py, anthropic.py, weather.py
+  integrations/  supabase_auth.py, twilio.py, anthropic.py, weather.py, posthog.py
 evals/        scenarios/*.yaml + runner (format: docs/plans/eval-scenarios-v1.md)
 ```
 
@@ -78,6 +78,10 @@ evals/        scenarios/*.yaml + runner (format: docs/plans/eval-scenarios-v1.md
 - Send to tenant/vendor happens **only** through the draft flow or the
   emergency safety path. There is no other code path that calls
   `twilio.send`. Keep it that way.
+- Feature flags (PostHog, server-side evaluation with local fallback)
+  gate rollouts and pricing cohorts only — **never** the emergency path,
+  rubric, or approval requirements. Flag-service failure must be
+  indistinguishable from flags-off.
 
 ## Testing
 

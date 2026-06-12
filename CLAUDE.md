@@ -47,7 +47,12 @@ criteria; `docs/plans/phase-1/issues/` has the detailed specs for #1–#15.
    Sentry, or error messages. The `auth_user_id` / row uuids are enough.
 6. **Schema names come from `schema-v1.md`.** A new column means editing
    that doc first, then the migration.
-7. Customer-facing copy: plain English (never "triage"), no legal/LTB
+7. **Analytics discipline (ADR-5):** PostHog identifies by landlord uuid
+   only — no emails/names/phones/message bodies in event properties;
+   session replay stays off. **Feature flags never gate safety behavior**
+   (emergency path, rubric, approval requirements) — flags are for
+   rollouts, pricing cohorts, and experiments only.
+8. Customer-facing copy: plain English (never "triage"), no legal/LTB
    mentions on marketing pages, never "founding/cohort/spot counts" — say
    "early access". Prices: free Emergency Line / $10 Full Plan /
    $5 early-access (grandfathered) / PMs $1.50/door.
