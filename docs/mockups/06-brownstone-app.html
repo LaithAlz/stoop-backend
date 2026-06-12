@@ -3,466 +3,311 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Stoop — Full App (Brownstone)</title>
+<title>Stoop — App (simple)</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400;0,500;0,700;0,900;1,400&family=Spline+Sans+Mono:wght@400;500;700&family=Newsreader:ital,opsz,wght@1,6..72,400&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400;0,500;0,700;0,900;1,400&display=swap" rel="stylesheet" />
 <style>
   :root {
     --void:#131009; --panel:#1b1710; --panel2:#221d14; --line:#322a1d; --lineb:#54462f;
-    --text:#f2ead9; --dim:#b3a68e; --faint:#91836b;
+    --text:#f2ead9; --dim:#b3a68e;
     --accent:#ffb454; --accentb:#a06a24; --accentbg:rgba(255,180,84,.09); --onaccent:#221603;
-    --terra:#e0673f; --mint:#7fdcab; --mintb:rgba(127,220,171,.35); --mintbg:rgba(127,220,171,.08);
-    --blue:#9fc2ec; --blueb:rgba(159,194,236,.35); --bluebg:rgba(159,194,236,.08);
-    --red:#ff6d5e; --redb:rgba(255,109,94,.5); --redbg:rgba(255,109,94,.09);
-    --grot:"Schibsted Grotesk",sans-serif; --mono:"Spline Sans Mono",monospace; --serif:"Newsreader",serif;
+    --mint:#7fdcab; --mintb:rgba(127,220,171,.35); --mintbg:rgba(127,220,171,.08);
+    --blue:#9fc2ec; --red:#ff6d5e; --redb:rgba(255,109,94,.5); --redbg:rgba(255,109,94,.09);
+    --grot:"Schibsted Grotesk",sans-serif;
     --spring:cubic-bezier(.34,1.45,.64,1); --ease:cubic-bezier(.16,1,.3,1);
   }
   *{margin:0;padding:0;box-sizing:border-box}
-  body{background:var(--void);color:var(--text);font-family:var(--grot);min-height:100vh}
+  body{background:var(--void);color:var(--text);font-family:var(--grot);min-height:100vh;font-size:16px}
   body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
-    background:radial-gradient(900px 500px at 85% -10%,rgba(255,180,84,.07),transparent 60%)}
-  :focus-visible{outline:3px solid var(--accent);outline-offset:2px;border-radius:6px}
+    background:radial-gradient(800px 460px at 80% -10%,rgba(255,180,84,.07),transparent 60%)}
+  :focus-visible{outline:3px solid var(--accent);outline-offset:3px;border-radius:8px}
 
-  .app{position:relative;z-index:1;display:grid;grid-template-columns:230px 1fr;min-height:100vh;max-width:1440px;margin:0 auto}
+  .wrap{position:relative;z-index:1;max-width:640px;margin:0 auto;padding:20px 20px 110px}
 
-  /* ── sidebar ── */
-  .side{border-right:1px solid var(--line);padding:22px 14px;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;height:100vh}
-  .logo{font-weight:900;font-size:22px;letter-spacing:-.02em;padding:0 12px 18px}
+  /* top bar: logo + one status line */
+  .top{display:flex;align-items:center;justify-content:space-between;padding:6px 2px 22px}
+  .logo{font-weight:900;font-size:24px;letter-spacing:-.02em}
   .logo .dot{color:var(--accent)}
-  .nav-btn{display:flex;align-items:center;gap:11px;width:100%;text-align:left;background:none;border:none;color:var(--dim);
-    font-family:var(--grot);font-weight:700;font-size:14px;padding:11px 12px;border-radius:12px;cursor:pointer;
-    transition:background .2s,color .2s,transform .25s var(--spring)}
-  .nav-btn:hover{color:var(--text);background:rgba(255,255,255,.03);transform:translateX(2px)}
-  .nav-btn.on{background:var(--accent);color:var(--onaccent)}
-  .nav-btn .n{margin-left:auto;font-family:var(--mono);font-size:10px;background:var(--redbg);color:var(--red);
-    border:1px solid var(--redb);border-radius:999px;padding:1px 7px}
-  .nav-btn.on .n{background:rgba(0,0,0,.18);color:var(--onaccent);border-color:transparent}
-  .side-foot{margin-top:auto;padding:12px;font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--faint);line-height:2}
-  .side-foot b{color:var(--mint);font-weight:500}
-  .demo-btn{margin-top:8px;width:100%;background:var(--redbg);border:1px solid var(--redb);color:var(--red);
-    font-family:var(--mono);font-size:10px;letter-spacing:.1em;padding:10px;border-radius:10px;cursor:pointer}
+  .status{font-size:13.5px;color:var(--mint);font-weight:700}
 
-  /* ── main ── */
-  .main{padding:26px 30px 70px;min-width:0}
-  .screen{display:none;animation:fadeUp .45s var(--ease)}
+  h1{font-size:30px;font-weight:900;letter-spacing:-.025em;line-height:1.15;margin-bottom:8px}
+  .sub{color:var(--dim);font-size:16px;line-height:1.55;margin-bottom:24px}
+
+  .screen{display:none;animation:fadeUp .4s var(--ease)}
   .screen.on{display:block}
-  @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1}}
-  .crumb{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint);margin-bottom:10px}
-  h1{font-size:30px;font-weight:900;letter-spacing:-.03em;margin-bottom:6px}
-  h1 em{font-family:var(--serif);font-style:italic;font-weight:400;color:var(--accent)}
-  .sub{color:var(--dim);font-size:14px;margin-bottom:26px}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1}}
 
-  .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:18px;
-    transition:transform .3s var(--spring),border-color .3s}
-  .card:hover{border-color:var(--lineb)}
-  .chip{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
-    padding:4px 11px;border-radius:999px;border:1px solid;white-space:nowrap}
-  .chip.urgent{color:var(--accent);border-color:var(--accentb);background:var(--accentbg)}
-  .chip.routine{color:var(--blue);border-color:var(--blueb);background:var(--bluebg)}
-  .chip.emergency{color:var(--red);border-color:var(--redb);background:var(--redbg)}
-  .chip.resolved{color:var(--mint);border-color:var(--mintb);background:var(--mintbg)}
-  .chip.vendor{color:var(--terra);border-color:rgba(224,103,63,.4);background:rgba(224,103,63,.09)}
-  .btn{font-family:var(--grot);font-weight:800;font-size:14px;padding:12px 20px;border-radius:999px;cursor:pointer;
-    border:1px solid var(--lineb);background:transparent;color:var(--dim);transition:all .2s var(--spring)}
+  .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:20px;padding:22px}
+  .card+.card{margin-top:14px}
+
+  .tag{display:inline-block;font-size:13px;font-weight:800;padding:5px 14px;border-radius:999px;margin-bottom:14px}
+  .tag.urgent{background:var(--accentbg);color:var(--accent);border:1px solid var(--accentb)}
+  .tag.easy{background:rgba(159,194,236,.1);color:var(--blue);border:1px solid rgba(159,194,236,.3)}
+  .tag.done{background:var(--mintbg);color:var(--mint);border:1px solid var(--mintb)}
+
+  .who{font-size:19px;font-weight:900;margin-bottom:4px}
+  .what{font-size:15.5px;color:var(--dim);line-height:1.6;margin-bottom:16px}
+
+  .said{background:var(--panel2);border:1px solid var(--line);border-radius:14px;border-top-left-radius:5px;
+    padding:14px 16px;font-size:15.5px;line-height:1.6;margin-bottom:12px}
+  .said b{display:block;font-size:12.5px;color:var(--dim);font-weight:700;margin-bottom:5px}
+  .reply{background:var(--accentbg);border:1px solid var(--accentb);border-radius:14px;border-top-right-radius:5px;
+    padding:14px 16px;font-size:15.5px;line-height:1.6}
+  .reply b{display:block;font-size:12.5px;color:var(--accent);font-weight:700;margin-bottom:5px}
+
+  details{margin-top:12px}
+  summary{cursor:pointer;font-size:14px;color:var(--dim);font-weight:700;list-style:none;padding:6px 0}
+  summary::before{content:"▸ ";color:var(--accent)}
+  details[open] summary::before{content:"▾ "}
+  details p{font-size:14.5px;color:var(--dim);line-height:1.7;padding:6px 2px}
+  details p b{color:var(--text)}
+
+  .actions{display:flex;gap:10px;margin-top:16px}
+  .btn{font-family:var(--grot);font-weight:800;font-size:16.5px;padding:16px 22px;min-height:54px;border-radius:999px;
+    cursor:pointer;border:1px solid var(--lineb);background:transparent;color:var(--dim);transition:all .2s var(--spring)}
   .btn:hover{color:var(--text);transform:translateY(-1px)}
-  .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--onaccent)}
-  .btn.primary:hover{box-shadow:0 6px 24px rgba(255,180,84,.25)}
-  .btn.danger{border-color:var(--redb);color:var(--red)}
-  .mono-label{font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);font-weight:500}
+  .btn.primary{flex:1;background:var(--accent);border-color:var(--accent);color:var(--onaccent)}
+  .btn.primary:hover{box-shadow:0 6px 26px rgba(255,180,84,.25)}
+  .btn.small{font-size:14px;padding:10px 18px;min-height:44px}
 
-  /* ── cases list ── */
-  .filters{display:flex;gap:8px;margin-bottom:18px;flex-wrap:wrap}
-  .filters .btn{padding:8px 16px;font-size:12.5px}
-  .filters .btn.on{background:var(--panel2);border-color:var(--accentb);color:var(--accent)}
-  .case-row{display:grid;grid-template-columns:auto 1fr auto auto;gap:16px;align-items:center;padding:16px 20px;cursor:pointer}
-  .case-row+.case-row{margin-top:10px}
-  .case-row .dot{width:8px;height:8px;border-radius:50%}
-  .case-row .t b{display:block;font-size:15px;font-weight:800}
-  .case-row .t small{font-family:var(--mono);font-size:10.5px;color:var(--faint);letter-spacing:.06em}
-  .case-row .when{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  .quiet{text-align:center;color:var(--dim);font-size:15px;padding:26px 10px;line-height:1.7}
+  .quiet b{color:var(--text)}
 
-  /* ── case detail / timeline ── */
-  .case-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap;margin-bottom:22px}
-  .timeline{position:relative;padding-left:26px}
-  .timeline::before{content:"";position:absolute;left:8px;top:6px;bottom:6px;width:1px;background:var(--line)}
-  .tl{position:relative;margin-bottom:16px}
-  .tl::before{content:"";position:absolute;left:-22px;top:8px;width:9px;height:9px;border-radius:50%;background:var(--lineb);border:2px solid var(--void)}
-  .tl.agent::before{background:var(--blue)} .tl.tenant::before{background:var(--dim)}
-  .tl.you::before{background:var(--accent)} .tl.vendor::before{background:var(--terra)} .tl.sys::before{background:var(--mint)}
-  .tl .meta{font-family:var(--mono);font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-bottom:5px}
-  .bubble{border-radius:14px;padding:12px 15px;font-size:14px;line-height:1.6;max-width:640px}
-  .bubble.tenant{background:var(--panel2);border:1px solid var(--line)}
-  .bubble.draft{border:1px solid var(--accentb);background:var(--accentbg)}
-  .bubble.vendor{border:1px solid rgba(224,103,63,.4);background:rgba(224,103,63,.07)}
-  .audit{font-family:var(--mono);font-size:11px;color:var(--dim);border:1px dashed var(--line);border-radius:10px;
-    padding:9px 13px;max-width:640px;line-height:1.7}
-  .audit b{color:var(--blue);font-weight:500}
-  .pending-bar{position:sticky;bottom:14px;margin-top:24px;display:flex;gap:10px;align-items:center;
-    background:var(--panel);border:1px solid var(--accentb);border-radius:16px;padding:14px 18px;box-shadow:0 14px 40px rgba(0,0,0,.4)}
-  .pending-bar .grow{flex:1;min-width:0}
-  .pending-bar .grow b{font-size:13.5px}
-  .pending-bar .grow small{display:block;font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:2px}
-
-  /* ── properties ── */
-  .grid3{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
-  .prop{padding:20px;cursor:pointer}
-  .prop b{font-size:17px;font-weight:800;display:block}
-  .prop small{font-family:var(--mono);font-size:10.5px;color:var(--faint);letter-spacing:.06em}
-  .prop .stat-line{display:flex;gap:14px;margin-top:14px;font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+  /* properties */
+  .prop{display:flex;align-items:center;justify-content:space-between;gap:14px;cursor:pointer}
+  .prop .l b{display:block;font-size:18px;font-weight:900}
+  .prop .l small{font-size:14px;color:var(--dim)}
+  .prop .r{font-size:14px;font-weight:700;text-align:right}
   .ok{color:var(--mint)} .warn{color:var(--accent)}
-  .kv{display:grid;grid-template-columns:170px 1fr;gap:10px 18px;padding:18px 20px;font-size:14px}
-  .kv dt{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);padding-top:3px}
-  .kv dd{color:var(--text)}
-  .kv dd small{color:var(--dim)}
-  .pill-list{display:flex;gap:8px;flex-wrap:wrap}
-  .pill{font-size:12.5px;font-weight:700;border:1px solid var(--line);border-radius:999px;padding:6px 13px;background:var(--panel2)}
-  .pill em{font-style:normal;color:var(--faint);font-family:var(--mono);font-size:10px;margin-left:5px}
 
-  /* ── trust ── */
-  .rung{display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;padding:15px 18px}
-  .rung+.rung{margin-top:10px}
-  .rung .lv{font-family:var(--mono);font-size:10px;letter-spacing:.14em;color:var(--faint)}
-  .rung b{display:block;font-size:14.5px}
-  .rung small{font-size:12.5px;color:var(--dim)}
-  .rung .st{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
-  .meter{height:9px;border-radius:999px;background:var(--panel2);border:1px solid var(--line);overflow:hidden;margin-top:10px}
-  .meter i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--terra),var(--accent))}
-  .switch{position:relative;width:42px;height:24px;border-radius:999px;background:var(--panel2);border:1px solid var(--lineb);cursor:pointer;flex:none}
-  .switch::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:var(--dim);transition:all .2s var(--spring)}
-  .switch.on{background:var(--accentbg);border-color:var(--accentb)}
-  .switch.on::after{left:21px;background:var(--accent)}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:16px 0;border-bottom:1px solid var(--line)}
+  .row:last-child{border-bottom:0}
+  .row .l b{display:block;font-size:16px;font-weight:800}
+  .row .l small{font-size:13.5px;color:var(--dim);line-height:1.5;display:block;margin-top:2px}
+  .switch{position:relative;width:50px;height:29px;border-radius:999px;background:var(--panel2);border:1px solid var(--lineb);cursor:pointer;flex:none}
+  .switch::after{content:"";position:absolute;top:3px;left:3px;width:21px;height:21px;border-radius:50%;background:var(--dim);transition:all .2s var(--spring)}
+  .switch.on{background:var(--mintbg);border-color:var(--mintb)}
+  .switch.on::after{left:24px;background:var(--mint)}
 
-  /* ── onboarding ── */
-  .wizard{max-width:560px}
-  .steps-dots{display:flex;gap:6px;margin-bottom:26px}
-  .steps-dots i{height:4px;flex:1;border-radius:99px;background:var(--line)}
-  .steps-dots i.done{background:var(--accent)}
-  .field{margin-bottom:16px}
-  .field label{display:block;font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-bottom:7px}
-  .field input,.field textarea{width:100%;background:var(--panel2);border:1px solid var(--lineb);border-radius:12px;color:var(--text);
-    font-family:var(--grot);font-size:14.5px;padding:13px 15px}
-  .field input:focus,.field textarea:focus{border-color:var(--accent);outline:none}
-  .hint{font-size:12.5px;color:var(--faint);margin-top:6px;line-height:1.5}
+  /* bottom nav — three things */
+  .bottom{position:fixed;bottom:0;left:0;right:0;z-index:50;background:rgba(27,23,16,.95);backdrop-filter:blur(12px);
+    border-top:1px solid var(--line)}
+  .bottom .inner{max-width:640px;margin:0 auto;display:grid;grid-template-columns:1fr 1fr 1fr}
+  .tab{background:none;border:none;color:var(--dim);font-family:var(--grot);font-weight:800;font-size:13.5px;
+    padding:14px 0 16px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:4px}
+  .tab svg{width:22px;height:22px}
+  .tab.on{color:var(--accent)}
+  .tab .badge{position:absolute;transform:translate(14px,-4px);background:var(--accent);color:var(--onaccent);
+    font-size:10px;font-weight:900;border-radius:999px;padding:1px 6px}
 
-  /* ── account ── */
-  .plan-box{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 20px;flex-wrap:wrap}
-  .plan-box .price{font-size:30px;font-weight:900}
-  .plan-box .price small{font-size:13px;color:var(--dim);font-weight:500}
-  .locked{font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--mint);border:1px dashed var(--mintb);border-radius:999px;padding:5px 12px}
-
-  /* ── emergency takeover ── */
-  .emergency{position:fixed;inset:0;z-index:100;display:none;flex-direction:column;align-items:center;justify-content:center;gap:18px;
-    background:radial-gradient(800px 500px at 50% 30%,rgba(255,109,94,.16),rgba(19,16,9,.97) 70%);backdrop-filter:blur(6px);text-align:center;padding:30px}
+  /* emergency takeover */
+  .emergency{position:fixed;inset:0;z-index:100;display:none;flex-direction:column;align-items:center;justify-content:center;gap:20px;
+    background:radial-gradient(700px 460px at 50% 30%,rgba(255,109,94,.18),rgba(19,16,9,.97) 70%);text-align:center;padding:28px}
   .emergency.on{display:flex}
-  .em-chip{animation:pulse 1.3s infinite}
+  .em-tag{background:var(--redbg);color:var(--red);border:1px solid var(--redb);font-weight:900;font-size:15px;
+    padding:8px 20px;border-radius:999px;animation:pulse 1.3s infinite}
   @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,109,94,.3)}60%{box-shadow:0 0 0 14px transparent}}
-  .emergency h2{font-size:clamp(28px,4vw,44px);font-weight:900;letter-spacing:-.02em}
-  .emergency p{color:var(--dim);max-width:46ch;line-height:1.7}
-  .emergency .safety{font-family:var(--mono);font-size:11px;color:var(--mint);border:1px dashed var(--mintb);border-radius:12px;padding:12px 18px;max-width:480px;line-height:1.8}
-  .ack{background:var(--red);border:none;color:#2a0c08;font-family:var(--grot);font-weight:900;font-size:17px;padding:18px 38px;border-radius:999px;cursor:pointer}
-  .ack:hover{transform:scale(1.03)}
-  .em-meta{font-family:var(--mono);font-size:10px;letter-spacing:.14em;color:var(--faint)}
+  .emergency h2{font-size:clamp(30px,7vw,42px);font-weight:900;letter-spacing:-.02em;line-height:1.1}
+  .emergency p{color:var(--dim);max-width:40ch;line-height:1.7;font-size:17px}
+  .emergency .safety{font-size:14.5px;color:var(--mint);border:1px dashed var(--mintb);border-radius:14px;padding:14px 18px;max-width:440px;line-height:1.7}
+  .ack{background:var(--red);border:none;color:#2a0c08;font-family:var(--grot);font-weight:900;font-size:19px;
+    padding:20px 40px;border-radius:999px;cursor:pointer}
+  .demo-link{position:fixed;top:14px;right:14px;z-index:60;font-size:11px;color:var(--red);background:var(--redbg);
+    border:1px solid var(--redb);border-radius:999px;padding:7px 12px;cursor:pointer;font-weight:700}
 
-  @media (max-width:880px){
-    .app{grid-template-columns:1fr}
-    .side{position:static;height:auto;flex-direction:row;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--line)}
-    .side-foot,.logo{display:none}
-    .kv{grid-template-columns:1fr}
-  }
   @media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 </style>
 </head>
 <body>
-<div class="app">
+<button class="demo-link" id="emDemo">▶ demo: emergency</button>
 
-  <!-- ════ SIDEBAR ════ -->
-  <nav class="side" aria-label="Primary">
-    <div class="logo">Stoop<span class="dot">.</span></div>
-    <button class="nav-btn on" data-s="cases">Queue <span class="n">2</span></button>
-    <button class="nav-btn" data-s="case">Case · No heat</button>
-    <button class="nav-btn" data-s="props">Properties</button>
-    <button class="nav-btn" data-s="prop">· 41 Palmerston</button>
-    <button class="nav-btn" data-s="vendors">Vendors</button>
-    <button class="nav-btn" data-s="trust">Trust</button>
-    <button class="nav-btn" data-s="onboard">Onboarding</button>
-    <button class="nav-btn" data-s="account">Account</button>
-    <div class="side-foot">
-      AGENT <b>● ON DUTY</b><br/>28/30 QUIET NIGHTS
-      <button class="demo-btn" id="emDemo">▶ DEMO: EMERGENCY TAKEOVER</button>
+<div class="wrap">
+  <header class="top">
+    <span class="logo">Stoop<span class="dot">.</span></span>
+    <span class="status">● Watching your messages</span>
+  </header>
+
+  <!-- ════ HOME ════ -->
+  <section class="screen on" id="s-home">
+    <h1>Morning, Laith.</h1>
+    <p class="sub">Two messages came in overnight. Here's what I'd like to say — just tap OK.</p>
+
+    <!-- card 1 -->
+    <div class="card" id="card1">
+      <span class="tag urgent">Needs you first</span>
+      <p class="who">Maria — no heat</p>
+      <p class="what">Unit 2 at 41 Palmerston · texted at 2:12 AM · I didn't wake you because it's cold, not dangerous.</p>
+      <div class="said"><b>Maria said</b>hey sorry to text so late but the heat hasn't worked since 10pm and it's getting really cold… we have the baby this week. anything you can do tonight??</div>
+      <div class="reply"><b>I'd like to reply</b>Hi Maria — so sorry, that's not okay with the little one there. Try the breaker in the hall closet (switch 4) and let me know in 10 min. Still cold? My heating guy will be there at 7:30 AM. Space heater's in basement storage tonight.</div>
+      <details>
+        <summary>Why I marked this "needs you first"</summary>
+        <p>No heat overnight with a <b>baby in the unit</b> is serious — but it was <b>−2° out</b>, not dangerous cold, and there's no flood, gas, or fire. So it waited for morning instead of ringing your phone. Toronto requires heat until June 1, so it shouldn't wait past today.</p>
+      </details>
+      <div class="actions">
+        <button class="btn" onclick="alert('Mock: edit the reply before it sends')">Change it</button>
+        <button class="btn primary" data-name="Maria">Looks good — send ✓</button>
+      </div>
     </div>
-  </nav>
 
-  <!-- ════ MAIN ════ -->
-  <main class="main">
+    <!-- card 2 -->
+    <div class="card" id="card2">
+      <span class="tag easy">Easy one</span>
+      <p class="who">Sam — dripping faucet</p>
+      <p class="what">12 Ossington · texted yesterday evening · not urgent, Sam said so too.</p>
+      <div class="reply"><b>I'd like to reply</b>Morning Sam — thanks for flagging it. I'll have Tony take a look Thursday morning. If it gets worse before then, text me a video and I'll move faster.</div>
+      <details>
+        <summary>Why Thursday? Why Tony?</summary>
+        <p><b>Tony</b> is your plumber — you added him when you set up. He works Thursday mornings near Ossington. A slow drip can wait two days; if Sam says it's getting worse, I'll bump it up.</p>
+      </details>
+      <div class="actions">
+        <button class="btn" onclick="alert('Mock: edit the reply before it sends')">Change it</button>
+        <button class="btn primary" data-name="Sam">Looks good — send ✓</button>
+      </div>
+    </div>
 
-    <!-- ── QUEUE / CASES LIST ── -->
-    <section class="screen on" id="s-cases">
-      <p class="crumb">Queue · Wednesday 7:41 AM</p>
-      <h1>Two things need <em>your okay.</em></h1>
-      <p class="sub">Everything else from last night was routine — it's in the recap.</p>
-      <div class="filters">
-        <button class="btn on">Needs action · 2</button>
-        <button class="btn">Waiting on tenant · 1</button>
-        <button class="btn">Resolved · 14</button>
-        <button class="btn">All severities ▾</button>
-        <button class="btn">All properties ▾</button>
-      </div>
-      <div class="card case-row" onclick="go('case')">
-        <span class="dot" style="background:var(--accent)"></span>
-        <span class="t"><b>No heat — Unit 2</b><small>41 PALMERSTON · MARIA · CASE 0193 · OPENED 2:12 AM</small></span>
-        <span class="chip urgent">Urgent</span><span class="when">5h ago</span>
-      </div>
-      <div class="card case-row">
-        <span class="dot" style="background:var(--blue)"></span>
-        <span class="t"><b>Faucet drip — Unit 1B</b><small>12 OSSINGTON · SAM · CASE 0194 · TONY SUGGESTED THURSDAY</small></span>
-        <span class="chip routine">Routine</span><span class="when">12h ago</span>
-      </div>
-      <div class="card case-row" style="opacity:.55">
-        <span class="dot" style="background:var(--mint)"></span>
-        <span class="t"><b>Visitor parking question</b><small>12 OSSINGTON · SAM · AUTO-SENT (TRUST LV2) · IN TONIGHT'S RECAP</small></span>
-        <span class="chip resolved">Handled</span><span class="when">9:02 AM</span>
-      </div>
-    </section>
+    <!-- already handled -->
+    <div class="card" style="opacity:.75">
+      <span class="tag done">Handled for you</span>
+      <p class="who">Sam — visitor parking</p>
+      <p class="what">Sam asked about weekend parking at 9:02 AM. I answered from your house rules — you've okayed enough of these that I send the simple ones myself.</p>
+      <details>
+        <summary>See what I sent</summary>
+        <p>"Hey Sam! One visitor spot behind the building (sign says P2) — first come, first served, max 48h. Street parking is fine after 6 too. Have a great weekend!"</p>
+      </details>
+    </div>
 
-    <!-- ── CASE DETAIL ── -->
-    <section class="screen" id="s-case">
-      <p class="crumb"><a href="#" onclick="go('cases');return false" style="color:var(--faint)">Queue</a> / Case 0193</p>
-      <div class="case-head">
-        <div>
-          <h1>No heat — <em>Unit 2</em></h1>
-          <p class="sub" style="margin-bottom:0">41 Palmerston · Maria · opened 2:12 AM · <span class="chip urgent">Urgent</span></p>
-        </div>
-        <div style="display:flex;gap:10px">
-          <button class="btn" onclick="alert('Mock: engage vendor — drafts a text to your HVAC contact through this same approval flow')">Ask my HVAC guy</button>
-          <button class="btn">Mark resolved</button>
-        </div>
-      </div>
+    <p class="quiet" id="allclear" style="display:none"><b>That's everything.</b><br/>I'm watching your messages. Go enjoy your day — I'll text you if anything needs you.</p>
+  </section>
 
-      <div class="timeline">
-        <div class="tl tenant"><div class="meta">Tenant · Maria · 2:12 AM</div>
-          <div class="bubble tenant">hey sorry to text so late but the heat hasn't worked since like 10pm and it's getting really cold in here. we have the baby this week… is there anything you can do tonight??</div></div>
-        <div class="tl sys"><div class="meta">Prefilter · 2:12:01 AM</div>
-          <div class="audit">Tier-0 scan: no hard triggers · soft: <b>“no heat”</b> → passed to agent with hint</div></div>
-        <div class="tl agent"><div class="meta">Agent · classified · 2:12:22 AM</div>
-          <div class="audit"><b>URGENT</b> — rules: no heat + overnight + <b>infant present</b> · weather: −2 °C overnight low (above the −10 °C line) · Ontario bylaw ≥21 °C · not emergency: no flood/gas/fire · voice profile: “warm, direct”</div></div>
-        <div class="tl agent"><div class="meta">Agent · drafted · 2:12:39 AM · held for approval</div>
-          <div class="bubble draft">Hi Maria — so sorry, that's not okay with the little one there. Try the breaker in the hall closet (panel, switch 4) and let me know in 10 min. Still cold? My HVAC guy will be there at 7:30 AM. Space heater's in basement storage if you need it tonight.</div></div>
-        <div class="tl sys"><div class="meta">System · 2:12:40 AM</div>
-          <div class="audit">Queued for morning — <b>your phone stayed silent</b> (severity contract: urgent waits for daylight)</div></div>
-      </div>
+  <!-- ════ PROPERTIES ════ -->
+  <section class="screen" id="s-props">
+    <h1>Your places.</h1>
+    <p class="sub">Tap one to see its people, its rules, and what I'm allowed to do there.</p>
+    <div class="card prop" onclick="alert('Mock: opens 41 Palmerston — tenants, your plumber & heating guy, house rules, and the switch below')">
+      <span class="l"><b>41 Palmerston</b><small>Maria &amp; Dev · 2 units</small></span>
+      <span class="r warn">1 thing waiting</span>
+    </div>
+    <div class="card prop">
+      <span class="l"><b>88 Dovercourt</b><small>3 units · full</small></span>
+      <span class="r ok">All quiet</span>
+    </div>
+    <div class="card prop">
+      <span class="l"><b>12 Ossington</b><small>Sam · 1 unit</small></span>
+      <span class="r ok">All quiet</span>
+    </div>
 
-      <div class="pending-bar">
-        <span class="chip urgent">Pending</span>
-        <span class="grow"><b>Draft waiting since 2:12 AM</b><small>APPROVING SENDS IN 5s — YOU CAN UNDO</small></span>
-        <button class="btn" onclick="alert('Mock: inline editor — edits are recorded for trust metrics')">Edit</button>
-        <button class="btn primary" id="approveBtn">Approve &amp; send ⏎</button>
+    <div class="card" style="margin-top:22px">
+      <p class="who" style="font-size:17px;margin-bottom:14px">What I'm allowed to do</p>
+      <div class="row">
+        <span class="l"><b>Answer simple questions myself</b><small>Parking, garbage day, receipts — at <b>12 Ossington</b> only. You've approved 30 of my replies there without changing a word, so I earned this one. Flip it off anytime.</small></span>
+        <span class="switch on" role="switch" aria-checked="true" tabindex="0" onclick="this.classList.toggle('on')"></span>
       </div>
-    </section>
+      <div class="row">
+        <span class="l"><b>Everything else waits for your OK</b><small>Always. Repairs, money, anything sensitive — I never send those alone. This one has no switch on purpose.</small></span>
+      </div>
+      <div class="row">
+        <span class="l"><b>Real emergencies ring your phone</b><small>Flood, gas, fire — I call you immediately, day or night. If you don't pick up, I call Omar. This can't be turned off either.</small></span>
+      </div>
+    </div>
+  </section>
 
-    <!-- ── PROPERTIES ── -->
-    <section class="screen" id="s-props">
-      <p class="crumb">Properties</p>
-      <h1>Your three <em>doors.</em></h1>
-      <p class="sub">6 units · all occupied · every one covered by its own number.</p>
-      <div class="grid3">
-        <div class="card prop" onclick="go('prop')">
-          <b>41 Palmerston</b><small>+1 (416) 555-0141 · 2 UNITS</small>
-          <div class="stat-line"><span class="warn">● 1 open case</span><span class="ok">94% trust</span></div>
-          <div class="meter"><i style="width:94%"></i></div>
-        </div>
-        <div class="card prop">
-          <b>88 Dovercourt</b><small>+1 (416) 555-0188 · 3 UNITS</small>
-          <div class="stat-line"><span class="ok">● all quiet</span><span class="ok">88% trust</span></div>
-          <div class="meter"><i style="width:88%"></i></div>
-        </div>
-        <div class="card prop">
-          <b>12 Ossington</b><small>+1 (416) 555-0112 · 1 UNIT</small>
-          <div class="stat-line"><span class="ok">● auto-send LIVE</span><span class="ok">100% trust</span></div>
-          <div class="meter"><i style="width:100%"></i></div>
-        </div>
-        <div class="card prop" style="border-style:dashed;display:grid;place-items:center;min-height:130px;color:var(--faint)">
-          <span>+ Add a property</span>
-        </div>
+  <!-- ════ SETTINGS ════ -->
+  <section class="screen" id="s-settings">
+    <h1>Settings.</h1>
+    <p class="sub">One page. That's all of it.</p>
+    <div class="card">
+      <div class="row">
+        <span class="l"><b>Your plan — $5 a month</b><small>Your early price, locked in for as long as you stay. <a href="#" style="color:var(--accent)">Switch to $50/year</a></small></span>
       </div>
-    </section>
-
-    <!-- ── PROPERTY DETAIL ── -->
-    <section class="screen" id="s-prop">
-      <p class="crumb"><a href="#" onclick="go('props');return false" style="color:var(--faint)">Properties</a> / 41 Palmerston</p>
-      <h1>41 <em>Palmerston</em></h1>
-      <p class="sub">Toronto, ON · tenant line +1 (416) 555-0141 · 2 units</p>
-
-      <p class="mono-label" style="margin-bottom:10px">People</p>
-      <div class="card kv" style="margin-bottom:18px">
-        <dt>Tenants</dt><dd class="pill-list"><span class="pill">Maria <em>UNIT 2 · INFANT</em></span><span class="pill">Dev <em>UNIT 1</em></span></dd>
-        <dt>Backup contact</dt><dd>Omar (brother) · +1 (647) 555-0177 <small>— called at T+10 min if you don't answer an emergency</small></dd>
+      <div class="row">
+        <span class="l"><b>Emergencies call</b><small>+1 (647) 555-0123 · backup: Omar (your brother)</small></span>
+        <button class="btn small">Change</button>
       </div>
-
-      <p class="mono-label" style="margin-bottom:10px">What the agent knows</p>
-      <div class="card kv" style="margin-bottom:18px">
-        <dt>House rules</dt><dd><small>“Visitor spot behind building (P2), 48h max. Garbage Thursday. Quiet hours 10pm–8am. Thermostat breaker = hall closet switch 4…”</small> <a href="#" style="color:var(--accent)">edit</a></dd>
-        <dt>Heating season</dt><dd>Sept 15 – Jun 1 <small>(Toronto bylaw, ≥21 °C)</small></dd>
-        <dt>Quiet hours</dt><dd>9:00 PM – 8:00 AM <small>— urgent drafts wait until morning</small></dd>
-        <dt>Voice profile</dt><dd>Warm, direct <small>· trained on 5 of your real replies</small> <a href="#" style="color:var(--accent)">view</a></dd>
+      <div class="row">
+        <span class="l"><b>Morning summary at 7:00 AM</b><small>One text with anything waiting for you</small></span>
+        <button class="btn small">Change</button>
       </div>
-
-      <p class="mono-label" style="margin-bottom:10px">Autonomy at this property</p>
-      <div class="card rung">
-        <span class="lv">ROUTINE</span>
-        <span><b>Auto-send routine replies</b><small>94/100 — six more clean approvals to unlock</small></span>
-        <span class="switch" role="switch" aria-checked="false" tabindex="0"></span>
+      <div class="row">
+        <span class="l"><b>Approve by text</b><small>Reply 1 to my texts to send a reply — no need to open the app</small></span>
+        <span class="switch on" onclick="this.classList.toggle('on')" role="switch" aria-checked="true" tabindex="0"></span>
       </div>
-    </section>
-
-    <!-- ── VENDORS ── -->
-    <section class="screen" id="s-vendors">
-      <p class="crumb">Vendors</p>
-      <h1>Your <em>people.</em></h1>
-      <p class="sub">Stoop suggests them in drafts and — with your approval — texts them directly. They never see tenant numbers.</p>
-      <div class="grid3">
-        <div class="card kv">
-          <dt>Name</dt><dd><b>Tony Greco</b> <span class="chip vendor">Plumbing</span></dd>
-          <dt>Phone</dt><dd>+1 (416) 555-0166</dd>
-          <dt>Hours</dt><dd>Mon–Sat 8–17 <small>· no Sundays</small></dd>
-          <dt>Notes</dt><dd><small>“Cash under $100. Knows 12 Ossington's shut-off.”</small></dd>
-          <dt>History</dt><dd>4 jobs · last: faucet, Mar 12</dd>
-        </div>
-        <div class="card kv">
-          <dt>Name</dt><dd><b>Petra HVAC</b> <span class="chip vendor">HVAC</span></dd>
-          <dt>Phone</dt><dd>+1 (416) 555-0190</dd>
-          <dt>Hours</dt><dd>Mon–Fri 7–18 · emerg 24/7</dd>
-          <dt>Notes</dt><dd><small>“7:30 AM slots if booked before 6.”</small></dd>
-          <dt>History</dt><dd>2 jobs · engaged on case 0193</dd>
-        </div>
-        <div class="card kv" style="border-style:dashed;display:grid;place-items:center;color:var(--faint)"><span>+ Add a vendor</span></div>
+      <div class="row">
+        <span class="l"><b>Your records</b><small>Every conversation, saved with dates and times</small></span>
+        <button class="btn small">Download</button>
       </div>
-    </section>
-
-    <!-- ── TRUST ── -->
-    <section class="screen" id="s-trust">
-      <p class="crumb">Trust</p>
-      <h1>It earns the keys <em>one approval at a time.</em></h1>
-      <p class="sub">Per property, per severity, always reversible. Emergencies and urgent messages never auto-send.</p>
-      <div class="card rung">
-        <span class="lv">LV 1</span>
-        <span><b>Everything held for approval</b><small>Day one. Where every property starts.</small></span>
-        <span class="st" style="color:var(--mint)">✓ ALWAYS ON</span>
+      <div class="row">
+        <span class="l"><b>Leave Stoop</b><small>Cancel anytime — you keep your records, no fees</small></span>
+        <button class="btn small" style="color:var(--red);border-color:var(--redb)">Cancel</button>
       </div>
-      <div class="card rung" style="border-color:var(--accentb)">
-        <span class="lv">LV 2</span>
-        <span><b>Routine auto-send</b><small>12 Ossington: <b style="color:var(--mint)">LIVE</b> · 41 Palmerston: 94/100 · 88 Dovercourt: 88/100</small>
-          <span class="meter"><i style="width:94%"></i></span></span>
-        <span class="st" style="color:var(--accent)">EARNING</span>
-      </div>
-      <div class="card rung">
-        <span class="lv">LV 3</span>
-        <span><b>Hands-off vendor scheduling</b><small>Stoop books your own tradespeople for routine fixes without the tap.</small></span>
-        <span class="st" style="color:var(--faint)">LOCKED · NEEDS LV2 HISTORY</span>
-      </div>
-      <div class="card kv" style="margin-top:18px">
-        <dt>30-day record</dt><dd>47 drafts · 44 approved unedited · 3 edited · 0 rejected · <b style="color:var(--mint)">0 misclassifications</b></dd>
-        <dt>Revoke anytime</dt><dd><small>One tap per property on its page — revocation is instant and logged.</small></dd>
-      </div>
-    </section>
-
-    <!-- ── ONBOARDING ── -->
-    <section class="screen" id="s-onboard">
-      <p class="crumb">Onboarding · step 4 of 6</p>
-      <div class="wizard">
-        <div class="steps-dots"><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i></i><i></i></div>
-        <h1>Teach it <em>your voice.</em></h1>
-        <p class="sub">Paste 3–5 real replies you've sent tenants. Stoop drafts the way you write — not the way a robot does.</p>
-        <div class="field">
-          <label>A reply you've actually sent</label>
-          <textarea rows="3">Hey! Yeah the visitor spot behind the building is free this weekend, tell her she's good til Monday 👍</textarea>
-          <p class="hint">Casual is good. Emojis are good. This is exactly what we want to learn.</p>
-        </div>
-        <div class="field">
-          <label>Another one</label>
-          <textarea rows="3" placeholder="Paste another real reply…"></textarea>
-        </div>
-        <div class="field">
-          <label>When something breaks, you usually sound…</label>
-          <div class="filters" style="margin-bottom:0">
-            <button class="btn on">Warm &amp; direct</button><button class="btn">Brief &amp; businesslike</button><button class="btn">Friendly &amp; chatty</button>
-          </div>
-        </div>
-        <div style="display:flex;gap:10px;margin-top:22px">
-          <button class="btn">← Back</button>
-          <button class="btn primary" style="flex:1">Next: tell your tenants →</button>
-        </div>
-        <p class="hint" style="margin-top:14px">Step 5 sends the tenant notice for you — it's required, and we wrote it so you don't have to.</p>
-      </div>
-    </section>
-
-    <!-- ── ACCOUNT ── -->
-    <section class="screen" id="s-account">
-      <p class="crumb">Account</p>
-      <h1>Plan &amp; <em>settings.</em></h1>
-      <p class="sub">Laith · laith@—.com · Toronto (America/Toronto)</p>
-      <div class="card plan-box" style="margin-bottom:14px">
-        <div>
-          <p class="mono-label" style="margin-bottom:6px">Your plan</p>
-          <span class="price">$5<small>/month · Full Plan</small></span>
-        </div>
-        <span class="locked">EARLY-ACCESS RATE — LOCKED FOR LIFE</span>
-        <div style="display:flex;gap:10px">
-          <button class="btn">Billing portal</button>
-          <button class="btn">Switch to $50/yr</button>
-        </div>
-      </div>
-      <div class="card kv" style="margin-bottom:14px">
-        <dt>Emergency calls</dt><dd>+1 (647) 555-0123 <small>— always on; this is the product</small></dd>
-        <dt>Morning queue</dt><dd>Notify at 7:00 AM <small>· push + email</small></dd>
-        <dt>Nightly recap</dt><dd>9:30 PM <small>· what was handled while you didn't look</small></dd>
-        <dt>Export</dt><dd><a href="#" style="color:var(--accent)">Download full message history</a> <small>— every conversation, timestamped</small></dd>
-      </div>
-      <button class="btn danger">Cancel subscription</button>
-      <p class="hint" style="margin-top:8px">Canceling keeps access until period end and emails you a full export. The emergency line stays free either way.</p>
-    </section>
-
-  </main>
+    </div>
+  </section>
 </div>
 
-<!-- ════ EMERGENCY TAKEOVER ════ -->
+<!-- ════ BOTTOM NAV — three things ════ -->
+<nav class="bottom" aria-label="Primary">
+  <div class="inner">
+    <button class="tab on" data-s="home">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+      Home <span class="badge" id="navBadge">2</span>
+    </button>
+    <button class="tab" data-s="props">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h3"/></svg>
+      Places
+    </button>
+    <button class="tab" data-s="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M2 12h3M19 12h3M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>
+      Settings
+    </button>
+  </div>
+</nav>
+
+<!-- ════ EMERGENCY ════ -->
 <div class="emergency" id="emergency" role="alertdialog" aria-label="Emergency">
-  <span class="chip emergency em-chip">Emergency</span>
-  <h2>Water through ceiling — Unit 3</h2>
-  <p>88 Dovercourt · Dev · 12:47 AM · Tier-0 triggered in 0.4s. We're calling your phone right now. If we can't reach you, Omar gets called at 12:57.</p>
-  <div class="safety">SENT TO DEV AT 12:47:31 — “Shut off the breaker for the living room now (panel, top-left). Don't touch the fixture. I've called your landlord — help is moving.”</div>
-  <button class="ack" id="ackBtn">I'M ON IT — STOP CALLING</button>
-  <p class="em-meta">ACKNOWLEDGING STOPS THE ESCALATION CHAIN · EVERYTHING IS BEING LOGGED</p>
+  <span class="em-tag">EMERGENCY</span>
+  <h2>Water coming through Dev's ceiling</h2>
+  <p>88 Dovercourt · 12:47 AM. <b style="color:var(--text)">I'm calling your phone right now.</b> If you don't pick up in 10 minutes, I call Omar.</p>
+  <div class="safety">I already told Dev what to do:<br/>"1. Turn off the breaker for the living room (top-left in the panel). 2. Move your things away. 3. Don't touch the light. Help is coming."</div>
+  <button class="ack" id="ackBtn">I'm on it</button>
 </div>
 
 <script>
   function go(s){
     document.querySelectorAll('.screen').forEach(x=>x.classList.remove('on'));
     document.getElementById('s-'+s).classList.add('on');
-    document.querySelectorAll('.nav-btn').forEach(b=>b.classList.toggle('on', b.dataset.s===s));
+    document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('on',b.dataset.s===s));
     window.scrollTo({top:0});
   }
-  document.querySelectorAll('.nav-btn').forEach(b=>b.addEventListener('click',()=>go(b.dataset.s)));
+  document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>go(b.dataset.s)));
 
-  // approve w/ undo
-  document.getElementById('approveBtn').addEventListener('click', function(){
-    const bar=this.closest('.pending-bar');
-    if(this.dataset.sending){ return; }
-    this.dataset.sending="1"; this.textContent="Sending in 5s — tap to undo";
-    this.onclick=()=>{ delete this.dataset.sending; this.textContent="Approve & send ⏎"; };
-    setTimeout(()=>{ if(this.dataset.sending){
-      bar.innerHTML='<span class="chip resolved">Sent</span><span class="grow"><b>Sent to Maria at '+new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})+'</b><small>TRUST +1 CLEAN APPROVAL · LOGGED TO CASE 0193</small></span>';
-    }},5000);
+  // approve with plain-words undo
+  let open=2;
+  document.querySelectorAll('.btn.primary[data-name]').forEach(btn=>{
+    btn.addEventListener('click',function(){
+      if(this.dataset.sending){ // undo
+        clearTimeout(this._t); delete this.dataset.sending;
+        this.textContent='Looks good — send ✓'; return;
+      }
+      this.dataset.sending='1';
+      this.textContent='Sending in 5… tap to stop';
+      this._t=setTimeout(()=>{
+        const card=this.closest('.card');
+        card.style.opacity='.75';
+        card.innerHTML='<span class="tag done">Sent ✓</span><p class="who">'+
+          (this.dataset.name==='Maria'?'Maria — no heat':'Sam — dripping faucet')+
+          '</p><p class="what">Your reply is on its way to '+this.dataset.name+'. It\'s saved in your records.</p>';
+        open--; const b=document.getElementById('navBadge');
+        if(open>0){ b.textContent=open; } else { b.style.display='none';
+          document.getElementById('allclear').style.display='block'; }
+      },5000);
+    });
   });
 
   // emergency demo
   const em=document.getElementById('emergency');
   document.getElementById('emDemo').addEventListener('click',()=>em.classList.add('on'));
-  document.getElementById('ackBtn').addEventListener('click',()=>{
-    em.classList.remove('on');
-    alert('Acknowledged at '+new Date().toLocaleTimeString()+' — escalation chain stopped, logged to the case.');
-  });
-  document.addEventListener('keydown',e=>{ if(e.key==='Escape') em.classList.remove('on'); });
+  document.getElementById('ackBtn').addEventListener('click',()=>em.classList.remove('on'));
+  document.addEventListener('keydown',e=>{if(e.key==='Escape')em.classList.remove('on')});
 </script>
 </body>
 </html>
