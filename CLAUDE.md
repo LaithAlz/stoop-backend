@@ -8,25 +8,25 @@ and only rings the landlord's phone for a true emergency.
 
 - `apps/api` — Python 3.12 / FastAPI / LangGraph backend (Fly.io). See `apps/api/CLAUDE.md`.
 - `apps/web` — TanStack Start + shadcn/ui dashboard & marketing site (Cloudflare Workers, Bun).
-- `docs/plans/` — **the source of truth.** Code follows these docs, not vice versa.
+- `docs/` — **the source of truth.** Code follows these docs, not vice versa.
 - `docs/mockups/` — HTML design mockups (Brownstone = dashboard direction; the live site uses Heritage).
 
 ## Doc map — read before touching the related area
 
 | Doc | Owns |
 |---|---|
-| `docs/plans/architecture.md` | stack, system diagram, ADRs, scaling triggers |
-| `docs/plans/schema-v1.md` | **canonical table/column names — never invent names** |
-| `docs/plans/api-contracts.md` | endpoint shapes, error envelope, pagination |
-| `docs/plans/severity-rubric-v1.md` | classification rubric **v1.0, frozen** |
-| `docs/plans/eval-scenarios-v1.md` | the 10 eval cases + scoring rules |
-| `docs/plans/conversation-model.md` | channel vs case, lifecycle, stale-draft rule |
-| `docs/plans/emergency-prefilter.md` | Tier-0 filter, degraded mode, escalation chain |
-| `docs/plans/stoop-all-epics.md` | release-train roadmap (Trains 1–3) |
-| `docs/plans/business-model.md` / `three-year-plan.md` | pricing, segments, horizons |
+| `docs/03-engineering/architecture.md` | stack, system diagram, ADRs, scaling triggers |
+| `docs/03-engineering/schema-v1.md` | **canonical table/column names — never invent names** |
+| `docs/03-engineering/api-contracts.md` | endpoint shapes, error envelope, pagination |
+| `docs/02-product/severity-rubric-v1.md` | classification rubric **v1.0, frozen** |
+| `docs/02-product/eval-scenarios-v1.md` | the 10 eval cases + scoring rules |
+| `docs/02-product/conversation-model.md` | channel vs case, lifecycle, stale-draft rule |
+| `docs/02-product/emergency-prefilter.md` | Tier-0 filter, degraded mode, escalation chain |
+| `docs/04-roadmap/release-train.md` | release-train roadmap (Trains 1–3) |
+| `docs/01-strategy/business-model.md` / `three-year-plan.md` | pricing, segments, horizons |
 
 GitHub issues on `LaithAlz/stoop-backend` carry per-task acceptance
-criteria; `docs/plans/phase-1/issues/` has the detailed specs for #1–#15.
+criteria; `docs/03-engineering/issue-specs/` has the detailed specs for #1–#15.
 
 ## Commands
 

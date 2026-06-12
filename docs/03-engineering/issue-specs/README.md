@@ -25,7 +25,7 @@ Open the `<details>` blocks only when you want to. The goal: design and implemen
 
 In your repo, run this prompt against Claude Code:
 
-> Read every `.md` file in `docs/plans/phase-1/issues/`. For each one:
+> Read every `.md` file in `docs/03-engineering/issue-specs/`. For each one:
 > 1. Parse the YAML frontmatter (title, labels, milestone).
 > 2. Create a GitHub issue using `gh issue create` with the file's full markdown body (excluding the frontmatter) as the body.
 > 3. Apply the labels and milestone from the frontmatter.
@@ -35,7 +35,7 @@ In your repo, run this prompt against Claude Code:
 >
 > Also create the milestone "Phase 1: Backend Foundation" if it doesn't exist.
 >
-> After creating all issues, also create one parent issue from `docs/plans/phase-1/EPIC.md` and link the 15 children to it via task list checkboxes.
+> After creating all issues, also create one parent issue from `docs/03-engineering/issue-specs/EPIC.md` and link the 15 children to it via task list checkboxes.
 
 Claude Code handles label creation, milestone, issue body, and EPIC linking in one go.
 
@@ -49,21 +49,21 @@ If you want to run it yourself, use `scripts/create-issues.sh` (included). Requi
 
 ## The issues
 
-1. [001](./issues/001-init-python-project.md) — Initialize Python backend with uv
-2. [002](./issues/002-dev-tooling.md) — Configure ruff, mypy, pre-commit
-3. [003](./issues/003-supabase-setup.md) — Create Supabase project
-4. [004](./issues/004-supabase-auth-setup.md) — Configure Supabase Auth
-5. [005](./issues/005-fastapi-app-factory.md) — FastAPI app factory + health endpoints
-6. [006](./issues/006-settings-module.md) — Settings module with pydantic-settings
-7. [007](./issues/007-logging-and-sentry.md) — Structured logging + Sentry + request_id
-8. [008](./issues/008-alembic-and-landlords.md) — Alembic + landlords table migration
-9. [009](./issues/009-async-sqlalchemy-session.md) — Async SQLAlchemy session management
-10. [010](./issues/010-supabase-jwt-dependency.md) — Supabase JWT verification dependency
-11. [011](./issues/011-me-endpoint.md) — GET /v1/me endpoint
-12. [012](./issues/012-dockerfile-and-compose.md) — Dockerfile + docker-compose
-13. [013](./issues/013-fly-deploy.md) — Fly.io deploy
-14. [014](./issues/014-github-actions-ci.md) — GitHub Actions CI
-15. [015](./issues/015-auth-user-lifecycle.md) — auth.users → landlords trigger sync (stretch)
+1. [001](./001-init-python-project.md) — Initialize Python backend with uv
+2. [002](./002-dev-tooling.md) — Configure ruff, mypy, pre-commit
+3. [003](./003-supabase-setup.md) — Create Supabase project
+4. [004](./004-supabase-auth-setup.md) — Configure Supabase Auth
+5. [005](./005-fastapi-app-factory.md) — FastAPI app factory + health endpoints
+6. [006](./006-settings-module.md) — Settings module with pydantic-settings
+7. [007](./007-logging-and-sentry.md) — Structured logging + Sentry + request_id
+8. [008](./008-alembic-and-landlords.md) — Alembic + landlords table migration
+9. [009](./009-async-sqlalchemy-session.md) — Async SQLAlchemy session management
+10. [010](./010-supabase-jwt-dependency.md) — Supabase JWT verification dependency
+11. [011](./011-me-endpoint.md) — GET /v1/me endpoint
+12. [012](./012-dockerfile-and-compose.md) — Dockerfile + docker-compose
+13. [013](./013-fly-deploy.md) — Fly.io deploy
+14. [014](./014-github-actions-ci.md) — GitHub Actions CI
+15. [015](./015-auth-user-lifecycle.md) — auth.users → landlords trigger sync (stretch)
 
 ## Sequencing
 

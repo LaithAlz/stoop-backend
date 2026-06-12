@@ -5,7 +5,7 @@ milestone: "Milestone 1: Walking skeleton"
 ---
 
 > **Rewritten 2026-06-11** — was "create Clerk application" (ADR-1 in
-> `docs/plans/architecture.md`). Same number so cross-references hold.
+> `docs/03-engineering/architecture.md`). Same number so cross-references hold.
 
 ## Goal
 

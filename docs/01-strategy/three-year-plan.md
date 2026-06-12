@@ -3,7 +3,7 @@
 > **Status:** Draft for founder review, 2026-06-11.
 > **What this is:** the business and technology plan on one page-set, with
 > explicit decision gates. Children of this doc: `architecture.md` (tech),
-> `business-model.md` (pricing/GTM), `stoop-all-epics.md` (build roadmap),
+> `business-model.md` (pricing/GTM), `release-train.md` (build roadmap),
 > `design-partners.md` (pilot recruiting).
 > **How to read it:** each horizon has a theme, business goals, tech
 > evolution, and a gate. Gates are conditions, not dates — dates are
@@ -50,7 +50,7 @@ network.
   this horizon buys *proof*, not revenue.)
 
 ### Tech (mostly already specced)
-- Release train v1.0 → v1.4 per `stoop-all-epics.md` (~10 weeks
+- Release train v1.0 → v1.4 per `release-train.md` (~10 weeks
   full-time): core loop, photos, onboarding, RLS, full API, Stripe,
   trust-ladder activation, mobile shell, multi-step jobs. Includes
   vendor coordination v1 (#115), emergency pre-filter + escalation

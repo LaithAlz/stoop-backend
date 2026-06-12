@@ -40,7 +40,7 @@ Repo layout:
 apps/api/     FastAPI backend (Python 3.12, uv, async SQLAlchemy, Alembic, Clerk)
 apps/web/     TanStack Start frontend (TypeScript, Bun, shadcn/ui, Cloudflare Workers)
 packages/     Shared code — only add here if genuinely reused across apps
-docs/plans/   Phase planning docs — read-only reference
+docs/   Phase planning docs — read-only reference
 ```
 
 ### 4. Commit

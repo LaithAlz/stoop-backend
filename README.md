@@ -1,57 +1,44 @@
 # Stoop
 
-AI-powered property management for independent landlords.
+Your tenants text. You sleep.
 
-## Monorepo structure
+Stoop receives tenant maintenance texts, sorts them by urgency, drafts
+replies in the landlord's voice for one-tap approval, lines up the
+landlord's own tradespeople, and rings the landlord's phone — with an
+escalation chain — when something genuinely can't wait. Everything is
+logged to a tamper-evident record. The emergency line is free, forever.
+
+**📚 All documentation: [`docs/README.md`](docs/README.md)** — strategy,
+product spec, engineering, roadmap, go-to-market, legal. Start there.
+
+## Repo layout
 
 ```
-apps/
-  api/      FastAPI backend — auth, tenants, AI agent layer
-  web/      TanStack Start web app — landlord dashboard (Cloudflare Workers)
-
-packages/   Shared code (types, utils) — added as needed
-
-docs/
-  plans/    Phase-by-phase build plans and issue specs
+apps/api    Python 3.12 · FastAPI · LangGraph agent · Fly.io   (being built — see issues)
+apps/web    TanStack Start · shadcn/ui · Cloudflare Workers    (marketing site + dashboard)
+docs/       The source of truth — numbered folders, see docs/README.md
+CLAUDE.md   Rules and doc-map for AI coding sessions (apps/api/CLAUDE.md for backend)
 ```
 
-## Apps
-
-| App | Stack | Deploy |
-|-----|-------|--------|
-| `apps/api` | Python 3.12, FastAPI, async SQLAlchemy, Alembic | Fly.io (`yyz`) |
-| `apps/web` | TypeScript, TanStack Start, shadcn/ui, Bun | Cloudflare Workers |
-
-## Getting started
-
-### API
+## Quickstart
 
 ```bash
-cd apps/api
-uv sync
-cp .env.example .env   # fill in values
-uv run uvicorn app.main:app --reload
+# web (marketing site + dashboard)
+cd apps/web && bun install && bun run dev    # → localhost:8080
+
+# api — being built issue-by-issue; see apps/api/CLAUDE.md for commands
 ```
 
-### Web
+## Building
 
-```bash
-cd apps/web
-bun install
-bun run dev
-```
+Work is tracked as GitHub issues with acceptance criteria, organized into
+release-train milestones (Train 1 → 3). The build order and feature map:
+[`docs/04-roadmap/release-train.md`](docs/04-roadmap/release-train.md).
 
-## Development workflow
+To implement with an AI session: *"Read CLAUDE.md, then implement issue #N."*
 
-Use `/ship <description>` in Claude Code to build any feature end-to-end:
-branch → build → commit → PR → CI → review → merge.
+## Status
 
-## Phases
-
-- **Phase 1** — Backend foundation (FastAPI + Supabase + Clerk + Fly.io) → [`docs/plans/phase-1`](docs/plans/phase-1/)
-- Phase 2+ — Schema, RLS, agent layer, workers, billing, mobile
-
-## Links
-
-- Repo: [github.com/LaithAlz/stoop-backend](https://github.com/LaithAlz/stoop-backend)
-- API (dev): `https://stoop-dev.fly.dev`
+- Planning: complete (architecture, schema, contracts, rubric + evals, roadmap, pricing, GTM)
+- Waitlist live at `/early-access` (pending domain + D1 setup — issue #114)
+- Backend: Train 1 not started — first issue: [#1](https://github.com/LaithAlz/stoop-backend/issues/1)

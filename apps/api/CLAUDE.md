@@ -2,7 +2,7 @@
 
 Read the root `CLAUDE.md` first. This file adds API-specific conventions.
 The app skeleton is built by issues #1–#16; layout below is the target
-(`docs/plans/architecture.md` §4 is the authority).
+(`docs/03-engineering/architecture.md` §4 is the authority).
 
 ## Stack & commands
 
@@ -24,7 +24,7 @@ uv run ruff check . && uv run mypy app    # lint + types (strict)
 app/
   main.py settings.py deps.py
   db/         engine, session, migrations/
-  models/     SQLAlchemy models — names from docs/plans/schema-v1.md
+  models/     SQLAlchemy models — names from docs/03-engineering/schema-v1.md
   routers/    me, properties, tenants, vendors, queue, cases, drafts,
               notifications, billing, webhooks/{twilio,stripe}
   agent/      graph.py, state.py, rubric.py, prefilter.py, tools.py,
@@ -32,12 +32,12 @@ app/
               identify_case, classify_intent, classify_severity,
               draft_response, emergency_protocol}
   integrations/  supabase_auth.py, twilio.py, anthropic.py, weather.py, posthog.py
-evals/        scenarios/*.yaml + runner (format: docs/plans/eval-scenarios-v1.md)
+evals/        scenarios/*.yaml + runner (format: docs/02-product/eval-scenarios-v1.md)
 ```
 
 ## Conventions
 
-- **Contracts:** every endpoint matches `docs/plans/api-contracts.md` —
+- **Contracts:** every endpoint matches `docs/03-engineering/api-contracts.md` —
   error envelope `{"error": {"code", "message", "request_id"}}`, cursor
   pagination, ISO-8601 UTC. New/changed endpoint ⇒ update that doc in the
   same PR.
@@ -57,7 +57,7 @@ evals/        scenarios/*.yaml + runner (format: docs/plans/eval-scenarios-v1.md
 ## Agent rules (the load-bearing ones)
 
 - `rubric.py` is **byte-identical** to the verbatim block in
-  `docs/plans/severity-rubric-v1.md` — a checksum test enforces it. To
+  `docs/02-product/severity-rubric-v1.md` — a checksum test enforces it. To
   change behavior: new rubric version + new prompt file + full eval run.
 - Prompts live in `prompts/v{n}.py`, frozen — never edit an existing
   version, add `v{n+1}`.
@@ -69,7 +69,7 @@ evals/        scenarios/*.yaml + runner (format: docs/plans/eval-scenarios-v1.md
   the webhook handler **before** the graph. The agent may escalate past a
   Tier-0 miss; it may never de-escalate a Tier-0 fire.
 - 20 s classification budget → one retry → degraded mode
-  (`docs/plans/emergency-prefilter.md`): holding ack + landlord
+  (`docs/02-product/emergency-prefilter.md`): holding ack + landlord
   notification. No silent failures.
 - One pending draft per case (partial unique index); new inbound on a
   pending case marks the draft `stale` and re-runs from `load_context`.

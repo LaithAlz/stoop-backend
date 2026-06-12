@@ -10,7 +10,7 @@ milestone: ""
 > 3-milestone roadmap after two founder decisions: (1) every planned
 > feature is **committed and ordered**, not gated behind "deferred" labels;
 > (2) the founder is **full-time with Claude Code**, compressing build
-> estimates ~3–4×. Architecture unchanged (`architecture.md`).
+> estimates ~3–4×. Architecture unchanged (`../03-engineering/architecture.md`).
 > GitHub milestones renamed to match: Train 1 / Train 2 / Train 3.
 
 **The principle:** ship continuously; first real tenant text at ~week 2–3,
@@ -105,7 +105,7 @@ trust auto-send live on ≥1 property.
 
 - The emergency line is never paywalled.
 - Prompt/rubric changes = new version + full eval run (CI-enforced).
-- Scaling work on triggers (`architecture.md` §11), not on faith.
+- Scaling work on triggers (`../03-engineering/architecture.md` §11), not on faith.
 - Every production misclassification becomes an eval case the same week.
 
 ## Issue bookkeeping

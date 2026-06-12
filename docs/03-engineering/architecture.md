@@ -388,6 +388,6 @@ the emergency path, rubric behavior, or approval requirements.
 
 **ADR-4 — 9 phases compressed to 3 milestones** (2026-06-11)
 Original phases optimized for completeness; milestones optimize for
-time-to-first-paying-landlord. See `stoop-all-epics.md` (rewritten) for the
+time-to-first-paying-landlord. See `release-train.md` (rewritten) for the
 mapping. Mobile app, Inngest, and multi-region drop off the critical path
 entirely.
