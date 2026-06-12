@@ -71,9 +71,11 @@ across Train 1/2/3 milestones, each with acceptance criteria).
 ## mockups/ — design references
 
 Open any file in a browser. `index.html` is the gallery.
-01–03 = three explored directions · **04 = Brownstone dashboard (the
-chosen app design)** · 05 = Brownstone landing (superseded for marketing —
-the live site uses the Heritage light design, see `apps/web`).
+01–03 = three explored directions · **04 = Brownstone dashboard ·
+06 = the complete app, every screen navigable (queue, case timeline,
+properties, vendors, trust, onboarding, account, emergency takeover)** ·
+05 = Brownstone landing (superseded for marketing — the live site uses
+the Heritage light design, see `apps/web`).
 
 ---
 
