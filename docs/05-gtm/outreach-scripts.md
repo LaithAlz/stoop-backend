@@ -88,3 +88,31 @@ maybe.
 "Self-managing or PM?" · "Ontario?" · "Would you be okay telling tenants
 a software assistant helps you respond?" — 4+ green answers = offer the
 pilot on the spot.
+
+---
+
+## 7. Referral mechanic (active from first happy pilot)
+
+**The offer:** give a month, get a month — the referred landlord gets
+their first paid month free; the referrer gets a free month per landlord
+who activates (sends real tenant traffic, not just signs up). Stacking
+allowed; a landlord who brings five friends rides free for five months —
+that outcome is a *win* (five new accounts at near-zero CAC vs. ~$15 in
+credits).
+
+**The ask (the only script that matters), used at two moments —
+end of a happy weekly check-in, and right after a visible save (an
+emergency handled, a brutal week summarized):**
+
+> "Glad it's working. Do you know one other landlord whose tenants text
+> their personal cell? If they sign up through your link you both get a
+> month free — and they get the locked $5 rate while it lasts."
+
+**Mechanics v1 (no code):** personal referral note in the waitlist
+`source` field ("ref:<landlord-id>"); founder applies credits manually in
+Stripe (volume makes this trivial for the first year). Productize (unique
+links, auto-credit) only when manual hurts — it's a Train 3 nicety.
+
+**Measurement:** referred-in count per landlord; % of new signups with a
+ref source. The 3-year plan's H1 gate ("a repeatable channel") is
+satisfied by referral alone if ref-source exceeds ~30% of signups.

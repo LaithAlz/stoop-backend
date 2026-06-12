@@ -54,8 +54,9 @@ across Train 1/2/3 milestones, each with acceptance criteria).
 | File | One line |
 |---|---|
 | [`design-partners.md`](05-gtm/design-partners.md) | The 10-pilot plan: who qualifies, where they are, the pitch, the offer, funnel math, pre-mortems |
-| [`outreach-scripts.md`](05-gtm/outreach-scripts.md) | Word-for-word: warm intro, Kijiji DM, Reddit post, REI 30-second pitch, follow-up cadence |
-| [`seo-content.md`](05-gtm/seo-content.md) | First two post outlines + the "Is it an emergency?" quiz spec (the rubric as a lead magnet) |
+| [`outreach-scripts.md`](05-gtm/outreach-scripts.md) | Word-for-word: warm intro, Kijiji DM, Reddit post, REI pitch, follow-up cadence, referral mechanic |
+| [`seo-content.md`](05-gtm/seo-content.md) | Post outlines, three free-tool specs (emergency checker, receipt generator, notice templates), technical SEO checklist |
+| [`waitlist-nurture.md`](05-gtm/waitlist-nurture.md) | What signups receive: welcome + 3-touch sequence (founder-personal, manual-first), PM variant |
 | [`video-plan.md`](05-gtm/video-plan.md) | 10-video library with full Higgsfield prompts per shot, guardrails, 3-session production order |
 
 ## 06-legal/ — the paperwork

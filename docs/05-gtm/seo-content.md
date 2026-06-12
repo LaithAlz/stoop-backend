@@ -91,6 +91,46 @@ of what landlords worry about — feed it back into content topics.
 
 ---
 
+## Free tool 2 — Ontario Rent Receipt Generator
+
+**Route:** /rent-receipt-generator · Target searches: *rent receipt
+template Ontario · landlord rent receipt requirement*
+
+- Form: landlord name, tenant name, address/unit, amount, period, payment
+  method → instant printable/PDF receipt (client-side; no signup wall).
+- Ontario hook (the content moat): landlords MUST provide receipts free
+  of charge when a tenant asks — state it plainly, link the post version.
+- Soft CTA under the result: "Stoop attaches receipts to tenant requests
+  automatically — [early access]." Optional email field: "email me a copy"
+  (that's the capture; the tool stays free without it).
+- Plausible events: `receipt_generated`, `receipt_email_captured`.
+
+## Free tool 3 — Landlord Notice Templates (pack)
+
+**Route:** /notices · Target searches: *N4 form guide Ontario · landlord
+notice of entry template Ontario · 24 hour notice template*
+
+- v1 = the two safest, highest-volume ones: **24-hour Notice of Entry**
+  (fill-in template + the rules around it, plainly) and a **maintenance
+  follow-up letter**. Official LTB forms (N4 etc.) are LINKED to the LTB
+  site with a plain-English "which form when" guide — we never reproduce
+  official forms, we explain them. [Lawyer pass before publishing, same
+  as 06-legal.]
+- Each template page is its own indexable URL (programmatic-SEO shape).
+- Same soft CTA + optional email pattern as the other tools.
+
+## Technical SEO checklist (apply to every page/post)
+
+- [ ] One target phrase per page; it appears in title, H1, URL slug, first paragraph — naturally
+- [ ] Title ≤60 chars; meta description ≤155 with the phrase + a reason to click
+- [ ] OG image (1200×630, Heritage brand) + og:title/description — links shared in FB groups must look real
+- [ ] FAQ schema (JSON-LD) on posts with Q&A sections; HowTo schema on the tools
+- [ ] Canonical tag; sitemap.xml + robots.txt once the domain is live; submit to Search Console day one
+- [ ] Internal links: every post → one tool + /early-access; every tool → one post
+- [ ] Images: descriptive alt text, compressed, lazy-loaded below the fold
+- [ ] Page speed: the marketing site is static-light already — keep tools client-side, no heavy deps
+- [ ] Each page registers its Plausible goal (checker_completed, receipt_generated, waitlist_submitted)
+
 ## Cadence & mechanics
 
 - 2 posts/month minimum; every post answers ONE search phrase an Ontario
