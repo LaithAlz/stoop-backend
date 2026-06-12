@@ -1,147 +1,115 @@
 ---
-title: "roadmap: Stoop v1 — three milestones"
+title: "roadmap: Stoop — release train"
 labels: ["roadmap"]
 milestone: ""
 ---
 
-# Stoop · Roadmap (v2)
+# Stoop · Roadmap (v3 — release train)
 
-> **Rewritten 2026-06-11.** Supersedes the 9-epic roadmap (in git history).
-> Architecture and rationale live in [`architecture.md`](./architecture.md) —
-> read that first. Changes: Clerk → Supabase Auth (ADR-1), Inngest cut
-> (ADR-2), 9 phases → 3 milestones (ADR-4). Old epic numbers are mapped below
-> so existing issues keep making sense.
+> **Rewritten 2026-06-11 (second revision, same day).** Supersedes the
+> 3-milestone roadmap after two founder decisions: (1) every planned
+> feature is **committed and ordered**, not gated behind "deferred" labels;
+> (2) the founder is **full-time with Claude Code**, compressing build
+> estimates ~3–4×. Architecture unchanged (`architecture.md`).
+> GitHub milestones renamed to match: Train 1 / Train 2 / Train 3.
 
-Three milestones from zero to first paying landlord. Each has one gate — a
-demo you can show, not a checklist feeling done. Everything not on this page
-is deliberately off the critical path (see "Cut or deferred").
+**The principle:** ship continuously; first real tenant text at ~week 2–3,
+everything after built on evidence. Code compresses with tooling —
+**evidence doesn't**: A2P/CASL registration, pilot recruiting, and
+trust-data accumulation move at the world's speed, so they all start on
+day one and run in parallel with the build.
 
----
-
-## Milestone 1 · Walking skeleton
-
-**Absorbs:** old Epics 1 (backend foundation), 3 (agent skeleton), 4 (Twilio loop), minus everything multi-tenant.
-**Duration target:** ~4–5 weeks part-time.
-**Gate:** *A real tenant texts a real Twilio number. Stoop classifies it, drafts a reply in your voice, you approve it on the deployed dashboard, the tenant gets the SMS. The whole run is visible as one LangSmith trace, and all 10 eval scenarios pass.*
-
-One landlord (you), your properties, production deployment. No billing, no
-RLS, no strangers.
-
-### In
-
-- FastAPI app factory, health endpoints, settings, structured logging,
-  Sentry, Docker, Fly.io (`yyz`), GitHub Actions CI *(old Epic 1, issues
-  001–003, 005–009, 012–014 — unchanged)*
-- **Supabase Auth** (replaces Clerk): asymmetric JWT verification via JWKS,
-  `require_user` dependency, `GET /v1/me` with lazy landlord upsert
-  *(issues 004, 010, 011, 015 — rewritten, same numbers)*
-- Core tables only: `landlords`, `properties`, `tenants`, `conversations`,
-  `messages` (append-only), `audit_log` (append-only), LangGraph checkpoint
-  tables. **The audit log is a v1 feature, not hardening.**
-- LangGraph graph: identify_property → load_context → classify_intent →
-  classify_severity → draft_response → interrupt (approval) → send.
-  Emergency branch: Twilio voice call to landlord + immediate safety SMS
-  (no approval gate). *(old Epics 3 + 4)*
-- Severity rubric v1, frozen prompts v1, LangSmith tracing from node one
-- 10 eval scenarios (emergency / urgent / routine / refusal),
-  `pytest -m eval` against the real API, run in CI on any change touching
-  prompts or rubric
-- Twilio: number provisioning, signed inbound webhook (persist before
-  process), outbound send, **A2P 10DLC / CASL registration filed in week 1**
-- Dashboard: approval queue wired to the real API (Brownstone design,
-  `docs/mockups/04`) — approve with 5-second undo, edit, reasoning trace
-- **Vendor coordination (#115, moved into v1):** vendors table, "Ask your
-  plumber" drafts through the same approval queue, time brokering on the
-  case timeline. Approval-first; vendor auto-send stays trust LV3+
-- Cost metering: tokens + cost recorded per message from message one
-
-### Out
-
-- RLS, other landlords, billing, mobile, Inngest, MMS/photos, trust-ladder
-  auto-send (trust *metrics* are recorded; auto-send stays off)
-
-### Risks
-
-- A2P/CASL registration lead time — file it first, it gates real SMS
-- Severity rubric quality — false-negative emergencies are the catastrophic
-  case; evals first, prompt cleverness second
-- Scope creep from the old roadmap — anything not needed for the gate demo
-  waits for M2
+**What can't ship early no matter the velocity (physics, not priorities):**
+trust-ladder *activation* (consumes weeks of real approvals), trust LV3
+(more of the same), the marketplace (needs measured no-vendor demand +
+supply seeded from real landlords), and Stoop Desk's integration choice
+(made by actual PM waitlist customers). All are committed; each activates
+when its fuel exists.
 
 ---
 
-## Milestone 2 · Multi-landlord
+## Train 1 · v1.0 – v1.1 — Core loop + photos (~weeks 1–4)
 
-**Absorbs:** old Epics 2 (schema + RLS), 5 (trust ladder), 6 (onboarding).
-**Gate:** *A stranger signs up, onboards a property, forwards their tenant line, and runs the full loop with zero founder intervention — and the RLS isolation suite proves Landlord A cannot read Landlord B's data, for every multi-tenant table.*
+**v1.0 (~wk 2–3):** the full loop, live in production for the founder's
+own properties.
+- Foundation: FastAPI, Supabase Auth, Fly.io, CI, Sentry, logging
+  *(issues #1–#16)*
+- Schema incl. cases/messages/audit_log/**vendors** *(#17–#19, #21, #24)*
+- Agent: identify → context (weather) → intent → severity (rubric v1.0)
+  → draft → interrupt → send; emergency branch *(#26–#37, #110)*
+- Emergency system: Tier-0 pre-filter, escalation chain, degraded mode
+  *(#107–#109)*
+- **Vendor coordination, approval-first** *(#115)*
+- Approval queue dashboard (5 s undo, reasoning trace), Twilio loop,
+  e2e test, cost metering, 10 evals in CI *(#40, #43–#45, #50, #61, #73,
+  #111)*
+- **Day-one parallel starts:** A2P/CASL filing, design-partner outreach
+  (`design-partners.md`), trust-metrics recording (fuel for v1.3)
 
-### In
+**v1.1 (~wk 4):**
+- **Photos/MMS** *(#46, reopened)*: Twilio media → Supabase Storage →
+  image into classification (Claude is vision-capable)
+- Basic hardening: backups verified, rate limits on public endpoints
 
-- Remaining tables (`trust_metrics`, `notifications`, `push_tokens`) +
-  RLS on every multi-tenant table + cross-tenant isolation test suite
-  *(old Epic 2 — unchanged in substance)*
-- `auth.users` → `landlords` Postgres trigger (replaces Clerk webhooks #015)
-- Trust ladder live: per-(property, severity) approval tracking unlocks
-  routine auto-send; always revocable; emergency/urgent never auto-send in v1
-- Self-serve onboarding: property + Twilio number provisioning, house rules,
-  voice-profile capture (tone questionnaire + sample replies)
-- Landing page live (Brownstone, `docs/mockups/05`) with the interactive
-  triage demo
-- 5–10 design-partner landlords recruited; every production
-  misclassification becomes an eval case
-
-### Out
-
-- Payments, mobile app, trade scheduling (trust ladder LV3+)
-
----
-
-## Milestone 3 · Money
-
-**Absorbs:** old Epic 7 (billing) + the launch slice of 8–9.
-**Gate:** *A landlord you've never met pays for a second door.*
-
-### In
-
-- Stripe: first door free, $19/door/mo after (pricing from the mockups —
-  validate against metered LLM + Twilio cost per door before launch)
-- Subscription state on `landlords`, dunning, cancel flow
-- Unit-economics query: revenue per door vs. cost per door, from the
-  metering that's existed since milestone 1
-- Production hardening pass: backup/restore drill, incident runbook,
-  rate limits on public endpoints
-
-### Out
-
-- Everything below
+**Gate:** real tenant texts (incl. a photo) handled end-to-end; 10 evals
+green; zero missed emergencies.
 
 ---
 
-## Cut or deferred (and what brings each back)
+## Train 2 · v1.2 – v1.4 — Open doors, revenue, mobile (~weeks 5–10)
 
-| Item | Status | Comes back when |
-|---|---|---|
-| Clerk | **Cut** (ADR-1) | Org/team features or enterprise SSO required |
-| Inngest | **Deferred** (ADR-2) | Webhook retries / background-task losses observed |
-| Mobile app (old Epic 8) | Deferred | Paying landlords ask; dashboard is mobile-first meanwhile |
-| MMS / photo handling | Deferred | Design partners hit it weekly (they will — pencil for M2.5) |
-| Trade scheduling (trust LV3) | Deferred | Trust LV2 proven in production |
-| SOC 2 | Deferred | First property-management company asks |
-| Multi-region | Effectively never | Beyond-North-America expansion only |
+**v1.2 — strangers can join:**
+- Self-serve onboarding (voice profile, house rules, disclosure) *(#113)*
+- RLS on every table + cross-tenant isolation suite *(#20, #22, #23, #64)*
+- Full API surface *(#53–#57)*; `auth.users` trigger *(#15)*
+- Brownstone dashboard port + landing live *(#112)*
+- Pilots onboarding in cohorts *(#98–#100)*
 
-## Scaling triggers
+**v1.3 — revenue + agent maturity:**
+- Stripe: Emergency Line free / $10 Full Plan / $5 early-access
+  grandfathered *(#52, #58, #59)*
+- **Trust ladder activates** — the approval history recorded since v1.0
+  now exists; routine auto-send unlocks per property *(#60)*
+- Agent upgrades: clarification, vendor_match, output filter, prompt
+  caching, 50-scenario evals *(#66–#70)*
+- Pilot feedback loop *(#101–#103)*
 
-Lifted from [`architecture.md`](./architecture.md) §11 — scale work starts
-when a number fires, not when it feels professional: durable queue on webhook
-losses; indexes → compute → replica on p95 > 300 ms; second Fly machine at
-~50 msg/min sustained; SOC 2 on enterprise ask.
+**v1.4 — reach:**
+- Mobile shell + push (approve from a notification in <10 s) *(#116)*
+- Multi-step agent jobs v1: quote → schedule → verify → close *(#117)*
+- Full hardening pass: runbook, alerts, unit-economics queries *(#71, #72)*
+
+**Gate:** a stranger onboards unaided AND pays; isolation suite green;
+trust auto-send live on ≥1 property.
 
 ---
+
+## Train 3 · v2.0+ — Stoop Desk, LV3, marketplace (condition-triggered)
+
+- **v2.0 Stoop Desk** *(#118)*: org multi-tenancy, teams, on-call
+  rotations, first PM integration (chosen by waitlist customers),
+  resident-benefit billing, SOC 2 kickoff.
+  *Trigger: ≥25 qualified PM waitlist signups (already capturing via
+  `/early-access` checkbox).*
+- **Trust LV3**: hands-off vendor scheduling for proven properties.
+  *Trigger: trust data, not code.*
+- **v3.0 Marketplace** *(#119)*: booking-fee revenue, cold-started from
+  other landlords' proven vendors nearby.
+  *Trigger: ≥20% of cases measurably end "no vendor for this trade."*
+- Provincial compliance packs, US decision, insurance partnerships per
+  `three-year-plan.md`.
+
+---
+
+## Standing rules
+
+- The emergency line is never paywalled.
+- Prompt/rubric changes = new version + full eval run (CI-enforced).
+- Scaling work on triggers (`architecture.md` §11), not on faith.
+- Every production misclassification becomes an eval case the same week.
 
 ## Issue bookkeeping
 
-- Phase-1 issue specs in `phase-1/issues/` remain valid except **004, 010,
-  011, 015 — rewritten for Supabase Auth** (same numbers, renamed files).
-  The GitHub issues on `LaithAlz/stoop-backend` need matching edits.
-- Old Epic 2–4 specs fold into Milestones 1–2 as mapped above; write new
-  child issues per milestone as work starts, not all up front.
+GitHub milestones = trains. Current distribution: Train 1 ≈ 46 issues,
+Train 2 ≈ 31, Train 3 ≈ 4 umbrellas (children created when triggers fire).
+Phase-1 specs in `phase-1/issues/` remain the detailed references.

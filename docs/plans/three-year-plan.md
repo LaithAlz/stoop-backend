@@ -36,7 +36,7 @@ network.
 
 ## Horizon 0 · "It works and strangers pay" — now → ~Q1 2027
 
-**Theme:** ship the three milestones, run the pilots, charge money.
+**Theme:** ship the release train (Trains 1–2), run the pilots, charge money. Founder is full-time with Claude Code — build pace ~3–4× the original part-time estimates; external clocks (A2P, recruiting, trust data) unchanged.
 
 ### Business
 - Execute `design-partners.md`: outreach starts week 1 of the build;
@@ -50,11 +50,11 @@ network.
   this horizon buys *proof*, not revenue.)
 
 ### Tech (mostly already specced)
-- M1 walking skeleton → M2 multi-landlord → M3 money, per
-  `stoop-all-epics.md`. Includes vendor coordination v1 (#115),
-  emergency pre-filter + escalation chain (#107–109), eval suite,
-  cost metering, audit log.
-- MMS/photos pulled in at M1.5 (the deferral most likely to be wrong).
+- Release train v1.0 → v1.4 per `stoop-all-epics.md` (~10 weeks
+  full-time): core loop, photos, onboarding, RLS, full API, Stripe,
+  trust-ladder activation, mobile shell, multi-step jobs. Includes
+  vendor coordination v1 (#115), emergency pre-filter + escalation
+  chain (#107–109), eval suite, cost metering, audit log.
 - Founder reviews every classification in LangSmith for each pilot's
   first two weeks. Every miss → eval case. Corpus target: **50 scenarios.**
 
