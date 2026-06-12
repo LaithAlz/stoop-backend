@@ -135,24 +135,24 @@
 
     <!-- card 1 -->
     <div class="card" id="card1">
-      <span class="tag urgent">Needs you first</span>
+      <span class="tag urgent">Needs your approval</span>
       <p class="who">Maria — no heat</p>
       <p class="what">Unit 2 at 41 Palmerston · texted at 2:12 AM · I didn't wake you because it's cold, not dangerous.</p>
       <div class="said"><b>Maria said</b>hey sorry to text so late but the heat hasn't worked since 10pm and it's getting really cold… we have the baby this week. anything you can do tonight??</div>
       <div class="reply"><b>I'd like to reply</b>Hi Maria — so sorry, that's not okay with the little one there. Try the breaker in the hall closet (switch 4) and let me know in 10 min. Still cold? My heating guy will be there at 7:30 AM. Space heater's in basement storage tonight.</div>
       <details>
-        <summary>Why I marked this "needs you first"</summary>
+        <summary>Why this needs your approval</summary>
         <p>No heat overnight with a <b>baby in the unit</b> is serious — but it was <b>−2° out</b>, not dangerous cold, and there's no flood, gas, or fire. So it waited for morning instead of ringing your phone. Toronto requires heat until June 1, so it shouldn't wait past today.</p>
       </details>
       <div class="actions">
-        <button class="btn" onclick="alert('Mock: edit the reply before it sends')">Change it</button>
-        <button class="btn primary" data-name="Maria">Looks good — send ✓</button>
+        <button class="btn" onclick="alert('Mock: edit the reply before it sends')">Edit</button>
+        <button class="btn primary" data-name="Maria">Approve &amp; send ✓</button>
       </div>
     </div>
 
     <!-- card 2 -->
     <div class="card" id="card2">
-      <span class="tag easy">Easy one</span>
+      <span class="tag easy">Routine</span>
       <p class="who">Sam — dripping faucet</p>
       <p class="what">12 Ossington · texted yesterday evening · not urgent, Sam said so too.</p>
       <div class="reply"><b>I'd like to reply</b>Morning Sam — thanks for flagging it. I'll have Tony take a look Thursday morning. If it gets worse before then, text me a video and I'll move faster.</div>
@@ -161,14 +161,14 @@
         <p><b>Tony</b> is your plumber — you added him when you set up. He works Thursday mornings near Ossington. A slow drip can wait two days; if Sam says it's getting worse, I'll bump it up.</p>
       </details>
       <div class="actions">
-        <button class="btn" onclick="alert('Mock: edit the reply before it sends')">Change it</button>
-        <button class="btn primary" data-name="Sam">Looks good — send ✓</button>
+        <button class="btn" onclick="alert('Mock: edit the reply before it sends')">Edit</button>
+        <button class="btn primary" data-name="Sam">Approve &amp; send ✓</button>
       </div>
     </div>
 
     <!-- already handled -->
     <div class="card" style="opacity:.75">
-      <span class="tag done">Handled for you</span>
+      <span class="tag done">Handled automatically</span>
       <p class="who">Sam — visitor parking</p>
       <p class="what">Sam asked about weekend parking at 9:02 AM. I answered from your house rules — you've okayed enough of these that I send the simple ones myself.</p>
       <details>
@@ -182,9 +182,9 @@
 
   <!-- ════ PROPERTIES ════ -->
   <section class="screen" id="s-props">
-    <h1>Your places.</h1>
-    <p class="sub">Tap one to see its people, its rules, and what I'm allowed to do there.</p>
-    <div class="card prop" onclick="alert('Mock: opens 41 Palmerston — tenants, your plumber & heating guy, house rules, and the switch below')">
+    <h1>Properties</h1>
+    <p class="sub">Tap a property to see its tenants, contractors, house rules, and permissions.</p>
+    <div class="card prop" onclick="alert('Mock: opens 41 Palmerston — tenants, contractors, house rules, permissions')">
       <span class="l"><b>41 Palmerston</b><small>Maria &amp; Dev · 2 units</small></span>
       <span class="r warn">1 thing waiting</span>
     </div>
@@ -198,7 +198,7 @@
     </div>
 
     <div class="card" style="margin-top:22px">
-      <p class="who" style="font-size:17px;margin-bottom:14px">What I'm allowed to do</p>
+      <p class="who" style="font-size:17px;margin-bottom:14px">Permissions</p>
       <div class="row">
         <span class="l"><b>Answer simple questions myself</b><small>Parking, garbage day, receipts — at <b>12 Ossington</b> only. You've approved 30 of my replies there without changing a word, so I earned this one. Flip it off anytime.</small></span>
         <span class="switch on" role="switch" aria-checked="true" tabindex="0" onclick="this.classList.toggle('on')"></span>
@@ -214,8 +214,8 @@
 
   <!-- ════ SETTINGS ════ -->
   <section class="screen" id="s-settings">
-    <h1>Settings.</h1>
-    <p class="sub">One page. That's all of it.</p>
+    <h1>Settings</h1>
+    <p class="sub">Everything configurable, on one page.</p>
     <div class="card">
       <div class="row">
         <span class="l"><b>Your plan — $5 a month</b><small>Your early price, locked in for as long as you stay. <a href="#" style="color:var(--accent)">Switch to $50/year</a></small></span>
@@ -237,7 +237,7 @@
         <button class="btn small">Download</button>
       </div>
       <div class="row">
-        <span class="l"><b>Leave Stoop</b><small>Cancel anytime — you keep your records, no fees</small></span>
+        <span class="l"><b>Cancel subscription</b><small>Cancel anytime — you keep your records, no fees</small></span>
         <button class="btn small" style="color:var(--red);border-color:var(--redb)">Cancel</button>
       </div>
     </div>
@@ -253,7 +253,7 @@
     </button>
     <button class="tab" data-s="props">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h3"/></svg>
-      Places
+      Properties
     </button>
     <button class="tab" data-s="settings">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M2 12h3M19 12h3M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>
@@ -286,10 +286,10 @@
     btn.addEventListener('click',function(){
       if(this.dataset.sending){ // undo
         clearTimeout(this._t); delete this.dataset.sending;
-        this.textContent='Looks good — send ✓'; return;
+        this.textContent='Approve & send ✓'; return;
       }
       this.dataset.sending='1';
-      this.textContent='Sending in 5… tap to stop';
+      this.textContent='Sending in 5 — tap to undo';
       this._t=setTimeout(()=>{
         const card=this.closest('.card');
         card.style.opacity='.75';
