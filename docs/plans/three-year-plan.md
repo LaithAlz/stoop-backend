@@ -89,9 +89,8 @@ watching every message.
   part-time landlord-success person from the pilot cohort.
 
 ### Tech
-- **Mobile**: the dashboard is already mobile-first; ship wrappers (Expo
-  shell over the web app) only when paying landlords ask — push
-  notifications are the real feature, not the app.
+- **Mobile**: shipped at v1.4 (#116, Expo shell + push); H1 work is
+  polish driven by usage — push is the real feature, not the app.
 - **Trust ladder LV3 live**: vendor auto-coordination for proven
   properties (approval-first vendor texting shipped in v1; LV3 removes
   the tap for routine vendor scheduling).
