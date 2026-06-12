@@ -143,6 +143,7 @@
       <details>
         <summary>Why this needs your approval</summary>
         <p>No heat overnight with a <b>baby in the unit</b> is serious — but it was <b>−2° out</b>, not dangerous cold, and there's no flood, gas, or fire. So it waited for morning instead of ringing your phone. Toronto requires heat until June 1, so it shouldn't wait past today.</p>
+        <p><a href="#" onclick="go('convo');return false" style="color:var(--accent);font-weight:700">See the whole conversation →</a></p>
       </details>
       <div class="actions">
         <button class="btn" onclick="alert('Mock: edit the reply before it sends')">Edit</button>
@@ -222,7 +223,7 @@
       <p class="who" style="font-size:17px;margin-bottom:6px">Tenants</p>
       <div class="row">
         <span class="l"><b>Maria — Unit 2</b><small>(416) 555-0102 · baby in the unit — heat and power problems get treated more seriously here</small></span>
-        <button class="btn small">Edit</button>
+        <button class="btn small" onclick="event.stopPropagation();go('convo')">Messages</button>
       </div>
       <div class="row">
         <span class="l"><b>Dev — Unit 1</b><small>(416) 555-0103</small></span>
@@ -277,6 +278,57 @@
     </div>
   </section>
 
+  <!-- ════ CONVERSATION ════ -->
+  <section class="screen" id="s-convo">
+    <p style="margin-bottom:14px"><a href="#" onclick="go('home');return false" style="color:var(--dim);text-decoration:none;font-weight:700;font-size:14px">← Back</a></p>
+    <h1>Maria — Unit 2</h1>
+    <p class="sub">41 Palmerston · every message, saved with dates and times</p>
+
+    <p style="text-align:center;font-size:12.5px;color:var(--dim);margin-bottom:14px;font-weight:700">— Tuesday, June 9 —</p>
+    <div class="said" style="max-width:88%"><b>Maria · 6:40 PM</b>got the rent receipt, thank you!!</div>
+    <div class="reply" style="max-width:88%;margin-left:auto;margin-bottom:12px"><b>You (sent by Stoop) · 6:52 PM</b>Anytime, Maria!</div>
+
+    <p style="text-align:center;font-size:12.5px;color:var(--dim);margin:18px 0 14px;font-weight:700">— Today —</p>
+    <div class="said" style="max-width:88%"><b>Maria · 2:12 AM</b>hey sorry to text so late but the heat hasn't worked since 10pm and it's getting really cold… we have the baby this week. anything you can do tonight??</div>
+    <div class="reply" style="max-width:88%;margin-left:auto;margin-bottom:12px"><b>Your reply — waiting for your OK</b>Hi Maria — so sorry, that's not okay with the little one there. Try the breaker in the hall closet (switch 4)…
+      <a href="#" onclick="go('home');return false" style="display:block;margin-top:8px;color:var(--accent);font-weight:800">Review and send →</a></div>
+
+    <div class="actions" style="margin-top:22px">
+      <button class="btn small">Download this conversation</button>
+    </div>
+    <p style="font-size:13px;color:var(--dim);margin-top:8px;line-height:1.6">Nothing here can be edited or deleted — that's what makes it useful if you ever need a record.</p>
+  </section>
+
+  <!-- ════ ONBOARDING ════ -->
+  <section class="screen" id="s-onboard">
+    <p style="margin-bottom:14px;font-size:14px;color:var(--dim);font-weight:700">Setting up · step 4 of 6</p>
+    <div style="display:flex;gap:6px;margin-bottom:24px">
+      <i style="height:4px;flex:1;border-radius:99px;background:var(--accent)"></i><i style="height:4px;flex:1;border-radius:99px;background:var(--accent)"></i><i style="height:4px;flex:1;border-radius:99px;background:var(--accent)"></i><i style="height:4px;flex:1;border-radius:99px;background:var(--accent)"></i><i style="height:4px;flex:1;border-radius:99px;background:var(--line)"></i><i style="height:4px;flex:1;border-radius:99px;background:var(--line)"></i>
+    </div>
+    <h1>Teach me your voice.</h1>
+    <p class="sub">Paste 3–5 real replies you've sent tenants. I'll write the way you write — casual is fine, emojis are fine.</p>
+    <div class="card" style="margin-bottom:14px">
+      <p style="font-size:13px;color:var(--dim);font-weight:700;margin-bottom:8px">A reply you've actually sent</p>
+      <div class="said" style="margin-bottom:0">Hey! Yeah the visitor spot behind the building is free this weekend, tell her she's good til Monday 👍</div>
+    </div>
+    <div class="card" style="margin-bottom:14px;border-style:dashed">
+      <p style="font-size:14px;color:var(--dim)">+ Paste another…</p>
+    </div>
+    <div class="card" style="margin-bottom:22px">
+      <p style="font-size:13px;color:var(--dim);font-weight:700;margin-bottom:10px">When something breaks, you usually sound…</p>
+      <div class="actions" style="margin-top:0">
+        <button class="btn small" style="border-color:var(--accentb);color:var(--accent)">Warm &amp; direct</button>
+        <button class="btn small">Brief &amp; businesslike</button>
+        <button class="btn small">Friendly &amp; chatty</button>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn">← Back</button>
+      <button class="btn primary">Next: tell your tenants →</button>
+    </div>
+    <p style="font-size:13px;color:var(--dim);margin-top:10px;line-height:1.6">Step 5 sends your tenants a short note about the new number — required, and already written for you.</p>
+  </section>
+
   <!-- ════ SETTINGS ════ -->
   <section class="screen" id="s-settings">
     <h1>Settings</h1>
@@ -296,6 +348,10 @@
       <div class="row">
         <span class="l"><b>Approve by text</b><small>Reply 1 to my texts to send a reply — no need to open the app</small></span>
         <span class="switch on" onclick="this.classList.toggle('on')" role="switch" aria-checked="true" tabindex="0"></span>
+      </div>
+      <div class="row">
+        <span class="l"><b>Setup wizard</b><small>Re-run any step — voice, house rules, tenant notice</small></span>
+        <button class="btn small" onclick="go('onboard')">Open</button>
       </div>
       <div class="row">
         <span class="l"><b>Your records</b><small>Every conversation, saved with dates and times</small></span>
@@ -340,7 +396,7 @@
   function go(s){
     document.querySelectorAll('.screen').forEach(x=>x.classList.remove('on'));
     document.getElementById('s-'+s).classList.add('on');
-    const hl = s==='prop' ? 'props' : s;
+    const hl = s==='prop' ? 'props' : (s==='convo'||s==='onboard') ? 'home' : s;
     document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('on',b.dataset.s===hl));
     window.scrollTo({top:0});
   }

@@ -73,6 +73,22 @@ When a draft is ready, the landlord's notification SMS reads:
 - Edits still require the app (typing a full reply over SMS is worse UX,
   not better).
 
+## The recap templates (the two scheduled messages)
+
+**Morning summary SMS (7:00 AM, only if something waits):**
+> Stoop: 2 things waiting for your OK — Maria (no heat, drafted) and Sam
+> (faucet, Tony suggested Thursday). Reply 1 to send Maria's, or open the
+> app. Nothing was an emergency overnight.
+
+**Nightly recap (9:30 PM, only if something happened):**
+> Stoop: today I handled 3 messages. Sent for you: Sam's parking question.
+> Waiting on: Tony to confirm Thursday. Your phone stayed quiet — nothing
+> was urgent. Details in the app.
+
+Rules: skipped entirely on empty days (silence is the product), never
+more than 2 segments, names not unit numbers, and "nothing was an
+emergency" stated explicitly — reassurance is the payload.
+
 ## Enforcement
 
 - `draft_response` and the safety templates carry these rules in their
