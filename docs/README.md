@@ -53,6 +53,7 @@ across Train 1/2/3 milestones, each with acceptance criteria).
 
 | File | One line |
 |---|---|
+| [`channel-playbook.md`](05-gtm/channel-playbook.md) | **The marketing operating system** — every channel's status/effort/KPI, the local-search plan (GBP + reviews engine), weekly 8-hour rhythm, scale/kill rules |
 | [`design-partners.md`](05-gtm/design-partners.md) | The 10-pilot plan: who qualifies, where they are, the pitch, the offer, funnel math, pre-mortems |
 | [`outreach-scripts.md`](05-gtm/outreach-scripts.md) | Word-for-word: warm intro, Kijiji DM, Reddit post, REI pitch, follow-up cadence, referral mechanic |
 | [`seo-content.md`](05-gtm/seo-content.md) | Post outlines, three free-tool specs (emergency checker, receipt generator, notice templates), technical SEO checklist |
@@ -82,6 +83,7 @@ the live site uses the Heritage light design, see `apps/web`).
 - **…know why we chose X technology** → `03-engineering/architecture.md` Decision log (ADRs)
 - **…see what the AI does with a message** → `02-product/severity-rubric-v1.md`, then `emergency-prefilter.md`
 - **…start building** → `/CLAUDE.md`, then GitHub issue #1
+- **…run marketing this week** → `05-gtm/channel-playbook.md` (the weekly rhythm table)
 - **…recruit a pilot landlord** → `05-gtm/outreach-scripts.md` + `06-legal/pilot-kit.md`
 - **…know what's left besides code** → incorporation, domain, account sweep, A2P filing, lawyer pass, 5 validation conversations (see `05-gtm/design-partners.md` + the humans-only list in `/apps/api/CLAUDE.md`)
 - **…make the marketing videos** → `05-gtm/video-plan.md` (execution-ready prompts)
