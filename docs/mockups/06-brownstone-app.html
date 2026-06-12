@@ -184,7 +184,7 @@
   <section class="screen" id="s-props">
     <h1>Properties</h1>
     <p class="sub">Tap a property to see its tenants, contractors, house rules, and permissions.</p>
-    <div class="card prop" onclick="alert('Mock: opens 41 Palmerston — tenants, contractors, house rules, permissions')">
+    <div class="card prop" onclick="go('prop')">
       <span class="l"><b>41 Palmerston</b><small>Maria &amp; Dev · 2 units</small></span>
       <span class="r warn">1 thing waiting</span>
     </div>
@@ -208,6 +208,71 @@
       </div>
       <div class="row">
         <span class="l"><b>Real emergencies ring your phone</b><small>Flood, gas, fire — I call you immediately, day or night. If you don't pick up, I call Omar. This can't be turned off either.</small></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════ PROPERTY DETAIL ════ -->
+  <section class="screen" id="s-prop">
+    <p style="margin-bottom:14px"><a href="#" onclick="go('props');return false" style="color:var(--dim);text-decoration:none;font-weight:700;font-size:14px">← Properties</a></p>
+    <h1>41 Palmerston</h1>
+    <p class="sub">Toronto · 2 units · Tenants text <b style="color:var(--text)">(416) 555-0141</b></p>
+
+    <div class="card">
+      <p class="who" style="font-size:17px;margin-bottom:6px">Tenants</p>
+      <div class="row">
+        <span class="l"><b>Maria — Unit 2</b><small>(416) 555-0102 · baby in the unit — heat and power problems get treated more seriously here</small></span>
+        <button class="btn small">Edit</button>
+      </div>
+      <div class="row">
+        <span class="l"><b>Dev — Unit 1</b><small>(416) 555-0103</small></span>
+        <button class="btn small">Edit</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <p class="who" style="font-size:17px;margin-bottom:6px">Contractors</p>
+      <div class="row">
+        <span class="l"><b>Tony Greco — Plumbing</b><small>(416) 555-0166 · Mon–Sat, no Sundays · "knows the shut-off locations"</small></span>
+        <button class="btn small">Edit</button>
+      </div>
+      <div class="row">
+        <span class="l"><b>Petra HVAC — Heating &amp; cooling</b><small>(416) 555-0190 · 7:30 AM slots if booked before 6</small></span>
+        <button class="btn small">Edit</button>
+      </div>
+      <div class="row">
+        <span class="l"><b>Add a contractor</b><small>I suggest the right one in replies — and with your OK, I text them directly. They never see tenant numbers.</small></span>
+        <button class="btn small">Add</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <p class="who" style="font-size:17px;margin-bottom:6px">House rules</p>
+      <p class="what" style="margin-bottom:12px">I answer everyday questions straight from this — parking, garbage, quiet hours. The more you put here, the less reaches you.</p>
+      <div class="said" style="margin-bottom:12px">Visitor spot behind the building (sign says P2), 48 hours max. Garbage pickup Thursday. Quiet hours 10 PM – 8 AM. Thermostat breaker: hall closet, switch 4. Spare space heater: basement storage.</div>
+      <button class="btn small">Edit house rules</button>
+    </div>
+
+    <div class="card">
+      <p class="who" style="font-size:17px;margin-bottom:6px">If there's an emergency</p>
+      <div class="row">
+        <span class="l"><b>I call you first</b><small>(647) 555-0123 — day or night</small></span>
+        <button class="btn small">Change</button>
+      </div>
+      <div class="row">
+        <span class="l"><b>Then Omar, if you don't pick up</b><small>(647) 555-0177 · your brother · called after 10 minutes</small></span>
+        <button class="btn small">Change</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <p class="who" style="font-size:17px;margin-bottom:6px">Permissions at this property</p>
+      <div class="row">
+        <span class="l"><b>Answer simple questions myself</b><small>Not yet — you've approved 94 of my last 100 replies here unchanged. Six more and I'll offer you this switch.</small></span>
+        <span class="switch" role="switch" aria-checked="false" tabindex="0" style="opacity:.45;pointer-events:none"></span>
+      </div>
+      <div class="row">
+        <span class="l"><b>Repairs, money, anything sensitive</b><small>Always waits for your OK. No switch, on purpose.</small></span>
       </div>
     </div>
   </section>
@@ -275,7 +340,8 @@
   function go(s){
     document.querySelectorAll('.screen').forEach(x=>x.classList.remove('on'));
     document.getElementById('s-'+s).classList.add('on');
-    document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('on',b.dataset.s===s));
+    const hl = s==='prop' ? 'props' : s;
+    document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('on',b.dataset.s===hl));
     window.scrollTo({top:0});
   }
   document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>go(b.dataset.s)));
