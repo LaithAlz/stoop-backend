@@ -28,6 +28,10 @@ and only rings the landlord's phone for a true emergency.
 GitHub issues on `LaithAlz/stoop-backend` carry per-task acceptance
 criteria; `docs/03-engineering/issue-specs/` has the detailed specs for #1–#15.
 
+**Dev-agent crew:** `.claude/agents/` defines implementer,
+frontend-builder, spec-guardian, safety-reviewer, copy-guardian — roles,
+review gates, and when each is mandatory: `docs/03-engineering/dev-agents.md`.
+
 ## Commands
 
 - web: `cd apps/web && bun install && bun run dev` · build `bun run build` · lint `bun run lint`

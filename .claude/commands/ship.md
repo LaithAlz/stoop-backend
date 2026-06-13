@@ -31,13 +31,21 @@ Before writing a line of code:
 - Read relevant existing files — understand the patterns before adding to them
 - Scope your change to exactly what was asked. No bonus refactors.
 
-### 3. Build
+### 3. Build — delegate to the crew
+
+Use the dev-agent system (docs/03-engineering/dev-agents.md):
+backend work → the `implementer` subagent with the issue number;
+web UI → `frontend-builder`. Then `spec-guardian` on the diff (fix and
+re-run until APPROVE, max 2 loops). If the change touches auth, RLS,
+webhooks, the agent graph, or approve flows → `safety-reviewer` is
+MANDATORY before PR. Customer-visible strings changed → `copy-guardian`.
+Paste reviewer verdicts into the PR description.
 
 Implement the feature. Keep changes contained to their app. Do not reach across app boundaries unless the task explicitly requires it.
 
 Repo layout:
 ```
-apps/api/     FastAPI backend (Python 3.12, uv, async SQLAlchemy, Alembic, Clerk)
+apps/api/     FastAPI backend (Python 3.12, uv, async SQLAlchemy, Alembic, Supabase Auth)
 apps/web/     TanStack Start frontend (TypeScript, Bun, shadcn/ui, Cloudflare Workers)
 packages/     Shared code — only add here if genuinely reused across apps
 docs/   Phase planning docs — read-only reference

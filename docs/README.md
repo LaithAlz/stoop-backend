@@ -37,6 +37,7 @@ strategy → product → engineering → roadmap → go-to-market → legal.
 | [`schema-v1.md`](03-engineering/schema-v1.md) | **Canonical DDL** — every table and column; nothing in code may invent a name |
 | [`api-contracts.md`](03-engineering/api-contracts.md) | Every endpoint's request/response shape, error envelope, the approve/undo semantics |
 | [`issue-specs/`](03-engineering/issue-specs/) | Detailed build specs for GitHub issues #1–#15 (+ EPIC) with hints and gotchas |
+| [`dev-agents.md`](03-engineering/dev-agents.md) | The AI construction crew: 5 subagents, build→review loop, mandatory safety gates, human-only decisions |
 
 Also: `/CLAUDE.md` (repo rules for AI coding sessions) and
 `/apps/api/CLAUDE.md` (backend conventions + the never-break agent rules).
