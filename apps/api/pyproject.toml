@@ -25,3 +25,36 @@ dev = [
     "respx>=0.23.1",
     "ruff>=0.15.17",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# errors, Pyflakes, import sorting, naming, bugbear, pyupgrade, async, security
+select = ["E", "F", "I", "N", "B", "UP", "ASYNC", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# asserts are fine in tests and eval harnesses
+"tests/**" = ["S101"]
+"evals/**" = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# third-party libs without type stubs
+module = ["twilio.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = [
+    "unit: fast, no I/O (default)",
+    "integration: requires a database via docker-compose",
+    "eval: hits the real Anthropic API — costs money, never in default runs",
+]
