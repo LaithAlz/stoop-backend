@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: backend (lint, type, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+
+    # Postgres for tests that need a DB (integration tests + Alembic land with
+    # #8/#9). Unit tests don't touch it, but the service is here and ready.
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: stoop
+          POSTGRES_USER: stoop
+          POSTGRES_PASSWORD: stoop
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stoop -d stoop"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Integration tests will connect here once they exist; unit tests use the
+      # placeholder env set in tests/conftest.py.
+      DATABASE_URL: postgresql+asyncpg://stoop:stoop@localhost:5432/stoop
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up uv (with cache)
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Cheap checks first so CI fails fast.
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Mypy (strict)
+        run: uv run mypy app
+
+      # NOTE: `alembic upgrade head` against the Postgres service lands with #8
+      # (Alembic setup), which is blocked on the Supabase project (#3/#4).
+
+      - name: Pytest
+        run: uv run pytest -m "not eval"
