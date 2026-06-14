@@ -26,7 +26,7 @@ import structlog.contextvars
 from httpx import ASGITransport
 
 from app.config import Settings
-from app.observability import init_sentry
+from app.observability import _scrub_event, init_sentry
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -302,6 +302,8 @@ async def test_debug_error_sentry_capture_offline() -> None:
 
     jwt_sentinel = "SENTINEL.JWT.SHOULD-NOT-LEAK"
     cookie_sentinel = "session=SENTINEL-COOKIE-SHOULD-NOT-LEAK"
+    query_sentinel = "SENTINEL-QUERY-TOKEN"
+    phone_sentinel = "SENTINEL-PHONE-15555550123"
 
     try:
         with patch("app.observability.settings", fresh_settings):
@@ -315,6 +317,7 @@ async def test_debug_error_sentry_capture_offline() -> None:
         ) as client:
             response = await client.get(
                 "/_debug/error",
+                params={"token": query_sentinel, "phone": phone_sentinel},
                 headers={
                     "Authorization": f"Bearer {jwt_sentinel}",
                     "Cookie": cookie_sentinel,
@@ -328,13 +331,96 @@ async def test_debug_error_sentry_capture_offline() -> None:
             "Verify FastApiIntegration is wired correctly."
         )
 
-        # never-break rule #5: the JWT / cookie must NOT appear anywhere in the
-        # serialised event — not in request headers, not in stack-frame locals.
+        # never-break rule #5: none of the sentinels may appear anywhere in the
+        # serialised event — not in request headers (JWT/cookie), not in the
+        # query string (token/phone), not in stack-frame locals.
         serialised = json.dumps(captured_events)
         assert jwt_sentinel not in serialised, "JWT leaked into Sentry event"
         assert cookie_sentinel not in serialised, "Cookie leaked into Sentry event"
+        assert query_sentinel not in serialised, "Query-string token leaked into Sentry event"
+        assert phone_sentinel not in serialised, "Query-string phone leaked into Sentry event"
     finally:
         # Reset Sentry so it does not bleed into other tests.
+        sentry_sdk.init(dsn=None)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+def test_scrub_event_strips_all_pii_carriers() -> None:
+    """_scrub_event drops every event field that can carry a JWT/phone/body.
+
+    Exercises the carriers the live SDK attaches independently of
+    send_default_pii — request (incl. query_string), breadcrumbs, extra,
+    logentry, and stack-frame vars — so the scrubber is validated directly,
+    not only through one SDK code path. See never-break rule #5.
+    """
+    event: dict[str, Any] = {
+        "level": "error",
+        "transaction": "/_debug/error",
+        "request": {
+            "url": "http://test/_debug/error",
+            "query_string": "token=SENTINEL&phone=SENTINEL",
+            "headers": {"Authorization": "Bearer SENTINEL"},
+            "cookies": "session=SENTINEL",
+            "data": {"message_body": "SENTINEL tenant text"},
+        },
+        "breadcrumbs": {"values": [{"message": "called for +1SENTINEL"}]},
+        "extra": {"phone": "+1SENTINEL"},
+        "logentry": {"message": "failed for %s", "params": ["+1SENTINEL"]},
+        "exception": {
+            "values": [
+                {
+                    "type": "RuntimeError",
+                    "value": "boom",
+                    "stacktrace": {"frames": [{"vars": {"jwt": "SENTINEL"}}]},
+                }
+            ]
+        },
+    }
+
+    scrubbed = _scrub_event(event, {})  # type: ignore[arg-type]
+
+    serialised = json.dumps(scrubbed)
+    assert "SENTINEL" not in serialised, "a PII carrier survived the scrubber"
+    # The actionable parts are preserved.
+    assert scrubbed["exception"]["values"][0]["type"] == "RuntimeError"
+    assert scrubbed["transaction"] == "/_debug/error"
+
+
+@pytest.mark.unit
+async def test_logging_integration_does_not_capture_events() -> None:
+    """A stdlib ERROR log must NOT become a Sentry event.
+
+    configure_logging() bridges all stdlib logging; the default
+    LoggingIntegration would capture ERROR+ records as events (a PII back
+    door). init_sentry() disables that, so an error log produces no captured
+    event. See never-break rule #5.
+    """
+    import logging as stdlib_logging
+
+    import sentry_sdk
+    from sentry_sdk.transport import Transport
+
+    captured_events: list[dict[str, Any]] = []
+
+    class _MemoryTransport(Transport):
+        def capture_envelope(self, envelope: Any) -> None:  # type: ignore[override]
+            for item in envelope.items:
+                if item.headers.get("type") == "event":
+                    captured_events.append(item.payload.json or {})
+
+    fresh_settings = _make_fresh_settings(
+        sentry_dsn="https://fake@o0.ingest.sentry.io/0",
+    )
+
+    try:
+        with patch("app.observability.settings", fresh_settings):
+            init_sentry(transport=_MemoryTransport())
+
+        stdlib_logging.getLogger("stoop.test").error("SENTINEL-LOG-SHOULD-NOT-CAPTURE")
+        sentry_sdk.flush(timeout=2)
+
+        assert not captured_events, "stdlib ERROR log was captured as a Sentry event"
+    finally:
         sentry_sdk.init(dsn=None)  # type: ignore[arg-type]
 
 

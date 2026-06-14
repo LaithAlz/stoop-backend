@@ -66,20 +66,33 @@ def configure_logging() -> None:
 
 
 def _scrub_event(event: Event, _hint: Hint) -> Event:
-    """Strip anything that could carry a JWT, phone number, or message body.
+    """Deny-by-default scrubber: drop every event field that can carry app data.
 
     Defense-in-depth on top of ``send_default_pii=False`` and
-    ``include_local_variables=False``.  ``send_default_pii=False`` only
-    filters the structured ``request.headers`` block; it does NOT stop
-    Sentry from serialising stack-frame local variables, which hold the raw
-    ASGI ``scope``/``request`` objects (and therefore the Authorization
-    header / JWT).  We drop those here so a single re-enabled global can't
-    silently start leaking tokens. See never-break rule #5.
+    ``include_local_variables=False``. Those flags are necessary but not
+    sufficient — several carriers ship regardless of them, and Stoop never
+    needs any of them in Sentry (never-break rule #5 — never send a JWT,
+    phone number, or message body to a third party):
+
+    - ``request`` — headers/cookies hold the Authorization JWT and session
+      cookie; ``data`` holds the request body (message text); ``query_string``
+      is attached by the ASGI integration *independently* of
+      ``send_default_pii`` and can hold a token or phone. We drop the whole
+      block; the ``transaction`` (route pattern) is enough to locate an error.
+    - ``breadcrumbs`` — the logging integration turns prior stdlib log lines
+      into breadcrumbs; we never want those leaving the box.
+    - ``extra`` / ``logentry`` — app-attached log context and the captured
+      log message+params.
+    - stack-frame ``vars`` — belt-and-suspenders even with
+      ``include_local_variables=False``.
+
+    The exception type/value and stack structure are kept so errors remain
+    actionable. (A ``raise ValueError(phone)`` would still carry PII in the
+    value — that is an application bug rule #5 forbids at the source, not
+    something this generic scrubber can detect.)
     """
-    request = event.get("request")
-    if isinstance(request, dict):
-        for key in ("headers", "cookies", "data"):
-            request.pop(key, None)
+    for key in ("request", "breadcrumbs", "extra", "logentry"):
+        event.pop(key, None)  # type: ignore[misc]
 
     for value in event.get("exception", {}).get("values", []):
         for frame in value.get("stacktrace", {}).get("frames", []):
@@ -114,6 +127,7 @@ def init_sentry(transport: Any | None = None) -> None:
 
     import sentry_sdk
     from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.logging import LoggingIntegration
     from sentry_sdk.integrations.starlette import StarletteIntegration
 
     sentry_sdk.init(
@@ -125,6 +139,13 @@ def init_sentry(transport: Any | None = None) -> None:
         integrations=[
             FastApiIntegration(),
             StarletteIntegration(),
+            # configure_logging() bridges ALL stdlib logging through structlog.
+            # The default LoggingIntegration would turn every log record into a
+            # breadcrumb and capture ERROR+ records as events — a back door for
+            # PII/message bodies into Sentry. Disable both behaviours (level and
+            # event_level = None); we capture exceptions explicitly via the ASGI
+            # integration instead. See never-break rule #5.
+            LoggingIntegration(level=None, event_level=None),
         ],
         traces_sample_rate=0.1 if settings.is_production else 1.0,
     )
