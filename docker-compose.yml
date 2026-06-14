@@ -1,0 +1,29 @@
+# Local-dev Postgres so the backend can run migrations and integration tests
+# without depending on (or polluting) the Supabase dev database.
+#
+#   docker compose up -d        # start Postgres on localhost:5432
+#   docker compose down         # stop (data persists in the named volume)
+#   docker compose down -v      # stop and wipe the data volume
+#
+# Credentials are local-only and intentionally trivial. Never reuse these
+# anywhere real — production secrets come from Fly secrets at runtime.
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: stoop
+      POSTGRES_USER: stoop
+      POSTGRES_PASSWORD: stoop
+    ports:
+      - "5432:5432"
+    volumes:
+      - stoop_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stoop -d stoop"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  stoop_pgdata:
