@@ -1,0 +1,37 @@
+# Repo-root pre-commit hooks.
+# The Python backend lives in apps/api (uv project); hooks scope themselves
+# to that subtree and run through `uv run` so the pinned project versions of
+# ruff/mypy are used — no version drift between local, CI, and pre-commit.
+#
+# Setup:  uv tool install pre-commit && pre-commit install
+default_install_hook_types: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check (apps/api)
+        entry: uv run --directory apps/api ruff check --fix .
+        language: system
+        pass_filenames: false
+        files: ^apps/api/.*\.py$
+
+      - id: ruff-format
+        name: ruff format (apps/api)
+        entry: uv run --directory apps/api ruff format .
+        language: system
+        pass_filenames: false
+        files: ^apps/api/.*\.py$
+
+      - id: mypy
+        name: mypy strict (apps/api)
+        entry: uv run --directory apps/api mypy app
+        language: system
+        pass_filenames: false
+        # only fires once application code exists (app/ lands in #5)
+        files: ^apps/api/app/.*\.py$
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
