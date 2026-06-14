@@ -194,6 +194,9 @@ def test_init_sentry_calls_sdk_init_when_dsn_set() -> None:
     assert call_kwargs.get("send_default_pii") is False, (
         "send_default_pii must be False — prevents JWT/body leakage"
     )
+    assert call_kwargs.get("include_local_variables") is False, (
+        "include_local_variables must be False — frame locals hold the JWT"
+    )
 
 
 @pytest.mark.unit
@@ -211,6 +214,7 @@ def test_init_sentry_send_default_pii_false_in_production() -> None:
 
     call_kwargs = mock_sdk_init.call_args.kwargs
     assert call_kwargs.get("send_default_pii") is False
+    assert call_kwargs.get("include_local_variables") is False
 
 
 @pytest.mark.unit
