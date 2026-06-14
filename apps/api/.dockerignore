@@ -1,0 +1,18 @@
+# Keep the build context (and final image) small and secret-free.
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+.git/
+.gitignore
+
+# Tests and docs are not needed in the runtime image.
+tests/
+*.md
+
+# Tooling caches.
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
