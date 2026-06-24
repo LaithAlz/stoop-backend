@@ -16,7 +16,7 @@ from app.config import settings
 from app.integrations.supabase_auth import AuthError
 from app.middleware.request_id import RequestIDMiddleware
 from app.observability import configure_logging, init_sentry
-from app.routers import health
+from app.routers import health, me
 
 log = structlog.get_logger(__name__)
 
@@ -82,6 +82,7 @@ def create_app() -> fastapi.FastAPI:
     )
 
     application.include_router(health.router)
+    application.include_router(me.router)
 
     # auth-test: always registered so engineers can verify JWT plumbing with
     # real Supabase tokens in any environment.
