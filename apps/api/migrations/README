@@ -1,0 +1,12 @@
+Stoop API — Alembic migrations
+
+Run with:
+    uv run alembic upgrade head        # apply all migrations
+    uv run alembic downgrade -1        # roll back one migration
+    uv run alembic current             # show current revision
+    uv run alembic history             # show migration history
+
+The database URL is read from the DATABASE_URL environment variable via
+app.config.settings — never hardcoded here.
+
+See alembic.ini for configuration.
