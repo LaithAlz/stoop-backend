@@ -18,8 +18,8 @@ jobs:
       run:
         working-directory: apps/api
 
-    # Postgres for tests that need a DB (integration tests + Alembic land with
-    # #8/#9). Unit tests don't touch it, but the service is here and ready.
+    # Postgres for the Alembic migration step and the integration tests
+    # (DB via this service). Unit tests don't touch it.
     services:
       postgres:
         image: postgres:15
@@ -61,8 +61,8 @@ jobs:
       - name: Mypy (strict)
         run: uv run mypy app
 
-      # NOTE: `alembic upgrade head` against the Postgres service lands with #8
-      # (Alembic setup), which is blocked on the Supabase project (#3/#4).
+      - name: Alembic migrate
+        run: uv run alembic upgrade head
 
       - name: Pytest
         run: uv run pytest -m "not eval"
