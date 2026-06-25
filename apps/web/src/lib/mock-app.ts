@@ -36,8 +36,7 @@ export const queue: QueueItem[] = [
     tenantPhoneMasked: "+1 905 ●●● 4421",
     severity: "emergency",
     receivedAgo: "2 min ago",
-    tenantMessage:
-      "There's water flooding from the ceiling — it's getting on the bed!!",
+    tenantMessage: "There's water flooding from the ceiling — it's getting on the bed!!",
     hasPhoto: true,
     draftReply:
       "Maria — this is an emergency. I'm contacting your landlord right now. If anyone is in danger or it's gas/fire, call 911. Move valuables and turn off the water main if you can.",
@@ -51,8 +50,7 @@ export const queue: QueueItem[] = [
     tenantPhoneMasked: "+1 416 ●●● 7421",
     severity: "urgent",
     receivedAgo: "17 min ago",
-    tenantMessage:
-      "Kitchen sink is pooling water underneath — started this morning.",
+    tenantMessage: "Kitchen sink is pooling water underneath — started this morning.",
     hasPhoto: true,
     draftReply:
       "Hi Jesse — thanks for the photo. That looks like a slow leak from the trap. I'll have Mike from Mike's Plumbing reach out today to take a look. In the meantime, put a bucket under the trap and try not to use that sink. I'll confirm the window once Mike replies.",

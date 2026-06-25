@@ -62,7 +62,7 @@ export function SiteFooter() {
       </div>
 
       <div className="mx-auto mt-12 flex max-w-7xl flex-col items-start justify-between gap-2 border-t border-border pt-6 text-xs text-ink-muted md:flex-row md:items-center">
-        <p>© {new Date().getFullYear()} Stoop. Maintenance triage for small landlords.</p>
+        <p>© {new Date().getFullYear()} Stoop. Tenant maintenance, handled for small landlords.</p>
         <p>Made in the GTA.</p>
       </div>
     </footer>

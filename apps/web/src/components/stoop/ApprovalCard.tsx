@@ -51,11 +51,7 @@ export function ApprovalCard({
           <Pencil className="size-4" aria-hidden="true" />
           Edit draft
         </Button>
-        <Button
-          type="button"
-          className="h-14 min-h-11 text-base font-semibold"
-          onClick={onApprove}
-        >
+        <Button type="button" className="h-14 min-h-11 text-base font-semibold" onClick={onApprove}>
           <Check className="size-4" aria-hidden="true" />
           Approve & send
         </Button>

@@ -14,7 +14,7 @@ export const Route = createFileRoute("/privacy")({
       { property: "og:title", content: "Privacy Policy — Stoop." },
       {
         property: "og:description",
-        content: "Privacy practices for Stoop. maintenance triage.",
+        content: "Privacy practices for Stoop. — tenant maintenance, handled.",
       },
     ],
   }),
