@@ -41,6 +41,16 @@ Eval scenarios E1 and E2 must trip Tier 0 (add `prefilter_must_fire: true`
 to both), and a negative suite asserts the guards (R-class "detector
 chirping" must NOT fire). The two layers can never drift apart silently.
 
+**PrefilterResult shape** (`app/agent/schemas.py`, the canonical type
+`check()` returns and that is snapshotted into `messages.prefilter` jsonb):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `hard_hit` | bool | True if any HARD trigger category matched |
+| `categories` | list[str] | HARD categories that fired: `fire`, `gas_co`, `water`, `security`, `person` |
+| `soft_annotations` | list[str] | SOFT matches: `no_heat`, `freezing`, `sparks`, `leak`, `locked_out` |
+| `guards` | list[str] | guard patterns that matched but were overridden by a trigger (kept for review) |
+
 ## How Tier 0 and the classifier compose
 
 ```
