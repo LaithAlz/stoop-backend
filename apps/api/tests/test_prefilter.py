@@ -749,3 +749,331 @@ class TestEvalScenarios:
         """Another R-class variant: continuous 'beeping' with battery mention."""
         result = _not_hard("the smoke alarm keeps beeping, I think it needs a new battery")
         assert "smoke_detector_battery" in result.guards
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: BLOCKING #1 — guard over-suppression (anchor-token suppression)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionBlocking1GuardOverSuppression:
+    """Guard over-suppression was the worst defect: the smoke-detector battery
+    guard was swallowing INDEPENDENT fire triggers because the proximity trigger
+    anchored on the FIRST 'smoke' token (inside the guard phrase) whose full
+    match span overlapped the guard span.  The fix: suppression is keyed on
+    the ANCHOR TOKEN span, not the full match.  A guard's .{0,80} tail no
+    longer extends its suppression range over downstream tokens.
+
+    INVARIANT: if any keyword occurrence satisfies a trigger and that anchor
+    token is NOT inside any guard core phrase, hard_hit MUST be True.
+    """
+
+    @pytest.mark.unit
+    def test_smoke_filling_kitchen_with_detector_mention(self) -> None:
+        """Second 'smoke' (filling the kitchen) is independent of detector mention."""
+        result = check("smoke detector chirping but smoke is filling the kitchen")
+        assert result.hard_hit is True, f"Expected hard_hit=True: {result}"
+        assert "fire" in result.categories
+        assert "smoke_detector_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_smoke_detector_beeping_smoke_everywhere(self) -> None:
+        """'smoke everywhere' is a standalone trigger; detector/beeping mention guarded."""
+        result = check("smoke detector beeping smoke everywhere")
+        assert result.hard_hit is True, f"Expected hard_hit=True: {result}"
+        assert "fire" in result.categories
+        assert "smoke_detector_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_smoke_detector_low_battery_smoke_filling_unit(self) -> None:
+        """Low battery mention + real smoke filling unit — must still fire."""
+        result = check("the smoke detector low battery there is smoke filling the unit now help")
+        assert result.hard_hit is True, f"Expected hard_hit=True: {result}"
+        assert "fire" in result.categories
+        assert "smoke_detector_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_smoke_detector_and_fire_alarm_chirping(self) -> None:
+        """Bare 'fire' in 'fire alarm' must NOT be swallowed by the .{0,80} guard window.
+
+        The guard core span is 'smoke (detector|alarm)', not 'smoke ... chirping'.
+        'fire' at position ~27 is outside the core span and must fire.
+        """
+        result = check("the smoke detector and the fire alarm keep chirping")
+        assert result.hard_hit is True, f"Expected hard_hit=True: {result}"
+        assert "fire" in result.categories
+        assert "smoke_detector_battery" in result.guards
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: BLOCKING #2 — breathing-distress family
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionBlocking2BreathingDistress:
+    """The old pattern required 'can t breathe' (with 'e'), missing 'breath'
+    (no trailing 'e') and missing 'cannot'/'can not' forms."""
+
+    @pytest.mark.unit
+    def test_i_cant_breath(self) -> None:
+        """'cant breath' (no 'e') — common informal spelling."""
+        _hard("i cant breath", "person")
+
+    @pytest.mark.unit
+    def test_cant_breath_short(self) -> None:
+        """Shortest form — still must fire."""
+        _hard("cant breath", "person")
+
+    @pytest.mark.unit
+    def test_cannot_breathe(self) -> None:
+        """'cannot breathe' — formal spelling."""
+        _hard("cannot breathe", "person")
+
+    @pytest.mark.unit
+    def test_she_can_not_breathe(self) -> None:
+        """'can not breathe' with space — also must fire."""
+        _hard("she can not breathe", "person")
+
+    @pytest.mark.unit
+    def test_having_trouble_breathing(self) -> None:
+        """Distress proximity form — 'trouble' near 'breathing'."""
+        _hard("having trouble breathing", "person")
+
+    @pytest.mark.unit
+    def test_struggling_to_breathe(self) -> None:
+        """Distress proximity form — 'struggling' near 'breathe'."""
+        _hard("struggling to breathe", "person")
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: BLOCKING #3 — pipe burst (reverse word order)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionBlocking3PipeBurst:
+    """The old pattern only had 'burst pipe'; 'pipe burst' is equally common."""
+
+    @pytest.mark.unit
+    def test_pipe_burst_bare(self) -> None:
+        """'pipe burst' — most common tenant shorthand."""
+        _hard("pipe burst", "water")
+
+    @pytest.mark.unit
+    def test_the_pipe_just_burst(self) -> None:
+        _hard("the pipe just burst", "water")
+
+    @pytest.mark.unit
+    def test_a_pipe_has_burst(self) -> None:
+        _hard("a pipe has burst", "water")
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: BLOCKING #4 — elevator entrapment phrasings
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionBlocking4ElevatorEntrapment:
+    """The old patterns required 'elevator stuck/trapped' or 'trapped in elevator';
+    'stuck in the elevator' and 'elevator is stuck' were missed."""
+
+    @pytest.mark.unit
+    def test_stuck_in_the_elevator(self) -> None:
+        _hard("stuck in the elevator", "person")
+
+    @pytest.mark.unit
+    def test_im_stuck_in_an_elevator(self) -> None:
+        _hard("im stuck in an elevator", "person")
+
+    @pytest.mark.unit
+    def test_the_elevator_is_stuck(self) -> None:
+        """'elevator is stuck' — gap between 'elevator' and 'stuck'."""
+        _hard("the elevator is stuck", "person")
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: BLOCKING #5 — broke into / breaking into
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionBlocking5BrokeInto:
+    """The old patterns ended at 'in' ('\bbreaking in\b'); '\bin\b' word
+    boundary prevented matching 'into' because '\b' sits before the 'to'."""
+
+    @pytest.mark.unit
+    def test_broke_into_apartment(self) -> None:
+        _hard("someone broke into the apartment", "security")
+
+    @pytest.mark.unit
+    def test_broke_into_my_place(self) -> None:
+        _hard("they broke into my place", "security")
+
+    @pytest.mark.unit
+    def test_breaking_into_apartment(self) -> None:
+        _hard("someone is breaking into my apartment", "security")
+
+    @pytest.mark.unit
+    def test_breaking_into_unit(self) -> None:
+        _hard("hes breaking into the unit", "security")
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: Recommended additions (safety-reviewer)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionRecommendedAdditions:
+    """Additional patterns recommended by safety review per bias rule."""
+
+    @pytest.mark.unit
+    def test_gas_is_leaking(self) -> None:
+        """'gas is leaking' — verb form not covered by old gas + leak proximity."""
+        _hard("gas is leaking", "gas_co")
+
+    @pytest.mark.unit
+    def test_gas_leaking_from_stove(self) -> None:
+        _hard("gas leaking from the stove", "gas_co")
+
+    @pytest.mark.unit
+    def test_smoke_alarm_blaring(self) -> None:
+        """Continuous alarm — rubric: a CONTINUOUS alarm is EMERGENCY."""
+        _hard("the smoke alarm is blaring", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_alarm_wont_stop(self) -> None:
+        _hard("smoke alarm wont stop", "fire")
+
+    @pytest.mark.unit
+    def test_nonstop_smoke_alarm(self) -> None:
+        """'nonstop' before 'smoke alarm' — reverse-order form."""
+        _hard("nonstop smoke alarm going off", "fire")
+
+    @pytest.mark.unit
+    def test_continuous_smoke_alarm(self) -> None:
+        """'continuous' before 'smoke alarm' — reverse-order form."""
+        _hard("continuous smoke alarm", "fire")
+
+    @pytest.mark.unit
+    def test_water_dripping_onto_outlet(self) -> None:
+        """Water + electrical contact = EMERGENCY per rubric."""
+        _hard("water is dripping onto the outlet", "water")
+
+    @pytest.mark.unit
+    def test_water_near_breaker_panel(self) -> None:
+        _hard("water near the breaker panel", "water")
+
+    @pytest.mark.unit
+    def test_water_near_wiring(self) -> None:
+        _hard("water touching the wiring in the wall", "water")
+
+    @pytest.mark.unit
+    def test_overdosed(self) -> None:
+        """'overdosed' (past tense) — must match 'overdose(d)?'."""
+        _hard("she overdosed on something", "person")
+
+    @pytest.mark.unit
+    def test_overdose(self) -> None:
+        """Bare 'overdose' (present form)."""
+        _hard("tenant may have had an overdose", "person")
+
+    @pytest.mark.unit
+    def test_collapsed(self) -> None:
+        """'collapsed' — strong medical emergency signal."""
+        _hard("he collapsed in the hallway", "person")
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: Must NOT regress — routine guard cases (confirmed hard_hit=False)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionMustNotRegress:
+    """These four cases were called out explicitly as must-not-fire.
+    Run every time to detect any broadening that accidentally breaks guards."""
+
+    @pytest.mark.unit
+    def test_smoke_detector_battery_chirping_still_guarded(self) -> None:
+        result = _not_hard("smoke detector battery chirping")
+        assert "smoke_detector_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_smoke_alarm_keeps_beeping_low_battery_still_guarded(self) -> None:
+        result = _not_hard("the smoke alarm keeps beeping low battery")
+        assert "smoke_detector_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_drill_at_2pm_today_still_guarded(self) -> None:
+        result = _not_hard("fire drill at 2pm today")
+        assert "fire_drill" in result.guards
+
+    @pytest.mark.unit
+    def test_annual_fire_alarm_test_tomorrow_still_guarded(self) -> None:
+        result = _not_hard("annual fire alarm test tomorrow")
+        assert "fire_alarm_test" in result.guards
+
+    @pytest.mark.unit
+    def test_continuous_alarm_guard_does_not_suppress_blaring(self) -> None:
+        """Blaring/nonstop/continuous smoke alarm is EMERGENCY, NOT guarded.
+        Verify the battery guard does NOT suppress 'blaring' smoke alarm."""
+        result = check("the smoke alarm is blaring")
+        assert result.hard_hit is True
+        assert "fire" in result.categories
+        # battery guard must NOT be present (no battery/chirp mention)
+        assert "smoke_detector_battery" not in result.guards
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: Invariant — independent trigger + guard phrase co-location
+# ---------------------------------------------------------------------------
+
+
+class TestAnchorTokenInvariant:
+    """Explicit invariant: for every curated 'guard phrase + independent
+    trigger keyword' message, hard_hit MUST be True.
+
+    These verify the anchor-token suppression algorithm: a guard may only
+    suppress anchor tokens that fall inside its CORE phrase span.
+    """
+
+    @pytest.mark.unit
+    def test_invariant_smoke_detector_then_smoke_filling(self) -> None:
+        """Guard phrase first; independent smoke trigger later."""
+        result = check("smoke detector chirping but smoke is filling the kitchen")
+        assert result.hard_hit is True
+        assert "fire" in result.categories
+        assert "smoke_detector_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_invariant_smoke_everywhere_after_battery_mention(self) -> None:
+        result = check("smoke detector beeping smoke everywhere")
+        assert result.hard_hit is True
+        assert "fire" in result.categories
+
+    @pytest.mark.unit
+    def test_invariant_fire_outside_guard_window(self) -> None:
+        """'fire' in 'fire alarm keep chirping' is outside the guard core span."""
+        result = check("the smoke detector and the fire alarm keep chirping")
+        assert result.hard_hit is True
+        assert "fire" in result.categories
+
+    @pytest.mark.unit
+    def test_invariant_fire_drill_with_real_fire(self) -> None:
+        """'fire drill' guard does not suppress later 'real fire'."""
+        result = check("fire drill earlier but real fire in stairwell")
+        assert result.hard_hit is True
+        assert "fire" in result.categories
+        assert "fire_drill" in result.guards
+
+    @pytest.mark.unit
+    def test_invariant_fire_alarm_test_with_real_fire(self) -> None:
+        """'fire alarm test' guard does not suppress 'fire in 4B'."""
+        result = check("fire alarm test today but fire in 4B")
+        assert result.hard_hit is True
+        assert "fire" in result.categories
+        assert "fire_alarm_test" in result.guards
+
+    @pytest.mark.unit
+    def test_invariant_guard_recorded_when_trigger_wins(self) -> None:
+        """When trigger beats guard, guard is still recorded in guards field."""
+        result = check("smoke detector is beeping battery but smoke is everywhere")
+        assert result.hard_hit is True
+        assert "smoke_detector_battery" in result.guards

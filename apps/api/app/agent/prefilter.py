@@ -1,6 +1,6 @@
-"""Tier-0 deterministic emergency pre-filter.
+r"""Tier-0 deterministic emergency pre-filter.
 
-Pure functions only — no I/O, no network, no DB, no Anthropic calls.
+Pure functions only -- no I/O, no network, no DB, no Anthropic calls.
 Sub-millisecond per call.  Called synchronously in the Twilio webhook
 handler BEFORE the agent graph is invoked.
 
@@ -8,9 +8,9 @@ Version coupling
 ----------------
 ``PREFILTER_VERSION`` is pinned to the rubric version it was generated
 from.  When the rubric is bumped to v1.1 a new prefilter module is
-created (prefilter_v2.py) — never edit the patterns in place.
+created (prefilter_v2.py) -- never edit the patterns in place.
 
-``prefilter v1.0  ⟺  rubric v1.0``
+``prefilter v1.0  <->  rubric v1.0``
 
 HARD trigger list source
 ------------------------
@@ -18,31 +18,51 @@ Patterns are derived from the EMERGENCY section of
 ``docs/02-product/severity-rubric-v1.md`` v1.0 (frozen 2026-06-11) and
 the canonical category list in ``docs/02-product/emergency-prefilter.md``.
 
-Guard semantics
----------------
-A guard suppresses *only* the specific trigger matches whose span falls
-inside (or overlaps with) the guard condition's own match span.  The
-algorithm:
+Guard semantics (re-architected from d8c83f1)
+---------------------------------------------
+The old implementation recorded the full match span of a proximity trigger
+and the full span of a guard's ``.{0,80}`` window.  This caused two failure
+modes:
 
-1. Normalize the text (lowercase, punctuation → space, collapse whitespace).
-2. For each HARD trigger pattern, find ALL match spans in the normalized
-   string.  Each (trigger_index, span) pair is a "hit slot".
-3. For each guard, find all match spans of the guard's condition pattern.
-   If any guard match span exists, record the guard name (it has activated).
-4. For each active hit slot, check whether the trigger match span is
-   fully covered by ANY guard match span in the same protected category.
+  1. Guard over-suppression: a proximity trigger anchored on the FIRST
+     keyword occurrence (inside the guard phrase) had its full span overlap
+     the guard span, so it was suppressed even though the proximity
+     condition was actually satisfied by a LATER, independent keyword
+     occurrence.
+
+  2. Wide-window suppression: the guard's ``.{0,80}`` tail stretched its
+     suppression span over unrelated downstream tokens (e.g. "fire" inside
+     "fire alarm" when the guard was triggered by "smoke detector chirping").
+
+The fixed algorithm uses ANCHOR-TOKEN suppression:
+
+1. Normalize the text (lowercase, punctuation -> space, collapse whitespace).
+2. For each trigger, find all match spans.  For SIMPLE triggers (no
+   proximity anchor needed) the full match span IS the anchor span.
+   For PROXIMITY triggers: enumerate every anchor keyword token; for each
+   occurrence check whether a proximity word appears within window_chars;
+   record a hit slot keyed on the ANCHOR token span (not the full window).
+3. For each guard, find all match spans of the guard's CORE pattern
+   (the literal phrase span only -- e.g. ``\bsmoke\s+(detector|alarm)\b``
+   -- NOT the ``{0,80}`` window).  If the full guard pattern matches,
+   record the guard name.  Suppression uses only the core-pattern spans.
+4. For each active hit slot, check whether the hit's ANCHOR token span
+   falls inside ANY guard suppression span in the same protected category.
    If so, remove that hit slot.
-5. After all guards: if ANY hit slot remains → ``hard_hit = True``.
+5. After all guards: if ANY hit slot remains -> ``hard_hit = True``.
 
 Key invariants:
-- A guard only suppresses trigger matches that fall WITHIN its own matched
-  span.  This prevents the guard trigger_sub from matching an independent
-  later occurrence of the same keyword.
-- Guards are always recorded in ``guards`` when their pattern matches,
-  whether or not they successfully suppressed anything (so the review log
-  is complete in both the suppressed and the overridden case).
-- A fire-drill guard matching "fire drill" only neutralises the "fire"
-  token inside "fire drill", not a subsequent independent "fire" token.
+- A proximity trigger hit is keyed on each qualifying ANCHOR keyword token,
+  not the full match.  Multiple anchor occurrences in one message each
+  produce independent hit slots.
+- A guard suppresses only anchor tokens that fall WITHIN its CORE phrase
+  span (e.g. the ``smoke detector`` tokens), never tokens downstream of
+  the ``.{0,80}`` window.
+- Guards are always recorded in ``guards`` when their full pattern matches,
+  whether or not they successfully suppressed anything.
+- INVARIANT: if ANY anchor keyword occurrence satisfies a trigger condition
+  and that anchor token does NOT fall inside ANY guard core span,
+  ``hard_hit = True``.
 
 Public API
 ----------
@@ -93,8 +113,18 @@ def _re(pattern: str) -> re.Pattern[str]:
 # ---------------------------------------------------------------------------
 # HARD trigger definitions
 # ---------------------------------------------------------------------------
-# Each trigger is a (category, compiled_pattern) pair.  One message can
-# fire multiple categories; all that fire are recorded.
+# Each trigger is either:
+#   - A SIMPLE trigger: one compiled pattern whose full match span is the
+#     anchor span recorded in the hit slot.
+#   - A PROXIMITY trigger: an anchor_pattern (finds the keyword token) plus
+#     a proximity_pattern applied to a window around each anchor occurrence.
+#     Hit slots are keyed on the ANCHOR token span, not the full window.
+#
+# This architecture prevents the guard-over-suppression bug: even when an
+# earlier keyword occurrence falls inside a guard phrase, a later independent
+# occurrence of the same keyword that satisfies the proximity condition
+# produces its OWN hit slot at the later token's position, which is outside
+# the guard core span and therefore NOT suppressed.
 #
 # Word-boundary note: \\b is used broadly but the bias rule applies — when
 # a word boundary would cause a miss on a realistic tenant phrasing, we
@@ -104,9 +134,60 @@ def _re(pattern: str) -> re.Pattern[str]:
 
 
 @dataclass(frozen=True)
-class _Trigger:
+class _SimpleTrigger:
+    """A trigger whose match span is directly the anchor span."""
+
     category: str
     pattern: re.Pattern[str]
+
+
+@dataclass(frozen=True)
+class _ProximityTrigger:
+    """A trigger that finds an anchor keyword and checks proximity condition.
+
+    ``anchor_pattern`` finds every occurrence of the keyword token.
+    ``proximity_fwd`` is checked against text from anchor_start to
+    anchor_end + window_chars.
+    ``proximity_bwd`` is checked against text from anchor_start - window_chars
+    to anchor_end.
+    Either fwd OR bwd hit counts.
+    """
+
+    category: str
+    anchor_pattern: re.Pattern[str]
+    proximity_fwd: re.Pattern[str] | None
+    proximity_bwd: re.Pattern[str] | None
+    window_chars: int = 60
+
+
+_Trigger = _SimpleTrigger | _ProximityTrigger
+
+
+def _make_proximity(
+    category: str,
+    anchor: str,
+    proximity_words: str,
+    window: int = 40,
+    allow_bwd: bool = True,
+) -> list[_ProximityTrigger]:
+    """Return a list of forward and optionally backward proximity triggers.
+
+    ``anchor`` is the regex for the anchor keyword (e.g. ``r"\\bsmoke\\b"``).
+    ``proximity_words`` is the alternation group for the proximity condition
+    (e.g. ``r"(smell|filling|everywhere)"``).
+    """
+    anchor_pat = _re(anchor)
+    prox_pat = _re(r"\b" + proximity_words + r"\b")
+    result: list[_ProximityTrigger] = [
+        _ProximityTrigger(
+            category=category,
+            anchor_pattern=anchor_pat,
+            proximity_fwd=prox_pat,
+            proximity_bwd=prox_pat if allow_bwd else None,
+            window_chars=window,
+        )
+    ]
+    return result
 
 
 _HARD_TRIGGERS: list[_Trigger] = [
@@ -114,91 +195,146 @@ _HARD_TRIGGERS: list[_Trigger] = [
     # "fire" as a standalone word.
     # Word boundaries prevent matching "campfire", "fireplace", "fired" etc.
     # Guards handle "fire drill" and "fire alarm test" as false-positive cases.
-    _Trigger("fire", _re(r"\bfire\b")),
-    # "smoke" near smell/filling/everywhere (within 40 chars either direction)
-    _Trigger("fire", _re(r"\bsmoke\b.{0,40}\b(smell|filling|everywhere)\b")),
-    _Trigger("fire", _re(r"\b(smell|filling|everywhere)\b.{0,40}\bsmoke\b")),
+    _SimpleTrigger("fire", _re(r"\bfire\b")),
+    # "smoke" near smell/filling/everywhere — PROXIMITY trigger anchored on
+    # each "smoke" token independently.  This prevents the guard from
+    # suppressing a later independent "smoke" that satisfies the condition.
+    *_make_proximity("fire", r"\bsmoke\b", r"(smell|filling|everywhere)"),
     # "burning smell" / "smell of burning"
-    _Trigger("fire", _re(r"\bburning\s+smell\b")),
-    _Trigger("fire", _re(r"\bsmell\s+of\s+burning\b")),
+    _SimpleTrigger("fire", _re(r"\bburning\s+smell\b")),
+    _SimpleTrigger("fire", _re(r"\bsmell\s+of\s+burning\b")),
+    # Continuous smoke alarm (rubric: a CONTINUOUS alarm is EMERGENCY).
+    # Two patterns: alarm first, then modifier; and modifier first, then alarm.
+    # These are SIMPLE triggers — not guarded by the battery/chirp guard
+    # because "blaring/nonstop/continuous/going off" != battery chirp.
+    _SimpleTrigger(
+        "fire",
+        _re(
+            r"\bsmoke\s+(alarm|detector)\b.{0,30}"
+            r"\b(blaring|wont\s+stop|won\s*t\s+stop|continuous|nonstop|going\s+off)\b"
+        ),
+    ),
+    _SimpleTrigger(
+        "fire",
+        _re(
+            r"\b(blaring|wont\s+stop|won\s*t\s+stop|continuous|nonstop)\b.{0,30}"
+            r"\bsmoke\s+(alarm|detector)\b"
+        ),
+    ),
     # ---------------------------------------------------------------- gas_co
     # "gas" near smell/leak/smells (within 40 chars either direction)
-    _Trigger("gas_co", _re(r"\bgas\b.{0,40}\b(smell|leak|smells)\b")),
-    _Trigger("gas_co", _re(r"\b(smell|leak|smells)\b.{0,40}\bgas\b")),
+    *_make_proximity("gas_co", r"\bgas\b", r"(smell|leak|smells|leaking)"),
+    # "leak" near "gas" (reverse order proximity)
+    *_make_proximity("gas_co", r"\bleak(s|ing)?\b", r"gas"),
     # carbon monoxide (spelled out)
-    _Trigger("gas_co", _re(r"\bcarbon\s+monoxide\b")),
+    _SimpleTrigger("gas_co", _re(r"\bcarbon\s+monoxide\b")),
     # CO alarm / CO detector
-    _Trigger("gas_co", _re(r"\bco\s+(alarm|detector)\b")),
+    _SimpleTrigger("gas_co", _re(r"\bco\s+(alarm|detector)\b")),
     # "alarm/detector going off" or "sounding" — covers CO alarm sounding
-    _Trigger("gas_co", _re(r"\b(alarm|detector)\s+going\s+off\b")),
-    _Trigger("gas_co", _re(r"\b(alarm|detector)\s+sounding\b")),
+    _SimpleTrigger("gas_co", _re(r"\b(alarm|detector)\s+going\s+off\b")),
+    _SimpleTrigger("gas_co", _re(r"\b(alarm|detector)\s+sounding\b")),
     # --------------------------------------------------------------- water
     # flood / flooding
-    _Trigger("water", _re(r"\bflood(ing)?\b")),
-    # burst pipe
-    _Trigger("water", _re(r"\bburst\s+pipe\b")),
+    _SimpleTrigger("water", _re(r"\bflood(ing)?\b")),
+    # burst pipe (both word orders)
+    _SimpleTrigger("water", _re(r"\bburst\s+pipe\b")),
+    _SimpleTrigger("water", _re(r"\bpipe\b.{0,20}\bburst\b")),
     # "water" near active-flow words (within 60 chars either direction)
-    _Trigger(
+    *_make_proximity(
         "water",
-        _re(r"\bwater\b.{0,60}\b(pouring|gushing|coming\s+through|through\s+the\s+ceiling)\b"),
+        r"\bwater\b",
+        r"(pouring|gushing|coming\s+through|through\s+the\s+ceiling)",
+        window=60,
     ),
-    _Trigger(
+    # water + electrical contact (rubric: water on electrical = EMERGENCY)
+    *_make_proximity(
         "water",
-        _re(r"\b(pouring|gushing|coming\s+through|through\s+the\s+ceiling)\b.{0,60}\bwater\b"),
+        r"\bwater\b",
+        r"(outlet|electrical|breaker|panel|wiring|socket|light\s+fixture)",
+        window=40,
     ),
     # sewage (backup is always an emergency)
-    _Trigger("water", _re(r"\bsewage\b")),
+    _SimpleTrigger("water", _re(r"\bsewage\b")),
     # ------------------------------------------------------------- security
-    _Trigger("security", _re(r"\bbreaking\s+in\b")),
-    _Trigger("security", _re(r"\bbroke\s+in\b")),
-    _Trigger("security", _re(r"\bbreak\s+in\b")),
-    _Trigger("security", _re(r"\bintruder\b")),
-    _Trigger("security", _re(r"\bsomeone\s+is\s+trying\s+to\s+get\s+in\b")),
+    _SimpleTrigger("security", _re(r"\bbreaking\s+in(to)?\b")),
+    _SimpleTrigger("security", _re(r"\bbroke\s+in(to)?\b")),
+    _SimpleTrigger("security", _re(r"\bbreak\s+in(to)?\b")),
+    _SimpleTrigger("security", _re(r"\bintruder\b")),
+    _SimpleTrigger("security", _re(r"\bsomeone\s+is\s+trying\s+to\s+get\s+in\b")),
     # -------------------------------------------------------------- person
-    _Trigger("person", _re(r"\b911\b")),
-    _Trigger("person", _re(r"\bambulance\b")),
-    # "can't breathe" / "cant breathe" (apostrophe stripped by normalization)
-    _Trigger("person", _re(r"\bcan\s*t\s+breathe\b")),
-    _Trigger("person", _re(r"\bunconsci(ous)?\b")),
+    _SimpleTrigger("person", _re(r"\b911\b")),
+    _SimpleTrigger("person", _re(r"\bambulance\b")),
+    # breathing distress — "can't breathe", "cannot breathe", "can not breathe",
+    # "cant breath" (apostrophe stripped by normalization, trailing 'e' optional)
+    _SimpleTrigger("person", _re(r"\b(can\s*t|cannot|can\s+not)\s+breath(e)?\b")),
+    # proximity: trouble/struggling/hard near breathing
+    _SimpleTrigger(
+        "person",
+        _re(r"\b(trouble|struggling|hard|cant|cannot)\b.{0,20}\bbreath(e|ing)?\b"),
+    ),
+    _SimpleTrigger("person", _re(r"\bunconsci(ous)?\b")),
     # Additional patterns clearly implied by rubric EMERGENCY "medical emergency"
     # Bias rule: include rather than omit.
-    _Trigger("person", _re(r"\bheart\s+attack\b")),
-    _Trigger("person", _re(r"\bseizure\b")),
-    _Trigger("person", _re(r"\bnot\s+breathing\b")),
-    # Elevator entrapment is listed explicitly in the rubric EMERGENCY section.
-    _Trigger("person", _re(r"\belevator\s+(entrapment|stuck|trapped)\b")),
-    _Trigger("person", _re(r"\btrapped\s+in\s+(the\s+)?elevator\b")),
+    _SimpleTrigger("person", _re(r"\bheart\s+attack\b")),
+    _SimpleTrigger("person", _re(r"\bseizure\b")),
+    _SimpleTrigger("person", _re(r"\bnot\s+breathing\b")),
+    # overdose(d) / collapsed — strong medical emergency signals
+    _SimpleTrigger("person", _re(r"\boverdose(d)?\b")),
+    _SimpleTrigger("person", _re(r"\bcollapsed\b")),
+    # Elevator entrapment — both word orders + gap form
+    _SimpleTrigger("person", _re(r"\belevator\s+(entrapment|stuck|trapped)\b")),
+    _SimpleTrigger("person", _re(r"\btrapped\s+in\s+(the\s+|an\s+)?elevator\b")),
+    _SimpleTrigger("person", _re(r"\bstuck\s+in\s+(the\s+|an\s+)?elevator\b")),
+    # "elevator" near stuck/trapped/entrapment with a gap allowed
+    _SimpleTrigger(
+        "person",
+        _re(r"\belevator\b.{0,15}\b(stuck|trapped|entrapment|not\s+moving)\b"),
+    ),
 ]
 
 # ---------------------------------------------------------------------------
 # Guard definitions
 # ---------------------------------------------------------------------------
 # Each guard defines:
-#   name      — recorded in PrefilterResult.guards when this guard activates.
-#   pattern   — the guard condition; MUST match for the guard to activate.
-#   protects  — which trigger category this guard can suppress.
+#   name        — recorded in PrefilterResult.guards when this guard activates.
+#   pattern     — the FULL guard condition (must match for guard to activate).
+#   core_pattern — the CORE phrase span used for suppression.  Anchor tokens
+#                 whose span falls WITHIN a core_pattern match are suppressed.
+#                 This is tighter than pattern and does NOT include the
+#                 ``.{0,80}`` proximity tail.
+#   protects    — which trigger category this guard can suppress.
 #
-# Suppression logic (see module docstring):
-#   A trigger hit slot (trigger_index, span) is suppressed when:
+# Suppression logic:
+#   A trigger hit slot (anchor_start, anchor_end) is suppressed when:
 #     1. The trigger is in guard.protects.
-#     2. The trigger match span falls WITHIN (overlaps) ANY guard pattern
+#     2. The trigger anchor token span falls WITHIN (overlaps) ANY core_pattern
 #        match span in the normalized string.
 #
-# By anchoring suppression to the guard's OWN match span (not a secondary
-# sub-pattern), we prevent a guard from silencing an independent later
-# occurrence of the same keyword that is NOT part of the guarded phrase.
+# By anchoring suppression to the CORE phrase span (the literal guarded keyword
+# phrase, e.g. "smoke detector") rather than the full window match, we prevent
+# a guard from silencing downstream independent occurrences of the same keyword.
 #
-# Example: "fire drill earlier but real fire in the stairwell"
-#   - guard "fire_drill" matches span [0,9] ("fire drill")
-#   - trigger \bfire\b matches at span [0,4] and also at span [??] for "real fire"
-#   - only the first "fire" is within [0,9] → suppressed
-#   - second "fire" is OUTSIDE [0,9] → NOT suppressed → hard_hit=True
+# Example: "smoke detector and the fire alarm keep chirping"
+#   - guard core_pattern "smoke (detector|alarm)" matches span [4,18]
+#   - trigger \bfire\b matches at span [27,31]
+#   - [27,31] does NOT overlap [4,18] → NOT suppressed → hard_hit=True
+#
+# Example: "smoke detector battery chirping"
+#   - guard core_pattern "smoke (detector|alarm)" matches span [0,14]
+#   - proximity trigger anchor "smoke" at span [0,5] falls inside [0,14]
+#   - suppressed → hard_hit=False
+#
+# Example: "smoke detector chirping but smoke is filling the kitchen"
+#   - guard core_pattern "smoke (detector|alarm)" matches span [0,14]
+#   - anchor "smoke" at [0,5] → inside [0,14] → SUPPRESSED
+#   - anchor "smoke" at [28,33] → OUTSIDE [0,14] → NOT suppressed → hard_hit=True
 
 
 @dataclass(frozen=True)
 class _Guard:
     name: str
-    pattern: re.Pattern[str]
+    pattern: re.Pattern[str]  # Full guard condition (determines activation)
+    core_pattern: re.Pattern[str]  # Core phrase span (determines suppression range)
     protects: str
 
 
@@ -206,13 +342,15 @@ _GUARDS: list[_Guard] = [
     # smoke detector/alarm + battery/chirp/beep → routine battery-chirp case.
     # Rubric ROUTINE: "smoke-detector battery chirp (single intermittent chirp —
     # a CONTINUOUS alarm is EMERGENCY)".
-    # Suppresses fire-category trigger matches whose span falls within the
-    # guard match (i.e. the "smoke" in "smoke detector battery chirping").
+    # Core pattern: "smoke (detector|alarm)" — suppresses only smoke tokens
+    # that are part of the "smoke detector/alarm" phrase itself.
+    # The .{0,80} tail is in the full pattern (guard activation check) only.
     _Guard(
         name="smoke_detector_battery",
         pattern=_re(
             r"\bsmoke\s+(detector|alarm)\b.{0,80}\b(battery|chirp|chirping|beep|beeping|low\s+battery)\b"
         ),
+        core_pattern=_re(r"\bsmoke\s+(detector|alarm)\b"),
         protects="fire",
     ),
     _Guard(
@@ -220,19 +358,23 @@ _GUARDS: list[_Guard] = [
         pattern=_re(
             r"\b(battery|chirp|chirping|beep|beeping|low\s+battery)\b.{0,80}\bsmoke\s+(detector|alarm)\b"
         ),
+        core_pattern=_re(r"\bsmoke\s+(detector|alarm)\b"),
         protects="fire",
     ),
     # "fire drill" — the word "fire" appears inside the phrase "fire drill"
     # and must not trigger the EMERGENCY path.
+    # Core = full pattern (both are the same literal phrase, no tail window).
     _Guard(
         name="fire_drill",
         pattern=_re(r"\bfire\s+drill\b"),
+        core_pattern=_re(r"\bfire\s+drill\b"),
         protects="fire",
     ),
     # "fire alarm test" / "fire alarm testing" — scheduled test, not real fire.
     _Guard(
         name="fire_alarm_test",
         pattern=_re(r"\bfire\s+alarm\s+test(ing)?\b"),
+        core_pattern=_re(r"\bfire\s+alarm\s+test(ing)?\b"),
         protects="fire",
     ),
 ]
@@ -269,13 +411,49 @@ _SOFT_PATTERNS: list[_Soft] = [
 @dataclass
 class _HitSlot:
     trigger_idx: int
-    start: int
-    end: int
+    anchor_start: int  # start of ANCHOR TOKEN span (not full match)
+    anchor_end: int  # end of ANCHOR TOKEN span
 
 
 # ---------------------------------------------------------------------------
 # Core algorithm
 # ---------------------------------------------------------------------------
+
+
+def _collect_hit_slots(norm: str) -> list[_HitSlot]:
+    """Collect all trigger hit slots, keying each on its anchor token span.
+
+    For _SimpleTrigger: the full match span is the anchor span.
+    For _ProximityTrigger: find every anchor keyword token; for each,
+    check whether a proximity word appears within window_chars in the
+    forward or backward direction; record a hit slot at the anchor token's
+    span when the condition is met.
+    """
+    hit_slots: list[_HitSlot] = []
+    for i, trigger in enumerate(_HARD_TRIGGERS):
+        if isinstance(trigger, _SimpleTrigger):
+            for m in trigger.pattern.finditer(norm):
+                hit_slots.append(
+                    _HitSlot(trigger_idx=i, anchor_start=m.start(), anchor_end=m.end())
+                )
+        else:
+            # _ProximityTrigger — enumerate every anchor token
+            for am in trigger.anchor_pattern.finditer(norm):
+                a_start, a_end = am.start(), am.end()
+                hit = False
+                if trigger.proximity_fwd is not None:
+                    window = norm[a_start : a_end + trigger.window_chars]
+                    if trigger.proximity_fwd.search(window):
+                        hit = True
+                if not hit and trigger.proximity_bwd is not None:
+                    window = norm[max(0, a_start - trigger.window_chars) : a_end]
+                    if trigger.proximity_bwd.search(window):
+                        hit = True
+                if hit:
+                    hit_slots.append(
+                        _HitSlot(trigger_idx=i, anchor_start=a_start, anchor_end=a_end)
+                    )
+    return hit_slots
 
 
 def check(text: str) -> PrefilterResult:
@@ -290,44 +468,42 @@ def check(text: str) -> PrefilterResult:
       whenever a guard condition matches, even when hard_hit is True).
 
     Pure function: no I/O, no side effects, no global state mutation.
+
+    Suppression invariant: a guard suppresses a hit slot ONLY when the
+    slot ANCHOR TOKEN falls within the guard CORE PHRASE span.
+    The .{0,80} tail of a guard pattern NEVER suppresses downstream
+    independent keyword occurrences.
     """
     norm = _normalize(text)
 
     # ------------------------------------------------------------------
-    # Step 1: collect all trigger hit slots
-    # A slot = one regex match of one trigger pattern in the normalized text.
-    # Multiple slots for the same trigger index are possible (multiple matches).
+    # Step 1: collect all trigger hit slots (anchor-token based)
     # ------------------------------------------------------------------
-    hit_slots: list[_HitSlot] = []
-    for i, trigger in enumerate(_HARD_TRIGGERS):
-        for m in trigger.pattern.finditer(norm):
-            hit_slots.append(_HitSlot(trigger_idx=i, start=m.start(), end=m.end()))
+    hit_slots = _collect_hit_slots(norm)
 
     # ------------------------------------------------------------------
     # Step 2: apply guards
     #
-    # For each guard, find all match spans of the guard's condition pattern.
-    # If any match exists: record the guard name (it activated).
-    # Then suppress every hit slot in guard.protects whose span falls
-    # WITHIN (overlaps) any guard match span.
-    #
-    # "Overlap" means: not (slot.end <= guard_start or slot.start >= guard_end)
-    #
-    # This confines suppression to the literal text region matched by the guard
-    # phrase, so an independent later occurrence of the keyword is NOT silenced.
+    # For each guard, find all match spans of the guard's FULL pattern
+    # (to determine if the guard activates), then find all match spans of
+    # the CORE pattern (to determine which anchor tokens are suppressed).
     # ------------------------------------------------------------------
     fired_guards: set[str] = set()
     suppressed: set[int] = set()  # indices into hit_slots
 
     for guard in _GUARDS:
-        guard_matches = list(guard.pattern.finditer(norm))
-        if not guard_matches:
+        # Check full pattern for guard activation
+        full_matches = list(guard.pattern.finditer(norm))
+        if not full_matches:
             continue
 
-        # The guard condition fired — record it unconditionally.
+        # Guard activated — record unconditionally
         fired_guards.add(guard.name)
 
-        guard_spans: list[tuple[int, int]] = [(gm.start(), gm.end()) for gm in guard_matches]
+        # Collect CORE phrase spans for suppression
+        core_spans: list[tuple[int, int]] = [
+            (cm.start(), cm.end()) for cm in guard.core_pattern.finditer(norm)
+        ]
 
         for slot_idx, slot in enumerate(hit_slots):
             if slot_idx in suppressed:
@@ -335,9 +511,9 @@ def check(text: str) -> PrefilterResult:
             trigger = _HARD_TRIGGERS[slot.trigger_idx]
             if trigger.category != guard.protects:
                 continue
-            # Suppress this slot if it overlaps any guard match span.
-            for gs, ge in guard_spans:
-                if not (slot.end <= gs or slot.start >= ge):
+            # Suppress if the ANCHOR TOKEN overlaps any core phrase span.
+            for cs, ce in core_spans:
+                if not (slot.anchor_end <= cs or slot.anchor_start >= ce):
                     suppressed.add(slot_idx)
                     break
 
