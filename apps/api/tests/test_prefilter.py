@@ -1020,6 +1020,26 @@ class TestRegressionMustNotRegress:
         # battery guard must NOT be present (no battery/chirp mention)
         assert "smoke_detector_battery" not in result.guards
 
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "the smoke detector is blaring and wont stop, is it just the battery low?",
+            "low battery warning but now the smoke alarm is blaring nonstop",
+            "smoke alarm wont stop beeping",
+            "smoke detector battery low and going off nonstop",
+            "smoke detector battery, but the smoke alarm is going off nonstop",
+        ],
+    )
+    def test_continuous_alarm_fires_even_with_battery_word(self, msg: str) -> None:
+        """Safety-review reintroduced-miss regression: a CONTINUOUS alarm
+        (blaring/nonstop/wont stop/going off) must FIRE even when a battery
+        word co-occurs and activates the battery-chirp guard. The continuous
+        triggers are suppressible=False, so the guard cannot silence them."""
+        result = check(msg)
+        assert result.hard_hit is True, f"continuous alarm wrongly suppressed: {msg!r}"
+        assert "fire" in result.categories
+
 
 # ---------------------------------------------------------------------------
 # REGRESSION: Invariant — independent trigger + guard phrase co-location

@@ -135,10 +135,18 @@ def _re(pattern: str) -> re.Pattern[str]:
 
 @dataclass(frozen=True)
 class _SimpleTrigger:
-    """A trigger whose match span is directly the anchor span."""
+    """A trigger whose match span is directly the anchor span.
+
+    ``suppressible=False`` exempts the trigger from ALL guard suppression —
+    used for triggers that describe a condition a guard must never silence
+    (e.g. a CONTINUOUS smoke alarm: the rubric says it is EMERGENCY even
+    though the message may also mention a battery, which would otherwise
+    activate the battery-chirp guard).
+    """
 
     category: str
     pattern: re.Pattern[str]
+    suppressible: bool = True
 
 
 @dataclass(frozen=True)
@@ -158,6 +166,7 @@ class _ProximityTrigger:
     proximity_fwd: re.Pattern[str] | None
     proximity_bwd: re.Pattern[str] | None
     window_chars: int = 60
+    suppressible: bool = True
 
 
 _Trigger = _SimpleTrigger | _ProximityTrigger
@@ -205,14 +214,19 @@ _HARD_TRIGGERS: list[_Trigger] = [
     _SimpleTrigger("fire", _re(r"\bsmell\s+of\s+burning\b")),
     # Continuous smoke alarm (rubric: a CONTINUOUS alarm is EMERGENCY).
     # Two patterns: alarm first, then modifier; and modifier first, then alarm.
-    # These are SIMPLE triggers — not guarded by the battery/chirp guard
-    # because "blaring/nonstop/continuous/going off" != battery chirp.
+    # suppressible=False: these MUST fire even when a "battery"/"low battery"
+    # word co-occurs and activates the battery-chirp guard (whose core span
+    # "smoke (detector|alarm)" overlaps the start of these matches). A blaring
+    # / nonstop alarm is an emergency regardless of whether the tenant also
+    # wonders aloud about the battery. (Safety review: this exemption closes a
+    # reintroduced miss.)
     _SimpleTrigger(
         "fire",
         _re(
             r"\bsmoke\s+(alarm|detector)\b.{0,30}"
             r"\b(blaring|wont\s+stop|won\s*t\s+stop|continuous|nonstop|going\s+off)\b"
         ),
+        suppressible=False,
     ),
     _SimpleTrigger(
         "fire",
@@ -220,6 +234,7 @@ _HARD_TRIGGERS: list[_Trigger] = [
             r"\b(blaring|wont\s+stop|won\s*t\s+stop|continuous|nonstop)\b.{0,30}"
             r"\bsmoke\s+(alarm|detector)\b"
         ),
+        suppressible=False,
     ),
     # ---------------------------------------------------------------- gas_co
     # "gas" near smell/leak/smells (within 40 chars either direction)
@@ -509,6 +524,9 @@ def check(text: str) -> PrefilterResult:
             if slot_idx in suppressed:
                 continue
             trigger = _HARD_TRIGGERS[slot.trigger_idx]
+            if not trigger.suppressible:
+                # Exempt from all guard suppression (e.g. continuous alarm).
+                continue
             if trigger.category != guard.protects:
                 continue
             # Suppress if the ANCHOR TOKEN overlaps any core phrase span.
