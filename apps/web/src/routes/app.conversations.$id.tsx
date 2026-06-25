@@ -46,27 +46,29 @@ export const Route = createFileRoute("/app/conversations/$id")({
       </div>
     </PhoneFrame>
   ),
-  errorComponent: ({ reset }) => {
-    const router = useRouter();
-    return (
-      <PhoneFrame>
-        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          <h1 className="font-display text-xl font-bold">Couldn't load this thread.</h1>
-          <button
-            onClick={() => {
-              router.invalidate();
-              reset();
-            }}
-            className="mt-6 inline-flex h-12 items-center rounded-xl bg-brand px-5 text-sm font-bold text-brand-foreground"
-          >
-            Try again
-          </button>
-        </div>
-      </PhoneFrame>
-    );
-  },
+  errorComponent: ConversationErrorComponent,
   component: ConversationPage,
 });
+
+function ConversationErrorComponent({ reset }: { reset: () => void }) {
+  const router = useRouter();
+  return (
+    <PhoneFrame>
+      <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
+        <h1 className="font-display text-xl font-bold">Couldn't load this thread.</h1>
+        <button
+          onClick={() => {
+            router.invalidate();
+            reset();
+          }}
+          className="mt-6 inline-flex h-12 items-center rounded-xl bg-brand px-5 text-sm font-bold text-brand-foreground"
+        >
+          Try again
+        </button>
+      </div>
+    </PhoneFrame>
+  );
+}
 
 function ConversationPage() {
   const item = Route.useLoaderData();

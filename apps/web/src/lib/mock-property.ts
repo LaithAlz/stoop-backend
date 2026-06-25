@@ -17,7 +17,8 @@ export const autonomyModes: AutonomyModeMeta[] = [
   {
     key: "auto-routine",
     label: "Auto-Routine",
-    description: "Routine replies send on their own. You still approve urgent and emergency drafts.",
+    description:
+      "Routine replies send on their own. You still approve urgent and emergency drafts.",
     requirement: "10 unedited approvals in a row.",
   },
   {
@@ -116,8 +117,20 @@ export const propertyConfigs: Record<string, PropertyConfig> = {
       monthToMonth: false,
     },
     vendors: [
-      { id: "v1", type: "Plumber", name: "Mike's Plumbing", phone: "(905) 555-0142", afterHours: true },
-      { id: "v2", type: "Electrician", name: "Sparks Electric", phone: "(905) 555-0387", afterHours: false },
+      {
+        id: "v1",
+        type: "Plumber",
+        name: "Mike's Plumbing",
+        phone: "(905) 555-0142",
+        afterHours: true,
+      },
+      {
+        id: "v2",
+        type: "Electrician",
+        name: "Sparks Electric",
+        phone: "(905) 555-0387",
+        afterHours: false,
+      },
     ],
     faq: [
       { id: "f1", q: "Where's the parking?", a: "Spot 14 in the back lot." },

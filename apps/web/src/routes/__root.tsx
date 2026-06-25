@@ -72,16 +72,17 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Stoop. — Maintenance triage for small landlords" },
+      { title: "Stoop. — Tenant maintenance, handled for small landlords" },
       {
         name: "description",
         content:
-          "Stoop is the AI triage layer for small landlords. Tenants text. Stoop drafts. You approve.",
+          "Stoop reads and sorts every tenant text and drafts the reply in your voice. Tenants text. Stoop drafts. You approve.",
       },
-      { property: "og:title", content: "Stoop. — Maintenance triage for small landlords" },
+      { property: "og:title", content: "Stoop. — Tenant maintenance, handled for small landlords" },
       {
         property: "og:description",
-        content: "AI triage and reply drafts for landlord–tenant maintenance over SMS.",
+        content:
+          "Reads, sorts, and drafts replies for tenant maintenance over SMS — you approve before it sends.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },

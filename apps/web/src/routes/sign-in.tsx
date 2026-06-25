@@ -15,7 +15,7 @@ export const Route = createFileRoute("/sign-in")({
       {
         name: "description",
         content:
-          "Sign in to Stoop. Maintenance triage for small landlords — handles the 2am text so you don't have to.",
+          "Sign in to Stoop. Tenant maintenance, sorted and drafted — handles the 2am text so you don't have to.",
       },
       { property: "og:title", content: "Sign in — Stoop." },
       {
@@ -45,7 +45,7 @@ function SignInPage() {
             Welcome back.
           </h1>
           <p className="mt-2 text-sm leading-relaxed text-ink-muted">
-            Sign in to triage your queue, edit drafts, and check on your properties.
+            Sign in to sort your queue, edit drafts, and check on your properties.
           </p>
 
           <div className="mt-6 flex flex-col gap-2">

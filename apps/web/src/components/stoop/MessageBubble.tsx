@@ -11,13 +11,7 @@ interface MessageBubbleProps {
   className?: string;
 }
 
-export function MessageBubble({
-  variant,
-  text,
-  timestamp,
-  author,
-  className,
-}: MessageBubbleProps) {
+export function MessageBubble({ variant, text, timestamp, author, className }: MessageBubbleProps) {
   if (variant === "tenant") {
     return (
       <div className={cn("flex flex-col items-start gap-1.5 max-w-[85%]", className)}>

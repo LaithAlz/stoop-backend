@@ -9,7 +9,7 @@ export const Route = createFileRoute("/terms")({
       {
         name: "description",
         content:
-          "Terms for using Stoop. — a maintenance triage tool for small landlords. We handle comms, not legal advice.",
+          "Terms for using Stoop. — a tenant-maintenance tool for small landlords. We handle comms, not legal advice.",
       },
       { property: "og:title", content: "Terms of Service — Stoop." },
       {

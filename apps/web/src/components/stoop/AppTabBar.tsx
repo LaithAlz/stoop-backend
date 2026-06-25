@@ -52,9 +52,7 @@ export function AppTabBar({ active = "queue", queueCount = 0 }: AppTabBarProps) 
                 </span>
               )}
             </div>
-            <span className="text-[10px] font-bold uppercase tracking-widest">
-              {t.label}
-            </span>
+            <span className="text-[10px] font-bold uppercase tracking-widest">{t.label}</span>
           </Link>
         );
       })}
