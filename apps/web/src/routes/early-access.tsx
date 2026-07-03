@@ -64,7 +64,7 @@ export const Route = createFileRoute("/early-access")({
       {
         name: "description",
         content:
-          "Early access for Ontario landlords: $5/month, locked in for life. Stoop reads every tenant text, drafts your replies, and only rings your phone for a true emergency.",
+          "Early access for Ontario landlords: $5/month, locked in for as long as you stay. Stoop reads every tenant text, drafts your replies, and only rings your phone for a true emergency.",
       },
     ],
   }),
@@ -265,8 +265,8 @@ function FoundingPage() {
               <CaptureForm />
 
               <p className="text-xs font-medium uppercase tracking-widest text-ink-muted">
-                $5/month early-access rate, locked in for life · Emergency line always free ·
-                Property managers: $1.50/door
+                $5/month early-access rate, locked in for as long as you stay · Emergency line
+                always free · Property managers: $1.50/door
               </p>
             </div>
 
