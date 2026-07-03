@@ -8,7 +8,6 @@ import {
   X,
   ArrowRight,
   ShieldCheck,
-  Quote,
 } from "lucide-react";
 import {
   Accordion,
@@ -108,7 +107,7 @@ function Hero() {
           </div>
 
           <p className="text-xs font-medium uppercase tracking-widest text-ink-muted">
-            Early access: $5/month, locked in for life · Emergency help always free
+            Early access: $5/month, locked in for as long as you stay · Emergency help always free
           </p>
         </div>
 
@@ -321,31 +320,16 @@ function PersonasSection() {
       tag: "Side-hustle",
       title: "You have a day job and 2 rentals.",
       body: "Stoop handles the inbox between meetings. You see one draft, tap Approve, get back to work.",
-      quote: {
-        text: "I stopped checking my phone during my kid's hockey practice. Stoop drafts the reply, I approve at intermission.",
-        author: "Devraj, Mississauga",
-        meta: "2 units",
-      },
     },
     {
       tag: "Empty-nester",
       title: "You hold a few paid-off properties.",
       body: "Set it up in 5 minutes with one of our property managers on the phone. Then leave it in Shadow mode forever if you want.",
-      quote: {
-        text: "I'm not interested in learning a new app every six months. Stoop is one screen. I read the message, I tap approve.",
-        author: "Margaret, Burlington",
-        meta: "4 units",
-      },
     },
     {
       tag: "Accidental",
       title: "You inherited a place. You're learning.",
       body: "Stoop knows what's actually an emergency, what can wait, and what vendor to suggest. You don't need to figure it out at 11pm.",
-      quote: {
-        text: "I didn't know a slow drain wasn't an emergency. Stoop did. It asked the right questions before I even saw the text.",
-        author: "Priya, Toronto",
-        meta: "1 unit",
-      },
     },
   ];
 
@@ -372,15 +356,6 @@ function PersonasSection() {
                 <h3 className="font-display text-2xl font-bold leading-snug">{p.title}</h3>
                 <p className="text-[15px] leading-relaxed text-ink-muted">{p.body}</p>
               </div>
-              <figure className="mt-auto rounded-2xl border border-border bg-surface/60 p-5">
-                <Quote className="size-5 text-brand/50" aria-hidden="true" />
-                <blockquote className="mt-2 text-sm leading-relaxed text-ink">
-                  "{p.quote.text}"
-                </blockquote>
-                <figcaption className="mt-3 text-xs font-semibold text-ink-muted">
-                  {p.quote.author} · {p.quote.meta}
-                </figcaption>
-              </figure>
             </article>
           ))}
         </div>
@@ -409,7 +384,7 @@ function PlansPreview() {
       id: "full",
       name: "Full Plan",
       price: "$10",
-      cap: "Up to 10 properties · $5/month with early access, locked in for life",
+      cap: "Up to 10 properties · $5/month with early access, locked in for as long as you stay",
       featured: true,
       bullets: [
         "Replies drafted in your voice — you approve",
@@ -588,8 +563,8 @@ function FinalCTA() {
           Get your evenings back this week.
         </h2>
         <p className="mx-auto mt-4 max-w-xl text-lg text-ink-muted">
-          Five-minute setup. Early access: $5/month, locked in for life. Cancel any time without a
-          phone call.
+          Five-minute setup. Early access: $5/month, locked in for as long as you stay. Cancel any
+          time without a phone call.
         </p>
         <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
           <Button asChild className="h-14 px-7 text-base font-bold">

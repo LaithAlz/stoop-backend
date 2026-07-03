@@ -18,7 +18,7 @@ export const Route = createFileRoute("/plans")({
       {
         name: "description",
         content:
-          "Free emergency line for every landlord. Full plan $10/month — $5/month locked in for life with early access. Property managers from $1.50 per door.",
+          "Free emergency line for every landlord. Full plan $10/month — $5/month locked in for as long as you stay with early access. Property managers from $1.50 per door.",
       },
       { property: "og:title", content: "Plans & pricing — Stoop." },
       {
@@ -205,7 +205,7 @@ function PlansPage() {
               Get your evenings back this week.
             </h2>
             <p className="mx-auto mt-3 max-w-xl text-lg text-ink-muted">
-              Five-minute setup. $5/month locked in for life with early access.
+              Five-minute setup. $5/month locked in for as long as you stay with early access.
             </p>
             <div className="mt-7">
               <Button asChild className="h-14 px-7 text-base font-bold">
