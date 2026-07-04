@@ -108,12 +108,17 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       },
       { rel: "stylesheet", href: appCss },
     ],
+    // Same-origin proxy (ADR-5 hard rule — no direct plausible.io script
+    // load, or adblockers strip the analytics signal). See the two
+    // narrowly-guarded routes in src/server.ts: GET /js/script.js and
+    // POST /api/event (data-api below points the script at the same one).
     scripts: plausibleDomain
       ? [
           {
             defer: true,
-            src: "https://plausible.io/js/script.js",
+            src: "/js/script.js",
             "data-domain": plausibleDomain,
+            "data-api": "/api/event",
           } as React.JSX.IntrinsicElements["script"],
         ]
       : undefined,

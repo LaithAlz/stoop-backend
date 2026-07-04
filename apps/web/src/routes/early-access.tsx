@@ -43,10 +43,12 @@ async function getWaitlistDb(): Promise<D1Like | null> {
 }
 
 const joinWaitlist = createServerFn({ method: "POST" }).handler(
-  async (ctx): Promise<{ ok: boolean; reason?: string }> => {
+  async (ctx): Promise<{ ok: boolean; reason?: string; skipped?: boolean }> => {
     const parsed = waitlistSchema.safeParse(ctx.data);
     if (!parsed.success) return { ok: false, reason: "invalid" };
-    if (parsed.data.website !== "") return { ok: true }; // honeypot: pretend success
+    // Honeypot: pretend success to the bot (identical UI), but flag it as
+    // `skipped` so the caller never fires a real analytics event for it.
+    if (parsed.data.website !== "") return { ok: true, skipped: true };
     const db = await getWaitlistDb();
     if (!db) return { ok: false, reason: "not-configured" };
     const { email, isPm } = parsed.data;
@@ -170,7 +172,7 @@ function CaptureForm() {
         },
       });
       setStatus(res.ok ? "done" : "error");
-      if (res.ok) {
+      if (res.ok && !res.skipped) {
         trackEvent("waitlist_submitted", { props: { source: WAITLIST_SOURCE } });
       }
     } catch {
