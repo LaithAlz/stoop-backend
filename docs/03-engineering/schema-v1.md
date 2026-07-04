@@ -8,6 +8,20 @@
 > **text + CHECK instead of Postgres enums** (cheaper to evolve in Alembic),
 > `landlord_id` on every multi-tenant table (the RLS key, policies in M-#22),
 > soft deletes only where noted. Append-only tables enforced by REVOKE.
+>
+> **v1.1 amendments (2026-07-04)** — migration 0003 implements these,
+> **pending** (#151):
+> 1. New append-only table `message_status_events` — Twilio
+>    delivery-status callbacks append here instead of ever touching
+>    `messages`.
+> 2. `messages.twilio_status` deprecated — superseded by
+>    `message_status_events`; column stays listed below (migration 0002
+>    already shipped it) until its DROP in migration 0003.
+> 3. `messages.party` CHECK extended to
+>    `('tenant','vendor','landlord')` for approve-by-SMS (#122)
+>    command-channel replies. Deployed migration 0002 shipped the
+>    narrower `CHECK (party IN ('tenant','vendor'))`; 0003 relaxes it to
+>    the version shown below.
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
@@ -129,11 +143,26 @@ CREATE TABLE messages (
   vendor_id       uuid REFERENCES vendors(id),       -- null for tenant messages
   case_id         uuid REFERENCES cases(id),         -- primary case; null = chitchat/pre-routing
   direction       text NOT NULL CHECK (direction IN ('inbound','outbound')),
-  party           text NOT NULL CHECK (party IN ('tenant','vendor')),
+  party           text NOT NULL CHECK (party IN ('tenant','vendor','landlord')),
+                                                     -- 'landlord' added v1.1: approve-by-SMS
+                                                     --  replies (#122) arrive as inbound SMS
+                                                     --  and must be representable; landlord
+                                                     --  rows are command-channel messages —
+                                                     --  never forwarded to tenants/vendors,
+                                                     --  excluded from tenant-conversation queries.
+                                                     --  Landlord rows carry tenant_id/vendor_id
+                                                     --  NULL (structural exclusion from channel
+                                                     --  queries — the channel index is on
+                                                     --  tenant_id), property_id = the property
+                                                     --  whose number received the reply,
+                                                     --  case_id = the referenced draft's case
   body            text NOT NULL,
   media           jsonb,                             -- [{url, content_type}] (#46)
   twilio_sid      text UNIQUE,                       -- idempotency key for webhooks
-  twilio_status   text,
+  twilio_status   text,                              -- DEPRECATED v1.1: never written after
+                                                     --  insert; delivery state lives in
+                                                     --  message_status_events; DROP scheduled
+                                                     --  in migration 0003
   prefilter       jsonb,                             -- PrefilterResult snapshot (#107)
   classification  jsonb,                             -- {severity, rules_fired, modifier,
                                                      --  refusal_flags, reasoning}
@@ -154,6 +183,29 @@ CREATE TABLE message_cases (                          -- multi-issue messages
   PRIMARY KEY (message_id, case_id)
 );
 
+-- ────────────── message_status_events (APPEND-ONLY, v1.1) ────
+-- Twilio delivery-status callbacks append here. Delivery state is
+-- derived by strict status precedence:
+--   failed/undelivered > delivered > sent > sending > queued/accepted
+-- (terminal states win; between terminals the failure wins so a real
+-- failure is never masked); recency is NEVER the criterion (Twilio
+-- repeats and reorders callbacks; a late transient row must not
+-- regress a terminal state). Duplicates are appended as
+-- facts — this is an event log, there is deliberately no UNIQUE
+-- constraint and no upsert. This table exists because `messages` is
+-- append-only (rule #2) — delivery status must never require an
+-- UPDATE on messages.
+CREATE TABLE message_status_events (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  message_id  uuid NOT NULL REFERENCES messages(id),
+  status      text NOT NULL CHECK (status IN ('accepted','queued','sending','sent','delivered','undelivered','failed')),
+  error_code  text,
+  payload     jsonb NOT NULL DEFAULT '{}',
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_message_status_events_message ON message_status_events (message_id, created_at);
+-- append-only: REVOKE UPDATE, DELETE ON message_status_events FROM app_role;
+
 -- ───────────────────────── drafts ────────────────────────────
 CREATE TABLE drafts (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -166,7 +218,8 @@ CREATE TABLE drafts (
                     CHECK (status IN ('pending','stale','approved','sending',
                                       'sent','rejected','cancelled')),
   auto_send         boolean NOT NULL DEFAULT false,  -- true only via trust ladder (#60)
-  scheduled_send_at timestamptz,                     -- approve + 5s undo window (#44)
+  scheduled_send_at timestamptz,                     -- approve + 5s undo window
+                                                     --  (#44; SMS approvals +5min, #122)
   sent_message_id   uuid REFERENCES messages(id),
   edited            boolean NOT NULL DEFAULT false,
   final_body        text,                            -- body actually sent if edited
@@ -255,9 +308,12 @@ CREATE TABLE push_tokens (
 - `text + CHECK` over Postgres enums: adding a value is an
   `ALTER ... DROP/ADD CONSTRAINT`, not an enum migration dance.
 - Append-only enforcement is part of the migration, not a convention:
-  `REVOKE UPDATE, DELETE ON messages, audit_log FROM <app role>`.
-- The undo window is data, not a sleep: approve sets
-  `drafts.scheduled_send_at = now() + 5s`; the sender only sends rows whose
+  `REVOKE UPDATE, DELETE ON messages, audit_log, message_status_events
+  FROM <app role>`.
+- The undo window is data, not a sleep: dashboard approve sets
+  `drafts.scheduled_send_at = now() + 5s` (#44); approve-by-SMS sets
+  `now() + 5 minutes` (#122, per `plain-language-rules.md` — SMS has no
+  undo bar). Same mechanism either way: the sender only sends rows whose
   time has come and whose status is still `approved`.
 - RLS (#22) keys every policy off `landlord_id` matched to
   `current_setting('app.current_landlord_id')`.

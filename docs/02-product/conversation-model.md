@@ -13,7 +13,10 @@ severities and lifecycles. So the model separates them:
 
 - **Channel** — the tenant↔property SMS relationship. One per tenant,
   permanent. All `messages` belong to the channel (this is what the tenant
-  experiences).
+  experiences). Exception: landlord command-channel replies
+  (`party='landlord'` — approve-by-SMS, #122) live on the landlord's own
+  notification thread, not a tenant channel, and are excluded from ALL
+  tenant-facing channel reads, including the dispute export.
 - **Case** — a unit of triage work: one issue, one severity, one LangGraph
   thread, one approval-queue card. Cases are *our* segmentation of the
   channel; the tenant never sees them.
@@ -85,6 +88,10 @@ Edge: landlord taps approve at the same moment a new message arrives →
 the approve action carries the draft id; if that id is already stale, the
 send is rejected and the card refreshes ("Maria replied — draft updated").
 The 5-second undo window absorbs most of this race in practice.
+(Approve-by-SMS uses a 5-minute window, which widens this race ~60x —
+a message arriving after approval but before send does not supersede
+the approved draft. How the sender handles that gap is an open design
+point tracked on #122.)
 
 ## Approval queue ordering
 

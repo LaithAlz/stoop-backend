@@ -66,7 +66,8 @@ When a draft is ready, the landlord's notification SMS reads:
 - Reply `1` → same path as dashboard approve (5-min window to text
   `UNDO`, since SMS has no undo bar). Reply `2` → rejected, case stays
   open. Anything else → treated as a question for the founder/support in
-  v1 (logged, never silently dropped).
+  v1 (recorded in `messages` and surfaced — never app-logged, rule #5;
+  never silently dropped).
 - Same trust-metric, audit, and stale-draft semantics as the API
   (`../03-engineering/api-contracts.md`) — this is a third client of the
   approve endpoint, not a new pathway.

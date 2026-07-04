@@ -9,20 +9,31 @@
 | Company | Segment | Model | Traction mechanism | Lesson for Stoop |
 |---|---|---|---|---|
 | **TurboTenant** | 1–10 door landlords | Freemium; ~$149/yr premium; tenant-paid screening fees | Free core tools + massive SEO/education machine; 1M+ landlords | Freemium + content WORKS in this market; monetization can sit on premium convenience |
+| **↳ TurboTenant Maintenance AI / Autopilot** | same base, moving into our lane | *Maintenance AI* (launched Oct 27, 2025): an AI first-responder bundled into TurboTenant's existing maintenance-tracking feature — asks tenants diagnostic questions, gathers photos/details, guides simple self-diagnosis before the landlord sees it. Pricing tier not publicly disclosed; appears to ride the free/premium suite rather than a separate paid add-on. *Autopilot* (launched Jan 20, 2026): a **separate, paid** flat-fee full-service offering — tenant placement, showings, day-to-day communication, *and* maintenance coordination; exact flat fee not disclosed (9,000+ tenants placed, 40,000+ repairs coordinated claimed at launch) | Riding the same SEO/freemium machine into maintenance specifically | TurboTenant is now actively building AI maintenance triage into its free suite — the "nobody does this" framing is no longer true; the wedge has to be the SMS-only/approval-first/owned-number combination, not the triage idea alone |
 | **Avail** (→ Realtor.com) | small landlords | Free unlimited units; $9/unit/mo plus tier | Freemium + marketplace distribution; acquired for distribution | Per-unit premium at single-digit $ is accepted |
 | **RentRedi** | small landlords | Paid-only, ~$30/mo flat | Flat-rate simplicity + partnerships (REI communities) | A no-free-tier model can work but grows slower; partnerships matter |
 | **Hemlane** | self-managing 1–15 units | $28 base + $2–58/unit tiers (top tier includes humans) | Hybrid software+human; premium prices for outcomes | Small landlords pay real money ($58/unit!) when outcomes, not software, are sold |
+| **↳ Hemlane Essential** | mid-tier, self-managing landlords who want maintenance off their plate | $48/mo (Basic $30 → Essential $48 → Complete $86; $28 base + $20/unit at Essential) — adds a dedicated repair coordinator handling requests 24/7 including emergencies, automatic diagnosis/troubleshooting, work-order management, no-markup invoicing, on top of Basic's software features | Sits between pure-software Basic and full-service Complete | Confirms real willingness-to-pay for "maintenance handled for me" well above our $10 — but Hemlane routes through a human coordinator, not an owned tenant-SMS relationship |
+| **Rentyn** (Canada) | landlord portfolios, per-unit | $49/mo Starter (≤5 units) → $149/mo Portfolio (≤25 units) → $299+/mo Operator ($6–8/unit past 25); annual billing gets 20% off | AI operating desk sold direct: 24/7 AI calls + texts, maintenance triage, emergency escalation, portfolio memory | Closest positioning match to Stoop (AI intake + triage + escalation) — but phone-first (not SMS-only), per-unit from $49/mo, and no free tier; validates the category in Canada without owning our specific wedge |
 | **Latchel** | property managers | **Free for the PM; tenant-funded** ($15–18/mo resident benefit); claims +$48/door/yr NEW PM revenue | Flipped the buyer's P&L: maintenance coordination became a profit center | The PM playbook: don't sell PMs a cost, sell them margin |
 | **Mezo** ($6M raised) | PM software | AI work-order triage | Sold into PM platforms; acquired by Property Meld 01/2025, now bundled **free** | Triage alone is a *feature* at the PM-platform level — it commoditizes there. Own the end relationship instead |
 | **EliseAI** ($2B val.) | enterprise multifamily | Full-lifecycle AI, enterprise contracts | Lighthouse enterprise accounts (28 of top-30 owners) | The top of the market is taken. Never compete there; it validates the category |
 
 **The structural insight:** the maintenance-triage capability is being
-commoditized *inside PM platforms* (Mezo → free bundle) while remaining
-**completely unserved for the self-managing landlord** — nobody owns the
-"your tenant texts one number and you sleep" relationship for the 1–10
-door owner. That's the wedge, and it's also why owning the tenant
-relationship (our own Twilio number) matters strategically: it can't be
-bundled away by someone else's platform.
+commoditized *inside PM platforms* (Mezo → free bundle) — that part of
+the thesis holds. What's no longer true is "unserved": TurboTenant shipped
+Maintenance AI into its free suite (Oct 2025) plus a paid Autopilot
+full-service tier (Jan 2026), Hemlane sells maintenance coordination as a
+hybrid software+human plan, and Rentyn is selling AI intake/triage/
+escalation direct to Canadian landlords from $49/mo. The self-managing
+1–10 door segment is actively being served by adjacent entrants — nobody
+owns it uncontested. So the wedge isn't "nobody does this"; it's the
+specific combination none of them ship together: tenant-side is **pure
+SMS to one number** (no app, no portal, no login), drafts are
+**approval-first, in the landlord's own voice** (never autonomous by
+default), the emergency line is **free and always-on**, and we **own the
+tenant relationship** on our own Twilio number so it can't be bundled away
+by someone else's platform.
 
 ## 2. Two segments, two plans
 
@@ -131,3 +142,7 @@ decisions are deliberate:
 - TurboTenant freemium/SEO — turbotenant.com, CRE Daily review
 - Avail/RentRedi comparisons — saasworthy, rentredi.com, KDS Development
 - Hemlane pricing/positioning — hemlane.com/pricing, Capterra, KDS
+- TurboTenant Maintenance AI launch (Oct 27, 2025) — [PR Newswire](https://www.prnewswire.com/news-releases/turbotenant-unveils-maintenance-ai-a-smarter-way-to-manage-rental-property-repairs-302594383.html), turbotenant.com/product-updates/introducing-maintenance-ai
+- TurboTenant Autopilot launch (Jan 20, 2026) — Access Newswire via [Yahoo Finance](https://finance.yahoo.com/news/turbotenant-launches-autopilot-flat-fee-140000977.html), digitaljournal.com
+- Hemlane Essential tier pricing (Basic $30 / Essential $48 / Complete $86) — hemlane.com/pricing
+- Rentyn pricing & features (Starter $49/mo, Portfolio $149/mo, Operator $299+/mo) — rentyn.ca
