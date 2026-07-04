@@ -30,6 +30,15 @@ Security properties tested
 15 token string NEVER appears in caplog / structlog output on failure
 16 omitted-exp token → 401 invalid_token (exp is required, not optional)
 17 valid token without user_metadata → full_name is None
+18 kid miss after key rotation → forced refresh picks up the new key, succeeds
+19 kid miss DoS guard → repeated unknown-kid verifies refetch at most once
+20 kid miss rate-limit window expiry → a second forced refresh is allowed
+   once the window has passed (issue #134)
+21 kid miss + failed forced refresh (500) still consumes the rate-limit
+   window — an attacker can't drive one upstream attempt per request while
+   Supabase's JWKS endpoint is erroring (issue #134 safety review, B1)
+22 kid miss + degenerate empty-keys 200 response does NOT clobber a
+   known-good cache (issue #134 safety review, A1)
 """
 
 from __future__ import annotations
@@ -578,3 +587,275 @@ async def test_token_never_logged_on_failure(
         assert token_parts[1] not in all_log_text, (
             "JWT payload section leaked into structured log output"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 18 — kid miss after key rotation → forced refresh succeeds (#134)
+# ---------------------------------------------------------------------------
+#
+# NOTE on respx usage in this section: per issue #145, we never nest respx
+# contexts (that raced on a cold JWKS cache and caused a flake). Each test
+# below uses a single respx.MockRouter as an async context manager, with a
+# ``side_effect`` list of canned responses consumed in call order — this lets
+# us simulate "JWKS changes between fetches" (a rotation) without more than
+# one respx context per test.
+
+
+@pytest.mark.unit
+async def test_kid_miss_forces_refresh_and_succeeds_after_rotation(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+) -> None:
+    """Simulates a Supabase signing-key rotation.
+
+    The cache is primed by verifying a token signed with the original key
+    (``kid`` = ``_KID``). A second token, signed by a brand-new key with a
+    *different* ``kid``, is then verified — the first ``_find_signing_key``
+    lookup misses (stale cache), which must force exactly one JWKS refresh
+    before retrying; the refreshed JWKS contains the new key, so the second
+    verify succeeds.
+    """
+    token_original = _mint_token(private_key, kid=_KID)
+
+    new_private, new_public = _make_keypair()
+    new_kid = "test-kid-rotated"
+    rotated_jwks = _public_key_to_jwks(new_public, new_kid)
+    token_rotated = _mint_token(new_private, kid=new_kid)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=jwks_payload),  # prime: serves original key
+            httpx.Response(200, json=rotated_jwks),  # forced refresh: serves rotated key
+        ]
+    )
+
+    async with router:
+        await verify_jwt(token_original)  # fetch #1 — primes the cache
+        user = await verify_jwt(token_rotated)  # kid miss -> forced refresh -> success
+        call_count = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count == 2, (
+        f"expected exactly one prime fetch + one forced refresh, got {call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 19 — DoS guard: repeated unknown-kid verifies refetch at most once (#134)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_repeated_unknown_kid_does_not_refetch_more_than_once_per_window(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+) -> None:
+    """An attacker spamming unknown ``kid`` values must not drive unbounded
+    refetches against Supabase's JWKS endpoint.
+
+    The route is only wired with two canned responses (one prime + one
+    forced refresh); if the implementation refetched more than once per
+    rate-limit window, respx would raise on the exhausted side_effect
+    iterator instead of this test's own assertion — a built-in tripwire.
+    """
+    token_original = _mint_token(private_key, kid=_KID)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=jwks_payload),  # prime
+            httpx.Response(200, json=jwks_payload),  # single forced refresh (kid still absent)
+        ]
+    )
+
+    async with router:
+        await verify_jwt(token_original)  # fetch #1 — primes the cache
+
+        for i in range(5):
+            bad_token = _mint_token(private_key, kid=f"unknown-kid-{i}")
+            with pytest.raises(AuthError) as exc_info:
+                await verify_jwt(bad_token)
+            assert exc_info.value.code == "invalid_token"
+
+        call_count = route.call_count
+
+    assert call_count == 2, (
+        f"JWKS fetched {call_count} times across 5 unknown-kid verifies "
+        "— forced-refresh rate limit not enforced"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 20 — rate-limit window expiry allows a new forced refresh (#134)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_forced_refresh_allowed_again_after_window_expires(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second forced refresh IS allowed once the rate-limit window has
+    passed — using the ``_now`` monkeypatch seam, never a real ``sleep()``.
+    """
+    token_original = _mint_token(private_key, kid=_KID)
+    token_still_unknown = _mint_token(private_key, kid="unknown-kid-during-window")
+
+    new_private, new_public = _make_keypair()
+    new_kid = "test-kid-rotated-later"
+    rotated_jwks = _public_key_to_jwks(new_public, new_kid)
+    token_rotated = _mint_token(new_private, kid=new_kid)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=jwks_payload),  # fetch #1: prime
+            httpx.Response(200, json=jwks_payload),  # fetch #2: forced refresh, still no match
+            httpx.Response(200, json=rotated_jwks),  # fetch #3: forced refresh after window
+        ]
+    )
+
+    async with router:
+        await verify_jwt(token_original)  # fetch #1
+
+        with pytest.raises(AuthError):
+            await verify_jwt(token_still_unknown)  # fetch #2 (forced refresh, still a miss)
+
+        assert auth_mod._last_forced_refresh is not None
+        stale_stamp = auth_mod._last_forced_refresh
+
+        # Advance the clock past the rate-limit window using the _now seam
+        # (never sleep()).
+        monkeypatch.setattr(
+            auth_mod, "_now", lambda: stale_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0
+        )
+
+        user = await verify_jwt(token_rotated)  # fetch #3: window passed, refresh allowed
+        call_count = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count == 3, (
+        f"expected prime + rate-limited-miss + post-window refresh (3 fetches), got {call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 21 — failed forced refresh (5xx) still consumes the rate-limit window
+# (issue #134 safety review, B1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_failed_forced_refresh_still_consumes_rate_limit_window(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced refresh attempt that itself fails (upstream 5xx) must still
+    consume the rate-limit window.
+
+    The window bounds *attempts*, not successes: otherwise an attacker
+    spamming unknown ``kid`` values while Supabase's JWKS endpoint happens
+    to be erroring could drive one upstream fetch attempt per request,
+    hammering the endpoint exactly while it's recovering.
+    """
+    token_original = _mint_token(private_key, kid=_KID)
+    unknown_token_1 = _mint_token(private_key, kid="unknown-kid-during-outage-1")
+    unknown_token_2 = _mint_token(private_key, kid="unknown-kid-during-outage-2")
+
+    new_private, new_public = _make_keypair()
+    new_kid = "test-kid-after-outage"
+    rotated_jwks = _public_key_to_jwks(new_public, new_kid)
+    token_after_outage = _mint_token(new_private, kid=new_kid)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=jwks_payload),  # fetch #1: prime
+            httpx.Response(500),  # fetch #2: forced refresh attempt fails (upstream 5xx)
+            httpx.Response(200, json=rotated_jwks),  # fetch #3: after window, succeeds
+        ]
+    )
+
+    async with router:
+        await verify_jwt(token_original)  # fetch #1 — primes the cache
+
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(unknown_token_1)  # fetch #2: forced refresh attempt, 500 -> fails
+        assert exc_info.value.code == "invalid_token"
+
+        # A second unknown-kid verify, still within the window: must be
+        # rate-limited (no new fetch attempt) even though the first
+        # attempt failed rather than succeeded.
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(unknown_token_2)
+        assert exc_info.value.code == "invalid_token"
+
+        call_count_within_window = route.call_count
+        assert auth_mod._last_forced_refresh is not None
+        stale_stamp = auth_mod._last_forced_refresh
+
+        # Advance the clock past the rate-limit window (never sleep()):
+        # a new attempt is allowed again, and this one succeeds.
+        monkeypatch.setattr(
+            auth_mod, "_now", lambda: stale_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0
+        )
+
+        user = await verify_jwt(token_after_outage)  # fetch #3
+        call_count_after_window = route.call_count
+
+    assert call_count_within_window == 2, (
+        "expected exactly 2 fetches (prime + one failed attempt) within the "
+        f"rate-limit window, got {call_count_within_window}"
+    )
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count_after_window == 3
+
+
+# ---------------------------------------------------------------------------
+# Test 22 — degenerate empty-keys 200 response does not clobber a known-good
+# cache (issue #134 safety review, A1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_degenerate_empty_keys_response_does_not_clobber_cache(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+) -> None:
+    """A forced refresh that returns HTTP 200 with a degenerate, empty
+    ``{"keys": []}`` body must NOT clobber the existing known-good cache.
+
+    Otherwise a single bad-but-200 upstream response would fail closed ALL
+    dashboard auth for up to the 24h TTL — worse than doing nothing.
+    """
+    token_original = _mint_token(private_key, kid=_KID)
+    unknown_token = _mint_token(private_key, kid="unknown-kid-during-glitch")
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=jwks_payload),  # fetch #1: prime (key A present)
+            httpx.Response(200, json={"keys": []}),  # fetch #2: forced refresh, degenerate body
+        ]
+    )
+
+    async with router:
+        await verify_jwt(token_original)  # fetch #1 — primes the cache with key A
+
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(unknown_token)  # fetch #2: forced refresh, empty-keys body
+        assert exc_info.value.code == "invalid_token"
+
+        # The ORIGINAL kid must still verify successfully: the degenerate
+        # empty-keys response must not have clobbered the cache, and no
+        # further fetch should be attempted (cache is intact).
+        user = await verify_jwt(token_original)
+        call_count = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count == 2, (
+        f"expected exactly 2 fetches (prime + one degenerate attempt), got {call_count}"
+    )

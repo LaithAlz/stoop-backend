@@ -47,9 +47,16 @@ def _reset_jwks_auth_state() -> Iterator[None]:
     Resetting both the cache and the lock here, for ALL test files, makes JWT
     verification deterministic regardless of test order. Imported lazily so it
     runs after the placeholder env above is set.
+
+    Also resets ``_last_forced_refresh`` (the kid-miss forced-refresh
+    rate-limit stamp, #134) — otherwise a test that forces a refresh leaves
+    that timestamp set, and a later test within the same rate-limit window
+    would see its own forced refresh silently skipped, causing an
+    order-dependent flake (the same class of bug that caused #141).
     """
     import app.integrations.supabase_auth as auth_mod
 
     auth_mod._jwks_cache = None  # noqa: SLF001
     auth_mod._jwks_lock = asyncio.Lock()  # noqa: SLF001
+    auth_mod._last_forced_refresh = None  # noqa: SLF001
     yield
