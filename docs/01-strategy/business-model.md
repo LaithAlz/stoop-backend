@@ -143,6 +143,6 @@ decisions are deliberate:
 - Avail/RentRedi comparisons — saasworthy, rentredi.com, KDS Development
 - Hemlane pricing/positioning — hemlane.com/pricing, Capterra, KDS
 - TurboTenant Maintenance AI launch (Oct 27, 2025) — [PR Newswire](https://www.prnewswire.com/news-releases/turbotenant-unveils-maintenance-ai-a-smarter-way-to-manage-rental-property-repairs-302594383.html), turbotenant.com/product-updates/introducing-maintenance-ai
-- TurboTenant Autopilot launch (Jan 20, 2026) — Access Newswire via [Yahoo Finance](https://finance.yahoo.com/news/turbotenant-launches-autopilot-flat-fee-140000977.html), digitaljournal.com; pricing per [TurboTenant support](https://support.turbotenant.com/en/articles/autopilot-pricing-and-billing)
+- TurboTenant Autopilot launch (Jan 20, 2026) — Access Newswire via [Yahoo Finance](https://finance.yahoo.com/news/turbotenant-launches-autopilot-flat-fee-140000977.html), digitaljournal.com; pricing per [TurboTenant support](https://support.turbotenant.com/en/articles/13862975-autopilot-pricing-and-billing)
 - Hemlane Essential tier pricing (Basic $30 / Essential $48 / Complete $86) — hemlane.com/pricing
 - Rentyn pricing & features (Starter $49/mo, Portfolio $149/mo, Operator $299+/mo) — rentyn.ca
