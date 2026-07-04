@@ -36,7 +36,12 @@ modes:
 
 The fixed algorithm uses ANCHOR-TOKEN suppression:
 
-1. Normalize the text (lowercase, punctuation -> space, collapse whitespace).
+1. Normalize the text: fold unicode (NFKD, strip combining marks) so
+   accented letters collapse to their ASCII base (e.g. "éverywhere" ->
+   "everywhere") BEFORE lowercasing/punctuation-stripping destroys them;
+   collapse "9-1-1"-shaped digit runs to "911" BEFORE generic punctuation
+   stripping turns each separator into its own space token; lowercase;
+   strip punctuation -> space; collapse whitespace.
 2. For each trigger, find all match spans.  For SIMPLE triggers (no
    proximity anchor needed) the full match span IS the anchor span.
    For PROXIMITY triggers: enumerate every anchor keyword token; for each
@@ -72,6 +77,7 @@ Public API
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from app.agent.schemas import PrefilterResult
@@ -91,11 +97,80 @@ PREFILTER_VERSION: str = "1.0"
 _PUNCT_RE: re.Pattern[str] = re.compile(r"[^a-z0-9\s]")
 _WS_RE: re.Pattern[str] = re.compile(r"\s+")
 
+# "9-1-1" collapse — applied BEFORE generic punctuation stripping.
+#
+# Generic punctuation stripping turns every separator into its own space
+# (`_PUNCT_RE` maps each non-alphanumeric char to a space independently), so
+# "9-1-1" becomes "9 1 1" — three separate tokens — and `\b911\b` misses it.
+#
+# Fix chosen: a narrow, anchored pre-pass that collapses "9", <sep>, "1",
+# <sep>, "1" into the literal "911" *before* the generic punctuation pass
+# runs, where <sep> is one-or-more of space/dot/hyphen and is REQUIRED on
+# BOTH sides (`+`, not `*`). This is preferred over loosening the trigger
+# regex itself (e.g. matching `\b9\s*1\s*1\b` against the fully-normalized
+# string) because a permissive *-quantified version also matches unrelated
+# digit runs that happen to reduce to the same shape — e.g. requiring only
+# an optional separator would collapse "$9.11" (a dollar amount: "9", ".",
+# "11") into "911" too, a false positive. Requiring a separator on BOTH
+# sides means plain contiguous "911" is left alone here (it doesn't need
+# this pre-pass — `\b911\b` already matches it post-normalization) and
+# "$9.11" is rejected (no separator between the two "1"s). It also happens
+# to reject "9-11-2001"-shaped dates (no separator between the "1"s in
+# "11") while still collapsing "9-1-1", "9.1.1", and spelled-with-spaces
+# "9 1 1" — all digit-by-digit forms of the emergency number. "/" is
+# deliberately NOT in the separator class so slash-formatted dates like
+# "9/1/1" are left alone.
+_NINE_ONE_ONE_RE: re.Pattern[str] = re.compile(r"\b9[\s.\-]+1[\s.\-]+1\b")
+
+
+# Unicode dash/hyphen look-alikes -> ASCII hyphen.
+#
+# NFKD does NOT decompose these to "-" (they're canonical, distinct
+# codepoints, not compatibility variants of HYPHEN-MINUS), so without this
+# explicit translation a message typed with e.g. U+2011 NON-BREAKING HYPHEN
+# ("9‑1‑1") sails through `_fold_unicode` unchanged and `_NINE_ONE_ONE_RE`
+# (whose separator class is plain ASCII `[\s.\-]`) never fires.
+_UNICODE_DASH_TRANSLATION: dict[int, str] = {
+    0x2010: "-",  # HYPHEN
+    0x2011: "-",  # NON-BREAKING HYPHEN
+    0x2012: "-",  # FIGURE DASH
+    0x2013: "-",  # EN DASH
+    0x2014: "-",  # EM DASH
+    0x2015: "-",  # HORIZONTAL BAR
+    0x2212: "-",  # MINUS SIGN
+}
+
+
+def _fold_unicode(text: str) -> str:
+    """Fold accented/composed unicode letters to their closest ASCII form,
+    and map unicode dash/hyphen look-alikes to ASCII "-".
+
+    ``_PUNCT_RE`` strips anything that isn't ``[a-z0-9\\s]``, which silently
+    deletes non-ASCII letters (e.g. "é") rather than folding them, destroying
+    keywords like "everywhere" when typed as "éverywhere". NFKD decomposes
+    each accented character into a base letter + combining mark(s); dropping
+    the combining marks yields the plain ASCII base letter. Stdlib-only
+    (``unicodedata``), deterministic, no locale/ICU dependency.
+
+    The dash translation runs AFTER NFKD so "9‑1‑1" (non-breaking hyphen) and
+    "9–1–1" (en dash) become plain ASCII "9-1-1" before `_NINE_ONE_ONE_RE`
+    (defect #143/#3) ever sees them — and so compatibility codepoints that
+    NFKD decomposes *into* one of the translated dashes (e.g. U+FE58 SMALL
+    EM DASH → U+2014) are folded too, instead of slipping past a
+    translate-first pass.
+    """
+    decomposed = unicodedata.normalize("NFKD", text)
+    dash_folded = decomposed.translate(_UNICODE_DASH_TRANSLATION)
+    return "".join(ch for ch in dash_folded if not unicodedata.combining(ch))
+
 
 def _normalize(text: str) -> str:
-    """Lowercase, strip punctuation to spaces, collapse whitespace."""
-    lowered = text.lower()
-    no_punct = _PUNCT_RE.sub(" ", lowered)
+    """Fold unicode, lowercase, collapse "9-1-1", strip punctuation, collapse
+    whitespace."""
+    folded = _fold_unicode(text)
+    lowered = folded.lower()
+    nine_one_one = _NINE_ONE_ONE_RE.sub("911", lowered)
+    no_punct = _PUNCT_RE.sub(" ", nine_one_one)
     return _WS_RE.sub(" ", no_punct).strip()
 
 
@@ -108,6 +183,25 @@ def _re(pattern: str) -> re.Pattern[str]:
     """Compile a regex with IGNORECASE (text is already lowercased but
     this is a safety net) and no multiline/dotall — single-message text."""
     return re.compile(pattern, re.IGNORECASE)
+
+
+# Shared continuous-alarm phrasing alternation — ONE definition, reused by
+# all six dedicated continuous-alarm triggers (smoke/fire/CO x fwd/bwd) AND
+# as the `refuse_if` veto on the three battery-chirp guard pairs.
+#
+# Three consecutive safety-review rounds each found a missed synonym in a
+# hand-copied variant of this alternation ("sounding", then "won't shut
+# off/up", then "will not stop"/"won't turn off"/"quit"/"has not stopped").
+# The root cause was six drifting copies; never inline this list again.
+# Negation is generalized: `won\s*t` with a zero-width gap also matches the
+# apostrophe-stripped "wont", and `will\s+not` covers spelled-out English.
+_CONTINUOUS_ALARM_PHRASES: str = (
+    r"\b(?:blaring|continuous|nonstop|sounding|ringing|going\s+off|went\s+off"
+    r"|(?:won\s*t|will\s+not)\s+(?:stop|shut\s+(?:off|up)|turn\s+off|quit)"
+    r"|has\s*n\s*t\s+stopped|has\s+not\s+stopped"
+    r"|not\s+stopping|is\s*n\s*t\s+stopping|are\s*n\s*t\s+stopping)\b"
+)
+_CONTINUOUS_ALARM_RE: re.Pattern[str] = _re(_CONTINUOUS_ALARM_PHRASES)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +299,15 @@ _HARD_TRIGGERS: list[_Trigger] = [
     # Word boundaries prevent matching "campfire", "fireplace", "fired" etc.
     # Guards handle "fire drill" and "fire alarm test" as false-positive cases.
     _SimpleTrigger("fire", _re(r"\bfire\b")),
+    # "flames" — unambiguous fire hazard word, independent of the bare "fire"
+    # anchor. Safety review (#143 finding 2): the fire compound-noun guards
+    # (fire escape/extinguisher/pit/hydrant, below) only ever suppress the
+    # "fire" token inside their own core phrase span, so a message like
+    # "flames shooting out near the fire escape" was silently swallowed
+    # because "fire" only appeared inside "fire escape" and "flames" wasn't
+    # tracked as its own trigger at all. "flames"/"flame" is never part of
+    # any guard's core phrase, so this anchor can never be suppressed.
+    _SimpleTrigger("fire", _re(r"\bflames?\b")),
     # "smoke" near smell/filling/everywhere — PROXIMITY trigger anchored on
     # each "smoke" token independently.  This prevents the guard from
     # suppressing a later independent "smoke" that satisfies the condition.
@@ -222,17 +325,42 @@ _HARD_TRIGGERS: list[_Trigger] = [
     # reintroduced miss.)
     _SimpleTrigger(
         "fire",
-        _re(
-            r"\bsmoke\s+(alarm|detector)\b.{0,30}"
-            r"\b(blaring|wont\s+stop|won\s*t\s+stop|continuous|nonstop|going\s+off)\b"
-        ),
+        _re(r"\bsmoke\s+(alarm|detector)\b.{0,30}" + _CONTINUOUS_ALARM_PHRASES),
         suppressible=False,
     ),
     _SimpleTrigger(
         "fire",
         _re(
-            r"\b(blaring|wont\s+stop|won\s*t\s+stop|continuous|nonstop)\b.{0,30}"
+            _CONTINUOUS_ALARM_PHRASES + r".{0,30}"
             r"\bsmoke\s+(alarm|detector)\b"
+        ),
+        suppressible=False,
+    ),
+    # Same continuous-alarm exemption extended to "fire alarm/detector" —
+    # discovered while verifying the safety-review CO fix (finding 1):
+    # the "fire_alarm_battery" guard (below) has the IDENTICAL structural
+    # hole the reviewer flagged for CO — its core span ("fire alarm" /
+    # "fire detector") overlaps the bare `\bfire\b` trigger, which IS
+    # suppressible by default, so "fire alarm wont stop, checked the
+    # battery already" / "fire alarm blaring, might be low battery" /
+    # "continuous fire alarm, might need a battery" were silently
+    # suppressed (confirmed empirically). "fire alarm going off"/"sounding"
+    # happened to still fire via the generic gas_co `alarm going off`/
+    # `alarm sounding` triggers (a different category, unrelated to this
+    # guard's `protects="fire"`), but "blaring"/"wont stop"/"nonstop"/
+    # "continuous" have no such rescue. Fixed proactively, same pattern as
+    # smoke/CO above, before this shipped: a continuous fire alarm is
+    # EMERGENCY regardless of a co-occurring battery mention.
+    _SimpleTrigger(
+        "fire",
+        _re(r"\bfire\s+(alarm|detector)\b.{0,30}" + _CONTINUOUS_ALARM_PHRASES),
+        suppressible=False,
+    ),
+    _SimpleTrigger(
+        "fire",
+        _re(
+            _CONTINUOUS_ALARM_PHRASES + r".{0,30}"
+            r"\bfire\s+(alarm|detector)\b"
         ),
         suppressible=False,
     ),
@@ -245,9 +373,43 @@ _HARD_TRIGGERS: list[_Trigger] = [
     _SimpleTrigger("gas_co", _re(r"\bcarbon\s+monoxide\b")),
     # CO alarm / CO detector
     _SimpleTrigger("gas_co", _re(r"\bco\s+(alarm|detector)\b")),
-    # "alarm/detector going off" or "sounding" — covers CO alarm sounding
-    _SimpleTrigger("gas_co", _re(r"\b(alarm|detector)\s+going\s+off\b")),
-    _SimpleTrigger("gas_co", _re(r"\b(alarm|detector)\s+sounding\b")),
+    # "alarm/detector going off" or "sounding" — covers CO alarm sounding.
+    # suppressible=False (safety review, #143 finding 1 — BLOCKING): the
+    # "co_alarm_battery" guard (below) protects "gas_co" and its anchor-token
+    # suppression span ("co alarm/detector" or "carbon monoxide
+    # alarm/detector") overlaps the START of these matches (both start on
+    # the same "alarm"/"detector" token), so a message like "the co alarm is
+    # going off, might be low battery" was silently swallowed. Nothing
+    # ROUTINE says "alarm going off" or "alarm sounding" — nonstop/sounding
+    # is a continuous-alarm condition, exactly like the smoke case above,
+    # and must never be silenced by a battery-word mention elsewhere in the
+    # message.
+    _SimpleTrigger("gas_co", _re(r"\b(alarm|detector)\s+going\s+off\b"), suppressible=False),
+    _SimpleTrigger("gas_co", _re(r"\b(alarm|detector)\s+sounding\b"), suppressible=False),
+    # Dedicated CO/carbon-monoxide continuous-alarm triggers, modeled
+    # exactly on the smoke continuous-alarm pair above. Needed IN ADDITION
+    # to the suppressible=False flip above because that flip only covers
+    # the literal adjacent phrasing "alarm going off" — it does NOT cover
+    # (a) the gap form "the co alarm IS going off" (an extra word between
+    # "alarm" and "going off"), or (b) "blaring"/"wont stop"/"continuous"/
+    # "nonstop", which have no dedicated CO trigger at all. Both gaps were
+    # confirmed misses even after suppressible=False alone.
+    # suppressible=False for the same reason as smoke/the flip above: a
+    # continuous CO alarm is EMERGENCY regardless of a co-occurring battery
+    # word.
+    _SimpleTrigger(
+        "gas_co",
+        _re(r"\b(?:co|carbon\s+monoxide)\s+(alarm|detector)\b.{0,30}" + _CONTINUOUS_ALARM_PHRASES),
+        suppressible=False,
+    ),
+    _SimpleTrigger(
+        "gas_co",
+        _re(
+            _CONTINUOUS_ALARM_PHRASES + r".{0,30}"
+            r"\b(?:co|carbon\s+monoxide)\s+(alarm|detector)\b"
+        ),
+        suppressible=False,
+    ),
     # --------------------------------------------------------------- water
     # flood / flooding
     _SimpleTrigger("water", _re(r"\bflood(ing)?\b")),
@@ -343,6 +505,20 @@ _HARD_TRIGGERS: list[_Trigger] = [
 #   - guard core_pattern "smoke (detector|alarm)" matches span [0,14]
 #   - anchor "smoke" at [0,5] → inside [0,14] → SUPPRESSED
 #   - anchor "smoke" at [28,33] → OUTSIDE [0,14] → NOT suppressed → hard_hit=True
+#
+# ``refuse_if`` (safety review, #143 finding 2): an OPTIONAL whole-message
+# veto pattern.  If set and it matches ANYWHERE in the normalized text, the
+# guard does not activate AT ALL for this message — it is not recorded in
+# ``guards`` and it suppresses nothing, even if ``pattern`` also matched.
+# Used by the fixture compound-noun guards (fire escape/extinguisher/pit/
+# hydrant): a fixture mention ("the fire escape door is broken") is routine,
+# but a fixture mention alongside an independent hazard word ("flames
+# shooting out near the fire escape", "smoke pouring out of the fire
+# extinguisher cabinet") is not — those messages must reach the classifier
+# un-suppressed. This is a global (whole-message) check, not anchor-token
+# scoped, because the hazard word is frequently NOT inside the same phrase
+# as the fixture (e.g. "flames" and "fire escape" are unrelated tokens).
+_FIRE_HAZARD_OVERRIDE_RE: re.Pattern[str] = _re(r"\bflames?\b|\bsmoke\b|\bburning\b|\bon\s+fire\b")
 
 
 @dataclass(frozen=True)
@@ -351,6 +527,7 @@ class _Guard:
     pattern: re.Pattern[str]  # Full guard condition (determines activation)
     core_pattern: re.Pattern[str]  # Core phrase span (determines suppression range)
     protects: str
+    refuse_if: re.Pattern[str] | None = None  # whole-message veto (see above)
 
 
 _GUARDS: list[_Guard] = [
@@ -367,6 +544,7 @@ _GUARDS: list[_Guard] = [
         ),
         core_pattern=_re(r"\bsmoke\s+(detector|alarm)\b"),
         protects="fire",
+        refuse_if=_CONTINUOUS_ALARM_RE,
     ),
     _Guard(
         name="smoke_detector_battery",
@@ -375,6 +553,87 @@ _GUARDS: list[_Guard] = [
         ),
         core_pattern=_re(r"\bsmoke\s+(detector|alarm)\b"),
         protects="fire",
+        refuse_if=_CONTINUOUS_ALARM_RE,
+    ),
+    # Tenants say "fire alarm"/"fire detector" for what is, functionally, a
+    # smoke alarm — the battery-chirp guard above only covered the literal
+    # "smoke (detector|alarm)" phrase, so "the fire alarm is chirping, needs
+    # a new battery" fired the bare `\bfire\b` trigger and rang the phone for
+    # a ROUTINE battery chirp. Same core-pattern-anchored suppression as
+    # "smoke_detector_battery": only the "fire alarm/detector" tokens are
+    # suppressed, never a later independent "fire" (continuous-alarm
+    # triggers are suppressible=False regardless and are unaffected).
+    #
+    # Deliberately narrower than "smoke_detector_battery": this guard's
+    # alternation requires the explicit word "battery" (not bare
+    # "chirp"/"chirping"/"beep"/"beeping" alone). "fire alarm" is a more
+    # ambiguous term than "smoke detector" — it can also refer to a
+    # building-wide fire-alarm siren, and an existing regression test
+    # ("the smoke detector and the fire alarm keep chirping",
+    # TestRegressionBlocking1GuardOverSuppression) establishes that a bare
+    # "fire alarm ... chirping" mention with NO battery word must still fire
+    # as an independent anchor. Requiring "battery" is the bias rule applied
+    # asymmetrically by category: "fire" is higher-stakes than "smoke", so
+    # this guard demands stronger evidence (explicit battery mention) before
+    # suppressing, while still fixing the confirmed defect (which does
+    # mention "battery").
+    _Guard(
+        name="fire_alarm_battery",
+        pattern=_re(r"\bfire\s+(detector|alarm)\b.{0,80}\b(battery|low\s+battery)\b"),
+        core_pattern=_re(r"\bfire\s+(detector|alarm)\b"),
+        protects="fire",
+        refuse_if=_CONTINUOUS_ALARM_RE,
+    ),
+    _Guard(
+        name="fire_alarm_battery",
+        pattern=_re(r"\b(battery|low\s+battery)\b.{0,80}\bfire\s+(detector|alarm)\b"),
+        core_pattern=_re(r"\bfire\s+(detector|alarm)\b"),
+        protects="fire",
+        refuse_if=_CONTINUOUS_ALARM_RE,
+    ),
+    # Same battery-chirp guard extended to CO alarm/detector and the spelled
+    # -out "carbon monoxide alarm/detector" — the rubric's battery-chirp
+    # ROUTINE case applies to any alarm type, not just smoke. Same "battery"
+    # (not bare chirp/beep) requirement as "fire_alarm_battery" above, for
+    # the same asymmetric-ambiguity reasoning; no existing test currently
+    # exercises a battery-less "co alarm ... chirping" case, but keeping
+    # both new guards consistent avoids introducing an unreviewed asymmetry
+    # between them.
+    #
+    # IMPORTANT (safety review, #143 finding 1 — BLOCKING, confirmed via
+    # regression against base): this guard's core span ("co alarm/detector"
+    # or "carbon monoxide alarm/detector") overlaps the START of the
+    # existing "alarm/detector going off"/"sounding" gas_co triggers AND of
+    # the dedicated CO continuous-alarm triggers below, because they all
+    # anchor on the same "alarm"/"detector" token. A message that mentions
+    # a battery ANYWHERE within 80 chars of "co alarm"/"carbon monoxide
+    # alarm" — e.g. "carbon monoxide alarm going off, might be a low
+    # battery" — would silently suppress the continuous-alarm signal too if
+    # those triggers were suppressible (they are not: see
+    # `suppressible=False` on the gas_co "going off"/"sounding" triggers and
+    # the dedicated CO continuous-alarm pair, both in `_HARD_TRIGGERS`
+    # above). This guard therefore can ONLY ever suppress the plain,
+    # non-continuous "co alarm"/"carbon monoxide" mention itself — never a
+    # continuous-alarm phrasing, regardless of a co-occurring battery word.
+    _Guard(
+        name="co_alarm_battery",
+        pattern=_re(
+            r"\b(?:co\s+(?:alarm|detector)|carbon\s+monoxide\s+(?:alarm|detector))\b"
+            r".{0,80}\b(battery|low\s+battery)\b"
+        ),
+        core_pattern=_re(r"\bco\s+(?:alarm|detector)\b|\bcarbon\s+monoxide\s+(?:alarm|detector)\b"),
+        protects="gas_co",
+        refuse_if=_CONTINUOUS_ALARM_RE,
+    ),
+    _Guard(
+        name="co_alarm_battery",
+        pattern=_re(
+            r"\b(battery|low\s+battery)\b.{0,80}"
+            r"\b(?:co\s+(?:alarm|detector)|carbon\s+monoxide\s+(?:alarm|detector))\b"
+        ),
+        core_pattern=_re(r"\bco\s+(?:alarm|detector)\b|\bcarbon\s+monoxide\s+(?:alarm|detector)\b"),
+        protects="gas_co",
+        refuse_if=_CONTINUOUS_ALARM_RE,
     ),
     # "fire drill" — the word "fire" appears inside the phrase "fire drill"
     # and must not trigger the EMERGENCY path.
@@ -391,6 +650,49 @@ _GUARDS: list[_Guard] = [
         pattern=_re(r"\bfire\s+alarm\s+test(ing)?\b"),
         core_pattern=_re(r"\bfire\s+alarm\s+test(ing)?\b"),
         protects="fire",
+    ),
+    # Anchor-token guards for compound nouns containing the literal word
+    # "fire" that are NOT the hazard itself. Modeled exactly on "fire drill"
+    # above: core == full pattern (a single literal phrase span), so only the
+    # "fire" token that is part of THIS phrase is suppressed — a second,
+    # independent "fire" token elsewhere in the message (e.g. "there is a
+    # fire near the fire escape") still fires because it falls outside this
+    # guard's core span.
+    #
+    # ``refuse_if=_FIRE_HAZARD_OVERRIDE_RE`` (safety review, #143 finding 2 —
+    # HIGH): a fixture mention next to an independent hazard word anywhere
+    # in the message ("flames shooting out near the fire escape", "smoke
+    # pouring out of the fire escape", "the fire extinguisher discharged and
+    # everyone is choking on smoke") must NOT be suppressed — the guard
+    # refuses to activate at all when flames/smoke/burning/"on fire" is
+    # present, regardless of where in the message it appears.
+    _Guard(
+        name="fire_escape",
+        pattern=_re(r"\bfire\s+escape\b"),
+        core_pattern=_re(r"\bfire\s+escape\b"),
+        protects="fire",
+        refuse_if=_FIRE_HAZARD_OVERRIDE_RE,
+    ),
+    _Guard(
+        name="fire_extinguisher",
+        pattern=_re(r"\bfire\s+extinguisher\b"),
+        core_pattern=_re(r"\bfire\s+extinguisher\b"),
+        protects="fire",
+        refuse_if=_FIRE_HAZARD_OVERRIDE_RE,
+    ),
+    _Guard(
+        name="fire_pit",
+        pattern=_re(r"\bfire\s+pit\b"),
+        core_pattern=_re(r"\bfire\s+pit\b"),
+        protects="fire",
+        refuse_if=_FIRE_HAZARD_OVERRIDE_RE,
+    ),
+    _Guard(
+        name="fire_hydrant",
+        pattern=_re(r"\bfire\s+hydrant\b"),
+        core_pattern=_re(r"\bfire\s+hydrant\b"),
+        protects="fire",
+        refuse_if=_FIRE_HAZARD_OVERRIDE_RE,
     ),
 ]
 
@@ -480,7 +782,9 @@ def check(text: str) -> PrefilterResult:
     - ``categories`` — sorted list of HARD categories that fired.
     - ``soft_annotations`` — sorted list of SOFT matches.
     - ``guards`` — sorted list of guard names that activated (recorded
-      whenever a guard condition matches, even when hard_hit is True).
+      whenever a guard condition matches AND its ``refuse_if`` hazard-token
+      veto, if any, does not match anywhere in the message; even when
+      hard_hit is True).
 
     Pure function: no I/O, no side effects, no global state mutation.
 
@@ -510,6 +814,11 @@ def check(text: str) -> PrefilterResult:
         # Check full pattern for guard activation
         full_matches = list(guard.pattern.finditer(norm))
         if not full_matches:
+            continue
+
+        # Whole-message hazard-token veto: if present anywhere, this guard
+        # does not activate at all — not recorded, suppresses nothing.
+        if guard.refuse_if is not None and guard.refuse_if.search(norm):
             continue
 
         # Guard activated — record unconditionally

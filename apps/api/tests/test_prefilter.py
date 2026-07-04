@@ -1097,3 +1097,724 @@ class TestAnchorTokenInvariant:
         result = check("smoke detector is beeping battery but smoke is everywhere")
         assert result.hard_hit is True
         assert "smoke_detector_battery" in result.guards
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: #143 defect 1 — "9-1-1" punctuation normalization (FALSE NEGATIVE)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionIssue143NineOneOneNormalization:
+    """Generic normalization maps every punctuation character to its own
+    space independently, so "9-1-1" became "9 1 1" (three separate tokens)
+    and `\\b911\\b` missed it -- a catastrophic false negative on the one
+    phrase tenants type verbatim when they've already called for help.
+
+    INVARIANT: any digit-by-digit rendering of the emergency number
+    ("9-1-1", "9.1.1", "9 1 1") must collapse to "911" and fire the
+    `person` category, exactly like the contiguous "911" already did.
+    """
+
+    @pytest.mark.unit
+    def test_i_called_911_hyphenated(self) -> None:
+        _hard("I called 9-1-1", "person")
+
+    @pytest.mark.unit
+    def test_hyphenated_911_in_sentence(self) -> None:
+        _hard("please someone call 9-1-1 right now", "person")
+
+    @pytest.mark.unit
+    def test_dot_separated_911(self) -> None:
+        """'9.1.1' — dot-separated digit-by-digit form."""
+        _hard("call 9.1.1 now", "person")
+
+    @pytest.mark.unit
+    def test_space_separated_911(self) -> None:
+        """'9 1 1' — space-separated digit-by-digit form."""
+        _hard("call 9 1 1 now", "person")
+
+    @pytest.mark.unit
+    def test_contiguous_911_still_fires(self) -> None:
+        """Regression guard: the pre-pass must not break the existing
+        contiguous '911' match."""
+        _hard("calling 911 right now", "person")
+
+    @pytest.mark.unit
+    def test_dollar_amount_does_not_false_positive(self) -> None:
+        """'$9.11' must NOT collapse to 911 -- no separator between the
+        two '1's, so this is a dollar amount, not the emergency number."""
+        result = check("I paid $9.11 for coffee")
+        assert result.hard_hit is False
+        assert result.categories == []
+
+    @pytest.mark.unit
+    def test_september_11_date_does_not_false_positive(self) -> None:
+        """'9-11-2001'-shaped dates must NOT collapse to 911 -- no
+        separator between the two '1's in '11'."""
+        result = check("the incident happened around 9-11-2001")
+        assert result.hard_hit is False
+        assert result.categories == []
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: #143 defect 2 — unicode fold before punctuation stripping (FN)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionIssue143UnicodeFold:
+    """`_PUNCT_RE` (``[^a-z0-9\\s]``) deletes any character outside plain
+    ASCII a-z/0-9, so a keyword typed with a diacritic (e.g. "éverywhere")
+    had its accented letter silently erased rather than folded, destroying
+    the keyword and producing a false negative.
+
+    INVARIANT: unicode NFKD-fold + combining-mark strip runs BEFORE
+    lowercasing/punctuation-stripping, so accented ASCII-derived letters
+    still match their plain-ASCII keyword patterns.
+    """
+
+    @pytest.mark.unit
+    def test_smoke_everywhere_with_accent(self) -> None:
+        _hard("smoke éverywhere", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_everywhere_with_accent_in_sentence(self) -> None:
+        _hard("there is smoke éverywhere in the hallway", "fire")
+
+    @pytest.mark.unit
+    def test_fire_word_with_accent_elsewhere_in_message(self) -> None:
+        """Accented word elsewhere in the message must not break the
+        unrelated bare 'fire' match."""
+        _hard("café downstairs called, there is a fire on the roof", "fire")
+
+    @pytest.mark.unit
+    def test_ambulance_with_accent_style_padding(self) -> None:
+        """Sanity check: unicode folding doesn't affect plain-ASCII triggers."""
+        _hard("we need an ambulance, déjà vu but it's real this time", "person")
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: #143 defect 3 — fire/CO alarm battery-chirp guard (FALSE POSITIVE)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionIssue143AlarmBatteryChirpGuard:
+    """The battery-chirp guard originally only recognized the literal phrase
+    "smoke (detector|alarm)" -- tenants overwhelmingly say "fire alarm" for
+    what is, functionally, a smoke alarm, and CO/carbon-monoxide alarms have
+    the identical battery-chirp failure mode. Without the guard, "the fire
+    alarm is chirping, needs a new battery" fired the bare `\\bfire\\b`
+    trigger and rang the landlord's phone for a rubric-ROUTINE battery chirp.
+
+    INVARIANT: "fire alarm/detector" and "co alarm/detector" /
+    "carbon monoxide alarm/detector" in chirp/low-battery context are
+    guarded exactly like "smoke (detector|alarm)" already was -- AND the
+    continuous-alarm phrasings ("... going off", "won't stop") for these
+    same alarm types are NOT swept up by the new guard, because the guard's
+    full pattern requires a battery/chirp/beep word to activate at all.
+    """
+
+    @pytest.mark.unit
+    def test_fire_alarm_chirping_needs_battery_guarded(self) -> None:
+        """The exact false positive reported in issue #143."""
+        result = _not_hard("the fire alarm is chirping, needs a new battery")
+        assert "fire_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_detector_beeping_low_battery_guarded(self) -> None:
+        result = _not_hard("the fire detector is beeping, low battery")
+        assert "fire_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_battery_before_fire_alarm_guarded(self) -> None:
+        """Battery/chirp word preceding 'fire alarm' -- reverse order."""
+        result = _not_hard("low battery warning on the fire alarm")
+        assert "fire_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_co_alarm_chirping_needs_battery_guarded(self) -> None:
+        result = _not_hard("the co alarm is chirping, needs a new battery")
+        assert "co_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_co_detector_low_battery_guarded(self) -> None:
+        result = _not_hard("co detector says low battery")
+        assert "co_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_detector_low_battery_guarded(self) -> None:
+        result = _not_hard("carbon monoxide detector low battery")
+        assert "co_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_alarm_beeping_guarded(self) -> None:
+        result = _not_hard("carbon monoxide alarm beeping, might need a battery")
+        assert "co_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_alarm_going_off_still_fires(self) -> None:
+        """Continuous alarm phrasing has no battery/chirp word -- the new
+        guard's full pattern never activates, so this still fires."""
+        _hard("fire alarm going off right now", "fire")
+
+    @pytest.mark.unit
+    def test_fire_alarm_wont_stop_still_fires(self) -> None:
+        _hard("fire alarm wont stop", "fire")
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_alarm_going_off_still_fires(self) -> None:
+        _hard("carbon monoxide alarm going off", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_alarm_going_off_still_fires(self) -> None:
+        _hard("the co alarm is going off", "gas_co")
+
+    @pytest.mark.unit
+    def test_smoke_detector_battery_guard_unaffected(self) -> None:
+        """Existing smoke-detector guard must be untouched by the new
+        fire/CO alarm guards (no weakening of the original trigger)."""
+        result = _not_hard("smoke detector battery chirping")
+        assert "smoke_detector_battery" in result.guards
+        assert "fire_alarm_battery" not in result.guards
+        assert "co_alarm_battery" not in result.guards
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: #143 defect 4 — fire compound-noun anchor guards (FALSE POSITIVE)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionIssue143FireCompoundNounGuards:
+    """Bare `\\bfire\\b` matched inside compound nouns that name a fixture,
+    not a hazard: "fire escape", "fire extinguisher", "fire pit", "fire
+    hydrant". Modeled exactly on the existing "fire drill" guard: core
+    pattern == full pattern (a single literal phrase span), so only the
+    "fire" token that is part of THIS phrase is suppressed.
+
+    INVARIANT (trigger-wins / independent anchor): a second, independent
+    "fire" token elsewhere in the same message is OUTSIDE the guard's core
+    span and must still fire -- "the fire escape is on fire" must fire.
+    """
+
+    @pytest.mark.unit
+    def test_fire_escape_door_broken_guarded(self) -> None:
+        result = _not_hard("the fire escape door is broken")
+        assert "fire_escape" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_extinguisher_expired_guarded(self) -> None:
+        result = _not_hard("the fire extinguisher expired last month")
+        assert "fire_extinguisher" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_pit_allowed_guarded(self) -> None:
+        result = _not_hard("is the fire pit allowed on the patio")
+        assert "fire_pit" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_hydrant_blocked_guarded(self) -> None:
+        result = _not_hard("a car is blocking the fire hydrant out front")
+        assert "fire_hydrant" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_escape_with_independent_fire_still_fires(self) -> None:
+        """Trigger-wins invariant: a second, independent 'fire' token
+        (outside the 'fire escape' core span) must still fire, and the
+        'fire_escape' guard is still recorded since no hazard word
+        (flames/smoke/burning/"on fire") is present to veto it."""
+        result = check("there is a fire near the fire escape")
+        assert result.hard_hit is True, f"Expected hard_hit=True: {result}"
+        assert "fire" in result.categories
+        assert "fire_escape" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_escape_on_fire_fires_via_hazard_veto(self) -> None:
+        """'the fire escape is on fire' still fires -- but now via the
+        hazard-token veto (finding #2 fix), not the anchor-token mechanism:
+        the literal 'on fire' phrase is itself a hazard token, so the
+        'fire_escape' guard refuses to activate at all and is NOT recorded
+        in guards (nothing was suppressed, so no guard needed to be beaten)."""
+        result = check("the fire escape is on fire")
+        assert result.hard_hit is True, f"Expected hard_hit=True: {result}"
+        assert "fire" in result.categories
+        assert "fire_escape" not in result.guards
+
+    @pytest.mark.unit
+    def test_fire_extinguisher_with_real_fire_still_fires(self) -> None:
+        text = "the fire extinguisher is empty and there is a real fire in the hallway"
+        result = check(text)
+        assert result.hard_hit is True, f"Expected hard_hit=True: {result}"
+        assert "fire" in result.categories
+        assert "fire_extinguisher" in result.guards
+
+    @pytest.mark.unit
+    def test_bare_fire_word_unaffected_by_new_guards(self) -> None:
+        """Sanity: plain 'fire' with none of the compound nouns present
+        still fires normally (no over-broad guard matching)."""
+        _hard("there is a fire on the second floor", "fire")
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: #143 acceptance-criteria spot checks
+# ---------------------------------------------------------------------------
+
+
+class TestIssue143AcceptanceSpotChecks:
+    """Explicit spot checks called out in issue #143's acceptance criteria,
+    verifying they classify correctly after the four defect fixes above."""
+
+    @pytest.mark.unit
+    def test_there_is_no_fire_still_fires(self) -> None:
+        """Negation is unhandled by design (bias rule: a false alarm costs
+        minutes, a missed one costs the building) -- 'there is no fire'
+        still fires the bare 'fire' trigger."""
+        _hard("there is no fire", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_detector_battery_low_guarded(self) -> None:
+        result = _not_hard("smoke detector battery low")
+        assert "smoke_detector_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_drill_tomorrow_guarded(self) -> None:
+        result = _not_hard("fire drill tomorrow")
+        assert "fire_drill" in result.guards
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_alarm_going_off_fires(self) -> None:
+        _hard("carbon monoxide alarm going off", "gas_co")
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: #143 safety-review BLOCKING #1 — CO continuous-alarm false
+# negative (co_alarm_battery guard silently swallowing continuous CO alarms)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionIssue143CoContinuousAlarmFalseNegative:
+    """CATASTROPHIC regression introduced by the `co_alarm_battery` guard
+    (finding 1, safety review): the guard's core span ("co alarm/detector" /
+    "carbon monoxide alarm/detector") overlaps the START of the existing
+    "alarm/detector going off"/"sounding" gas_co triggers -- both anchor on
+    the same "alarm"/"detector" token -- so ANY message mentioning a battery
+    within 80 chars of a CO/carbon-monoxide alarm silently suppressed a
+    genuinely continuous (EMERGENCY) CO alarm.
+
+    Fix: (a) `\\b(alarm|detector)\\s+going\\s+off\\b` and
+    `\\b(alarm|detector)\\s+sounding\\b` are now suppressible=False -- nothing
+    ROUTINE says "alarm going off"; (b) dedicated CO/carbon-monoxide
+    continuous-alarm triggers (blaring/wont-stop/nonstop/continuous/going
+    off), also suppressible=False, cover the "gap" phrasing ("the co alarm
+    IS going off") that (a) alone does not match verbatim.
+
+    INVARIANT: a continuous CO/carbon-monoxide alarm phrasing fires
+    regardless of a co-occurring battery word; a plain battery-chirp
+    mention (no continuous-alarm word) is still guarded (ROUTINE).
+    """
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_alarm_going_off_might_be_battery(self) -> None:
+        _hard("carbon monoxide alarm going off, might be a low battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_alarm_going_off_might_be_low_battery(self) -> None:
+        _hard("co alarm going off, might be low battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_detector_sounding_probably_low_battery(self) -> None:
+        _hard("carbon monoxide detector sounding, probably low battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_alarm_is_going_off_gap_form_with_battery_light(self) -> None:
+        """The 'is going off' gap form -- (a) alone (literal adjacency)
+        does not match this; only the dedicated CO continuous trigger
+        (b), whose gap between anchor and modifier is `.{0,30}`, does."""
+        _hard("the co alarm is going off and the low battery light is on", "gas_co")
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_alarm_blaring_is_it_just_a_battery(self) -> None:
+        """'blaring' has no dedicated CO trigger before this fix at all."""
+        _hard("carbon monoxide alarm blaring, is it just a low battery?", "gas_co")
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_alarm_wont_stop_with_battery_mention(self) -> None:
+        _hard("carbon monoxide alarm wont stop, checked the battery already", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_detector_continuous_nonstop_with_battery_mention(self) -> None:
+        _hard("co detector nonstop, not sure if its the battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_alarm_chirping_needs_battery_still_guarded(self) -> None:
+        """Routine battery-chirp case (no continuous-alarm word) must
+        remain guarded -- the fix must not weaken this."""
+        result = _not_hard("the co alarm is chirping, needs a new battery")
+        assert "co_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_co_detector_says_low_battery_still_guarded(self) -> None:
+        result = _not_hard("co detector says low battery")
+        assert "co_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_detector_low_battery_still_guarded(self) -> None:
+        result = _not_hard("carbon monoxide detector low battery")
+        assert "co_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_carbon_monoxide_alarm_beeping_might_need_battery_still_guarded(self) -> None:
+        result = _not_hard("carbon monoxide alarm beeping, might need a battery")
+        assert "co_alarm_battery" in result.guards
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: #143 — same continuous-alarm false negative found in
+# "fire_alarm_battery" while verifying the CO fix above (proactive fix,
+# not a separate reviewer finding, but the identical structural defect)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionIssue143FireAlarmContinuousFalseNegative:
+    """Discovered while verifying the safety-review CO fix (finding 1):
+    the "fire_alarm_battery" guard (added earlier in #143 to fix the
+    battery-chirp false positive) has the IDENTICAL structural hole the
+    reviewer flagged for CO — its core span ("fire alarm"/"fire detector")
+    overlaps the bare `\\bfire\\b` trigger, which IS suppressible by
+    default, so a continuous "fire alarm" phrasing alongside a battery
+    mention was silently suppressed. "going off"/"sounding" happened to
+    still fire via the (unrelated-category) generic gas_co triggers, but
+    "blaring"/"wont stop"/"nonstop"/"continuous" had no rescue at all.
+
+    Fixed the same way as smoke/CO: a dedicated suppressible=False
+    continuous "fire alarm/detector" trigger pair.
+
+    INVARIANT: a continuous fire-alarm phrasing fires regardless of a
+    co-occurring battery word; the plain battery-chirp case remains guarded.
+    """
+
+    @pytest.mark.unit
+    def test_fire_alarm_blaring_might_be_low_battery(self) -> None:
+        _hard("fire alarm blaring, might be low battery", "fire")
+
+    @pytest.mark.unit
+    def test_fire_alarm_nonstop_checked_the_battery(self) -> None:
+        _hard("fire alarm nonstop, checked the battery", "fire")
+
+    @pytest.mark.unit
+    def test_continuous_fire_alarm_might_need_a_battery(self) -> None:
+        _hard("continuous fire alarm, might need a battery", "fire")
+
+    @pytest.mark.unit
+    def test_fire_detector_wont_stop_low_battery_light_is_on(self) -> None:
+        _hard("fire detector wont stop, low battery light is on", "fire")
+
+    @pytest.mark.unit
+    def test_fire_alarm_going_off_might_be_low_battery_fires_fire_category(self) -> None:
+        """Before this fix, 'fire' category was suppressed and only the
+        unrelated gas_co 'alarm going off' trigger rescued hard_hit; now
+        the dedicated fire-alarm continuous trigger also fires 'fire'."""
+        result = check("fire alarm going off, might be a low battery")
+        assert result.hard_hit is True
+        assert "fire" in result.categories
+
+    @pytest.mark.unit
+    def test_fire_alarm_chirping_needs_battery_still_guarded(self) -> None:
+        """Routine battery-chirp case (no continuous-alarm word) must
+        remain guarded -- the fix must not weaken this."""
+        result = _not_hard("the fire alarm is chirping, needs a new battery")
+        assert "fire_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_smoke_detector_and_fire_alarm_keep_chirping_unaffected(self) -> None:
+        """Pre-existing regression (TestRegressionBlocking1GuardOverSuppression)
+        must remain unaffected: 'chirping' is not a continuous-alarm modifier,
+        so the new dedicated trigger does not change this outcome."""
+        result = check("the smoke detector and the fire alarm keep chirping")
+        assert result.hard_hit is True
+        assert "fire" in result.categories
+        assert "smoke_detector_battery" in result.guards
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: #143 safety-review finding #2 — fire compound-noun guards
+# silencing real fires (flames/smoke/burning hazard-token veto)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionIssue143FireFixtureHazardVeto:
+    """HIGH-severity regression: the fire_escape/fire_extinguisher/fire_pit/
+    fire_hydrant guards (added to fix defect 4) suppressed the ONLY "fire"
+    anchor in messages describing a real fire near/at the fixture, because
+    neither "flames" nor "smoke ... pouring" (etc.) were tracked as
+    independent triggers/anchors.
+
+    Fix: (a) a new unconditional "flames"/"flame" HARD trigger (never part
+    of any guard's core phrase, so never suppressible by these guards);
+    (b) the four fixture guards gained `refuse_if` -- a whole-message
+    hazard-token veto (flames?/smoke/burning/"on fire") that voids guard
+    activation entirely when any of those words appear ANYWHERE in the
+    message, not just near the fixture phrase.
+
+    INVARIANT: a fixture mention alone (no hazard word) is still ROUTINE
+    and guarded; a fixture mention alongside flames/smoke/burning/"on fire"
+    is NOT suppressed, regardless of where in the message the hazard word
+    appears.
+    """
+
+    @pytest.mark.unit
+    def test_flames_near_fire_escape_fires(self) -> None:
+        _hard("flames shooting out near the fire escape", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_pouring_out_of_fire_escape_fires(self) -> None:
+        _hard("smoke pouring out of the fire escape", "fire")
+
+    @pytest.mark.unit
+    def test_fire_extinguisher_discharged_choking_on_smoke_fires(self) -> None:
+        _hard("the fire extinguisher discharged and everyone is choking on smoke", "fire")
+
+    @pytest.mark.unit
+    def test_bare_flames_word_fires(self) -> None:
+        """Sanity: 'flames' alone (no fixture mention at all) fires."""
+        _hard("there are flames coming from the kitchen", "fire")
+
+    @pytest.mark.unit
+    def test_fire_escape_door_broken_still_guarded(self) -> None:
+        """No hazard word present -- guard still activates normally."""
+        result = _not_hard("the fire escape door is broken")
+        assert "fire_escape" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_extinguisher_expired_still_guarded(self) -> None:
+        result = _not_hard("the fire extinguisher expired last month")
+        assert "fire_extinguisher" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_pit_allowed_still_guarded(self) -> None:
+        result = _not_hard("is the fire pit allowed on the patio")
+        assert "fire_pit" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_hydrant_blocked_still_guarded(self) -> None:
+        result = _not_hard("a car is blocking the fire hydrant out front")
+        assert "fire_hydrant" in result.guards
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: #143 safety-review finding #3 — unicode dash/hyphen folding
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionIssue143UnicodeDashFolding:
+    """LOW-severity but confirmed miss: `_fold_unicode` NFKD-folds accented
+    letters but did not fold unicode dash look-alikes to ASCII "-", so
+    "I called 9‑1‑1" (U+2011 NON-BREAKING HYPHEN) sailed through
+    unchanged and `_NINE_ONE_ONE_RE` (whose separator class is plain ASCII)
+    never fired.
+
+    INVARIANT: U+2010-U+2015 and U+2212 all fold to ASCII "-" before the
+    "9-1-1" collapse runs, so any dash look-alike digit-by-digit rendering
+    of the emergency number fires exactly like the ASCII-hyphen form.
+    """
+
+    @pytest.mark.unit
+    def test_non_breaking_hyphen_911(self) -> None:
+        """U+2011 NON-BREAKING HYPHEN."""
+        _hard("I called 9‑1‑1", "person")
+
+    @pytest.mark.unit
+    def test_en_dash_911(self) -> None:
+        """U+2013 EN DASH."""
+        _hard("call 9–1–1 now", "person")
+
+    @pytest.mark.unit
+    def test_em_dash_911(self) -> None:
+        """U+2014 EM DASH."""
+        _hard("please call 9—1—1 immediately", "person")
+
+    @pytest.mark.unit
+    def test_minus_sign_911(self) -> None:
+        """U+2212 MINUS SIGN."""
+        _hard("dial 9−1−1", "person")
+
+
+class TestRegressionPr144SoundingContinuousAlarm:
+    """PR-#144 senior review, BLOCKING finding 1: the dedicated continuous-alarm
+    alternations enumerated blaring/wont-stop/continuous/nonstop/going-off but
+    omitted "sounding" (and "won't shut off/up"), even though the adjacency-only
+    trigger `alarm sounding` was flipped suppressible=False with a comment
+    claiming sounding is never suppressible. Any word between "alarm" and
+    "sounding" defeated the adjacency form, and the fire/CO battery guards then
+    suppressed the only remaining anchor — base-HARD messages went silent.
+
+    INVARIANT: every continuous-alarm synonym in the dedicated alternations
+    (blaring, wont stop, won't shut off/up, continuous, nonstop, sounding,
+    going off, went off) fires for smoke, fire, AND CO alarms even when a
+    battery word co-occurs, in gap forms ("keeps sounding", "is sounding"),
+    not just strict adjacency.
+    """
+
+    @pytest.mark.unit
+    def test_fire_alarm_is_sounding_low_battery(self) -> None:
+        _hard("the fire alarm is sounding, could be low battery", "fire")
+
+    @pytest.mark.unit
+    def test_fire_alarm_keeps_sounding_battery(self) -> None:
+        _hard("fire alarm keeps sounding, probably needs a battery", "fire")
+
+    @pytest.mark.unit
+    def test_co_alarm_keeps_sounding_battery(self) -> None:
+        _hard("the co alarm keeps sounding, might be the battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_alarm_wont_shut_off_battery(self) -> None:
+        _hard("the co alarm wont shut off, maybe new battery needed?", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_alarm_wont_shut_off_battery(self) -> None:
+        _hard("the fire alarm wont shut off, is it the battery?", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_alarm_keeps_sounding_battery(self) -> None:
+        """Pre-existing base false negative on the smoke pair — fixed for
+        consistency with the fire/CO pairs, not a regression repair."""
+        _hard("the smoke alarm keeps sounding, might be the battery", "fire")
+
+    @pytest.mark.unit
+    def test_co_alarm_went_off_battery(self) -> None:
+        """PR-#144 review advisory 2: past-tense "went off" is an alarm
+        activation report — per the bias rule it must reach the landlord even
+        with a battery hedge."""
+        _hard("the carbon monoxide alarm went off, might be the battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_alarm_chirping_battery_still_guarded(self) -> None:
+        """Chirp + battery with NO continuous-alarm synonym stays ROUTINE."""
+        _not_hard("the fire alarm is chirping, needs a new battery")
+
+    @pytest.mark.unit
+    def test_co_alarm_chirping_battery_still_guarded(self) -> None:
+        _not_hard("the co alarm is chirping, needs a new battery")
+
+    @pytest.mark.unit
+    def test_smoke_detector_battery_low_still_guarded(self) -> None:
+        _not_hard("smoke detector battery low")
+
+
+class TestRegressionPr144CompatibilityDashFold:
+    """PR-#144 review advisory 3: the dash translation ran BEFORE NFKD, but
+    NFKD decomposes some compatibility codepoints INTO the dashes being
+    translated (U+FE58 SMALL EM DASH -> U+2014), so those slipped past a
+    translate-first pass.
+
+    INVARIANT: dash folding runs after NFKD, so compatibility dash variants
+    fold to ASCII "-" too.
+    """
+
+    @pytest.mark.unit
+    def test_small_em_dash_911(self) -> None:
+        """U+FE58 SMALL EM DASH (NFKD-decomposes to U+2014 EM DASH)."""
+        _hard("please call 9﹘1﹘1", "person")
+
+
+class TestRegressionRound3ContinuousSynonymFamily:
+    """Safety-review round 3, BLOCKING: the continuous-alarm alternation was
+    hand-copied six times (smoke/fire/CO x fwd/bwd) and each review round
+    found a synonym missing from some copy — round 3 found spelled-out
+    negation ("will not"), "turn off", "quit", and "has not stopped" all
+    uncovered, so continuous CO/fire alarms with a battery hedge went silent.
+
+    STRUCTURAL FIX under test: one shared `_CONTINUOUS_ALARM_PHRASES`
+    alternation reused by all six triggers, ALSO wired as `refuse_if` on the
+    three battery-guard pairs so a continuous phrasing ANYWHERE in the
+    message vetoes battery suppression, independent of the triggers'
+    30-char proximity windows.
+
+    INVARIANT: any continuous-alarm phrasing plus any alarm-type mention
+    fires, no matter which negation spelling, verb synonym, or distance;
+    chirp/battery-only messages with no continuous phrasing stay guarded.
+    """
+
+    @pytest.mark.unit
+    def test_co_will_not_stop_battery(self) -> None:
+        _hard("the co alarm will not stop, maybe low battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_wont_turn_off_battery(self) -> None:
+        _hard("the co alarm won't turn off, low battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_will_not_turn_off_battery(self) -> None:
+        _hard("the co alarm will not turn off, low battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_will_not_shut_off_battery(self) -> None:
+        _hard("the fire alarm will not shut off, checked the battery", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_will_not_shut_up_battery(self) -> None:
+        _hard("smoke alarm will not shut up, low battery", "fire")
+
+    @pytest.mark.unit
+    def test_co_wont_quit_battery(self) -> None:
+        _hard("the co alarm won't quit, battery maybe", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_has_not_stopped_battery(self) -> None:
+        _hard("carbon monoxide alarm has not stopped, battery?", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_wont_turn_off_battery(self) -> None:
+        _hard("fire alarm wont turn off, might be battery", "fire")
+
+    @pytest.mark.unit
+    def test_refuse_if_beyond_proximity_window(self) -> None:
+        """The continuous phrasing sits far outside the trigger's 30-char
+        window from the alarm noun — only the guard-level refuse_if veto can
+        rescue this message. It must fire via the plain alarm-mention
+        trigger once the battery guard is vetoed."""
+        _hard(
+            "the co alarm, which might just need a new battery like last "
+            "time honestly, really will not stop",
+            "gas_co",
+        )
+
+    @pytest.mark.unit
+    def test_chirp_only_cases_stay_guarded(self) -> None:
+        """No continuous phrasing anywhere -> battery guards stay active."""
+        _not_hard("smoke alarm chirping low battery")
+        _not_hard("the fire alarm is chirping, needs a new battery")
+        _not_hard("co detector says low battery")
+        _not_hard("smoke detector battery chirping")
+        _not_hard("carbon monoxide detector low battery")
+
+
+class TestRound4RecommendedHardening:
+    """Safety-review round 4 (APPROVE) recommended two highest-frequency
+    residual synonyms for the shared continuous-alarm list: "ringing" and
+    present-tense "not stopping" (incl. "isn't stopping").
+
+    INVARIANT: same as the round-3 class — continuous phrasing + alarm-type
+    mention fires despite a battery hedge; chirp-only stays guarded.
+    """
+
+    @pytest.mark.unit
+    def test_co_alarm_still_ringing_battery(self) -> None:
+        _hard("co alarm still ringing, might be the battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_alarm_keeps_ringing_battery(self) -> None:
+        _hard("the fire alarm keeps ringing, low battery maybe", "fire")
+
+    @pytest.mark.unit
+    def test_co_alarm_not_stopping_battery(self) -> None:
+        _hard("carbon monoxide alarm not stopping, battery?", "gas_co")
+
+    @pytest.mark.unit
+    def test_smoke_alarm_isnt_stopping_battery(self) -> None:
+        _hard("smoke alarm isn't stopping, could be low battery", "fire")
+
+    @pytest.mark.unit
+    def test_chirp_only_still_guarded_after_hardening(self) -> None:
+        _not_hard("the fire alarm is chirping, needs a new battery")
+        _not_hard("co detector says low battery")
+        _not_hard("smoke detector battery low")
