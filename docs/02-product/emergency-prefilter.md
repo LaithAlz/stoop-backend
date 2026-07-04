@@ -10,25 +10,56 @@
 
 Runs **synchronously in the Twilio webhook handler**, on the raw message,
 before the agent is even invoked. Pure regex over a normalized string
-(lowercased, punctuation stripped). No network calls. Sub-millisecond.
+(unicode-folded — accented letters and dash look-alikes collapse to their
+ASCII form, e.g. "éverywhere" → "everywhere" and U+2011/U+2013/U+2014/
+U+2212 dashes → "-" — then lowercased, "9-1-1"-shaped digit runs collapsed
+to "911", punctuation stripped). No network calls. Sub-millisecond.
 
 **HARD triggers** — any match fires the emergency protocol immediately,
 without waiting for classification:
 
 | Category | Patterns (illustrative, not exhaustive) |
 |---|---|
-| Fire | `fire`, `smoke` + (`smell\|filling\|everywhere`), `burning smell` |
+| Fire | `fire`, `flames?`, `smoke` + (`smell\|filling\|everywhere`), `burning smell` |
 | Gas/CO | `gas` + (`smell\|leak\|smells like`), `carbon monoxide`, `co alarm\|detector going off` |
 | Water | `flood(ing)?`, `burst pipe`, `water` + (`pouring\|gushing\|coming through\|through the ceiling`), `sewage` |
 | Security | `break(ing)? in`, `broke in`, `intruder`, `someone is trying to get in` |
 | Person | `911`, `ambulance`, `can't breathe`, `unconscious` |
 
+Continuous-alarm phrasings (`blaring`, `won't stop`, `nonstop`, `continuous`,
+`going off`, `sounding`) near a smoke, fire, CO, or carbon-monoxide
+alarm/detector are **never suppressible** by any guard — a CONTINUOUS alarm
+is EMERGENCY per the rubric regardless of a co-occurring battery mention.
+(The fire- and CO-alarm variants were added after a safety review found the
+battery-chirp guards for those alarm types silently swallowing continuous
+phrasings that mentioned a battery — the smoke-alarm variant shipped with
+the original prefilter.)
+
 **Guarded negatives** — narrow exclusions for known false positives,
 checked before firing: `smoke detector` + (`battery\|chirp\|beep`) alone,
-`fire drill`, `fire alarm test(ing)?`. The list of exclusions is small on
-purpose: per the rubric's bias rule, a false emergency call costs minutes;
-a missed one costs the building. When a guard and a trigger both match,
-**the trigger wins**.
+`fire alarm\|detector` + `battery` alone, `co alarm\|detector` /
+`carbon monoxide alarm\|detector` + `battery` alone, `fire drill`,
+`fire alarm test(ing)?`, and the fixture compound nouns `fire escape`,
+`fire extinguisher`, `fire pit`, `fire hydrant` (a mention of the fixture
+alone, with no second independent "fire"/hazard word, is not a fire). The
+list of exclusions is small on purpose: per the rubric's bias rule, a false
+emergency call costs minutes; a missed one costs the building. When a guard
+and a trigger both match, **the trigger wins** — e.g. "there is a fire near
+the fire escape" still fires on the second, independent "fire" token, and a
+continuous alarm ("fire alarm going off", "carbon monoxide alarm won't
+stop") still fires even when a battery word also appears in the message,
+because those continuous-alarm triggers are never suppressible.
+
+The four fixture guards (`fire_escape`, `fire_extinguisher`, `fire_pit`,
+`fire_hydrant`) additionally refuse to activate at all — not just "lose"
+to an independent trigger, but never suppress anything in the first
+place — when a hazard word (`flames?`, `smoke`, `burning`, or the phrase
+`on fire`) appears **anywhere in the message**, not only next to the
+fixture: "flames shooting out near the fire escape" and "the fire
+extinguisher discharged and everyone is choking on smoke" both fire, even
+though neither mentions "fire" a second time as its own standalone word —
+the hazard-word veto (and, for "flames", a dedicated `flames?` trigger)
+covers the gap.
 
 **SOFT annotations** — `no heat`, `freezing`, `sparks`, `leak`, `locked
 out`: never fire the protocol alone, but are attached to the message
