@@ -26,10 +26,15 @@ without waiting for classification:
 | Security | `break(ing)? in`, `broke in`, `intruder`, `someone is trying to get in` |
 | Person | `911`, `ambulance`, `can't breathe`, `unconscious` |
 
-Continuous-alarm phrasings (`blaring`, `won't stop`, `nonstop`, `continuous`,
-`going off`, `sounding`) near a smoke, fire, CO, or carbon-monoxide
+Continuous-alarm phrasings (`blaring`, `nonstop`, `continuous`, `sounding`,
+`going off`, `went off`, `won't`/`will not` + `stop`/`shut off`/`shut up`/
+`turn off`/`quit`, `hasn't stopped` — one shared pattern in code, never
+per-trigger copies) near a smoke, fire, CO, or carbon-monoxide
 alarm/detector are **never suppressible** by any guard — a CONTINUOUS alarm
 is EMERGENCY per the rubric regardless of a co-occurring battery mention.
+The same shared phrasing list also vetoes the three battery-chirp guards
+outright when it appears anywhere in the message, independent of the
+triggers' proximity windows.
 (The fire- and CO-alarm variants were added after a safety review found the
 battery-chirp guards for those alarm types silently swallowing continuous
 phrasings that mentioned a battery — the smoke-alarm variant shipped with

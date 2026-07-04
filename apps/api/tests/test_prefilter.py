@@ -1635,3 +1635,186 @@ class TestRegressionIssue143UnicodeDashFolding:
     def test_minus_sign_911(self) -> None:
         """U+2212 MINUS SIGN."""
         _hard("dial 9−1−1", "person")
+
+
+class TestRegressionPr144SoundingContinuousAlarm:
+    """PR-#144 senior review, BLOCKING finding 1: the dedicated continuous-alarm
+    alternations enumerated blaring/wont-stop/continuous/nonstop/going-off but
+    omitted "sounding" (and "won't shut off/up"), even though the adjacency-only
+    trigger `alarm sounding` was flipped suppressible=False with a comment
+    claiming sounding is never suppressible. Any word between "alarm" and
+    "sounding" defeated the adjacency form, and the fire/CO battery guards then
+    suppressed the only remaining anchor — base-HARD messages went silent.
+
+    INVARIANT: every continuous-alarm synonym in the dedicated alternations
+    (blaring, wont stop, won't shut off/up, continuous, nonstop, sounding,
+    going off, went off) fires for smoke, fire, AND CO alarms even when a
+    battery word co-occurs, in gap forms ("keeps sounding", "is sounding"),
+    not just strict adjacency.
+    """
+
+    @pytest.mark.unit
+    def test_fire_alarm_is_sounding_low_battery(self) -> None:
+        _hard("the fire alarm is sounding, could be low battery", "fire")
+
+    @pytest.mark.unit
+    def test_fire_alarm_keeps_sounding_battery(self) -> None:
+        _hard("fire alarm keeps sounding, probably needs a battery", "fire")
+
+    @pytest.mark.unit
+    def test_co_alarm_keeps_sounding_battery(self) -> None:
+        _hard("the co alarm keeps sounding, might be the battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_alarm_wont_shut_off_battery(self) -> None:
+        _hard("the co alarm wont shut off, maybe new battery needed?", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_alarm_wont_shut_off_battery(self) -> None:
+        _hard("the fire alarm wont shut off, is it the battery?", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_alarm_keeps_sounding_battery(self) -> None:
+        """Pre-existing base false negative on the smoke pair — fixed for
+        consistency with the fire/CO pairs, not a regression repair."""
+        _hard("the smoke alarm keeps sounding, might be the battery", "fire")
+
+    @pytest.mark.unit
+    def test_co_alarm_went_off_battery(self) -> None:
+        """PR-#144 review advisory 2: past-tense "went off" is an alarm
+        activation report — per the bias rule it must reach the landlord even
+        with a battery hedge."""
+        _hard("the carbon monoxide alarm went off, might be the battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_alarm_chirping_battery_still_guarded(self) -> None:
+        """Chirp + battery with NO continuous-alarm synonym stays ROUTINE."""
+        _not_hard("the fire alarm is chirping, needs a new battery")
+
+    @pytest.mark.unit
+    def test_co_alarm_chirping_battery_still_guarded(self) -> None:
+        _not_hard("the co alarm is chirping, needs a new battery")
+
+    @pytest.mark.unit
+    def test_smoke_detector_battery_low_still_guarded(self) -> None:
+        _not_hard("smoke detector battery low")
+
+
+class TestRegressionPr144CompatibilityDashFold:
+    """PR-#144 review advisory 3: the dash translation ran BEFORE NFKD, but
+    NFKD decomposes some compatibility codepoints INTO the dashes being
+    translated (U+FE58 SMALL EM DASH -> U+2014), so those slipped past a
+    translate-first pass.
+
+    INVARIANT: dash folding runs after NFKD, so compatibility dash variants
+    fold to ASCII "-" too.
+    """
+
+    @pytest.mark.unit
+    def test_small_em_dash_911(self) -> None:
+        """U+FE58 SMALL EM DASH (NFKD-decomposes to U+2014 EM DASH)."""
+        _hard("please call 9﹘1﹘1", "person")
+
+
+class TestRegressionRound3ContinuousSynonymFamily:
+    """Safety-review round 3, BLOCKING: the continuous-alarm alternation was
+    hand-copied six times (smoke/fire/CO x fwd/bwd) and each review round
+    found a synonym missing from some copy — round 3 found spelled-out
+    negation ("will not"), "turn off", "quit", and "has not stopped" all
+    uncovered, so continuous CO/fire alarms with a battery hedge went silent.
+
+    STRUCTURAL FIX under test: one shared `_CONTINUOUS_ALARM_PHRASES`
+    alternation reused by all six triggers, ALSO wired as `refuse_if` on the
+    three battery-guard pairs so a continuous phrasing ANYWHERE in the
+    message vetoes battery suppression, independent of the triggers'
+    30-char proximity windows.
+
+    INVARIANT: any continuous-alarm phrasing plus any alarm-type mention
+    fires, no matter which negation spelling, verb synonym, or distance;
+    chirp/battery-only messages with no continuous phrasing stay guarded.
+    """
+
+    @pytest.mark.unit
+    def test_co_will_not_stop_battery(self) -> None:
+        _hard("the co alarm will not stop, maybe low battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_wont_turn_off_battery(self) -> None:
+        _hard("the co alarm won't turn off, low battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_will_not_turn_off_battery(self) -> None:
+        _hard("the co alarm will not turn off, low battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_will_not_shut_off_battery(self) -> None:
+        _hard("the fire alarm will not shut off, checked the battery", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_will_not_shut_up_battery(self) -> None:
+        _hard("smoke alarm will not shut up, low battery", "fire")
+
+    @pytest.mark.unit
+    def test_co_wont_quit_battery(self) -> None:
+        _hard("the co alarm won't quit, battery maybe", "gas_co")
+
+    @pytest.mark.unit
+    def test_co_has_not_stopped_battery(self) -> None:
+        _hard("carbon monoxide alarm has not stopped, battery?", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_wont_turn_off_battery(self) -> None:
+        _hard("fire alarm wont turn off, might be battery", "fire")
+
+    @pytest.mark.unit
+    def test_refuse_if_beyond_proximity_window(self) -> None:
+        """The continuous phrasing sits far outside the trigger's 30-char
+        window from the alarm noun — only the guard-level refuse_if veto can
+        rescue this message. It must fire via the plain alarm-mention
+        trigger once the battery guard is vetoed."""
+        _hard(
+            "the co alarm, which might just need a new battery like last "
+            "time honestly, really will not stop",
+            "gas_co",
+        )
+
+    @pytest.mark.unit
+    def test_chirp_only_cases_stay_guarded(self) -> None:
+        """No continuous phrasing anywhere -> battery guards stay active."""
+        _not_hard("smoke alarm chirping low battery")
+        _not_hard("the fire alarm is chirping, needs a new battery")
+        _not_hard("co detector says low battery")
+        _not_hard("smoke detector battery chirping")
+        _not_hard("carbon monoxide detector low battery")
+
+
+class TestRound4RecommendedHardening:
+    """Safety-review round 4 (APPROVE) recommended two highest-frequency
+    residual synonyms for the shared continuous-alarm list: "ringing" and
+    present-tense "not stopping" (incl. "isn't stopping").
+
+    INVARIANT: same as the round-3 class — continuous phrasing + alarm-type
+    mention fires despite a battery hedge; chirp-only stays guarded.
+    """
+
+    @pytest.mark.unit
+    def test_co_alarm_still_ringing_battery(self) -> None:
+        _hard("co alarm still ringing, might be the battery", "gas_co")
+
+    @pytest.mark.unit
+    def test_fire_alarm_keeps_ringing_battery(self) -> None:
+        _hard("the fire alarm keeps ringing, low battery maybe", "fire")
+
+    @pytest.mark.unit
+    def test_co_alarm_not_stopping_battery(self) -> None:
+        _hard("carbon monoxide alarm not stopping, battery?", "gas_co")
+
+    @pytest.mark.unit
+    def test_smoke_alarm_isnt_stopping_battery(self) -> None:
+        _hard("smoke alarm isn't stopping, could be low battery", "fire")
+
+    @pytest.mark.unit
+    def test_chirp_only_still_guarded_after_hardening(self) -> None:
+        _not_hard("the fire alarm is chirping, needs a new battery")
+        _not_hard("co detector says low battery")
+        _not_hard("smoke detector battery low")
