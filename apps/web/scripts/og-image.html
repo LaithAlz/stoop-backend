@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Stoop. — OG image source</title>
+    <!--
+      Self-contained 1200x630 template for generating public/og-image.png.
+      Not part of the Vite build (lives in scripts/, not src/) — the
+      orchestrator screenshots this file directly (e.g. with Playwright:
+      page.setViewportSize({ width: 1200, height: 630 }) then
+      page.screenshot({ path: "public/og-image.png" })).
+
+      Copy sourced verbatim from apps/web/src/routes/__root.tsx's
+      og:title / og:description meta — do not invent new copy here.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+    />
+    <style>
+      /* Heritage utility palette — mirrors apps/web/src/styles.css tokens
+         (hex values copied from the comments next to each oklch() token). */
+      :root {
+        --canvas: #fdfcfb;
+        --brand: #2d4a3e;
+        --brand-muted: #e9edea;
+        --ink: #1a1c19;
+        --ink-muted: #5e635e;
+        --emergency: #991b1b;
+        --border: #e2e4e1;
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+      }
+
+      body {
+        background: var(--canvas);
+        font-family: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+      }
+
+      .card {
+        position: relative;
+        width: 1200px;
+        height: 630px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 26px;
+        padding: 100px 96px;
+        border: 1px solid var(--border);
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-self: flex-start;
+        align-items: center;
+        padding: 8px 18px;
+        border-radius: 999px;
+        background: var(--brand-muted);
+        color: var(--brand);
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .wordmark {
+        font-family: "Fraunces", ui-serif, Georgia, serif;
+        font-weight: 700;
+        font-size: 132px;
+        line-height: 1;
+        letter-spacing: -0.01em;
+        color: var(--ink);
+      }
+
+      .wordmark span {
+        color: var(--emergency);
+      }
+
+      .tagline {
+        max-width: 880px;
+        font-size: 32px;
+        line-height: 1.35;
+        font-weight: 500;
+        color: var(--ink-muted);
+      }
+
+      /* Stoop / step motif, echoes public/favicon.svg */
+      .steps {
+        position: absolute;
+        right: 96px;
+        bottom: 96px;
+        display: flex;
+        align-items: flex-end;
+        gap: 10px;
+      }
+
+      .steps i {
+        display: block;
+        width: 34px;
+        background: var(--brand);
+        border-radius: 8px 8px 0 0;
+      }
+
+      .steps i:nth-child(1) {
+        height: 46px;
+      }
+      .steps i:nth-child(2) {
+        height: 80px;
+      }
+      .steps i:nth-child(3) {
+        height: 114px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <!-- from og:title, minus the "Stoop. — " prefix (the wordmark below covers that) -->
+      <p class="eyebrow">Tenant maintenance, handled for small landlords</p>
+      <h1 class="wordmark">Stoop<span>.</span></h1>
+      <!-- verbatim og:description -->
+      <p class="tagline">
+        Reads, sorts, and drafts replies for tenant maintenance over SMS — you approve before it
+        sends.
+      </p>
+      <div class="steps" aria-hidden="true"><i></i><i></i><i></i></div>
+    </div>
+  </body>
+</html>

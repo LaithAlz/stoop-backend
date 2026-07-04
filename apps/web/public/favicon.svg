@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Stoop">
+  <rect width="32" height="32" rx="7" fill="#2D4A3E"/>
+  <rect x="6" y="19" width="20" height="3.4" rx="1.4" fill="#FDFCFB"/>
+  <rect x="6" y="14.2" width="14" height="3.4" rx="1.4" fill="#FDFCFB" fill-opacity="0.82"/>
+  <rect x="6" y="9.4" width="8" height="3.4" rx="1.4" fill="#FDFCFB" fill-opacity="0.64"/>
+  <circle cx="25" cy="25" r="3" fill="#991B1B"/>
+</svg>
