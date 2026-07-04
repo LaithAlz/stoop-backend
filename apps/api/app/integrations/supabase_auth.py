@@ -43,6 +43,15 @@ _ALLOWED_ALGORITHMS: list[str] = ["ES256", "RS256"]
 _AUD = "authenticated"
 _JWKS_TTL_SECONDS: float = 86_400.0  # 24 hours
 
+# Rate limit for the "force a refresh on unknown-kid" path (see
+# ``_refresh_jwks_on_kid_miss`` below). Key rotation is rare (Supabase key
+# rotation happens on the order of weeks/months), so one forced refresh per
+# minute is more than enough to pick up a rotated key quickly while bounding
+# how often an attacker spamming random ``kid`` values can force us to hit
+# Supabase's JWKS endpoint. Config-free on purpose: this is a DoS guard, not
+# a deployment knob.
+_FORCED_REFRESH_WINDOW_SECONDS: float = 60.0
+
 # ---------------------------------------------------------------------------
 # JWKS cache (module-level, protected by an asyncio.Lock)
 # ---------------------------------------------------------------------------
@@ -50,6 +59,21 @@ _JWKS_TTL_SECONDS: float = 86_400.0  # 24 hours
 # (_jwks_data, _fetched_at_monotonic)
 _jwks_cache: tuple[dict[str, Any], float] | None = None
 _jwks_lock = asyncio.Lock()
+
+# Monotonic timestamp of the last *forced* refresh triggered by an
+# unknown-``kid`` miss (as opposed to a routine TTL-expiry refresh). ``None``
+# means no forced refresh has happened yet in this process.
+_last_forced_refresh: float | None = None
+
+
+def _now() -> float:
+    """Monotonic clock used for cache/rate-limit bookkeeping.
+
+    A thin wrapper around ``time.monotonic()`` so tests can monkeypatch a
+    single seam to simulate the passage of time (e.g. to exercise the
+    forced-refresh rate-limit window) without real ``sleep()`` calls.
+    """
+    return time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -129,18 +153,97 @@ async def _get_jwks() -> dict[str, Any]:
     # Fast path (no lock): check if we have a fresh cache.
     if _jwks_cache is not None:
         data, fetched_at = _jwks_cache
-        if time.monotonic() - fetched_at < _JWKS_TTL_SECONDS:
+        if _now() - fetched_at < _JWKS_TTL_SECONDS:
             return data
 
     # Slow path: acquire the lock, re-check (double-check locking), then fetch.
     async with _jwks_lock:
         if _jwks_cache is not None:
             data, fetched_at = _jwks_cache
-            if time.monotonic() - fetched_at < _JWKS_TTL_SECONDS:
+            if _now() - fetched_at < _JWKS_TTL_SECONDS:
                 return data
 
         data = await _fetch_jwks()
-        _jwks_cache = (data, time.monotonic())
+        _jwks_cache = (data, _now())
+        return data
+
+
+async def _refresh_jwks_on_kid_miss() -> dict[str, Any]:
+    """Force a single, rate-limited JWKS refresh *attempt* after an
+    unknown-``kid`` miss.
+
+    Supabase rotates its signing keys occasionally; when it does, every
+    newly-issued token carries a ``kid`` absent from our (up to 24h-old)
+    cache. Without this, every authenticated request would fail-closed until
+    the TTL naturally expires — an availability outage, not a security one.
+
+    Rate limiting: at most one forced refresh *attempt* per
+    ``_FORCED_REFRESH_WINDOW_SECONDS`` window, tracked via the module-level
+    ``_last_forced_refresh`` timestamp. ``_last_forced_refresh`` is stamped
+    BEFORE the fetch is attempted, not only on success — the window must
+    bound *attempts*, not successes. If the fetch itself fails (connection
+    error, 5xx via ``raise_for_status``, malformed JSON), the window is
+    still consumed: otherwise an attacker spamming unknown ``kid`` values
+    while Supabase's JWKS endpoint happens to be erroring could drive one
+    upstream attempt per request — hammering the endpoint exactly while
+    it's recovering. The tradeoff is that a transiently-failed refresh can
+    delay picking up a real rotation by up to the window (60s), which the
+    issue explicitly accepts.
+
+    Cache-write guard: a fetch that succeeds (HTTP 200) but returns a
+    degenerate/empty ``{"keys": []}`` body must NOT clobber a known-good
+    cache — otherwise a single bad-but-200 upstream response could fail
+    closed ALL dashboard auth for up to 24h (the full TTL). The cache is
+    only replaced when the fetched payload has a non-empty ``"keys"`` list;
+    otherwise the existing cache (if any) is kept, and the caller's retry
+    simply misses and fails closed as normal.
+
+    Concurrency: the rate-limit check, the stamp, and the fetch attempt all
+    happen under ``_jwks_lock`` so that concurrent kid-misses coalesce into
+    a single attempt — the first coroutine through the lock stamps
+    ``_last_forced_refresh`` and performs the fetch; any coroutine that
+    acquires the lock afterwards, within the window, sees the stamp and
+    skips its own attempt (regardless of whether the first attempt
+    succeeded, failed, or returned a degenerate body).
+
+    Returns whatever JWKS is currently cached — either freshly refetched
+    (only if it contained keys), or the previously-cached copy. The caller
+    re-attempts ``_find_signing_key`` against the result and gets a normal
+    ``invalid_token`` if the ``kid`` still isn't present.
+    """
+    global _jwks_cache, _last_forced_refresh  # noqa: PLW0603
+
+    async with _jwks_lock:
+        now = _now()
+        rate_limited = (
+            _last_forced_refresh is not None
+            and now - _last_forced_refresh < _FORCED_REFRESH_WINDOW_SECONDS
+        )
+        if rate_limited:
+            # Rate-limited: another kid-miss already attempted a refresh
+            # recently (possibly a concurrent one that just released the
+            # lock, or one that failed outright). Reuse whatever is cached
+            # rather than attempting another fetch.
+            if _jwks_cache is not None:
+                return _jwks_cache[0]
+            return {"keys": []}
+
+        # Stamp BEFORE attempting the fetch — see docstring: the window
+        # must bound attempts, not just successes.
+        _last_forced_refresh = now
+
+        data = await _fetch_jwks()
+
+        if not data.get("keys"):
+            # Degenerate-but-200 response: do NOT clobber a known-good
+            # cache with this. Keep the existing cache (if any) so the
+            # caller's retry fails closed on the *real* cached keys rather
+            # than resetting the 24h TTL on empty data.
+            if _jwks_cache is not None:
+                return _jwks_cache[0]
+            return data
+
+        _jwks_cache = (data, _now())
         return data
 
 
@@ -213,7 +316,20 @@ async def verify_jwt(token: str) -> AuthUser:
     except Exception as exc:
         raise AuthError("invalid_token", "Authentication failed.") from exc
 
-    signing_key = _find_signing_key(jwks, kid)
+    try:
+        signing_key = _find_signing_key(jwks, kid)
+    except AuthError:
+        # Unknown kid: our cache may simply be stale because Supabase
+        # rotated its signing keys. Force a single, rate-limited refresh
+        # (see _refresh_jwks_on_kid_miss) and retry exactly once against the
+        # refreshed set. If the kid is still missing after that, the
+        # AuthError from this second lookup propagates as a normal
+        # invalid_token — no further retries, no loops.
+        try:
+            jwks = await _refresh_jwks_on_kid_miss()
+        except Exception as exc:
+            raise AuthError("invalid_token", "Authentication failed.") from exc
+        signing_key = _find_signing_key(jwks, kid)
 
     # Step 3 — full verification with explicit allowlist.
     # PyJWT verifies: signature, exp, iss, aud.
