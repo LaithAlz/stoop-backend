@@ -108,6 +108,8 @@ oldest-first):
 ```
 - 409 `draft_stale` if a newer tenant message invalidated it — body
   includes `"fresh_draft_id"`. Idempotent on repeat.
+- Undo window is +5s from the dashboard (approve-by-SMS: +5min — see
+  Webhooks).
 `DELETE /v1/drafts/{id}/approve` → 200 `{ "status": "pending" }`
 (cancels within the undo window; 409 `already_sent` after).
 `POST /v1/drafts/{id}/reject` — body `{ "note?": "…" }` → 200.
@@ -130,9 +132,47 @@ dashboard's emergency banner.
 ## Webhooks (no auth header; signature-verified)
 
 - `POST /webhooks/twilio/sms` — form-encoded from Twilio. Always 200 fast;
-  persist before process; dedupe on `MessageSid`. (#40)
+  persist before process; dedupe on `MessageSid`. (#40) **Approve-by-SMS
+  (#122):**
+  - Tier-0 (`emergency-prefilter.md`) runs on **every** inbound SMS
+    before any routing split. A Tier-0 hard trigger on a
+    landlord-authored message does **not** invoke the tenant emergency
+    protocol (there is no tenant/case to act on); it is recorded,
+    surfaced as a `needs_eyes` notification, and acknowledged in the
+    reply — never silently dropped.
+  - Routing predicate after Tier-0: `From` == the landlord's phone for
+    the property owning the `To` number AND `From` does not match an
+    active tenant of that property → approve-by-SMS handler. On
+    collision (self-managing landlord living in-unit) the **tenant
+    pipeline wins**, so an emergency can never be bypassed.
+  - Replies correlate to the draft id carried in that landlord's most
+    recent draft-ready notification (`notifications.payload`), scoped
+    to the property owning the `To` number (via
+    `case_id → cases.property_id`) — a multi-property landlord replying
+    `1` can only ever act on a draft for the property whose thread they
+    replied in. If that draft is no longer pending
+    (stale/superseded/approved) nothing sends and the landlord gets a
+    fresh-draft notice.
+  - `1` = approve — identical trust/audit/stale-draft semantics to
+    `POST /v1/drafts/{id}/approve` but `scheduled_send_at = now()+5min`;
+    `2` = reject; `UNDO` within those 5 minutes cancels.
+  - The `From` number is a weak authenticator (spoofable): a reply can
+    only act on the single referenced draft, and the 5-minute window
+    bounds a spoofed approve.
+  - The landlord's reply is stored in `messages` (`party='landlord'`,
+    `tenant_id` NULL) and **never** forwarded to a tenant or vendor.
+  - Unrecognized replies are recorded in `messages` and surfaced —
+    never routed to app logs, never silently dropped.
 - `POST /webhooks/twilio/voice` — TwiML callbacks for the emergency call
   (`Digits=1` → acknowledge). (#108)
+- `POST /webhooks/twilio/status` — Twilio delivery-status callback,
+  signature-verified like the others. Looks up the message by
+  `twilio_sid`, appends a `message_status_events` row (#151, endpoint:
+  #152). Every callback is appended as a fact — duplicates/out-of-order
+  arrivals expected; delivery state derives from status precedence
+  (terminal wins), never recency. Unknown `twilio_sid` or
+  out-of-vocabulary status → 200 + drop with a metadata-only log (no
+  body, no phone). Always 200 fast.
 - `POST /webhooks/stripe` — signature + event-id idempotent. (#59)
 
 ## Health
