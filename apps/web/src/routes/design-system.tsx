@@ -33,6 +33,7 @@ export const Route = createFileRoute("/design-system")({
         name: "description",
         content: "The Heritage Utility design system for Stoop.",
       },
+      { name: "robots", content: "noindex" },
     ],
   }),
   component: DesignSystemPage,

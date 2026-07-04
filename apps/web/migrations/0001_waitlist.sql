@@ -1,4 +1,4 @@
--- Founding-cohort waitlist (issue #114)
+-- Early-access waitlist (issue #114)
 CREATE TABLE IF NOT EXISTS waitlist (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,

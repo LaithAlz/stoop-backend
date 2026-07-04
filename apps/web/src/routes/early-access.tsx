@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { MarketingNav } from "@/components/stoop/MarketingNav";
 import { SiteFooter } from "@/components/stoop/SiteFooter";
 import { cn } from "@/lib/utils";
+import { trackEvent } from "@/lib/analytics";
 
 /* ──────────────────────────────────────────────────────────────────
  * Early-access page (issue #114).
@@ -25,6 +26,10 @@ type D1Like = {
     bind(...v: unknown[]): { run(): Promise<unknown> };
   };
 };
+
+// Pairs with the D1 `waitlist.source` column (ADR-5) and the
+// `waitlist_submitted` Plausible event prop below — keep these in sync.
+const WAITLIST_SOURCE = "early-access-page";
 
 async function getWaitlistDb(): Promise<D1Like | null> {
   try {
@@ -48,10 +53,10 @@ const joinWaitlist = createServerFn({ method: "POST" }).handler(
     await db
       .prepare(
         `INSERT INTO waitlist (name, email, is_pm, source)
-         VALUES ('', ?, ?, 'early-access-page')
+         VALUES ('', ?, ?, ?)
          ON CONFLICT(email) DO NOTHING`,
       )
-      .bind(email.toLowerCase(), isPm ? 1 : 0)
+      .bind(email.toLowerCase(), isPm ? 1 : 0, WAITLIST_SOURCE)
       .run();
     return { ok: true };
   },
@@ -68,7 +73,7 @@ export const Route = createFileRoute("/early-access")({
       },
     ],
   }),
-  component: FoundingPage,
+  component: EarlyAccessPage,
 });
 
 /* ── overnight example card (the right-hand visual) ──────────────── */
@@ -165,6 +170,9 @@ function CaptureForm() {
         },
       });
       setStatus(res.ok ? "done" : "error");
+      if (res.ok) {
+        trackEvent("waitlist_submitted", { props: { source: WAITLIST_SOURCE } });
+      }
     } catch {
       setStatus("error");
     }
@@ -236,7 +244,7 @@ function CaptureForm() {
 
 /* ── page ────────────────────────────────────────────────────────── */
 
-function FoundingPage() {
+function EarlyAccessPage() {
   return (
     <div className="min-h-screen bg-canvas text-ink">
       <MarketingNav />

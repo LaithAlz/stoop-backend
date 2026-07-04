@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+Disallow: /design-system
+Disallow: /app
+
+# Sitemap: https://<production-domain>/sitemap.xml
+# ^ uncomment once the production domain is chosen and deployed — a
+# relative or placeholder URL here would be invalid per the sitemap spec.

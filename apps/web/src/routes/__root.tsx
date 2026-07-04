@@ -9,6 +9,12 @@ import {
 } from "@tanstack/react-router";
 
 import appCss from "../styles.css?url";
+import { Toaster } from "@/components/ui/sonner";
+
+// ADR-5: marketing analytics is Plausible — anonymous, cookieless, no
+// consent banner. Env-gated: unset (current state, no production domain
+// yet) means no script tag is injected and src/lib/analytics.ts no-ops.
+const plausibleDomain = import.meta.env.VITE_PLAUSIBLE_DOMAIN as string | undefined;
 
 function NotFoundComponent() {
   return (
@@ -85,9 +91,15 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
           "Reads, sorts, and drafts replies for tenant maintenance over SMS — you approve before it sends.",
       },
       { property: "og:type", content: "website" },
+      // TODO(domain): og:image must be an absolute URL for scrapers to
+      // resolve it (Facebook/Twitter/LinkedIn don't resolve relative
+      // paths) — swap to `https://<production-domain>/og-image.png` once
+      // the domain exists. Source template: scripts/og-image.html.
+      { property: "og:image", content: "/og-image.png" },
       { name: "twitter:card", content: "summary_large_image" },
     ],
     links: [
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
       {
@@ -96,6 +108,15 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       },
       { rel: "stylesheet", href: appCss },
     ],
+    scripts: plausibleDomain
+      ? [
+          {
+            defer: true,
+            src: "https://plausible.io/js/script.js",
+            "data-domain": plausibleDomain,
+          } as React.JSX.IntrinsicElements["script"],
+        ]
+      : undefined,
   }),
   shellComponent: RootShell,
   component: RootComponent,
@@ -123,6 +144,7 @@ function RootComponent() {
   return (
     <QueryClientProvider client={queryClient}>
       <Outlet />
+      <Toaster />
     </QueryClientProvider>
   );
 }
