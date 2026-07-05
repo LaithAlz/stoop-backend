@@ -115,21 +115,34 @@ def _mint_token(
     private: EllipticCurvePrivateKey,
     *,
     sub: str,
-    email: str = "tenant@example.com",
+    email: str | int | None = "tenant@example.com",
     full_name: str | None = "Test Landlord",
     kid: str = _KID,
     exp_offset: int = 3600,
 ) -> str:
+    """Mint a test JWT.
+
+    ``email`` handling distinguishes three cases that must be normalized
+    identically by ``supabase_auth.verify_jwt`` (issue #135 safety review):
+
+    - ``email=None`` — omit the claim entirely (a token that never had one).
+    - ``email=""`` / ``email="   "`` — encode the claim as present but empty
+      or whitespace-only, matching real GoTrue behaviour: it serializes the
+      JWT ``email`` claim from a Go string with no ``omitempty``, so a real
+      phone-only signup emits ``"email": ""`` rather than an absent claim.
+    - ``email=<non-string>`` (e.g. an int) — a malformed/junk claim value.
+    """
     now = int(time.time())
     payload: dict[str, Any] = {
         "sub": sub,
         "iss": _ISSUER,
         "aud": "authenticated",
         "role": "authenticated",
-        "email": email,
         "iat": now,
         "exp": now + exp_offset,
     }
+    if email is not None:
+        payload["email"] = email
     if full_name is not None:
         payload["user_metadata"] = {"full_name": full_name}
     return jwt.encode(payload, private, algorithm="ES256", headers={"kid": kid})
@@ -496,5 +509,224 @@ async def test_me_concurrent_first_calls_no_duplicate_key(
         )
         count = result.scalar_one()
         assert count == 1, f"Expected 1 landlords row after concurrent calls, found {count}"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_me_phone_only_token_returns_403_email_required(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """A verified token with no ``email`` claim (phone-only signup) must be
+    rejected with 403 ``email_required`` via the standard error envelope,
+    BEFORE any DB write — issue #135 part 2 (was a 500 NotNullViolation).
+    """
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email=None)
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    try:
+        assert response.status_code == 403, response.text
+        body = response.json()
+        assert "error" in body
+        error = body["error"]
+        assert error["code"] == "email_required"
+        assert "message" in error
+        assert "request_id" in error
+
+        # The message must be generic and never contain token material.
+        assert token not in error["message"]
+        assert sub not in error["message"]
+
+        # Nothing written: no landlords row for this auth_user_id.
+        result = await db_session.execute(
+            text("SELECT COUNT(*) FROM landlords WHERE auth_user_id = :uid"),
+            {"uid": sub},
+        )
+        count = result.scalar_one()
+        assert count == 0, f"Expected no landlords row to be written, found {count}"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_me_existing_landlord_token_loses_email_returns_403_row_untouched(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """An existing landlord row (created via a normal email token) must also
+    be rejected with 403 ``email_required`` if a later token for the same
+    ``sub`` has lost the email claim — never 200, never 500, and the row
+    (including ``updated_at``) must be left completely untouched.
+    """
+    sub = str(uuid.uuid4())
+    email_token = _mint_token(private_key, sub=sub, email="existing@example.com")
+    phone_only_token = _mint_token(private_key, sub=sub, email=None)
+
+    jwks_response = httpx.Response(200, json=jwks_payload)
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=jwks_response)
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed_response = await client.get(
+                "/v1/me", headers={"Authorization": f"Bearer {email_token}"}
+            )
+            auth_mod._jwks_cache = None  # noqa: SLF001
+
+            row_before = (
+                (
+                    await db_session.execute(
+                        text("SELECT email, updated_at FROM landlords WHERE auth_user_id = :uid"),
+                        {"uid": sub},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+
+            response = await client.get(
+                "/v1/me", headers={"Authorization": f"Bearer {phone_only_token}"}
+            )
+
+    try:
+        assert seed_response.status_code == 200, seed_response.text
+        assert response.status_code == 403, response.text
+        body = response.json()
+        assert body["error"]["code"] == "email_required"
+
+        row_after = (
+            (
+                await db_session.execute(
+                    text("SELECT email, updated_at FROM landlords WHERE auth_user_id = :uid"),
+                    {"uid": sub},
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+        assert row_after["email"] == row_before["email"] == "existing@example.com"
+        assert row_after["updated_at"] == row_before["updated_at"], (
+            "Row must be untouched — updated_at changed after a rejected email_required call"
+        )
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "junk_email",
+    ["", "   ", 12345],
+    ids=["empty_string", "whitespace_only", "non_string"],
+)
+async def test_me_junk_email_claim_returns_403_email_required(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+    junk_email: str | int,
+) -> None:
+    """A token whose ``email`` claim is *present but unusable* — empty,
+    whitespace-only, or non-string — must be normalized to "no email" by
+    ``verify_jwt`` and rejected exactly like an entirely absent claim
+    (issue #135 safety review).
+
+    GoTrue serializes the JWT ``email`` claim from a Go string with no
+    ``omitempty``, so a real phone-only signup emits ``"email": ""``
+    (present, empty) rather than omitting the claim — an ``is None`` check
+    alone would miss this and let it reach the upsert. Must be 403
+    ``email_required``, never 200 and never a 500 NotNullViolation, and
+    nothing written.
+    """
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email=junk_email)
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    try:
+        assert response.status_code == 403, response.text
+        assert response.json()["error"]["code"] == "email_required"
+
+        result = await db_session.execute(
+            text("SELECT COUNT(*) FROM landlords WHERE auth_user_id = :uid"),
+            {"uid": sub},
+        )
+        count = result.scalar_one()
+        assert count == 0, f"Expected no landlords row to be written, found {count}"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_me_existing_landlord_empty_string_email_does_not_overwrite_stored_email(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """Regression for the empty-string overwrite bug (issue #135 safety
+    review): an existing landlord's stored email must NOT be silently
+    clobbered to ``""`` via ``ON CONFLICT ... SET email = EXCLUDED.email``
+    when a later token for the same ``sub`` carries a present-but-empty
+    ``email`` claim. Must be 403 ``email_required``, and the stored email
+    left byte-for-byte unchanged.
+    """
+    sub = str(uuid.uuid4())
+    email_token = _mint_token(private_key, sub=sub, email="existing2@example.com")
+    empty_email_token = _mint_token(private_key, sub=sub, email="")
+
+    jwks_response = httpx.Response(200, json=jwks_payload)
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=jwks_response)
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed_response = await client.get(
+                "/v1/me", headers={"Authorization": f"Bearer {email_token}"}
+            )
+            auth_mod._jwks_cache = None  # noqa: SLF001
+
+            response = await client.get(
+                "/v1/me", headers={"Authorization": f"Bearer {empty_email_token}"}
+            )
+
+    try:
+        assert seed_response.status_code == 200, seed_response.text
+        assert response.status_code == 403, response.text
+        assert response.json()["error"]["code"] == "email_required"
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT email FROM landlords WHERE auth_user_id = :uid"),
+                    {"uid": sub},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["email"] == "existing2@example.com", (
+            f"Stored email must be unchanged, got {row['email']!r} — an empty-string "
+            "email claim on a plain GET silently overwrote a real stored email"
+        )
     finally:
         await _cleanup(db_session, sub)

@@ -122,6 +122,13 @@ class AuthUser:
     email : str | None
         The ``email`` claim.  May change if the user updates their address;
         treat as display-only contact info, never as an authorization key.
+        Normalized at the ``verify_jwt`` boundary (issue #135 safety
+        review): an empty string, a whitespace-only string, or a non-string
+        claim value all collapse to ``None`` here — a real value is always
+        a non-empty, stripped string. This matters because GoTrue emits
+        ``"email": ""`` (present, empty) rather than omitting the claim for
+        phone-only signups; callers checking ``is None``/truthiness need
+        exactly one consistent "no email" signal, not two.
     full_name : str | None
         ``user_metadata.full_name`` — **user-writable**; use only for display.
         Never use as an authorization signal.
@@ -447,7 +454,18 @@ async def verify_jwt(token: str) -> AuthUser:
     except (KeyError, ValueError) as exc:
         raise AuthError("invalid_token", "Authentication failed.") from exc
 
-    email: str | None = claims.get("email")
+    # Normalize the email claim at this boundary (issue #135 safety review):
+    # GoTrue serializes the JWT `email` claim from a Go string with no
+    # `omitempty`, so a real phone-only signup emits `"email": ""`
+    # (present, empty) rather than an absent claim — a bare `.get("email")`
+    # would let that empty string sail past any `is None` check downstream.
+    # A non-string claim (malformed/junk token) is treated the same way.
+    # Collapsing empty/whitespace-only/non-string to None here means every
+    # caller of `AuthUser.email` gets one consistent "no email" signal.
+    _raw_email: Any = claims.get("email")
+    email: str | None = (
+        _raw_email.strip() if isinstance(_raw_email, str) and _raw_email.strip() else None
+    )
     user_metadata: dict[str, Any] = claims.get("user_metadata") or {}
     full_name: str | None = user_metadata.get("full_name")
 
