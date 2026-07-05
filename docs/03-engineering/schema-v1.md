@@ -187,6 +187,54 @@
 >    (`docs/02-product/conversation-model.md`: a tenant's one SMS thread
 >    maps to potentially many cases over time, each with its own
 >    checkpoint history).
+>
+> **v1.5 amendments (2026-07-05)** — migration 0008 implements this (#110),
+> closing the schema-vocabulary gap flagged during #110's implementation:
+> `conversation-model.md`'s "tenant confirms fixed → agent *proposes*
+> resolution, landlord-visible, auto-applies after 48h unless contradicted"
+> phase has no representable state without a durable, timer-shaped marker —
+> `cases.status` has no pending/proposed value, and `audit_log.action` has
+> no matching vocabulary entry (only the terminal `case_resolved`). Per the
+> repo's own precedent ("the undo window is data, not a sleep" — the
+> `drafts.scheduled_send_at` design above), the resolved answer is a new
+> column, not a new implicit timer someone has to remember exists.
+> 1. New nullable column `cases.pending_resolved_at timestamptz` (no
+>    default, no backfill — every existing row has none pending). `NULL`
+>    means "no proposal pending" (the overwhelmingly common case).
+> 2. **Design choice — this column stores the APPLY-AT time, not the
+>    proposal time**: when `identify_case` (`app/agent/case_lifecycle.py`'s
+>    `propose_resolution`) sees a tenant confirm an issue is fixed, it sets
+>    `pending_resolved_at = now() + 48h` directly, rather than storing the
+>    proposal timestamp and having every reader re-derive the deadline.
+>    Chosen over the proposal-time alternative because (a) the column name
+>    is then self-describing (it literally names the moment the case
+>    resolves, not an event that happened earlier), (b) the sweep query is
+>    a trivial `pending_resolved_at <= now()` with no arithmetic or
+>    duplicated `interval '48 hours'` literal to keep in sync between
+>    `propose_resolution` and the sweep, and (c) a future change to the
+>    proposal window (e.g. 48h → 24h) is a one-line constant change with no
+>    migration, because the window is baked in at proposal time, not read
+>    out at sweep time.
+> 3. **Precedence over the 14-day auto-stale sweep**: a case with
+>    `pending_resolved_at IS NOT NULL` is NEVER auto-staled, regardless of
+>    how old its `last_activity_at` is — the pending, tenant-confirmed
+>    resolution is a more specific and more recent signal than mere
+>    inactivity, and auto-staling out from under it would silently discard
+>    that signal. It resolves via exactly one of: the 48h deadline arrives
+>    (`resolved_reason = 'tenant_confirmed'`), or a new message on the case
+>    contradicts it first (`pending_resolved_at` cleared back to `NULL`,
+>    case stays open/active — no `audit_log` entry for a contradiction,
+>    since none was ever written for the proposal either; both are
+>    reasoning_log-visible on the approval card, not audit facts).
+> 4. `audit_log` vocabulary is UNCHANGED — the proposal and any
+>    contradiction are visible via the column plus `reasoning_log` only;
+>    an `audit_log` entry is written ONLY when the resolution actually
+>    APPLIES (`action = 'case_resolved'`, same as every other resolution
+>    path), matching the existing rule that `audit_log` records facts that
+>    happened, not intentions that might not.
+> 5. `pending_resolved_at` is cleared (`NULL`) on every path that resolves,
+>    reopens, or re-proposes a case — a resolved/reopened case must never
+>    carry a stale pending-resolution deadline forward.
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
@@ -292,6 +340,10 @@ CREATE TABLE cases (
   emergency_fired_at  timestamptz,                   -- dedupe: protocol fires once per case
   last_activity_at    timestamptz NOT NULL DEFAULT now(),
   resolved_at         timestamptz,
+  pending_resolved_at timestamptz,                    -- v1.5 (migration 0008, #110): tenant said
+                                                        --  "all fixed" at T -> resolution auto-
+                                                        --  applies at T+48h unless contradicted;
+                                                        --  NULL = no proposal pending
   created_at          timestamptz NOT NULL DEFAULT now(),
   updated_at          timestamptz NOT NULL DEFAULT now()
 );

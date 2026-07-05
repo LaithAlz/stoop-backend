@@ -23,6 +23,7 @@ populate fields as the graph runs; unvisited branches leave them as
 from __future__ import annotations
 
 from typing import Any, TypedDict
+from uuid import UUID
 
 from app.agent.schemas import (
     CaseContext,
@@ -39,9 +40,34 @@ class AgentState(TypedDict, total=False):
 
     Fields
     ------
+    message_id:
+        The ``messages.id`` of the inbound message that triggered this graph
+        run.  Set by the CALLER (``app/agent/graph_entry.py``, #30 onward)
+        before the graph starts — this is the one piece of state that is
+        never re-derived by a node, it is the entry point every node re-
+        derives FROM.  ``identify_property`` loads the message row keyed on
+        this id and re-derives ``case_context``'s identifiers from the
+        row's own persisted ``landlord_id``/``property_id``/``tenant_id``
+        rather than trusting anything else the caller might have set (the
+        message row, written by the webhook before the graph ever runs, is
+        the source of truth — see ``app/agent/nodes/identify_property.py``).
+
     case_context:
         Identifiers and property metadata populated by ``identify_property``
         and ``load_context``.  Present on every run.
+
+    open_cases:
+        The tenant's currently OPEN cases (``open``/``awaiting_approval``/
+        ``awaiting_tenant``/``reopened`` — never ``resolved``), extracted by
+        ``load_context`` and consumed by ``identify_case``'s routing
+        decision (conversation-model.md's ambiguity rule: 0 → new case, 1 →
+        attach, >1 → ambiguous, attach to most recent + note).  Ordered most
+        -recently-active first.  Each entry is an ``OpenCaseSummary`` (or its
+        ``model_dump()`` dict equivalent) — same "store as dicts for
+        checkpoint serialisation" convention as ``channel_history`` below.
+        ``None``/absent before ``load_context`` runs, or when the message
+        has no known tenant (unknown sender — no case can ever be opened,
+        see ``app/agent/nodes/identify_case.py``).
 
     channel_history:
         A recent slice of the channel's message history (tenant ↔ property
@@ -83,16 +109,33 @@ class AgentState(TypedDict, total=False):
     reasoning_log:
         Append-only list of human-readable trace lines.  Every node MUST
         append at least one entry describing what it observed and decided.
-        Example entries:
-          "identify_property: matched property 'id=…' via Twilio number +1416…"
-          "classify_severity: EMERGENCY — burst pipe (active uncontained water rule)"
-          "vulnerable_occupant modifier: raised URGENT → EMERGENCY (infant)"
+        This is landlord-visible copy (the approval card), not a debug log —
+        warm, plain English, no ``node_name:`` prefixes, no field=value
+        reprs, no raw ids (#30/#110 review). Example entries:
+          "This message came in from Maria at 41 Palmerston."
+          "Right now it's -8°C outside, with an overnight low of -12°C."
+          "This looks like it continues Maria's open conversation, so I
+           added it there."
         This list is shown verbatim on the landlord's approval card and is
         included in LangSmith traces.  Do NOT include tenant phone numbers,
-        message bodies, or any PII in these strings.
+        message bodies, or any other PII in these strings — put ids/booleans
+        in structlog calls instead, never in a ``reasoning_log`` string.
+
+        Accumulation note (until #34 wires the graph): plain TypedDict keys
+        have LangGraph's default "last write wins" merge semantics, not
+        list-append, unless a node's return value is annotated with a
+        reducer (e.g. ``Annotated[list[str], operator.add]``) — a decision
+        left to #34 ("wire state graph"), not this issue. Every node in
+        ``app/agent/nodes/`` is therefore written defensively: it reads the
+        FULL incoming ``reasoning_log``, appends its own line(s), and
+        returns the FULL list — so the log accumulates correctly whether or
+        not #34 later adds a reducer annotation (a reducer would simply make
+        this belt-and-braces pattern redundant, never incorrect).
     """
 
+    message_id: UUID
     case_context: CaseContext
+    open_cases: list[dict[str, Any]]
     channel_history: list[dict[str, Any]]
     prefilter: PrefilterResult | None
     weather: WeatherSnapshot | None

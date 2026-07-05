@@ -469,8 +469,8 @@ def test_agent_state_construction_representative_payload() -> None:
             body="Please call 911 if you are in immediate danger. I have been notified."
         ),
         "reasoning_log": [
-            "identify_property: property matched via Twilio number",
-            "load_context: tenant loaded, vulnerable_occupant=elderly",
+            "I matched this message to property matched via Twilio number",
+            "I loaded the details for tenant loaded, vulnerable_occupant=elderly",
             "prefilter: no hard hit; soft_annotations=['no_heat']",
             "classify_severity: EMERGENCY — overnight low -12 °C ≤ -10 °C threshold",
             "vulnerable_occupant modifier applied: elderly raised URGENT → EMERGENCY",
@@ -497,12 +497,12 @@ def test_agent_state_reasoning_log_accumulates() -> None:
     }
 
     # Simulate nodes appending to the log one at a time.
-    state["reasoning_log"].append("identify_property: matched property abc")
-    state["reasoning_log"].append("load_context: context loaded")
+    state["reasoning_log"].append("I matched this message to matched property abc")
+    state["reasoning_log"].append("I loaded the details for context loaded")
     state["reasoning_log"].append("classify_severity: ROUTINE — minor dripping tap")
 
     assert len(state["reasoning_log"]) == 3
-    assert state["reasoning_log"][0] == "identify_property: matched property abc"
+    assert state["reasoning_log"][0] == "I matched this message to matched property abc"
     assert state["reasoning_log"][2] == "classify_severity: ROUTINE — minor dripping tap"
 
 
@@ -511,7 +511,7 @@ def test_agent_state_partial_construction() -> None:
     """AgentState can be constructed with only some fields (total=False)."""
     state: AgentState = {
         "case_context": CaseContext(),
-        "reasoning_log": ["identify_property: matched property xyz"],
+        "reasoning_log": ["I matched this message to matched property xyz"],
     }
     # Fields not yet populated should be absent (not KeyError on TypedDict).
     assert state.get("severity") is None

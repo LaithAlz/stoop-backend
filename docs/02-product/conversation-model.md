@@ -47,7 +47,15 @@ holds the *primary* case for the common single-issue path.
   (agent detects "all good now, thanks" and *proposes* resolution —
   landlord-visible, auto-applies after 48 h if not contradicted), or
   (c) auto-stale after **14 days** of inactivity, recorded as
-  `resolved(auto-stale)` so reporting can distinguish it.
+  `resolved(auto-stale)` so reporting can distinguish it. Auto-stale
+  applies to `open`/`awaiting_tenant`/`reopened` cases only — a case
+  sitting in `awaiting_approval` (a drafted reply the landlord hasn't
+  approved yet) is **never** auto-staled, however long it sits there:
+  that status represents the landlord's own unactioned backlog, and
+  silently resolving it would hide the backlog instead of surfacing it.
+  It waits for the landlord (or a new tenant message) indefinitely.
+  When a case does auto-stale, the landlord gets a low-urgency
+  notification ("closed for inactivity") — an auto-close is never silent.
 - **Reopen:** a new message matching a case resolved within the last
   **30 days** reopens that case (same id, same audit trail) rather than
   opening a duplicate. Past 30 days → new case with a `related_case_id`

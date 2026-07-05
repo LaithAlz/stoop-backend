@@ -66,6 +66,21 @@ def _reset_jwks_auth_state() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_weather_cache() -> Iterator[None]:
+    """Reset the weather integration's module-level TTL cache before every
+    test — same cross-test-leakage rationale as ``_reset_jwks_auth_state``
+    above: tests reuse the same handful of synthetic lat/lon coordinates
+    (e.g. Toronto's), so a cache entry populated by an earlier test would
+    otherwise make a later test that expects a fresh fetch silently observe
+    a cache hit instead — an order-dependent flake.
+    """
+    import app.integrations.weather as weather_mod
+
+    weather_mod._cache_state.reset_for_tests()  # noqa: SLF001
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_checkpointer_pool() -> Iterator[None]:
     """Forget the checkpointer's module-global psycopg pool between tests.
 

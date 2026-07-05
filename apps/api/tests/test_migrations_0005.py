@@ -479,6 +479,18 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # has already exited/closed — it must open its own admin session
         # for the same pre-identity reason the webhook router does.
         "app/agent/graph_entry.py",
+        # #30/#110: the deterministic graph nodes run in the SAME
+        # background/graph context as graph_entry.py above — no HTTP
+        # request, no landlord JWT to resolve a `landlord_id` GUC from.
+        # Each opens its own admin session, following graph_entry.py's
+        # exact pattern (see each module's own docstring).
+        "app/agent/nodes/identify_property.py",
+        "app/agent/nodes/load_context.py",
+        "app/agent/nodes/identify_case.py",
+        # #110: sweep_cases() (the time-driven case-lifecycle sweep) is a
+        # future scheduled-job entrypoint with the same pre-identity
+        # rationale — see its own docstring "The scheduler seam".
+        "app/agent/case_lifecycle.py",
     }
 )
 
