@@ -26,6 +26,7 @@ _PLACEHOLDER_ENV: dict[str, str] = {
     "SUPABASE_JWT_ISSUER": "https://test.supabase.co/auth/v1",
     "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
     "TWILIO_AUTH_TOKEN": "test-twilio-auth-token",
+    "ANTHROPIC_API_KEY": "test-anthropic-api-key",
 }
 
 for _key, _value in _PLACEHOLDER_ENV.items():
@@ -61,4 +62,23 @@ def _reset_jwks_auth_state() -> Iterator[None]:
     import app.integrations.supabase_auth as auth_mod
 
     auth_mod._jwks_state.reset_for_tests()  # noqa: SLF001
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_checkpointer_pool() -> Iterator[None]:
+    """Forget the checkpointer's module-global psycopg pool between tests.
+
+    Same failure class as ``_reset_jwks_auth_state`` above (#141): the
+    ``AsyncConnectionPool`` (internal ``asyncio.Lock`` + background worker
+    tasks) binds to the event loop that opened it, and each test runs its
+    own loop. A pool surviving across tests is a latent cross-loop flake —
+    caught by the PR #172 senior review before it fired. We drop the
+    reference (loop-independent) rather than awaiting ``close()`` here,
+    because this synchronous fixture has no running loop; abandoned pools
+    from prior test loops are garbage-collected with their loop.
+    """
+    import app.agent.checkpointer as cp_mod
+
+    cp_mod._pool = None  # noqa: SLF001
     yield

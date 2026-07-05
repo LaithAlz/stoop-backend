@@ -14,6 +14,7 @@ Network-free design:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import uuid
@@ -27,7 +28,7 @@ import structlog.contextvars
 from httpx import ASGITransport
 
 from app.config import Settings
-from app.observability import _scrub_event, init_sentry
+from app.observability import _scrub_event, init_langsmith_tracing, init_sentry
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -310,6 +311,73 @@ def test_init_sentry_traces_sample_rate_dev() -> None:
 
     call_kwargs = mock_sdk_init.call_args.kwargs
     assert call_kwargs.get("traces_sample_rate") == 1.0
+
+
+# ---------------------------------------------------------------------------
+# LangSmith tracing init gating (#26)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_init_langsmith_tracing_no_op_without_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No LangSmith account yet -- init_langsmith_tracing() must not export
+    ANY LANGSMITH_* env var when langsmith_api_key is unset."""
+    for var in ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+
+    with patch("app.observability.settings") as mock_settings:
+        mock_settings.langsmith_api_key = None
+        mock_settings.langsmith_project = None
+        init_langsmith_tracing()
+
+    assert "LANGSMITH_TRACING" not in os.environ
+    assert "LANGSMITH_API_KEY" not in os.environ
+    assert "LANGSMITH_PROJECT" not in os.environ
+
+
+@pytest.mark.unit
+def test_init_langsmith_tracing_exports_env_vars_when_key_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once a LangSmith key IS configured, the SDK-ambient env vars must be
+    exported so a hello-world graph run traces automatically."""
+    for var in ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+
+    with patch("app.observability.settings") as mock_settings:
+        mock_settings.langsmith_api_key = "ls-test-key"
+        mock_settings.langsmith_project = "stoop-dev"
+        init_langsmith_tracing()
+
+    assert os.environ["LANGSMITH_TRACING"] == "true"
+    assert os.environ["LANGSMITH_API_KEY"] == "ls-test-key"
+    assert os.environ["LANGSMITH_PROJECT"] == "stoop-dev"
+
+    monkeypatch.delenv("LANGSMITH_TRACING", raising=False)
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    monkeypatch.delenv("LANGSMITH_PROJECT", raising=False)
+
+
+@pytest.mark.unit
+def test_init_langsmith_tracing_project_optional_even_with_key_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """langsmith_project is optional -- when unset, LANGSMITH_PROJECT is
+    never exported (the SDK falls back to its own 'default' project)."""
+    for var in ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+
+    with patch("app.observability.settings") as mock_settings:
+        mock_settings.langsmith_api_key = "ls-test-key"
+        mock_settings.langsmith_project = None
+        init_langsmith_tracing()
+
+    assert os.environ["LANGSMITH_TRACING"] == "true"
+    assert os.environ["LANGSMITH_API_KEY"] == "ls-test-key"
+    assert "LANGSMITH_PROJECT" not in os.environ
+
+    monkeypatch.delenv("LANGSMITH_TRACING", raising=False)
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
 
 
 # ---------------------------------------------------------------------------

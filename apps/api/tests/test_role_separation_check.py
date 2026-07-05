@@ -256,14 +256,24 @@ async def test_lifespan_calls_verify_request_engine_role_separation(
     """Pin: ``app.main``'s ``lifespan`` must actually invoke
     ``verify_request_engine_role_separation`` at startup — a future edit
     that only defines the check without wiring it into ``create_app()``
-    would otherwise silently never run it."""
-    called = False
+    would otherwise silently never run it.
+
+    Also pins that ``setup_checkpointer()`` (#24) runs AFTER it,
+    unconditionally — faked away here (not a real DB call) since this test
+    is only about the WIRING, not either function's own behaviour (each has
+    its own dedicated tests: this file's role-separation tests, and
+    ``tests/test_checkpointer.py``'s integration round trip).
+    """
+    order: list[str] = []
 
     async def _fake_verify() -> None:
-        nonlocal called
-        called = True
+        order.append("verify")
+
+    async def _fake_setup_checkpointer() -> None:
+        order.append("checkpointer")
 
     monkeypatch.setattr("app.main.verify_request_engine_role_separation", _fake_verify)
+    monkeypatch.setattr("app.main.setup_checkpointer", _fake_setup_checkpointer)
 
     from app.main import _lifespan
     from app.main import app as fastapi_app
@@ -271,4 +281,7 @@ async def test_lifespan_calls_verify_request_engine_role_separation(
     async with _lifespan(fastapi_app):
         pass
 
-    assert called is True
+    # Order matters: the role-separation gate must pass BEFORE the
+    # checkpointer opens its pool — a swapped ordering would boot the
+    # graph infrastructure on a misconfigured deployment.
+    assert order == ["verify", "checkpointer"]

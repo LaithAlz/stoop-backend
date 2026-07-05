@@ -144,6 +144,49 @@
 >    one would silently reopen the exact duplicate-escalation hole this
 >    migration closes (a redelivered `MessageSid` would no longer find a
 >    conflicting row and would re-fire the emergency protocol).
+>
+> **v1.4 amendments (2026-07-05)** — migration 0007 implements this (#24),
+> closing the forward note in the v1.2 amendments block's point 5 and
+> migration 0005's module docstring point 5: LangGraph's checkpoint tables
+> now have a home.
+> 1. New schema `langgraph` — `CREATE SCHEMA IF NOT EXISTS langgraph`, with
+>    defensive `REVOKE ALL ... FROM PUBLIC` / `app_role` / (guarded)
+>    `anon`/`authenticated`, mirroring migration 0005's Supabase Data API
+>    belt-and-braces closure for `public`. This is an ADMIN-ENGINE-ONLY,
+>    **RLS-free by construction** zone — `app_role` gets no grant on it at
+>    all (not even `USAGE`), so there is no RLS policy to write and no
+>    `public`-schema table for
+>    `tests/test_rls_isolation_matrix.py::test_no_tables_outside_
+>    descriptor_set_exist_in_public_schema` to ever see (that test only
+>    scans `public`) — option (b) from that test's own docstring, chosen
+>    deliberately over adding a 14th `TableDescriptor` + RLS policy.
+> 2. No tables are created by the migration itself.
+>    `AsyncPostgresSaver.setup()` (`langgraph-checkpoint-postgres`, called
+>    idempotently by `app/agent/checkpointer.py`'s `setup_checkpointer()`
+>    at FastAPI startup — `app/main.py`'s lifespan, after the #22 role-
+>    separation self-check) creates and migrates its own four unqualified
+>    tables — `checkpoints`, `checkpoint_blobs`, `checkpoint_writes`,
+>    `checkpoint_migrations` — the first time it runs against a connection
+>    whose `search_path` is pinned to `langgraph` (see that module's
+>    docstring for exactly how the pin is applied; the library itself has
+>    no schema-qualification option, only unqualified table names in its
+>    own SQL).
+> 3. `app/agent/checkpointer.py` reaches this schema through its OWN
+>    dedicated psycopg3 connection pool, built directly from
+>    `settings.database_url` (the admin/service-role connection string) —
+>    NEVER through `get_admin_session`/SQLAlchemy (a different driver/
+>    connection path entirely) and NEVER through `app_role`/
+>    `app_database_url`. No change to `get_admin_session`'s allowlist
+>    (`tests/test_migrations_0005.py`) is needed: this module never
+>    references that function.
+> 4. Thread convention: ONE checkpoint thread per **case**, keyed on
+>    `cases.langgraph_thread_id` (already `UNIQUE NOT NULL` since migration
+>    0002) — never per tenant channel/phone number. Every graph invocation
+>    (#25 onward) passes `{"configurable": {"thread_id":
+>    case.langgraph_thread_id}}` as its `RunnableConfig`
+>    (`docs/02-product/conversation-model.md`: a tenant's one SMS thread
+>    maps to potentially many cases over time, each with its own
+>    checkpoint history).
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
@@ -427,7 +470,9 @@ CREATE TABLE push_tokens (
 );
 
 -- LangGraph checkpoint tables: created by AsyncPostgresSaver.setup() (#24),
--- service-role connection, thread_id = cases.langgraph_thread_id.
+-- service-role connection, thread_id = cases.langgraph_thread_id. They live
+-- in the dedicated `langgraph` schema (migration 0007), NOT here in
+-- `public` -- see the v1.4 amendments block above.
 ```
 
 ## Notes for implementers (human or agent)

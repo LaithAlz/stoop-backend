@@ -403,3 +403,94 @@ def test_missing_required_vars_raises_validation_error(
     assert "database_url" in missing_fields
     assert "supabase_url" in missing_fields
     assert "supabase_service_role_key" in missing_fields
+
+
+# ---------------------------------------------------------------------------
+# anthropic_api_key (#26) — required, like twilio_auth_token/supabase_*.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_anthropic_api_key_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing ANTHROPIC_API_KEY fails loudly at startup, same as the other
+    required credentials (#26)."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        )
+
+    errors = exc_info.value.errors()
+    missing_fields = {e["loc"][0] for e in errors if e["type"] == "missing"}
+    assert "anthropic_api_key" in missing_fields
+
+
+@pytest.mark.unit
+def test_anthropic_api_key_is_carried_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        anthropic_api_key="sk-ant-test",  # noqa: S106
+    )
+    assert s.anthropic_api_key == "sk-ant-test"
+
+
+# ---------------------------------------------------------------------------
+# langsmith_api_key / langsmith_project (#26) — optional, like sentry_dsn.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_langsmith_fields_default_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No LangSmith account yet -- both fields must be optional and default
+    to None so Settings construction never fails on their absence."""
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    monkeypatch.delenv("LANGSMITH_PROJECT", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        anthropic_api_key="sk-ant-test",  # noqa: S106
+    )
+    assert s.langsmith_api_key is None
+    assert s.langsmith_project is None
+
+
+@pytest.mark.unit
+def test_langsmith_fields_can_be_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    monkeypatch.delenv("LANGSMITH_PROJECT", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        anthropic_api_key="sk-ant-test",  # noqa: S106
+        langsmith_api_key="ls-test-key",  # noqa: S106
+        langsmith_project="stoop-dev",
+    )
+    assert s.langsmith_api_key == "ls-test-key"
+    assert s.langsmith_project == "stoop-dev"

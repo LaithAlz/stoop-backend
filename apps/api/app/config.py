@@ -139,6 +139,49 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Anthropic (agent — #26/#9+; sensitive — no default)
+    # ------------------------------------------------------------------
+
+    anthropic_api_key: str = Field(
+        ...,
+        description=(
+            "Anthropic API key used by the agent's classify_severity/"
+            "draft_response nodes (app/integrations/anthropic.py, lands "
+            "with #9+). Required -- a real key already exists for this "
+            "project (see .env). NEVER logged, NEVER included in any error "
+            "message."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # LangSmith (agent tracing — #26; optional, like sentry_dsn)
+    # ------------------------------------------------------------------
+
+    langsmith_api_key: str | None = Field(
+        default=None,
+        description=(
+            "LangSmith API key for LangGraph/LangChain tracing (#26). "
+            "Leave unset to disable tracing entirely -- there is no "
+            "LangSmith account yet. When set, "
+            "app/observability.py's init_langsmith_tracing() exports the "
+            "LANGSMITH_TRACING/LANGSMITH_API_KEY/LANGSMITH_PROJECT env "
+            "vars the langsmith SDK reads ambiently; when unset, none of "
+            "those env vars are ever exported and nothing about tracing "
+            "is attempted -- a missing/absent LangSmith account must "
+            "never break app startup or agent runs."
+        ),
+    )
+
+    langsmith_project: str | None = Field(
+        default=None,
+        description=(
+            "LangSmith project name traces are grouped under (#26). Only "
+            "meaningful when langsmith_api_key is set; the langsmith SDK "
+            "falls back to its own 'default' project when unset."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Observability (optional)
     # ------------------------------------------------------------------
 
