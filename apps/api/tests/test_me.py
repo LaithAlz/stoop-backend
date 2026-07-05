@@ -220,7 +220,7 @@ def jwks_payload(
 @pytest.fixture(autouse=True)
 def reset_jwks_cache() -> None:
     """Clear the module-level JWKS cache before each test."""
-    auth_mod._jwks_cache = None  # noqa: SLF001
+    auth_mod._jwks_state.cache = None  # noqa: SLF001
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -339,7 +339,7 @@ async def test_me_second_call_returns_same_id(
         ) as client:
             r1 = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
             # Reset JWKS cache so the second call re-fetches (both succeed).
-            auth_mod._jwks_cache = None  # noqa: SLF001
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
             r2 = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
 
     try:
@@ -384,7 +384,7 @@ async def test_me_email_sync_on_second_call(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
             r1 = await client.get("/v1/me", headers={"Authorization": f"Bearer {token1}"})
-            auth_mod._jwks_cache = None  # noqa: SLF001
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
             r2 = await client.get("/v1/me", headers={"Authorization": f"Bearer {token2}"})
 
     try:
@@ -477,7 +477,7 @@ async def test_me_concurrent_first_calls_no_duplicate_key(
             return await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
 
     # Reset cache just before firing so both coroutines start with a cold cache.
-    auth_mod._jwks_cache = None  # noqa: SLF001
+    auth_mod._jwks_state.cache = None  # noqa: SLF001
 
     # A single respx.MockRouter wraps BOTH coroutines and the gather call
     # itself (per issue #145): two coroutines each opening their own
@@ -487,7 +487,7 @@ async def test_me_concurrent_first_calls_no_duplicate_key(
     # (concurrent first calls -> no duplicate-key error, one landlord row),
     # so we deliberately do NOT pre-warm the cache with a call before the
     # concurrent pair. Depending on how the two coroutines interleave around
-    # ``_jwks_lock``, the JWKS route may be hit once or twice (both are
+    # ``_jwks_state.lock``, the JWKS route may be hit once or twice (both are
     # correct) — its call count is intentionally not asserted.
     router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
     router.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
@@ -584,7 +584,7 @@ async def test_me_existing_landlord_token_loses_email_returns_403_row_untouched(
             seed_response = await client.get(
                 "/v1/me", headers={"Authorization": f"Bearer {email_token}"}
             )
-            auth_mod._jwks_cache = None  # noqa: SLF001
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
 
             row_before = (
                 (
@@ -703,7 +703,7 @@ async def test_me_existing_landlord_empty_string_email_does_not_overwrite_stored
             seed_response = await client.get(
                 "/v1/me", headers={"Authorization": f"Bearer {email_token}"}
             )
-            auth_mod._jwks_cache = None  # noqa: SLF001
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
 
             response = await client.get(
                 "/v1/me", headers={"Authorization": f"Bearer {empty_email_token}"}
