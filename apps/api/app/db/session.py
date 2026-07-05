@@ -378,10 +378,12 @@ async def get_admin_session() -> AsyncGenerator[AsyncSession, None]:
 
     See the module docstring ("``get_admin_session`` — the pre-identity /
     service-path escape hatch") for WHEN this is the correct dependency to
-    use instead of ``get_session``/``require_landlord``. Today's only
-    caller is ``GET /v1/me`` (``routers/me.py``) — its provisioning upsert
-    cannot be scoped by a GUC for a ``landlords`` row that doesn't exist
-    yet.
+    use instead of ``get_session``/``require_landlord``. Callers (each
+    allowlist-tested in ``tests/test_migrations_0005.py``): ``GET /v1/me``
+    (``routers/me.py`` — provisioning is pre-identity, no GUC can scope a
+    row that doesn't exist yet), the Twilio webhooks
+    (``routers/webhooks/twilio.py`` — unauthenticated inbound, rule #1),
+    and ``agent/graph_entry.py`` (background task, no request context).
 
     Deliberately a near-duplicate of ``get_session``'s body rather than a
     shared helper parameterized by session factory: keeping the two
