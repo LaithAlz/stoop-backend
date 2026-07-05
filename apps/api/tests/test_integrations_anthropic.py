@@ -105,6 +105,15 @@ def test_reset_client_for_tests_drops_the_cache() -> None:
     assert client_a is not client_b
 
 
+@pytest.mark.unit
+def test_get_client_disables_sdk_retries() -> None:
+    """Senior review, 2026-07-05: the SDK's hidden default (2 retries)
+    must be disabled -- our own budget arithmetic owns all retry
+    behavior, never the SDK beneath it."""
+    client = anthropic_mod.get_client()
+    assert client.max_retries == 0
+
+
 # ---------------------------------------------------------------------------
 # call_tool_forced — success path
 # ---------------------------------------------------------------------------

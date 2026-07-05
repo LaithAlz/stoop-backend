@@ -210,13 +210,22 @@ _client: anthropic.AsyncAnthropic | None = None
 def get_client() -> anthropic.AsyncAnthropic:
     """Return the process-wide ``AsyncAnthropic`` client, created lazily.
 
+    ``max_retries=0`` (senior review, 2026-07-05): the SDK's own hidden
+    default is 2 retries with backoff on retryable errors — layered UNDER
+    our own retry-once policy (:func:`new_deadline` / :func:`attempt_timeout`),
+    that would silently triple the worst-case number of round-trips per
+    "attempt" (up to 3 real HTTP calls per :func:`call_tool_forced`
+    invocation, invisible to our budget arithmetic, which only ever awaits
+    ONE ``asyncio.wait_for`` per attempt). Our budget arithmetic owns ALL
+    retry behavior end-to-end; the SDK must not retry on its own beneath it.
+
     A single client is reused across calls (connection pooling); tests
     monkeypatch this function directly to substitute a fake client rather
     than mutating the module-level singleton in place.
     """
     global _client
     if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=0)
     return _client
 
 

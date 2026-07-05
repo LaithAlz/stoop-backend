@@ -83,13 +83,12 @@ this payload — only the structured fields above (per-issue reasoning
 sentences stay in ``reasoning_log``/``state["severity"]``, landlord-visible
 on the approval card, never duplicated into the audit trail).
 
-**Doc-first note (reported, not applied here):** the five ``messages``
-columns above should be marked DEPRECATED in ``schema-v1.md`` (never
-written; canonical record is ``audit_log`` 'classified'; DROP in a future
-migration) — mirroring the ``twilio_status`` deprecation wording exactly.
-Editing that doc is a schema-doc change outside this issue's scope
-(``schema-v1.md`` is the source of truth other issues also depend on);
-flagged in the issue report for the doc owner.
+**Doc-first, applied:** the five ``messages`` columns above are marked
+DEPRECATED in ``schema-v1.md`` (v1.6 amendments — never written; canonical
+record is ``audit_log`` 'classified'; DROP in a future migration), both in
+the amendments prose and as inline column comments — mirroring the
+``twilio_status`` deprecation wording exactly. Done in this same PR, not
+deferred.
 
 Cost accounting: ``Severity.db_value`` is used for the audit payload's
 ``severity`` field (lowercase, matching ``cases.severity``'s CHECK) per

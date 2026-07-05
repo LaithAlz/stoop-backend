@@ -153,6 +153,28 @@ async def _insert_tenant(session: AsyncSession, landlord_id: str, property_id: s
     return tenant_id
 
 
+async def _insert_case(
+    session: AsyncSession, *, landlord_id: str, property_id: str, tenant_id: str
+) -> str:
+    case_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO cases (id, landlord_id, property_id, tenant_id, status, "
+            "langgraph_thread_id) "
+            "VALUES (:id, :landlord_id, :property_id, :tenant_id, 'open', :thread_id)"
+        ),
+        {
+            "id": case_id,
+            "landlord_id": landlord_id,
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "thread_id": str(uuid.uuid4()),
+        },
+    )
+    await session.commit()
+    return case_id
+
+
 async def _insert_message(
     session: AsyncSession,
     *,
@@ -252,6 +274,9 @@ async def test_classify_intent_success_records_state_and_reasoning_log(
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
     message_id = await _insert_message(
         db_session,
         landlord_id=landlord_id,
@@ -280,6 +305,7 @@ async def test_classify_intent_success_records_state_and_reasoning_log(
                 landlord_id=uuid.UUID(landlord_id),
                 property_id=uuid.UUID(property_id),
                 tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
             ),
             "reasoning_log": [],
         }
@@ -295,6 +321,34 @@ async def test_classify_intent_success_records_state_and_reasoning_log(
             "type": "tool",
             "name": "classify_intent",
         }
+
+        audit_rows = (
+            (
+                await db_session.execute(
+                    text("SELECT actor, action, payload FROM audit_log WHERE case_id = :cid"),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        assert len(audit_rows) == 1
+        row = audit_rows[0]
+        assert row["actor"] == "agent"
+        assert row["action"] == "classified"
+        payload = row["payload"]
+        assert payload["kind"] == "intent"
+        assert payload["intent"] == "maintenance"
+        assert payload["summary"] == "Slow drip in the kitchen faucet"
+        assert payload["model"] == "claude-sonnet-5"
+        assert payload["tokens_in"] == 80
+        assert payload["tokens_out"] == 20
+        assert payload["prompt_version"] == "inline-v0"
+        assert isinstance(payload["cost_cents"], (int, float))
+        assert payload["cost_cents"] > 0
+        # The RAW tenant message body never enters the payload (the agent's
+        # own short summary is expected/allowed, per the payload shape).
+        assert "the kitchen faucet has a slow drip" not in str(payload)
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -361,6 +415,9 @@ async def test_classify_intent_double_failure_leaves_intent_unset(
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
     message_id = await _insert_message(
         db_session,
         landlord_id=landlord_id,
@@ -384,6 +441,7 @@ async def test_classify_intent_double_failure_leaves_intent_unset(
                 landlord_id=uuid.UUID(landlord_id),
                 property_id=uuid.UUID(property_id),
                 tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
             ),
             "reasoning_log": [],
         }
@@ -392,6 +450,13 @@ async def test_classify_intent_double_failure_leaves_intent_unset(
         assert update["intent"] is None
         assert any("couldn't figure out" in line for line in update["reasoning_log"])
         assert len(fake_messages.calls) == 2
+
+        audit_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM audit_log WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert audit_count == 0  # no audit row on failure
     finally:
         await _cleanup(db_session, landlord_id)
 

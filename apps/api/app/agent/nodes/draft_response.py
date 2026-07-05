@@ -12,66 +12,90 @@ Voice profile + house rules
 ------------------------------
 ``app.agent.prompts.v1.build_draft_system_prompt`` (frozen) injects
 ``case_context.voice_profile`` (``{tone, samples}``) into the SYSTEM
-prompt. House rules, the tenant's message, the classified severity/rules/
-modifier, and any required refusal-deferral language are all DYNAMIC,
-per-request content — they go in the USER message, never the frozen system
-prompt (the same "system is frozen, the per-request user content is
-dynamic by nature" distinction ``classify_severity.py`` relies on for its
-own context injection).
+prompt. House rules, the tenant's message, and the classified severity/
+rules/modifier are all DYNAMIC, per-request content — they go in the USER
+message, never the frozen system prompt (the same "system is frozen, the
+per-request user content is dynamic by nature" distinction
+``classify_severity.py`` relies on for its own context injection).
 
-Refusal-deferral templates: sourced from ``prompts/v1.py`` (present)
+Refusal-deferral templates: code APPENDS, the model never weaves them in
+(deferral architecture ruling, senior review 2026-07-05)
 -------------------------------------------------------------------------
-``app.agent.prompts.v1.REFUSAL_TEMPLATES`` / ``get_refusal_deferral`` are
-frozen and already cover every ``RefusalFlag`` — this node does NOT define
-its own refusal-deferral copy. It DOES define one small, node-local
-fallback template (:data:`_GENERIC_SAFE_FALLBACK`) for the (rare) case
-where a hard guard trips twice with NO refusal flag to fall back on at all
-— see "Hard guards" below.
+An earlier revision asked the model to "include the deferral language
+naturally" in its own reply — but the frozen system prompt's plain-
+language guidance (concise, no repeated boilerplate) pushed AGAINST
+verbatim reproduction, so a model that PARAPHRASED a refusal topic (e.g.
+"about the rent discount you mentioned — Laith will sort that out") still
+carried enough of the same vocabulary ("discount") to trip its own guard
+under the exact-string whitelist alone — degrading a perfectly safe reply
+to the generic fallback purely for topical wording, not an actual
+violation.
+
+Fixed by SEPARATING drafting from deferral entirely:
+
+1. The DYNAMIC user content (see ``_build_user_content``) tells the model
+   NOT to address a flagged topic at all — at most ONE brief, neutral
+   sentence noting it's been passed along, never a policy explanation, and
+   explicitly NOT to write, quote, or paraphrase any deferral language
+   itself (a separate note is appended automatically).
+2. The model's OWN acknowledgment text is guard-checked (see "Hard
+   guards" below) — REJECTED and regenerated once if it violates, exactly
+   as before.
+3. Once accepted (or replaced by :data:`_GENERIC_SAFE_FALLBACK` after a
+   second violation), THIS NODE appends the canned
+   ``app.agent.prompts.v1.REFUSAL_TEMPLATES`` deferral text for every flag
+   on the classification — verbatim, by construction
+   (:func:`_append_deferrals`). The model never generates, never
+   paraphrases, and is never asked to reproduce this text; there is
+   nothing for it to get wrong once the code itself writes it.
+
+``_strip_mandated_templates`` is kept as defense-in-depth: it scrubs any
+mandated template text out of the MODEL's own acknowledgment before guard
+-checking, in case a model quotes/paraphrases a topic despite being told
+not to.
 
 Hard guards — post-generation, code-enforced (never LLM-trusted alone)
 ---------------------------------------------------------------------------
-Per this issue's own scope: dollar amounts/compensation promises
-(including percentage/relative framing — "20% off", "half off your
-rent"), access/door codes or PINs (including non-numeric disclosure — a
-key/lockbox/spare LOCATED somewhere, e.g. "the lockbox is under the mat"),
-and legal positions (LTB, eviction, entitlement claims, and indirect/
-negative framings — "our lawyer says", "you have no right to", "you don't
-have a case") are checked with plain substring/regex matching AFTER
-generation — never left to the model's own restraint, and never solved by
-prompt wording alone (the frozen system prompt already tells the model not
-to do these things; this is the enforcement backstop, not a duplicate
-ask). A fourth guard mirrors the DraftResult schema's own design: the
-model self-reports which refusal deferrals it used
-(``DraftResult.refusal_templates_used``) — if a refusal flag was set on
-the classified severity but the model didn't report using its deferral,
-that is ALSO a guard violation (the draft may be silently engaging the
-refused topic instead of deferring it).
+Run against the MODEL's OWN acknowledgment text only (before this node
+appends any deferral — see above), with every mandated
+``REFUSAL_TEMPLATES`` string stripped out first
+(:func:`_strip_mandated_templates`). Three categories:
 
-**Guard/deferral self-collision fix (HIGH, safety review 2026-07-05):**
-guards run against the draft text with every ``REFUSAL_TEMPLATES`` string
-stripped out FIRST (:func:`_strip_mandated_templates`) — they police
-MODEL-ORIGINATED content only, never the node-mandated deferral text this
-node itself instructs the model to include. Without the scrub,
-``REFUSAL_TEMPLATES['cost_compensation']`` (contains "compensation") and
-``REFUSAL_TEMPLATES['legal_rent_ltb']`` (contains "Landlord and Tenant
-Board") tripped their OWN guards on the happy path: a correctly-deferred
-cost/LTB message would fail, retry, fail again, and get silently swapped
-for the generic fallback with ``draft_guard_failed=True`` — corrupting the
-"needs a person's eyes" signal on exactly the messages where the deferral
-worked. A draft that pairs the mandated deferral WITH a genuine violation
-("I'll take $200 off your rent") still fails — the violation survives the
-scrub untouched.
+- **Dollar amounts / compensation PROMISES**: an explicit amount
+  ("$50"), a percentage/relative offer ("20% off", "half off your rent"),
+  or a compensation WORD ("reimburse", "refund", "waive", "discount",
+  "rent reduction/abatement") paired with a first-person COMMITMENT
+  ("I'll", "I can", "we'll", "you'll get") within a short window and with
+  NO negation between them (:func:`_has_compensation_commitment`). Bare
+  topical vocabulary alone — "about the rent discount you mentioned" with
+  no commitment attached, or "I can't discuss compensation" (a negated
+  commitment) — is deliberately NOT a violation (safety review,
+  2026-07-05): a message that merely acknowledges a topic exists, or
+  correctly refuses to engage it, must never be punished for the
+  vocabulary alone.
+- **Access/door codes or PINs**: an explicit code/PIN value, or
+  non-numeric disclosure (a key/lockbox/spare LOCATED somewhere — "the
+  lockbox is under the mat").
+- **Legal positions**: LTB/eviction/entitlement claims, and indirect/
+  negative framings ("our lawyer says", "you have no right to", "you
+  don't have a case"). Known limitation, not fixed this round (no test
+  demands it and the bare terms are comparatively rare/specific): a
+  neutral acknowledgment that happens to NAME the topic ("I've noted your
+  eviction question") could still trip this guard the same way the
+  dollar-guard used to — flagged here rather than silently assumed fixed.
 
 A violating draft is REJECTED and regenerated exactly ONCE, with the
 violation named in the retry's USER-message suffix (never the system
 prompt — frozen). A SECOND violation (of any kind, including a repeated
-Anthropic API failure) falls back to a synthesized, always-safe draft:
-the REFUSAL_TEMPLATES deferral text for every flag on the classification
-(joined), or :data:`_GENERIC_SAFE_FALLBACK` when there were no refusal
-flags at all. ``state["draft_guard_failed"] = True`` is set in that case —
-a "needs a person's eyes on this one" signal for a future node/
-notification to act on (the same seam pattern
-``app/agent/nodes/classify_severity.py`` uses for ``classification_failed``).
+Anthropic API failure) replaces the model's acknowledgment with
+:data:`_GENERIC_SAFE_FALLBACK` — ``state["draft_guard_failed"] = True`` is
+set in that case, the same seam pattern
+``app/agent/nodes/classify_severity.py`` uses for
+``classification_failed``. Either way, the canned deferral(s) are STILL
+appended afterward (see above) — guard failure is now purely about
+whether the model's OWN acknowledgment was safe, never about whether the
+deferral made it into the draft (the code guarantees that
+unconditionally, regardless of guard outcome).
 
 **v1 pattern-coverage, not the authoritative gate:** these are
 deterministic substring/regex checks, not semantic understanding of the
@@ -81,6 +105,28 @@ replaced BEFORE a landlord ever sees the draft. ``#35``'s eval grader
 for "did this draft actually violate a hard rule"; these guards are the
 first line of defense that ships with this issue, not a replacement for
 that grader.
+
+**Plain-language exception, documented:** appending the canned deferral
+can push a routine reply past the "≤2 SMS segments (~300 chars)" guidance
+in ``docs/02-product/plain-language-rules.md`` when the deferral text
+itself is long (e.g. ``legal_rent_ltb``'s multi-sentence template). This
+is an intentional, documented exception — correctness (never omitting
+the mandated deferral) outweighs strict segment-length adherence on the
+comparatively rare messages that touch a refusal topic; ``#35``'s eval
+grader enforces the length budget on ordinary replies, not refusal-topic
+ones.
+
+Cost accounting (audit_log 'drafted' payload)
+--------------------------------------------------
+Every real Anthropic call this node makes (the initial attempt AND any
+regeneration) contributes its ``tokens_in``/``tokens_out`` to a running
+total — both calls cost real money even when the first one is rejected by
+a guard. ``model`` records the last call's reported model id (``None`` if
+every attempt failed at the transport level with no response at all).
+All four (``model``, ``tokens_in``, ``tokens_out``, ``cost_cents``) are
+added to the existing ``'drafted'`` ``audit_log`` payload alongside
+``draft_id``, ``refusal_templates_used``, and ``guard_failed`` — never a
+message body.
 
 Reported gap: the EMERGENCY safety instruction
 --------------------------------------------------
@@ -203,22 +249,55 @@ _PLAIN_LANGUAGE_REMINDER: str = (
 # ---------------------------------------------------------------------------
 # Hard guards — post-generation regex checks (see module docstring).
 # Deliberately conservative: false positives here cost one extra
-# regeneration; false negatives are the failure mode that matters.
+# regeneration; false negatives are the failure mode that matters. The
+# compensation check additionally requires a nearby, non-negated
+# first-person COMMITMENT (see _has_compensation_commitment) so bare
+# topical vocabulary alone never trips it (safety review, 2026-07-05).
 # ---------------------------------------------------------------------------
 
-_DOLLAR_COMPENSATION_RE = re.compile(
-    r"\$\s?\d"
-    r"|\bcompensat(?:e|ion|ing)\b"
+_DOLLAR_AMOUNT_RE = re.compile(r"\$\s?\d")
+_PERCENT_OFF_RE = re.compile(r"\b\d{1,3}\s?%\s*off\b", re.IGNORECASE)
+_HALF_OFF_RE = re.compile(r"\bhalf\s+off\b", re.IGNORECASE)
+
+_COMPENSATION_WORD_RE = re.compile(
+    r"\bcompensat(?:e|ion|ing)\b"
     r"|\breimburs(?:e|ement|ing)\b"
     r"|\brefund(?:s|ed|ing)?\b"
     r"|\brent\s+(?:reduction|abatement)\b"
     r"|\bwaive(?:d|s|r)?\b"
-    r"|\bdiscount(?:s|ed|ing)?\b"
-    # Percentage/relative compensation — "20% off", "half off your rent".
-    r"|\b\d{1,3}\s?%\s*off\b"
-    r"|\bhalf\s+off\b",
+    r"|\bdiscount(?:s|ed|ing)?\b",
     re.IGNORECASE,
 )
+
+_COMMITMENT_PHRASE_RE = re.compile(
+    r"\bi(?:'ll|\s+will|\s+can)\b"
+    r"|\bwe(?:'ll|\s+will|\s+can)\b"
+    r"|\byou(?:'ll|\s+will)\s+(?:get|receive)\b",
+    re.IGNORECASE,
+)
+
+# Deliberately broad, substring-level "n't" match (not word-bounded) so it
+# catches every English contraction (can't, won't, wouldn't, ...) without
+# enumerating them; a bare "not"/"never" token is also a negation.
+_NEGATION_RE = re.compile(r"\bnot\b|n't|\bnever\b", re.IGNORECASE)
+
+_COMPENSATION_PROXIMITY_WINDOW_CHARS = 40
+
+
+def _has_compensation_commitment(text: str) -> bool:
+    """True when a compensation WORD appears near a first-person
+    commitment phrase with NO negation between them — see module docstring
+    "Hard guards" for why bare topical vocabulary alone (no commitment, or
+    a NEGATED commitment like "I can't discuss compensation") is
+    deliberately NOT a violation."""
+    for comp_match in _COMPENSATION_WORD_RE.finditer(text):
+        start = max(0, comp_match.start() - _COMPENSATION_PROXIMITY_WINDOW_CHARS)
+        end = min(len(text), comp_match.end() + _COMPENSATION_PROXIMITY_WINDOW_CHARS)
+        window = text[start:end]
+        if _COMMITMENT_PHRASE_RE.search(window) and not _NEGATION_RE.search(window):
+            return True
+    return False
+
 
 _ACCESS_CODE_RE = re.compile(
     r"\b(?:access|door|gate|lock\s*box|entry|building|keypad|garage)\s*codes?\b\D{0,20}\d{2,}"
@@ -276,21 +355,11 @@ _INSERT_DRAFTED_AUDIT_SQL = text(
 
 def _strip_mandated_templates(body: str) -> str:
     """Remove every exact ``REFUSAL_TEMPLATES`` string from *body* before the
-    hard guards ever see it.
-
-    Safety-review finding (guard/deferral self-collision, HIGH): the guards
-    police MODEL-ORIGINATED content only, never the node-mandated deferral
-    text this SAME node instructed the model to include verbatim (see
-    ``_build_user_content``'s "Required deferral language" block). Without
-    this scrub, ``REFUSAL_TEMPLATES['cost_compensation']`` (contains
-    "compensation") and ``REFUSAL_TEMPLATES['legal_rent_ltb']`` (contains
-    "Landlord and Tenant Board") trip their OWN guards on the happy path —
-    every correctly-deferred cost/LTB message would be rejected, retried,
-    rejected again, and silently swapped for the generic fallback, with
-    ``draft_guard_failed=True`` — corrupting the "needs a person's eyes"
-    signal on the exact messages where the deferral worked as intended.
-    Stripping the mandated text FIRST means only text the MODEL added on
-    top of (or instead of) the mandated deferral can ever trip a guard.
+    hard guards ever see it — defense-in-depth (see module docstring
+    "Refusal-deferral templates"): under the current architecture the model
+    is told never to write this text at all (the code appends it
+    afterward), but a model that quotes/paraphrases it anyway must not have
+    that mandated text held against it.
     """
     scrubbed = body
     for template_text in REFUSAL_TEMPLATES.values():
@@ -298,62 +367,44 @@ def _strip_mandated_templates(body: str) -> str:
     return scrubbed
 
 
-def _check_hard_guards(
-    *,
-    body: str,
-    refusal_flags: list[RefusalFlag],
-    refusal_templates_used: list[RefusalFlag],
-) -> list[str]:
-    """Return the list of violated guard names — empty means clean.
-
-    Guards run against *body* with every mandated ``REFUSAL_TEMPLATES``
-    string stripped out first (see :func:`_strip_mandated_templates`) — a
-    draft that is JUST the mandated deferral (verbatim or paraphrased
-    around it) never trips a guard on the template text itself; a draft
-    that pairs the deferral with a genuine violation ("I'll take $200 off
-    your rent, but also, per the LTB...") still does, because the genuine
-    violation survives the scrub untouched.
-
-    v1 pattern-coverage note: these are plain substring/regex checks, not a
-    semantic understanding of the draft — they are a fast, deterministic
-    backstop, not the authoritative gate. ``#35``'s eval grader (LLM-as-
-    judge + its own substring assertions) is the authoritative check for
-    "did this draft actually violate a hard rule"; these guards exist so a
-    violation is caught and retried/replaced BEFORE a landlord ever sees
-    the draft, not after an eval run days later.
-    """
+def _check_hard_guards(*, body: str) -> list[str]:
+    """Return the list of violated guard names for the MODEL's OWN
+    acknowledgment text — empty means clean. See module docstring "Hard
+    guards" for the full rationale of each category."""
     scrubbed_body = _strip_mandated_templates(body)
     violations: list[str] = []
-    if _DOLLAR_COMPENSATION_RE.search(scrubbed_body):
+    if (
+        _DOLLAR_AMOUNT_RE.search(scrubbed_body)
+        or _PERCENT_OFF_RE.search(scrubbed_body)
+        or _HALF_OFF_RE.search(scrubbed_body)
+        or _has_compensation_commitment(scrubbed_body)
+    ):
         violations.append("dollar_compensation")
     if _ACCESS_CODE_RE.search(scrubbed_body):
         violations.append("access_code")
     if _LEGAL_POSITION_RE.search(scrubbed_body):
         violations.append("legal_position")
-    missing = [flag for flag in refusal_flags if flag not in refusal_templates_used]
-    if missing:
-        violations.append("missing_refusal_deferral:" + ",".join(f.value for f in missing))
     return violations
 
 
 def _violation_retry_note(violations: list[str]) -> str:
     return (
-        "\n\nIMPORTANT: your previous draft violated the following hard rule(s): "
+        "\n\nIMPORTANT: your previous reply violated the following hard rule(s): "
         f"{', '.join(violations)}. Do not include dollar amounts, compensation promises, "
         "reimbursement/refund/discount language, access codes or PINs, or any legal "
-        "position (LTB, eviction, entitlement claims). If a refusal topic applies, you "
-        "MUST include its deferral language (provided above) and list that flag in "
-        "refusal_templates_used. Revise and resend the FULL reply."
+        "position (LTB, eviction, entitlement claims). Revise and resend the FULL reply."
     )
 
 
-def _fallback_draft(refusal_flags: list[RefusalFlag]) -> DraftResult:
-    """The always-safe draft used after a second guard violation — see
-    module docstring "Hard guards"."""
+def _append_deferrals(ack_body: str, refusal_flags: list[RefusalFlag]) -> str:
+    """Append the canned ``REFUSAL_TEMPLATES`` deferral(s), verbatim, for
+    every flag on the classification — code-appended, never model-
+    generated (see module docstring "Refusal-deferral templates"). A no-op
+    when there are no refusal flags."""
     if not refusal_flags:
-        return DraftResult(body=_GENERIC_SAFE_FALLBACK, refusal_templates_used=[])
+        return ack_body
     deferrals = [get_refusal_deferral(flag.value) for flag in refusal_flags]
-    return DraftResult(body=" ".join(deferrals), refusal_templates_used=list(refusal_flags))
+    return f"{ack_body.rstrip()} {' '.join(deferrals)}"
 
 
 def _build_user_content(
@@ -362,7 +413,7 @@ def _build_user_content(
     tenant_name: str | None,
     house_rules: str | None,
     severity_result: SeverityResult,
-    refusal_deferrals: list[tuple[RefusalFlag, str]],
+    refusal_flags: list[RefusalFlag],
 ) -> str:
     lines: list[str] = [f"Tenant's message:\n{body}", ""]
     if tenant_name:
@@ -374,13 +425,18 @@ def _build_user_content(
         lines.append(f"Modifier applied: {severity_result.modifier}")
     if house_rules:
         lines.append(f"\nProperty house rules (use only what's relevant):\n{house_rules}")
-    if refusal_deferrals:
+    if refusal_flags:
+        topics = ", ".join(flag.value.replace("_", " ") for flag in refusal_flags)
         lines.append(
-            "\nRequired deferral language for flagged topics — include this naturally in "
-            "the reply, and list the matching flag(s) in refusal_templates_used:"
+            f"\nThis message touches on a topic the landlord handles directly, not you: "
+            f"{topics}. Do NOT explain, negotiate, discuss specifics, or take any position "
+            "on this topic. At most, include ONE brief, neutral sentence noting you've "
+            "passed it along and the landlord will follow up directly -- do not go further "
+            "than that. A separate, pre-approved note about this topic will be appended to "
+            "your reply automatically after you write it -- do NOT write that note "
+            "yourself, and do NOT quote, paraphrase, or summarize any standard policy "
+            "language."
         )
-        for flag, deferral_text in refusal_deferrals:
-            lines.append(f"- [{flag.value}] {deferral_text}")
     lines.append(f"\n{_PLAIN_LANGUAGE_REMINDER}")
     return "\n".join(lines)
 
@@ -434,22 +490,22 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
             tenant_name = tenant_row["name"] if tenant_row is not None else None
 
     system_prompt = build_draft_system_prompt(case_context.voice_profile)
-    refusal_deferrals = [
-        (flag, get_refusal_deferral(flag.value)) for flag in severity_result.refusal_flags
-    ]
     base_user_content = _build_user_content(
         body=body,
         tenant_name=tenant_name,
         house_rules=case_context.house_rules,
         severity_result=severity_result,
-        refusal_deferrals=refusal_deferrals,
+        refusal_flags=severity_result.refusal_flags,
     )
 
-    draft_result: DraftResult | None = None
+    ack_body: str | None = None
     violations: list[str] = []
     call_errors: list[str] = []
     user_content = base_user_content
     deadline = anthropic_mod.new_deadline()
+    total_tokens_in = 0
+    total_tokens_out = 0
+    last_model: str | None = None
 
     for attempt in range(2):
         timeout = anthropic_mod.attempt_timeout(deadline, is_retry=attempt == 1)
@@ -475,13 +531,13 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
             )
             continue
 
-        violations = _check_hard_guards(
-            body=candidate.body,
-            refusal_flags=severity_result.refusal_flags,
-            refusal_templates_used=candidate.refusal_templates_used,
-        )
+        total_tokens_in += call_result.tokens_in
+        total_tokens_out += call_result.tokens_out
+        last_model = call_result.model
+
+        violations = _check_hard_guards(body=candidate.body)
         if not violations:
-            draft_result = candidate
+            ack_body = candidate.body
             break
 
         log.warning(
@@ -493,9 +549,9 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
         user_content = base_user_content + _violation_retry_note(violations)
 
     guard_failed = False
-    if draft_result is None:
+    if ack_body is None:
         guard_failed = True
-        draft_result = _fallback_draft(severity_result.refusal_flags)
+        ack_body = _GENERIC_SAFE_FALLBACK
         reasoning_log.append(
             "I wasn't confident this draft was safe to send as-is, so I used a safer "
             "standard reply instead — worth a look before it goes out."
@@ -509,6 +565,14 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
         )
     else:
         reasoning_log.append("I've drafted a reply for you to review.")
+
+    final_body = _append_deferrals(ack_body, severity_result.refusal_flags)
+    draft_result = DraftResult(
+        body=final_body, refusal_templates_used=list(severity_result.refusal_flags)
+    )
+    cost_cents = anthropic_mod.estimate_cost_cents(
+        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+    )
 
     async with asynccontextmanager(get_admin_session)() as session:
         pending_row = (
@@ -566,6 +630,10 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
                             flag.value for flag in draft_result.refusal_templates_used
                         ],
                         "guard_failed": guard_failed,
+                        "model": last_model,
+                        "tokens_in": total_tokens_in,
+                        "tokens_out": total_tokens_out,
+                        "cost_cents": cost_cents,
                     }
                 ),
             },

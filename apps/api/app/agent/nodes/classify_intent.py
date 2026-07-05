@@ -58,6 +58,22 @@ On double failure (including a skipped retry when the budget is
 exhausted) this node logs, appends a plain reasoning_log line, and
 returns with ``intent`` left unset -- no invented category.
 
+Cost accounting (audit_log 'classified' payload)
+-----------------------------------------------------
+On a SUCCESSFUL classification only (mirroring ``classify_severity.py``'s
+"no audit row on failure"), this node writes its OWN ``audit_log`` row:
+``actor='agent'``, ``action='classified'`` (the SAME existing vocabulary
+entry ``classify_severity.py`` uses — schema-v1.md's ``audit_log.action``
+CHECK doesn't have a separate "intent classified" action, and doesn't need
+one), ``payload = {kind: 'intent', intent, summary, model, tokens_in,
+tokens_out, cost_cents, prompt_version: 'inline-v0'}``. ``kind`` disambig
+uates this row from a severity-classification 'classified' row on the same
+case's timeline. ``prompt_version`` is ``'inline-v0'``, not ``'v1'`` —
+this node's system prompt is the small INLINE, unversioned string above
+(see "Prompt-file gap"), never the governed ``prompts/v1.py`` module, so
+it gets its own, clearly-distinct version tag rather than borrowing the
+governed one. No message body ever enters this payload.
+
 DB access
 ---------
 Admin engine (background/graph context) — same pattern as the other #30/
@@ -67,20 +83,27 @@ Admin engine (background/graph context) — same pattern as the other #30/
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from typing import Any
+from uuid import UUID
 
 import structlog
 from pydantic import ValidationError
 from sqlalchemy import text
 
-from app.agent.schemas import Intent, IntentResult
+from app.agent.schemas import CaseContext, Intent, IntentResult
 from app.agent.state import AgentState
 from app.agent.tools import CLASSIFY_INTENT_TOOL
 from app.db.session import get_admin_session
 from app.integrations import anthropic as anthropic_mod
 
 log = structlog.get_logger(__name__)
+
+_INTENT_PROMPT_VERSION: str = "inline-v0"
+"""Distinct from ``app.agent.prompts.v1.PROMPT_VERSION`` ("v1") — this
+node's system prompt is the inline, unversioned string above, never the
+governed ``prompts/v1.py`` module (see "Prompt-file gap")."""
 
 # ---------------------------------------------------------------------------
 # Inline system prompt — see module docstring "Prompt-file gap".
@@ -107,6 +130,11 @@ Respond only by calling the tool — no other text.
 """
 
 _SELECT_MESSAGE_SQL = text("SELECT body FROM messages WHERE id = :message_id")
+
+_INSERT_CLASSIFIED_AUDIT_SQL = text(
+    "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+    "VALUES (:landlord_id, :case_id, 'agent', 'classified', CAST(:payload AS jsonb))"
+)
 
 _INTENT_DISPLAY: dict[Intent, str] = {
     Intent.maintenance: "a maintenance issue",
@@ -159,9 +187,39 @@ async def _classify_intent_once(
     return intent_result, call_result
 
 
+async def _insert_intent_classified_audit(
+    *,
+    landlord_id: UUID,
+    case_id: UUID | None,
+    intent_result: IntentResult,
+    call_result: anthropic_mod.ToolCallResult,
+    cost_cents: float,
+) -> None:
+    payload = {
+        "kind": "intent",
+        "intent": intent_result.intent.value,
+        "summary": intent_result.summary,
+        "model": call_result.model,
+        "tokens_in": call_result.tokens_in,
+        "tokens_out": call_result.tokens_out,
+        "cost_cents": cost_cents,
+        "prompt_version": _INTENT_PROMPT_VERSION,
+    }
+    async with asynccontextmanager(get_admin_session)() as session:
+        await session.execute(
+            _INSERT_CLASSIFIED_AUDIT_SQL,
+            {
+                "landlord_id": str(landlord_id),
+                "case_id": str(case_id) if case_id is not None else None,
+                "payload": json.dumps(payload),
+            },
+        )
+
+
 async def classify_intent(state: AgentState) -> dict[str, Any]:
     """Classify the inbound message's intent. Returns a partial state update."""
     message_id = state["message_id"]
+    case_context = state.get("case_context") or CaseContext()
     reasoning_log = list(state.get("reasoning_log") or [])
     open_cases = list(state.get("open_cases") or [])
     channel_history = list(state.get("channel_history") or [])
@@ -179,13 +237,14 @@ async def classify_intent(state: AgentState) -> dict[str, Any]:
 
     deadline = anthropic_mod.new_deadline()
     intent_result: IntentResult | None = None
+    call_result: anthropic_mod.ToolCallResult | None = None
     for attempt in range(2):
         timeout = anthropic_mod.attempt_timeout(deadline, is_retry=attempt == 1)
         if timeout is None:
             log.error("classify_intent_retry_skipped_budget_exhausted", message_id=str(message_id))
             break
         try:
-            intent_result, _call_result = await _classify_intent_once(
+            intent_result, call_result = await _classify_intent_once(
                 user_content=user_content, budget_seconds=timeout
             )
             break
@@ -197,7 +256,7 @@ async def classify_intent(state: AgentState) -> dict[str, Any]:
                 exc_type=type(exc).__name__,
             )
 
-    if intent_result is None:
+    if intent_result is None or call_result is None:
         reasoning_log.append(
             "I couldn't figure out what kind of message this is right now — moving on without it."
         )
@@ -205,6 +264,20 @@ async def classify_intent(state: AgentState) -> dict[str, Any]:
 
     display = _INTENT_DISPLAY[intent_result.intent]
     reasoning_log.append(f"This looks like {display}: {intent_result.summary}")
+
+    cost_cents = anthropic_mod.estimate_cost_cents(
+        tokens_in=call_result.tokens_in, tokens_out=call_result.tokens_out
+    )
+    if case_context.landlord_id is not None:
+        await _insert_intent_classified_audit(
+            landlord_id=case_context.landlord_id,
+            case_id=case_context.case_id,
+            intent_result=intent_result,
+            call_result=call_result,
+            cost_cents=cost_cents,
+        )
+    else:  # pragma: no cover — invariant: landlord_id is always known by this point
+        log.error("classify_intent_missing_landlord_id", message_id=str(message_id))
 
     return {"intent": intent_result, "reasoning_log": reasoning_log}
 

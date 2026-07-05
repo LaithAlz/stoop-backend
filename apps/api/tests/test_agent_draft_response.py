@@ -490,9 +490,15 @@ async def test_draft_response_success_inserts_pending_draft_and_audit(
         assert len(audit_rows) == 1
         assert audit_rows[0]["actor"] == "agent"
         assert audit_rows[0]["action"] == "drafted"
-        assert audit_rows[0]["payload"]["guard_failed"] is False
+        payload = audit_rows[0]["payload"]
+        assert payload["guard_failed"] is False
+        assert payload["model"] == "claude-sonnet-5"
+        assert payload["tokens_in"] == 150
+        assert payload["tokens_out"] == 40
+        assert isinstance(payload["cost_cents"], (int, float))
+        assert payload["cost_cents"] > 0
         # No draft body/message body in the audit payload.
-        assert "Maria" not in str(audit_rows[0]["payload"])
+        assert "Maria" not in str(payload)
 
         # Voice profile injected into the outgoing system prompt.
         system_prompt = fake_messages.calls[0]["system"]
@@ -578,11 +584,14 @@ async def test_draft_response_missing_severity_skips_drafting(
 
 
 @pytest.mark.integration
-async def test_draft_response_refusal_flag_templating_present_in_request(
+async def test_draft_response_refusal_flag_instruction_present_but_not_the_deferral_text(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Refusal flags -> deferral text is sourced from prompts/v1.py and
-    included in the outgoing user message; model reports it used."""
+    """Deferral architecture ruling (senior review, 2026-07-05): the
+    dynamic user content tells the model to acknowledge the topic ONLY,
+    and explicitly NOT to write the deferral itself -- the canned deferral
+    text is never sent to the model at all (the code appends it after
+    generation, see _append_deferrals)."""
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -600,11 +609,8 @@ async def test_draft_response_refusal_flag_templating_present_in_request(
     fake_messages = _FakeMessages(
         responses=[
             _fake_message(
-                body=(
-                    "I'm not able to share access codes or authorize entry for anyone over "
-                    "this channel. Please contact your landlord directly."
-                ),
-                refusal_templates_used=["access_codes"],
+                body="Thanks for letting me know -- I've passed this along to the landlord.",
+                refusal_templates_used=[],
             )
         ]
     )
@@ -626,8 +632,13 @@ async def test_draft_response_refusal_flag_templating_present_in_request(
 
         assert update["draft_guard_failed"] is False
         user_content = fake_messages.calls[0]["messages"][0]["content"]
-        assert "not able to share, confirm, or reset access codes" in user_content
-        assert "access_codes" in user_content
+        # The topic name is present, as an instruction NOT to address it...
+        assert "access codes" in user_content
+        assert "Do NOT" in user_content
+        # ...but the canned deferral text itself is never sent to the model.
+        assert REFUSAL_TEMPLATES["access_codes"] not in user_content
+        # The code appended the deferral verbatim to the FINAL stored draft.
+        assert REFUSAL_TEMPLATES["access_codes"] in update["draft"].body
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -726,7 +737,7 @@ async def test_draft_response_hard_guard_positive_cases(
         body="tenant message",
     )
 
-    violations = node_mod._check_hard_guards(body=body, refusal_flags=[], refusal_templates_used=[])
+    violations = node_mod._check_hard_guards(body=body)
     assert guard_name in violations
 
     # Also exercise the full node: BOTH attempts violate -> safe fallback used.
@@ -771,7 +782,7 @@ async def test_draft_response_hard_guard_positive_cases(
 def test_draft_response_hard_guard_negative_cases(body: str) -> None:
     """Clean, ordinary replies must never trip a hard guard (false-positive
     check)."""
-    violations = node_mod._check_hard_guards(body=body, refusal_flags=[], refusal_templates_used=[])
+    violations = node_mod._check_hard_guards(body=body)
     assert violations == []
 
 
@@ -788,19 +799,13 @@ def test_draft_response_every_refusal_template_stays_clean_under_widened_guards(
     flag_value: str,
 ) -> None:
     template_text = REFUSAL_TEMPLATES[flag_value]
-    violations = node_mod._check_hard_guards(
-        body=template_text,
-        refusal_flags=[RefusalFlag(flag_value)],
-        refusal_templates_used=[RefusalFlag(flag_value)],
-    )
+    violations = node_mod._check_hard_guards(body=template_text)
     assert violations == []
 
 
 @pytest.mark.unit
 def test_draft_response_generic_fallback_stays_clean_under_widened_guards() -> None:
-    violations = node_mod._check_hard_guards(
-        body=node_mod._GENERIC_SAFE_FALLBACK, refusal_flags=[], refusal_templates_used=[]
-    )
+    violations = node_mod._check_hard_guards(body=node_mod._GENERIC_SAFE_FALLBACK)
     assert violations == []
 
 
@@ -815,13 +820,14 @@ def test_draft_response_strip_mandated_templates_removes_exact_template_text() -
 
 
 @pytest.mark.integration
-async def test_draft_response_cost_compensation_deferral_verbatim_is_accepted(
+async def test_draft_response_paraphrase_of_topic_accepted_not_generic_fallback(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression (guard/deferral self-collision, HIGH): a draft that
-    includes the mandated cost_compensation deferral VERBATIM must be
-    accepted on the first attempt -- no guard failure, no fallback, no
-    second call."""
+    """Deferral architecture ruling (senior review, 2026-07-05): a
+    paraphrase-shaped model acknowledgment that merely mentions the TOPIC
+    vocabulary ("rent discount"), with no actual commitment attached, must
+    be ACCEPTED on the first attempt -- never degraded to the generic
+    fallback purely because of topical wording."""
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -833,17 +839,12 @@ async def test_draft_response_cost_compensation_deferral_verbatim_is_accepted(
         landlord_id=landlord_id,
         property_id=property_id,
         tenant_id=tenant_id,
-        body="can you cover the cost of my ruined couch from the leak?",
+        body="can I get a discount on rent since the heat was out last month?",
     )
 
-    deferral_text = REFUSAL_TEMPLATES["cost_compensation"]
+    ack_body = "About the rent discount you mentioned — Laith will sort that out separately."
     fake_messages = _FakeMessages(
-        responses=[
-            _fake_message(
-                body=f"Thanks for flagging this. {deferral_text}",
-                refusal_templates_used=["cost_compensation"],
-            )
-        ]
+        responses=[_fake_message(body=ack_body, refusal_templates_used=[])]
     )
     _patch_client(monkeypatch, fake_messages)
 
@@ -863,18 +864,73 @@ async def test_draft_response_cost_compensation_deferral_verbatim_is_accepted(
 
         assert update["draft_guard_failed"] is False
         assert len(fake_messages.calls) == 1  # accepted first try -- no retry, no fallback
-        assert deferral_text in update["draft"].body
+        assert ack_body in update["draft"].body
+        assert update["draft"].body != node_mod._GENERIC_SAFE_FALLBACK
     finally:
         await _cleanup(db_session, landlord_id)
 
 
 @pytest.mark.integration
-async def test_draft_response_legal_rent_ltb_deferral_verbatim_is_accepted(
+async def test_draft_response_appends_cost_compensation_deferral_verbatim(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Same regression as cost_compensation, for legal_rent_ltb (whose
-    template text contains "Landlord and Tenant Board", which would
-    otherwise trip its own legal_position guard)."""
+    """The model writes ONLY a brief neutral acknowledgment (never the
+    deferral itself); the code appends the canned cost_compensation
+    deferral verbatim afterward."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="can you cover the cost of my ruined couch from the leak?",
+    )
+
+    deferral_text = REFUSAL_TEMPLATES["cost_compensation"]
+    ack_body = "Thanks for flagging this — I've passed it along to the landlord."
+    fake_messages = _FakeMessages(
+        responses=[_fake_message(body=ack_body, refusal_templates_used=[])]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity([RefusalFlag.cost_compensation]),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        assert len(fake_messages.calls) == 1
+        assert ack_body in update["draft"].body
+        assert deferral_text in update["draft"].body
+        # Deferral is APPENDED after the model's own acknowledgment.
+        assert update["draft"].body.index(ack_body) < update["draft"].body.index(deferral_text)
+        assert update["draft"].refusal_templates_used == [RefusalFlag.cost_compensation]
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_appends_legal_rent_ltb_deferral_verbatim(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same as cost_compensation, for legal_rent_ltb (whose template text
+    contains "Landlord and Tenant Board", which would trip its own
+    legal_position guard if the MODEL wrote it -- but the model never
+    does; the code appends it)."""
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -890,13 +946,9 @@ async def test_draft_response_legal_rent_ltb_deferral_verbatim_is_accepted(
     )
 
     deferral_text = REFUSAL_TEMPLATES["legal_rent_ltb"]
+    ack_body = "I hear you — I've noted this and the landlord will follow up directly."
     fake_messages = _FakeMessages(
-        responses=[
-            _fake_message(
-                body=f"I hear you. {deferral_text}",
-                refusal_templates_used=["legal_rent_ltb"],
-            )
-        ]
+        responses=[_fake_message(body=ack_body, refusal_templates_used=[])]
     )
     _patch_client(monkeypatch, fake_messages)
 
@@ -916,18 +968,19 @@ async def test_draft_response_legal_rent_ltb_deferral_verbatim_is_accepted(
 
         assert update["draft_guard_failed"] is False
         assert len(fake_messages.calls) == 1
+        assert ack_body in update["draft"].body
         assert deferral_text in update["draft"].body
     finally:
         await _cleanup(db_session, landlord_id)
 
 
 @pytest.mark.integration
-async def test_draft_response_template_plus_genuine_violation_still_rejected(
+async def test_draft_response_genuine_violation_still_rejected_even_with_refusal_flag(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The mandated deferral is present AND the model ALSO added a genuine
-    violation ("I'll take $200 off") -- the genuine violation must still
-    be caught; the whitelist only protects the mandated text itself."""
+    """The model's OWN acknowledgment contains a genuine violation ("I'll
+    take $200 off") -- must still be caught and, after a second violation,
+    replaced by the generic fallback (with the deferral still appended)."""
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -942,12 +995,11 @@ async def test_draft_response_template_plus_genuine_violation_still_rejected(
         body="the leak ruined my couch, can you cover it?",
     )
 
-    deferral_text = REFUSAL_TEMPLATES["cost_compensation"]
-    violating_body = f"{deferral_text} Actually, I'll take $200 off next month's rent."
+    violating_body = "Actually, I'll take $200 off next month's rent for you."
     fake_messages = _FakeMessages(
         responses=[
-            _fake_message(body=violating_body, refusal_templates_used=["cost_compensation"]),
-            _fake_message(body=violating_body, refusal_templates_used=["cost_compensation"]),
+            _fake_message(body=violating_body, refusal_templates_used=[]),
+            _fake_message(body=violating_body, refusal_templates_used=[]),
         ]
     )
     _patch_client(monkeypatch, fake_messages)
@@ -968,17 +1020,21 @@ async def test_draft_response_template_plus_genuine_violation_still_rejected(
 
         assert update["draft_guard_failed"] is True
         assert len(fake_messages.calls) == 2
-        assert update["draft"].body != violating_body
+        assert "$200" not in update["draft"].body
+        assert node_mod._GENERIC_SAFE_FALLBACK in update["draft"].body
+        # The deferral is STILL appended even on the fallback path.
+        assert REFUSAL_TEMPLATES["cost_compensation"] in update["draft"].body
     finally:
         await _cleanup(db_session, landlord_id)
 
 
 @pytest.mark.integration
-async def test_draft_response_missing_refusal_deferral_is_a_guard_violation(
+async def test_draft_response_deferral_always_appended_regardless_of_guard_outcome(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A refusal flag is set on the classification but the model didn't
-    report using its deferral template -> treated as a guard violation."""
+    """The deferral is appended by CODE, unconditionally, whenever a
+    refusal flag is set -- independent of whether the model's own
+    acknowledgment passed the guards or was replaced by the fallback."""
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -995,10 +1051,7 @@ async def test_draft_response_missing_refusal_deferral_is_a_guard_violation(
 
     fake_messages = _FakeMessages(
         responses=[
-            # First attempt: engages the topic without the required deferral.
             _fake_message(body="Sure, I can help with that!", refusal_templates_used=[]),
-            # Second attempt: still doesn't report using the deferral.
-            _fake_message(body="Let me look into it for you.", refusal_templates_used=[]),
         ]
     )
     _patch_client(monkeypatch, fake_messages)
@@ -1017,10 +1070,69 @@ async def test_draft_response_missing_refusal_deferral_is_a_guard_violation(
         }
         update = await draft_response(state)
 
-        assert update["draft_guard_failed"] is True
-        # Fallback body is the canned access_codes deferral template itself.
-        assert "not able to share, confirm, or reset access codes" in update["draft"].body
+        # "Sure, I can help with that!" trips no hard guard on its own
+        # (no dollar/access/legal pattern) -- accepted as-is, deferral
+        # still appended afterward regardless.
+        assert update["draft_guard_failed"] is False
+        assert "Sure, I can help with that!" in update["draft"].body
+        assert REFUSAL_TEMPLATES["access_codes"] in update["draft"].body
         assert update["draft"].refusal_templates_used == [RefusalFlag.access_codes]
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_appended_deferral_may_exceed_segment_guidance_by_design(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plain-language exception, documented (module docstring): appending
+    the legal_rent_ltb deferral can push the final draft past the ~300
+    -char "<=2 SMS segments" routine guidance -- this is an intentional
+    trade-off (never omit the mandated deferral), not a bug, and this node
+    performs NO truncation to force the length budget."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="I want a rent reduction or I'm going to the LTB",
+    )
+
+    ack_body = "Thanks for letting me know — I've flagged this for the landlord to follow up on."
+    fake_messages = _FakeMessages(
+        responses=[_fake_message(body=ack_body, refusal_templates_used=[])]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity([RefusalFlag.legal_rent_ltb]),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        final_len = len(update["draft"].body)
+        # Document the exception explicitly rather than asserting a length
+        # cap: this draft is EXPECTED to exceed the ~300-char routine
+        # guidance once the deferral is appended, and that is by design.
+        assert final_len > 300, (
+            "expected the appended legal_rent_ltb deferral to exceed the routine "
+            f"~300-char guidance (documented exception); got {final_len} chars"
+        )
     finally:
         await _cleanup(db_session, landlord_id)
 
