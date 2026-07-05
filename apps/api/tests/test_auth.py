@@ -41,6 +41,35 @@ Security properties tested
    known-good cache (issue #134 safety review, A1)
 23 EC coordinate with a leading zero byte still verifies (regression for a
    latent ``_b64url`` fixed-width encoding bug found via issue #145)
+24 cold cache + degenerate {"keys": []} 200 on the routine _get_jwks path
+   fails closed WITHOUT caching the empty result; a later verify with real
+   keys queued triggers a fresh fetch rather than reusing the empty cache
+   (issue #147, guard parity with _refresh_jwks_on_kid_miss)
+25 warm cache + TTL-expired refetch that returns a degenerate
+   {"keys": []} keeps serving the stale-but-real cached keys (instead of
+   caching the empty body), and does NOT refresh ``fetched_at`` — a
+   subsequent call still retries the fetch rather than getting a fresh
+   24h TTL on the empty result (issue #147)
+26 degenerate-fetch cooldown bounds a sustained-outage storm: repeated
+   verifies with a cold/degenerate cache inside the cooldown window drive
+   at most one routine fetch (plus at most one rate-limited kid-miss
+   fetch); after the window passes, the next verify fetches again
+   (issue #147 follow-up, safety review)
+27 recovery clears the degenerate-fetch cooldown stamp: a good fetch after
+   an incident succeeds and immediately re-arms a FRESH cooldown on the
+   next degenerate incident, proven behaviorally (not just via the global)
+   (issue #147 follow-up)
+28 cold cache, degenerate routine fetch, degenerate kid-miss forced
+   refresh, then a second verify within both rate-limit windows → hits the
+   previously-"unreachable" rate-limited fallback in
+   _refresh_jwks_on_kid_miss, fails closed, drives NO further fetches
+   (issue #147 follow-up, spec-guardian finding)
+29 a body of {} (the "keys" field entirely absent) on the routine
+   _get_jwks path is treated exactly like {"keys": []} — not cached
+   (issue #147 follow-up)
+30 a body of {} (the "keys" field entirely absent) on the
+   _refresh_jwks_on_kid_miss path is treated exactly like {"keys": []} —
+   does not clobber a known-good cache (issue #147 follow-up)
 """
 
 from __future__ import annotations
@@ -928,4 +957,491 @@ async def test_leading_zero_byte_coordinate_still_verifies() -> None:
     assert user.user_id == UUID("11111111-1111-1111-1111-111111111111"), (
         f"found a leading-zero-byte coordinate after {attempts_used} attempt(s) "
         "but verification did not return the expected identity"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 24 — cold cache + degenerate {"keys": []} on the routine path fails
+# closed WITHOUT being cached for 24h (issue #147)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_cold_cache_degenerate_keys_fails_closed_without_caching(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degenerate ``{"keys": []}`` 200 fetched by the routine ``_get_jwks``
+    path (cold cache) must NOT be cached — same guard as
+    ``_refresh_jwks_on_kid_miss``, applied for parity (issue #147).
+
+    With an empty JWKS, ``_find_signing_key`` always misses (there is no
+    ``kid`` to find), which triggers the existing forced-refresh-on-kid-miss
+    path as an unavoidable side effect — so this first, failing ``verify_jwt``
+    call consumes two fetches (the routine one and the forced-refresh one),
+    both degenerate here. What this test actually proves is the second
+    ``verify_jwt`` call: with a real JWKS now queued, it must trigger ANOTHER
+    fetch through the routine path rather than being served the empty result
+    — i.e. the degenerate body from the first call was never cached.
+
+    The degenerate-fetch cooldown added alongside this guard (issue #147
+    follow-up) would otherwise skip that second fetch entirely within its
+    window — this test isn't about the cooldown itself (see
+    ``test_degenerate_fetch_cooldown_bounds_repeated_verifies``), so the
+    clock is advanced past the cooldown window before the second call.
+    """
+    token = _mint_token(private_key)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={"keys": []}),  # fetch #1: _get_jwks, cold cache
+            httpx.Response(200, json={"keys": []}),  # fetch #2: forced refresh (still empty)
+            httpx.Response(200, json=jwks_payload),  # fetch #3: _get_jwks retries, succeeds
+        ]
+    )
+
+    async with router:
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+
+        # Cache must still be cold — nothing was cached from the degenerate
+        # attempts above.
+        assert auth_mod._jwks_cache is None  # noqa: SLF001
+
+        # Advance past the degenerate-fetch cooldown window so the second
+        # call's routine fetch isn't skipped by the cooldown (a separate
+        # mechanism from the no-cache guard under test here).
+        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
+        stale_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+        monkeypatch.setattr(
+            auth_mod, "_now", lambda: stale_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0
+        )
+
+        user = await verify_jwt(token)  # fetch #3: real keys, no longer degenerate
+        call_count = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count == 3, (
+        f"expected 3 fetches (empty routine fetch + empty forced-refresh "
+        f"fetch + a retried routine fetch), got {call_count} — the empty "
+        "payload must not have been cached for the 24h TTL"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 25 — warm cache + TTL-expired refetch that returns degenerate
+# {"keys": []} keeps the stale-but-real cache and does not touch fetched_at
+# (issue #147)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_warm_cache_ttl_expired_degenerate_refetch_keeps_stale_cache(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warm cache whose 24h TTL has expired, refetched via the routine
+    ``_get_jwks`` path, may get back a degenerate ``{"keys": []}`` body.
+
+    That must NOT clobber the existing (stale but real) cache — a stale
+    real key set beats an empty one — so a token signed by the originally
+    cached key must still verify. Also: ``fetched_at`` must NOT be bumped
+    by the degenerate attempt, so the very next call retries the fetch
+    again instead of getting a fresh 24h TTL on nothing.
+
+    The third call's clock advance must clear BOTH the TTL (relative to
+    the original fetch) AND the degenerate-fetch cooldown (relative to the
+    second, degenerate fetch's own stamp) — otherwise the cooldown added
+    alongside this guard (issue #147 follow-up) would itself skip the
+    third fetch, which is exactly what this test needs to happen to prove
+    ``fetched_at`` wasn't refreshed.
+    """
+    token_original = _mint_token(private_key, kid=_KID)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=jwks_payload),  # fetch #1: prime, warm cache
+            httpx.Response(200, json={"keys": []}),  # fetch #2: TTL-expired refetch, degenerate
+            httpx.Response(200, json=jwks_payload),  # fetch #3: retried again, real keys
+        ]
+    )
+
+    async with router:
+        await verify_jwt(token_original)  # fetch #1 — primes the cache
+
+        assert auth_mod._jwks_cache is not None  # noqa: SLF001
+        original_fetched_at = auth_mod._jwks_cache[1]  # noqa: SLF001
+
+        # Advance the clock past the 24h TTL (never sleep()) so the routine
+        # path considers the cache expired and refetches.
+        monkeypatch.setattr(
+            auth_mod,
+            "_now",
+            lambda: original_fetched_at + auth_mod._JWKS_TTL_SECONDS + 1.0,
+        )
+
+        # fetch #2 is degenerate; the stale-but-real cache must be kept and
+        # served, so the ORIGINALLY cached kid still verifies.
+        user = await verify_jwt(token_original)
+        assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+        assert route.call_count == 2
+
+        # fetched_at must be untouched by the degenerate attempt.
+        assert auth_mod._jwks_cache is not None  # noqa: SLF001
+        assert auth_mod._jwks_cache[1] == original_fetched_at  # noqa: SLF001
+
+        # The degenerate-fetch cooldown (issue #147 follow-up) was stamped
+        # by the fetch #2 attempt above; capture it so the next clock
+        # advance clears both that cooldown AND the (still-expired) TTL.
+        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
+        degenerate_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+
+        # Advance the clock only slightly further than the cooldown window
+        # (measured from the degenerate stamp) — NOT merely +2.0s from the
+        # original TTL expiry, which would still be inside the cooldown and
+        # would wrongly skip fetch #3. Since fetched_at was never refreshed,
+        # the cache is STILL considered expired relative to the ORIGINAL
+        # timestamp, so this call must retry the fetch a third time —
+        # proving the degenerate attempt didn't reset the TTL.
+        monkeypatch.setattr(
+            auth_mod,
+            "_now",
+            lambda: degenerate_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0,
+        )
+        await verify_jwt(token_original)
+        call_count = route.call_count
+
+    assert call_count == 3, (
+        f"expected a third fetch after the degenerate attempt (fetched_at "
+        f"must not have been refreshed), got {call_count} calls"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 26 — degenerate-fetch cooldown bounds a sustained-outage storm
+# (issue #147 follow-up, safety review)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_degenerate_fetch_cooldown_bounds_repeated_verifies(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sustained Supabase degenerate-200 incident hit by many requests
+    with a cold cache must drive at most ONE routine fetch (plus at most
+    one rate-limited kid-miss forced-refresh fetch) per cooldown window —
+    NOT one fetch per request (issue #147 follow-up, safety review).
+
+    Call-count accounting for the FIRST (failing) ``verify_jwt`` call:
+      fetch #1 — routine ``_get_jwks`` path, cold cache, degenerate.
+                 Stamps ``_last_degenerate_fetch``.
+      fetch #2 — ``_find_signing_key`` misses on the empty result, which
+                 (unavoidably, given the existing kid-miss mechanism)
+                 triggers ``_refresh_jwks_on_kid_miss``; also degenerate.
+                 Stamps ``_last_forced_refresh``.
+    Both cooldowns are now active. Several MORE ``verify_jwt`` calls,
+    still within the window, must add ZERO further fetches: the routine
+    path's cooldown check short-circuits before fetching, and (since
+    ``_jwks_cache`` is still ``None``) ``_find_signing_key`` misses again,
+    landing on the also-rate-limited kid-miss fallback — no fetch there
+    either. Total across all of these: still 2.
+
+    Only once the clock advances past the window does the next verify
+    drive a fresh fetch (fetch #3, a real JWKS this time).
+    """
+    token = _mint_token(private_key)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={"keys": []}),  # fetch #1: routine, cold cache
+            httpx.Response(200, json={"keys": []}),  # fetch #2: kid-miss forced refresh
+            httpx.Response(200, json=jwks_payload),  # fetch #3: after the window, succeeds
+        ]
+    )
+
+    async with router:
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+        assert route.call_count == 2
+
+        # Several more verifies, still within the cooldown window: must
+        # NOT add any further fetches (both cooldowns are active, and the
+        # cache stays cold throughout — nothing to fall back to but the
+        # degenerate result itself).
+        for _ in range(4):
+            with pytest.raises(AuthError) as exc_info:
+                await verify_jwt(token)
+            assert exc_info.value.code == "invalid_token"
+
+        call_count_within_window = route.call_count
+        assert call_count_within_window == 2, (
+            f"expected the storm bounded at 2 total fetches (1 routine + 1 "
+            f"kid-miss, both degenerate) across 5 verify_jwt calls, got "
+            f"{call_count_within_window}"
+        )
+
+        # Advance the clock past both cooldown windows (they were stamped
+        # within microseconds of each other, in the same failing call) so
+        # the next verify fetches again.
+        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
+        stale_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+        monkeypatch.setattr(
+            auth_mod, "_now", lambda: stale_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0
+        )
+
+        user = await verify_jwt(token)  # fetch #3: cooldown expired, real keys
+        call_count_after_window = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count_after_window == 3, (
+        f"expected exactly one more fetch once the cooldown window passed, "
+        f"got {call_count_after_window} total calls"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 27 — recovery clears the degenerate-fetch cooldown stamp, and a
+# later incident starts a FRESH cooldown (issue #147 follow-up)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_degenerate_fetch_cooldown_stamp_cleared_on_recovery(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful (non-degenerate) fetch clears the degenerate-fetch
+    cooldown stamp so recovery from an incident is instant, and so that a
+    LATER, separate degenerate incident starts its own fresh cooldown
+    rather than inheriting stale state (issue #147 follow-up).
+
+    Proven behaviorally, not just via the module global: after recovery, a
+    fresh degenerate incident's cooldown is shown to be ACTIVE (blocking a
+    would-be fetch) shortly after IT starts.
+    """
+    token = _mint_token(private_key, kid=_KID)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={"keys": []}),  # fetch #1: routine, cold, degenerate
+            httpx.Response(200, json={"keys": []}),  # fetch #2: kid-miss forced refresh, degenerate
+            httpx.Response(200, json=jwks_payload),  # fetch #3: recovery, real keys
+            httpx.Response(200, json={"keys": []}),  # fetch #4: a NEW, separate incident
+        ]
+    )
+
+    async with router:
+        # --- Incident 1: cold cache, degenerate, fails closed. ---
+        with pytest.raises(AuthError):
+            await verify_jwt(token)
+        assert route.call_count == 2
+
+        # --- Recovery: advance past the cooldown window, queue a good
+        # response. The routine path fetches again and succeeds directly
+        # (no kid-miss needed — the good JWKS contains the matching kid). ---
+        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
+        incident_1_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+        monkeypatch.setattr(
+            auth_mod,
+            "_now",
+            lambda: incident_1_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0,
+        )
+        user = await verify_jwt(token)
+        assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+        assert route.call_count == 3
+        assert auth_mod._last_degenerate_fetch is None  # noqa: SLF001
+
+        # --- Force the routine path to refetch: jump past the FRESH 24h
+        # TTL (relative to the recovery fetch) so a second, separate
+        # degenerate incident can begin. ---
+        assert auth_mod._jwks_cache is not None  # noqa: SLF001
+        recovered_fetched_at = auth_mod._jwks_cache[1]  # noqa: SLF001
+        incident_2_time = recovered_fetched_at + auth_mod._JWKS_TTL_SECONDS + 1.0
+        monkeypatch.setattr(auth_mod, "_now", lambda: incident_2_time)
+
+        # fetch #4 is degenerate; the stale-but-real cache from recovery is
+        # kept, so the token still verifies (via the stale-keep fallback),
+        # and a FRESH cooldown stamp is set at incident_2_time.
+        user = await verify_jwt(token)
+        assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+        assert route.call_count == 4
+        assert auth_mod._last_degenerate_fetch == incident_2_time  # noqa: SLF001
+
+        # --- Behavioral proof the new cooldown is genuinely fresh (not
+        # leftover from incident 1, and not permanently disabled after
+        # clearing): shortly after incident 2's stamp — well within a
+        # fresh window — the next verify must be served from the
+        # stale-but-real cache WITHOUT fetching again. Only 4 canned
+        # responses are wired, so a 5th fetch attempt here would raise on
+        # the exhausted side_effect iterator instead of this assertion. ---
+        monkeypatch.setattr(auth_mod, "_now", lambda: incident_2_time + 1.0)
+        await verify_jwt(token)
+        call_count = route.call_count
+
+    assert call_count == 4, (
+        f"expected the post-recovery incident's cooldown to block a "
+        f"further fetch shortly after it started, got {call_count} "
+        "total calls"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 28 — the previously-"unreachable" rate-limited fallback in
+# _refresh_jwks_on_kid_miss IS reachable (issue #147 follow-up,
+# spec-guardian finding)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_second_verify_within_window_hits_kid_miss_rate_limited_fallback(
+    private_key: EllipticCurvePrivateKey,
+) -> None:
+    """The specific path spec-guardian flagged in the #147 review: a cold
+    cache whose routine fetch AND kid-miss forced-refresh are BOTH
+    degenerate, followed by a second ``verify_jwt`` call still inside both
+    rate-limit windows, must land on ``_refresh_jwks_on_kid_miss``'s
+    rate-limited fallback with ``_jwks_cache`` still ``None`` — the branch
+    whose comment previously (incorrectly) called it unreachable in
+    production.
+
+    Fails closed, and drives NO further fetches: only 2 canned responses
+    are wired, so a third fetch attempt would raise on the exhausted
+    side_effect iterator rather than this test's own assertion.
+    """
+    token = _mint_token(private_key)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={"keys": []}),  # fetch #1: routine, cold, degenerate
+            httpx.Response(200, json={"keys": []}),  # fetch #2: kid-miss forced refresh, degenerate
+        ]
+    )
+
+    async with router:
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+        assert route.call_count == 2
+        assert auth_mod._jwks_cache is None  # noqa: SLF001
+
+        # Second verify, still within BOTH the degenerate-fetch cooldown
+        # and the forced-refresh rate-limit window: the routine path skips
+        # its fetch (cooldown active), _find_signing_key misses on the
+        # resulting {"keys": []}, and _refresh_jwks_on_kid_miss's
+        # rate-limited fallback returns {"keys": []} too (still nothing to
+        # fall back to) — all without touching the network again.
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+        call_count = route.call_count
+
+    assert call_count == 2, (
+        f"expected no further fetches on the second, still-rate-limited "
+        f"verify, got {call_count} total calls"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 29 — a body of {} (no "keys" field at all) is treated like
+# {"keys": []} on the routine _get_jwks path (issue #147 follow-up)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_missing_keys_field_treated_as_degenerate_on_routine_path(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``{}`` (the ``"keys"`` field entirely absent, vs. present-but-empty)
+    must be treated exactly like ``{"keys": []}`` by the routine
+    ``_get_jwks`` guard — ``dict.get("keys")`` returns ``None`` either way,
+    which is equally falsy. Not cached; the next call (after the cooldown
+    window) retries the fetch.
+    """
+    token = _mint_token(private_key)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={}),  # fetch #1: routine, cold cache, "keys" absent
+            httpx.Response(200, json={}),  # fetch #2: kid-miss forced refresh, "keys" absent
+            httpx.Response(200, json=jwks_payload),  # fetch #3: retried, succeeds
+        ]
+    )
+
+    async with router:
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+        assert auth_mod._jwks_cache is None  # noqa: SLF001
+
+        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
+        stale_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+        monkeypatch.setattr(
+            auth_mod, "_now", lambda: stale_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0
+        )
+
+        user = await verify_jwt(token)
+        call_count = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Test 30 — a body of {} (no "keys" field at all) does not clobber a
+# known-good cache via _refresh_jwks_on_kid_miss (issue #147 follow-up)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_missing_keys_field_treated_as_degenerate_on_kid_miss_path(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+) -> None:
+    """``{}`` (the ``"keys"`` field entirely absent) reaching
+    ``_refresh_jwks_on_kid_miss`` must be treated exactly like
+    ``{"keys": []}``: it must NOT clobber a known-good cache. Mirrors test
+    22, with ``{}`` instead of ``{"keys": []}`` as the degenerate body.
+    """
+    token_original = _mint_token(private_key, kid=_KID)
+    unknown_token = _mint_token(private_key, kid="unknown-kid-missing-keys-field")
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=jwks_payload),  # fetch #1: prime (key A present)
+            httpx.Response(200, json={}),  # fetch #2: forced refresh, "keys" field absent
+        ]
+    )
+
+    async with router:
+        await verify_jwt(token_original)  # fetch #1 — primes the cache with key A
+
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(unknown_token)  # fetch #2: forced refresh, {} body
+        assert exc_info.value.code == "invalid_token"
+
+        # The ORIGINAL kid must still verify: the {} response must not
+        # have clobbered the cache, and no further fetch should have been
+        # attempted (cache is intact).
+        user = await verify_jwt(token_original)
+        call_count = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count == 2, (
+        f"expected exactly 2 fetches (prime + one {{}} attempt), got {call_count}"
     )
