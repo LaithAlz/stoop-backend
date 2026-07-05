@@ -106,6 +106,39 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Twilio (webhook signature verification — #40/#152; sensitive)
+    # ------------------------------------------------------------------
+
+    twilio_auth_token: str = Field(
+        ...,
+        description=(
+            "Twilio Auth Token used to verify X-Twilio-Signature on inbound "
+            "webhooks (app/integrations/twilio.py). NEVER logged, NEVER "
+            "included in any error message. Required — a real Twilio "
+            "account/number already exists for this project (see .env); "
+            "unlike app_database_url this has no safe fallback because "
+            "there is no way to verify a webhook signature without it."
+        ),
+    )
+
+    public_base_url: str | None = Field(
+        default=None,
+        description=(
+            "The public HTTPS origin Twilio is configured to POST webhooks "
+            "to, e.g. https://api.stoop.example — used to reconstruct the "
+            "EXACT url Twilio signed, proxy-aware. When set, the signed url "
+            "is public_base_url + request path (+ query). When unset "
+            "(local dev default), app/integrations/twilio.py falls back to "
+            "request.url, honoring X-Forwarded-Proto/X-Forwarded-Host from "
+            "the trusted proxy hop (Fly.io terminates TLS at its edge — see "
+            "that module's reconstruct_signing_url docstring). REQUIRED when "
+            "ENVIRONMENT=production -- see _require_public_base_url_in_production: "
+            "signature verification must not depend on trusting proxy headers "
+            "in production."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Observability (optional)
     # ------------------------------------------------------------------
 
@@ -174,6 +207,50 @@ class Settings(BaseSettings):
                 "See app/db/session.py's module docstring for the one-time "
                 "operator step (ALTER ROLE app_role LOGIN PASSWORD ...; "
                 "then set the APP_DATABASE_URL Fly secret)."
+            )
+        return self
+
+    # ------------------------------------------------------------------
+    # Production boot gate (#40/#152 consolidated review item 5) --
+    # mirrors _normalize_app_database_url / _require_app_database_url_in_
+    # production exactly, same rationale, different field.
+    # ------------------------------------------------------------------
+
+    @field_validator("public_base_url", mode="after")
+    @classmethod
+    def _normalize_public_base_url(cls, v: str | None) -> str | None:
+        """Treat a whitespace-only value the same as unset — same reasoning
+        as ``_normalize_app_database_url`` above (a blank/placeholder Fly
+        secret must not silently sail past the boot gate below)."""
+        if v is None:
+            return None
+        stripped = v.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def _require_public_base_url_in_production(self) -> Settings:
+        """Refuse to boot in production without a configured
+        ``public_base_url`` (#40/#152 consolidated safety review).
+
+        ``app/integrations/twilio.py``'s ``reconstruct_signing_url`` falls
+        back to trusting ``X-Forwarded-Proto``/``X-Forwarded-Host`` request
+        headers when ``public_base_url`` is unset — safe ONLY because
+        Fly.io is the single, trusted proxy hop in front of this app today.
+        That fallback is a reasonable DEFAULT for local dev (see
+        ``public_base_url``'s field description) but is NOT an acceptable
+        steady state for a production boot: Twilio signature verification
+        (the only thing standing between this webhook and an unauthenticated
+        caller) must not depend on trusting proxy headers whose provenance
+        this config layer cannot itself verify. Mirrors
+        ``_require_app_database_url_in_production``'s precedent exactly.
+        """
+        if self.environment == "production" and not self.public_base_url:
+            raise ValueError(
+                "PUBLIC_BASE_URL is required when ENVIRONMENT=production "
+                "(#40/#152) -- refusing to boot without it. Twilio signature "
+                "verification must not depend on trusting proxy headers in "
+                "production; set PUBLIC_BASE_URL to the public HTTPS origin "
+                "Twilio is configured to POST webhooks to."
             )
         return self
 

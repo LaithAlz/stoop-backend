@@ -36,6 +36,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
         supabase_jwt_issuer="https://x.supabase.co/auth/v1",
         supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
     )
     assert s.environment == "dev"
     assert s.log_level == "INFO"
@@ -57,6 +58,7 @@ def test_app_database_url_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> N
         supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
         supabase_jwt_issuer="https://x.supabase.co/auth/v1",
         supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
     )
     assert s.app_database_url is None
 
@@ -74,6 +76,7 @@ def test_app_database_url_can_be_set(monkeypatch: pytest.MonkeyPatch) -> None:
         supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
         supabase_jwt_issuer="https://x.supabase.co/auth/v1",
         supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
     )
     assert s.app_database_url == "postgresql+asyncpg://app_role:secret@h:6543/db"
 
@@ -98,6 +101,7 @@ def test_app_database_url_whitespace_only_normalizes_to_none(
         supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
         supabase_jwt_issuer="https://x.supabase.co/auth/v1",
         supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
     )
     assert s.app_database_url is None
 
@@ -120,6 +124,7 @@ def test_production_with_whitespace_only_app_database_url_raises(
             supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
             supabase_jwt_issuer="https://x.supabase.co/auth/v1",
             supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
         )
 
     assert "APP_DATABASE_URL" in str(exc_info.value)
@@ -141,6 +146,7 @@ def test_production_without_app_database_url_raises(monkeypatch: pytest.MonkeyPa
             supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
             supabase_jwt_issuer="https://x.supabase.co/auth/v1",
             supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
         )
 
     message = str(exc_info.value)
@@ -163,6 +169,11 @@ def test_production_with_app_database_url_succeeds(monkeypatch: pytest.MonkeyPat
         supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
         supabase_jwt_issuer="https://x.supabase.co/auth/v1",
         supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        # Required alongside environment="production" -- the #40/#152 boot
+        # gate (see test_production_without_public_base_url_raises) would
+        # otherwise refuse to construct this Settings instance at all.
+        public_base_url="https://api.stoop.example",
     )
     assert s.is_production is True
     assert s.app_database_url == "postgresql+asyncpg://app_role:secret@h:6543/db"
@@ -183,6 +194,7 @@ def test_non_production_without_app_database_url_is_fine(monkeypatch: pytest.Mon
             supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
             supabase_jwt_issuer="https://x.supabase.co/auth/v1",
             supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
         )
         assert s.app_database_url is None
 
@@ -204,6 +216,10 @@ def test_is_production_property(monkeypatch: pytest.MonkeyPatch) -> None:
         supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
         supabase_jwt_issuer="https://x.supabase.co/auth/v1",
         supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        # Required alongside environment="production" -- see the
+        # public_base_url boot-gate tests below.
+        public_base_url="https://api.stoop.example",
     )
     assert s_prod.is_production is True
 
@@ -215,8 +231,127 @@ def test_is_production_property(monkeypatch: pytest.MonkeyPatch) -> None:
         supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
         supabase_jwt_issuer="https://x.supabase.co/auth/v1",
         supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
     )
     assert s_dev.is_production is False
+
+
+# ---------------------------------------------------------------------------
+# public_base_url production boot gate (#40/#152 consolidated review item 5)
+# -- mirrors the app_database_url gate tests above exactly, different field.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_production_without_public_base_url_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ENVIRONMENT=production with APP_DATABASE_URL set but no
+    PUBLIC_BASE_URL must refuse to construct Settings at all -- signature
+    verification must not depend on trusting proxy headers in production."""
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            environment="production",
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        )
+
+    message = str(exc_info.value)
+    assert "PUBLIC_BASE_URL" in message
+
+
+@pytest.mark.unit
+def test_production_with_whitespace_only_public_base_url_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whitespace-only PUBLIC_BASE_URL must be treated exactly like unset
+    (same reasoning as the app_database_url gate's 13a fix)."""
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            environment="production",
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
+            public_base_url="   ",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        )
+
+    assert "PUBLIC_BASE_URL" in str(exc_info.value)
+
+
+@pytest.mark.unit
+def test_production_with_public_base_url_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The boot gate does not fire once PUBLIC_BASE_URL is actually set."""
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        environment="production",
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
+        public_base_url="https://api.stoop.example",
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+    )
+    assert s.is_production is True
+    assert s.public_base_url == "https://api.stoop.example"
+
+
+@pytest.mark.unit
+def test_non_production_without_public_base_url_is_fine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The boot gate is production-only -- dev/staging without
+    PUBLIC_BASE_URL must NOT raise (the documented local-dev fallback)."""
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+    for env in ("dev", "staging"):
+        s = Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            environment=env,  # type: ignore[arg-type]
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        )
+        assert s.public_base_url is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("blank_value", ["", "   ", "\t\n"], ids=["empty", "spaces", "tab_newline"])
+def test_public_base_url_whitespace_only_normalizes_to_none(
+    monkeypatch: pytest.MonkeyPatch, blank_value: str
+) -> None:
+    """Same normalization as app_database_url's 13a fix, applied to
+    public_base_url."""
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        public_base_url=blank_value,
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+    )
+    assert s.public_base_url is None
 
 
 @pytest.mark.unit
@@ -233,6 +368,7 @@ def test_invalid_environment_literal_raises(monkeypatch: pytest.MonkeyPatch) -> 
             supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
             supabase_jwt_issuer="https://x.supabase.co/auth/v1",
             supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
         )
 
 

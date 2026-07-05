@@ -22,6 +22,7 @@ from app.integrations.supabase_auth import AuthError
 from app.middleware.request_id import RequestIDMiddleware
 from app.observability import configure_logging, init_sentry
 from app.routers import health, me
+from app.routers.webhooks import twilio as webhooks_twilio
 
 log = structlog.get_logger(__name__)
 
@@ -103,6 +104,9 @@ def create_app() -> fastapi.FastAPI:
       4. register AuthError exception handler (401 → standard envelope)
       4b. register AppError exception handler (status_code → standard envelope)
       5. include health router (always)
+      5b. include Twilio webhook router (always — no auth header, its own
+          signature verification; not gated by environment since Twilio
+          must reach it in every deployment, including production)
       6. include auth-test router (always — for manual JWT verification)
       7. include debug router (non-production only)
 
@@ -139,6 +143,7 @@ def create_app() -> fastapi.FastAPI:
 
     application.include_router(health.router)
     application.include_router(me.router)
+    application.include_router(webhooks_twilio.router)
 
     # auth-test: always registered so engineers can verify JWT plumbing with
     # real Supabase tokens in any environment.

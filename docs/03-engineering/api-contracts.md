@@ -189,6 +189,23 @@ dashboard's emergency banner.
     `tenant_id` NULL) and **never** forwarded to a tenant or vendor.
   - Unrecognized replies are recorded in `messages` and surfaced —
     never routed to app logs, never silently dropped.
+  - **Unknown `To` number** (#40 contract addition — the contract was
+    previously silent on this): if the `To` number matches no
+    `properties.twilio_number`, persistence is structurally impossible
+    (there is no `landlord_id`/`property_id` to satisfy `messages`' NOT
+    NULL columns) — the handler answers 200 with a metadata-only log (no
+    phone number) and stores nothing. Not a 500 (Twilio would retry a
+    request that can never succeed) and not a silent no-op (the log line
+    exists). Covers a number that isn't provisioned yet or has been
+    released.
+  - **Out-of-order delivery / timestamp ordering** (#40 contract note):
+    the inbound SMS webhook payload Twilio sends carries no per-message
+    timestamp field to order by, and `messages` has no `sent_at` column
+    (`created_at` is arrival time) — see schema-v1.md. #40 stores
+    messages in arrival order; the eventual ordering guarantee referenced
+    by issue #40's acceptance criteria is delivered by #110's case/
+    timeline logic, not by this endpoint. Flagged here rather than
+    inventing a schema column pre-#110.
 - `POST /webhooks/twilio/voice` — TwiML callbacks for the emergency call
   (`Digits=1` → acknowledge). (#108)
 - `POST /webhooks/twilio/status` — Twilio delivery-status callback,
@@ -198,7 +215,17 @@ dashboard's emergency banner.
   arrivals expected; delivery state derives from status precedence
   (terminal wins), never recency. Unknown `twilio_sid` or
   out-of-vocabulary status → 200 + drop with a metadata-only log (no
-  body, no phone). Always 200 fast.
+  body, no phone). Always 200 fast — the entire post-signature body is
+  wrapped so a transient DB error never surfaces as anything but 200
+  (#152 contract fidelity fix: an earlier revision could 500 on a DB
+  blip during the `twilio_sid` lookup).
+  - **Replay bound** (#40/#152 contract addition): at most 100
+    `message_status_events` rows are appended per `message_id`; once that
+    cap is reached, further callbacks for that message are dropped with a
+    metadata-only log (count only) rather than accepted forever. Bounds
+    storage under a replay storm while remaining generous headroom over
+    any legitimate delivery flow (a message realistically sees at most a
+    handful of status transitions).
 - `POST /webhooks/stripe` — signature + event-id idempotent. (#59)
 
 ## Health
