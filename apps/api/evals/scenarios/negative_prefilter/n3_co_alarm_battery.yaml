@@ -1,0 +1,21 @@
+# See n1_smoke_detector_battery.yaml's header comment. Message text reused
+# verbatim from tests/test_prefilter.py::
+# TestRegressionIssue143AlarmBatteryChirpGuard::
+# test_co_alarm_chirping_needs_battery_guarded.
+id: n3-co-alarm-battery
+category: routine
+tier0_only: true
+prefilter_must_fire: false
+context:
+  property: "88 Dovercourt"
+  tenant: { name: Dev, unit: "3" }
+  time_local: "16:20"
+message: >
+  the co alarm is chirping, needs a new battery
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+rationale: >
+  R-class "detector chirping" extended to CO/carbon-monoxide alarms, which
+  have the identical battery-chirp failure mode as smoke alarms. Must NOT
+  trip Tier-0's gas_co trigger. Guards on the co_alarm_battery pattern.

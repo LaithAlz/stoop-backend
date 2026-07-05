@@ -1,0 +1,21 @@
+# Source: docs/02-product/eval-scenarios-v1.md, "R1 - dripping faucet -
+# classic routine". Lifted verbatim, plus an explicit top-level
+# `prefilter_must_fire: false` (deliberate strengthening -- see
+# evals/scenario.py's docstring).
+id: r1-faucet-drip
+category: routine
+prefilter_must_fire: false
+context:
+  property: "12 Ossington"
+  tenant: { name: Sam, unit: "1B" }
+  time_local: "09:02"
+message: >
+  morning! not urgent at all but the kitchen faucet has a slow drip. maybe a
+  washer thing? whenever someone's around.
+expect:
+  severity: routine
+  actions: [draft_and_hold] # auto-send only if property has earned LV2
+  draft_must_include: [specific scheduling proposal]
+rationale: >
+  Baseline routine. Also the trust-ladder test fixture: with LV2 unlocked
+  this same scenario asserts auto_send instead of draft_and_hold.

@@ -19,7 +19,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -116,6 +116,18 @@ class SeverityResult(BaseModel):
     ``reasoning`` holds per-issue one-sentence explanations (one entry per
     distinct issue found in a multi-issue message).  The node also appends
     a summary line to ``AgentState.reasoning_log`` for the approval card.
+
+    Robustness (paid eval gate finding, 2026-07-05): the real gate's F1
+    scenario got ``reasoning`` back as a bare string (not a list) once --
+    the model, faced with an INCONCLUSIVE-shaped message, emitted a single
+    unwrapped sentence instead of a one-item list. ``rules_fired`` and
+    ``refusal_flags`` carry the identical "the model found exactly one
+    thing and unwrapped it" risk (nothing about their JSON-schema shape
+    stops a model from doing the same), so all three list-typed fields
+    share the same before-validator (:func:`_coerce_singular_to_list`)
+    coercing a bare string into a single-item list before Pydantic's own
+    list/enum validation runs -- a real list (or ``None``, for fields that
+    allow it) passes through unchanged.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -125,6 +137,16 @@ class SeverityResult(BaseModel):
     modifier: str | None = None
     refusal_flags: list[RefusalFlag] = Field(default_factory=list)
     reasoning: list[str] = Field(default_factory=list)
+
+    @field_validator("rules_fired", "refusal_flags", "reasoning", mode="before")
+    @classmethod
+    def _coerce_singular_to_list(cls, value: object) -> object:
+        """A bare string in place of a single-item list -- see class
+        docstring "Robustness". Anything else (a real list, ``None``, ...)
+        passes through unchanged for Pydantic's own validation."""
+        if isinstance(value, str):
+            return [value]
+        return value
 
 
 class IntentResult(BaseModel):

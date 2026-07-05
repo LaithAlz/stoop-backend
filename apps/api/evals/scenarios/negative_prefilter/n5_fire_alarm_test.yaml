@@ -1,0 +1,19 @@
+# See n1_smoke_detector_battery.yaml's header comment. Message text reused
+# verbatim from
+# tests/test_prefilter.py::TestGuards::test_annual_fire_alarm_test.
+id: n5-fire-alarm-test
+category: routine
+tier0_only: true
+prefilter_must_fire: false
+context:
+  property: "41 Palmerston"
+  tenant: { name: Maria, unit: "2" }
+  time_local: "08:15"
+message: >
+  annual fire alarm test tomorrow morning
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+rationale: >
+  A scheduled fire-alarm test is not a fire. Must NOT trip Tier-0's fire
+  trigger. Guards on the fire_alarm_test pattern.

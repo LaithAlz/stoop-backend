@@ -1,0 +1,20 @@
+# See n1_smoke_detector_battery.yaml's header comment. Message text reused
+# verbatim from
+# tests/test_prefilter.py::TestRegressionIssue143FireCompoundNounGuards::
+# test_fire_hydrant_blocked_guarded.
+id: n9-fire-hydrant
+category: routine
+tier0_only: true
+prefilter_must_fire: false
+context:
+  property: "88 Dovercourt"
+  tenant: { name: Dev, unit: "3" }
+  time_local: "09:15"
+message: >
+  a car is blocking the fire hydrant out front
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+rationale: >
+  A parking/access complaint, not a hazard. Must NOT trip Tier-0's fire
+  trigger. Guards on the fire_hydrant pattern.

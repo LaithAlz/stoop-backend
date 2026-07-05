@@ -1,0 +1,29 @@
+# NOT from eval-scenarios-v1.md -- the negative Tier-0 prefilter suite
+# docs/02-product/emergency-prefilter.md requires ("a negative suite asserts
+# the guards (R-class 'detector chirping' must NOT fire)"), per issue #36's
+# acceptance criteria. `tier0_only: true` means the runner asserts ONLY the
+# Tier-0 (app/agent/prefilter.py) result -- no real Anthropic calls are made
+# for this scenario, since its entire purpose is exercising the
+# deterministic keyword filter's smoke_detector_battery guard, already
+# covered exhaustively (pure-function, no I/O) by
+# tests/test_prefilter.py::TestEvalScenarios::test_r_class_chirp_variant,
+# whose exact message text is reused here for continuity between the unit
+# -test corpus and the eval corpus.
+id: n1-smoke-detector-battery
+category: routine
+tier0_only: true
+prefilter_must_fire: false
+context:
+  property: "12 Ossington"
+  tenant: { name: Sam, unit: "1B" }
+  time_local: "14:00"
+message: >
+  the smoke alarm keeps beeping, I think it needs a new battery
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+rationale: >
+  R-class "detector chirping": a smoke-detector battery chirp is rubric
+  ROUTINE ("smoke-detector battery chirp (single intermittent chirp)") and
+  must NOT trip Tier-0's HARD fire trigger, even though the bare word
+  "smoke" is present. Guards on the smoke_detector_battery pattern.

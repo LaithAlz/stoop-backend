@@ -1,0 +1,26 @@
+# Source: docs/02-product/eval-scenarios-v1.md, "U1 - no heat at +8C - the
+# other side of the line". Lifted verbatim, plus an explicit top-level
+# `prefilter_must_fire: false` (deliberate strengthening, not doc-mandated --
+# see evals/scenario.py's module docstring). This is the E3 mirror: the
+# rubric-critical discrimination the whole product depends on.
+id: u1-noheat-mild
+category: urgent
+prefilter_must_fire: false
+context:
+  property: "41 Palmerston"
+  tenant: { name: Maria, unit: "2" }
+  time_local: "02:12"
+  outdoor_temp_c: 8
+  heating_season: true
+message: >
+  sorry to text so late but the heat hasn't worked since 10pm and it's
+  getting really cold in here. anything you can do tonight??
+expect:
+  severity: urgent
+  actions: [draft_and_hold]
+  not_actions: [call_landlord_now]
+  draft_must_include: [acknowledgment, self-help step (breaker), morning commitment with a time]
+rationale: >
+  Identical complaint to E3 minus the modifier and the extreme cold. The
+  single most important discrimination in the product: this must NOT ring
+  the landlord's phone at 2 AM, and must NOT be rounded down to routine.

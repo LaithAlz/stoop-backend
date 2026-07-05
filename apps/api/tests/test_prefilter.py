@@ -1818,3 +1818,193 @@ class TestRound4RecommendedHardening:
         _not_hard("the fire alarm is chirping, needs a new battery")
         _not_hard("co detector says low battery")
         _not_hard("smoke detector battery low")
+
+
+# ---------------------------------------------------------------------------
+# TENSE/INFLECTION-COMPLETENESS SWEEP (post-#144, found building the #35/#36
+# eval harness) — CONFIRMED DEFECT: E2's canonical eval message ("... has
+# smelled like gas ...", lifted verbatim from eval-scenarios-v1.md) did not
+# trip Tier-0, even though emergency-prefilter.md mandates E1/E2 must.
+#
+# Root cause: several trigger word lists were a hand-copied alternation of
+# ONE verb's tenses that never covered the full base/3rd-person/past/
+# progressive set (the exact class #144's own commit message named). Fixed
+# in app/agent/prefilter.py; see that module's docstring "Tense/inflection
+# -completeness sweep" for the full list and rationale.
+#
+# Verification discipline (mirrors #144's own precedent): every message in
+# THIS file (254 pre-existing + these additions) was run on BOTH the
+# pre-fix and post-fix prefilter.py (a base-vs-head matrix) — zero
+# base-HARD -> head-silent flips, and exactly one new fire in the corpus
+# (E2's own message, in the intended direction). See the PR description /
+# issue report for the full matrix output.
+# ---------------------------------------------------------------------------
+
+
+class TestTenseCompletenessSweepGasSmelled:
+    """The exact confirmed defect: E2's canonical message, lifted verbatim."""
+
+    @pytest.mark.unit
+    def test_e2_exact_message_now_fires(self) -> None:
+        _hard(
+            "hey not sure if this is a big deal but the kitchen has smelled "
+            "like gas since I got home an hour ago? windows are open",
+            "gas_co",
+        )
+
+    @pytest.mark.unit
+    def test_smelled_like_gas_short_form(self) -> None:
+        _hard("the kitchen has smelled like gas since this morning", "gas_co")
+
+    @pytest.mark.unit
+    def test_smelt_gas_british_spelling(self) -> None:
+        """ "Smelt" (British/Canadian past-tense spelling) is equally valid
+        tenant phrasing and was explicitly named in the fix scope."""
+        _hard("I smelt gas near the stove", "gas_co")
+
+    @pytest.mark.unit
+    def test_gas_smelling_progressive(self) -> None:
+        _hard("the kitchen keeps smelling like gas every evening", "gas_co")
+
+    @pytest.mark.unit
+    def test_gas_leaked_past_tense(self) -> None:
+        _hard("the gas leaked from the stove overnight", "gas_co")
+
+    @pytest.mark.unit
+    def test_leaked_gas_reverse_order(self) -> None:
+        """Reverse-order proximity anchor (leak forms -> gas) also needed
+        the "ed" completion."""
+        _hard("there was a leaked gas smell in the hallway", "gas_co")
+
+    @pytest.mark.unit
+    def test_gas_leaks_third_person(self) -> None:
+        _hard("the stove gas leaks sometimes when it's windy", "gas_co")
+
+
+class TestTenseCompletenessSweepFireSmoke:
+    """Fire's smoke-proximity list had the exact same "smell" gap as gas_co,
+    plus a missing past tense for "filling"."""
+
+    @pytest.mark.unit
+    def test_smoke_smelled_earlier(self) -> None:
+        _hard("I smelled smoke coming from the hallway earlier", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_smelling_progressive(self) -> None:
+        _hard("the hallway keeps smelling like smoke today", "fire")
+
+    @pytest.mark.unit
+    def test_smoke_filled_past_tense(self) -> None:
+        _hard("smoke filled the hallway last night", "fire")
+
+
+class TestTenseCompletenessSweepWater:
+    """flood(ing)? was missing "flooded"; the active-flow proximity list
+    was progressive-only (pouring/gushing/coming through), missing the
+    simple past for each."""
+
+    @pytest.mark.unit
+    def test_basement_flooded_past_tense(self) -> None:
+        _hard("the basement flooded last night after the storm", "water")
+
+    @pytest.mark.unit
+    def test_water_poured_past_tense(self) -> None:
+        _hard("water poured all over the kitchen floor", "water")
+
+    @pytest.mark.unit
+    def test_water_gushed_past_tense(self) -> None:
+        _hard("water gushed out of the wall this morning", "water")
+
+    @pytest.mark.unit
+    def test_water_came_through_ceiling_past_tense(self) -> None:
+        _hard("water came through the ceiling around midnight", "water")
+
+
+class TestTenseCompletenessSweepPerson:
+    """overdose(d)? was missing "overdosing"; collapsed was missing the
+    base "collapse" and progressive "collapsing"/"collapses" entirely."""
+
+    @pytest.mark.unit
+    def test_overdosing_progressive(self) -> None:
+        _hard("I think he's overdosing right now, please help", "person")
+
+    @pytest.mark.unit
+    def test_overdose_base_form_still_fires(self) -> None:
+        _hard("tenant may have had an overdose", "person")
+
+    @pytest.mark.unit
+    def test_overdosed_past_still_fires(self) -> None:
+        _hard("she overdosed on something", "person")
+
+    @pytest.mark.unit
+    def test_collapse_base_form(self) -> None:
+        _hard("he looks like he might collapse any minute", "person")
+
+    @pytest.mark.unit
+    def test_collapsing_progressive(self) -> None:
+        _hard("she's collapsing right now, please hurry", "person")
+
+    @pytest.mark.unit
+    def test_collapses_third_person(self) -> None:
+        _hard("he collapses whenever this happens", "person")
+
+    @pytest.mark.unit
+    def test_collapsed_past_still_fires(self) -> None:
+        """Regression: the ONLY form that existed before must still fire."""
+        _hard("he collapsed in the hallway", "person")
+
+
+class TestTenseCompletenessSweepSoftSparks:
+    """The SOFT "sparks" annotation was missing "sparked" -- the adjacent
+    SOFT "leak" annotation already had its "ed" form, proving the two had
+    drifted out of sync with each other."""
+
+    @pytest.mark.unit
+    def test_sparked_past_tense(self) -> None:
+        _soft("the outlet sparked earlier today", "sparks")
+
+    @pytest.mark.unit
+    def test_sparks_and_sparking_still_fire(self) -> None:
+        _soft("I saw sparks from the outlet", "sparks")
+        _soft("the outlet is sparking", "sparks")
+
+
+class TestTenseCompletenessSweepGuardsStillSuppress:
+    """The whole point of a TRIGGER-side-only tense sweep: every
+    battery-chirp / continuous-alarm GUARD must keep suppressing exactly as
+    before -- these word lists were deliberately NOT touched. Regression
+    coverage combining a guard-phrase with one of the NEWLY completed
+    trigger forms, to prove the two don't interact badly."""
+
+    @pytest.mark.unit
+    def test_smoke_detector_chirping_still_guarded_alone(self) -> None:
+        result = _not_hard("the smoke detector is chirping, might need a new battery")
+        assert "smoke_detector_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_battery_chirp_guard_does_not_suppress_independent_flooded(self) -> None:
+        """Guard suppresses the smoke-detector mention; the independent,
+        newly-completed "flooded" trigger in the SAME message must still
+        fire (trigger-wins invariant, unaffected by this sweep)."""
+        text = "the smoke detector is chirping about the battery, and the basement flooded"
+        result = check(text)
+        assert result.hard_hit is True
+        assert "water" in result.categories
+        assert "smoke_detector_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_fire_alarm_battery_guard_still_suppresses_with_smelled_elsewhere(self) -> None:
+        """Guard suppresses the "fire alarm ... battery" phrase; an
+        unrelated, independent "smelled smoke" elsewhere in the message
+        still fires via the newly-completed smoke-proximity list."""
+        text = "the fire alarm is chirping, needs a new battery, and I smelled smoke by the stove"
+        result = check(text)
+        assert result.hard_hit is True
+        assert "fire" in result.categories
+        assert "fire_alarm_battery" in result.guards
+
+    @pytest.mark.unit
+    def test_continuous_alarm_still_fires_regardless_of_sweep(self) -> None:
+        """Continuous-alarm phrasing (untouched by this sweep) still
+        overrides the battery guard exactly as before."""
+        _hard("the smoke alarm is blaring and wont stop, might be the battery", "fire")

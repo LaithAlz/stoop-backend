@@ -14,6 +14,11 @@ __pycache__/
 dist/
 *.egg-info/
 
+# Eval results snapshots (evals/runner.py) -- only git-tracked when the
+# orchestrator deliberately commits a real (paid) gate run's output.
+apps/api/evals/results/*.json
+!apps/api/evals/results/.gitkeep
+
 # Node / Bun (apps/web)
 node_modules/
 .output/

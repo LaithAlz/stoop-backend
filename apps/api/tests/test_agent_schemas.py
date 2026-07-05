@@ -151,6 +151,64 @@ def test_severity_result_rejects_invalid_severity() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SeverityResult singular -> list coercion (paid eval gate finding,
+# 2026-07-05: F1's real run got `reasoning` back as a bare string once)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_severity_result_coerces_bare_reasoning_string_to_list() -> None:
+    result = SeverityResult.model_validate(
+        {
+            "severity": "ROUTINE",
+            "reasoning": "Tenant references a past dispute; flagged for landlord review.",
+        }
+    )
+    assert result.reasoning == ["Tenant references a past dispute; flagged for landlord review."]
+
+
+@pytest.mark.unit
+def test_severity_result_coerces_bare_rules_fired_string_to_list() -> None:
+    result = SeverityResult.model_validate(
+        {"severity": "URGENT", "rules_fired": "No heat (outdoor temp above -10C)"}
+    )
+    assert result.rules_fired == ["No heat (outdoor temp above -10C)"]
+
+
+@pytest.mark.unit
+def test_severity_result_coerces_bare_refusal_flag_string_to_list() -> None:
+    result = SeverityResult.model_validate({"severity": "ROUTINE", "refusal_flags": "access_codes"})
+    assert result.refusal_flags == [RefusalFlag.access_codes]
+
+
+@pytest.mark.unit
+def test_severity_result_real_list_input_unaffected_by_coercion() -> None:
+    """The coercion must never touch an already-correct list -- this is a
+    before-validator safety net, not a behavior change for the normal
+    (already-a-list) case."""
+    result = SeverityResult.model_validate(
+        {
+            "severity": "EMERGENCY",
+            "rules_fired": ["a", "b"],
+            "refusal_flags": ["legal_rent_ltb"],
+            "reasoning": ["one", "two"],
+        }
+    )
+    assert result.rules_fired == ["a", "b"]
+    assert result.refusal_flags == [RefusalFlag.legal_rent_ltb]
+    assert result.reasoning == ["one", "two"]
+
+
+@pytest.mark.unit
+def test_severity_result_coercion_still_validates_enum_membership() -> None:
+    """A bare, but INVALID, refusal-flag string still raises -- the
+    coercion only unwraps the string into a list; it does not bypass
+    normal enum validation."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate({"severity": "ROUTINE", "refusal_flags": "not_a_real_flag"})
+
+
+# ---------------------------------------------------------------------------
 # IntentResult round-trip + validation
 # ---------------------------------------------------------------------------
 

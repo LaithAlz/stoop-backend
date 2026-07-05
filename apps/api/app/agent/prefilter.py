@@ -69,6 +69,38 @@ Key invariants:
   and that anchor token does NOT fall inside ANY guard core span,
   ``hard_hit = True``.
 
+Tense/inflection-completeness sweep (post-#144, found building the #35/#36
+eval harness)
+--------------------------------------------------------------------------
+The eval harness's E2 scenario ("the kitchen has smelled like gas since I
+got home an hour ago" -- lifted VERBATIM from eval-scenarios-v1.md) did not
+trip Tier-0, despite emergency-prefilter.md mandating that E1/E2 must.
+Root cause: the ``gas_co`` proximity trigger's word list had "smell"/
+"smells" (present tense) but never the PAST tense "smelled" at all -- a
+hand-copied-alternation-drift defect, the exact class #144's commit
+message already named. A full sweep of every OTHER trigger/soft-annotation
+word list for the same defect class (a verb-based alternation missing one
+or more of its base/3rd-person/past/progressive forms) found and fixed
+several more instances (see each site's own inline comment for specifics):
+``fire``'s smoke-proximity list (missing smelled/smelt/smelling/filled),
+``gas_co``'s gas-proximity list AND its reverse leak-anchor (missing
+smelled/smelt/smelling/leaked/leaks), ``water``'s ``flood`` trigger
+(missing "flooded") and its active-flow proximity list (missing poured/
+gushed/came through), ``person``'s ``overdose`` (missing "overdosing") and
+``collapsed`` (missing base "collapse" and progressive "collapsing")
+triggers, and the SOFT ``sparks`` annotation (missing "sparked" -- the
+adjacent SOFT ``leak`` annotation already correctly had its "ed" form,
+proving the two had drifted out of sync with each other). Deliberately
+NOT touched in this pass: the continuous-alarm shared phrase list
+(``_CONTINUOUS_ALARM_PHRASES``) and every GUARD word list (battery/chirp/
+beep) -- both are suppression-side logic, already extensively hardened
+across multiple prior safety-review rounds (see their own comments), and
+out of scope for a TRIGGER-side tense-completion pass (a guard's word-list
+gap has no ``hard_hit`` correctness impact -- see the issue report for the
+proof). No new vocabulary was introduced anywhere in this pass: every
+change only completes the inflection set of a verb ALREADY present in its
+own alternation.
+
 Public API
 ----------
 ``check(text: str) -> PrefilterResult``
@@ -311,7 +343,17 @@ _HARD_TRIGGERS: list[_Trigger] = [
     # "smoke" near smell/filling/everywhere — PROXIMITY trigger anchored on
     # each "smoke" token independently.  This prevents the guard from
     # suppressing a later independent "smoke" that satisfies the condition.
-    *_make_proximity("fire", r"\bsmoke\b", r"(smell|filling|everywhere)"),
+    # Tense/inflection completeness (#144-class defect, found building the
+    # #35/#36 eval harness): the proximity word list only had the bare
+    # present-tense "smell" — missing "smells"/"smelled"/"smelling" (the SAME
+    # verb, other tenses) and "filled" (past tense of "filling"). A tenant
+    # saying "I smelled smoke earlier" or "smoke filled the hallway" did not
+    # fire. Fixed by completing both verbs' base/3rd-person/past/progressive
+    # forms — no new vocabulary, only missing inflections of what was
+    # already there.
+    *_make_proximity(
+        "fire", r"\bsmoke\b", r"(smell|smells|smelled|smelling|filling|filled|everywhere)"
+    ),
     # "burning smell" / "smell of burning"
     _SimpleTrigger("fire", _re(r"\bburning\s+smell\b")),
     _SimpleTrigger("fire", _re(r"\bsmell\s+of\s+burning\b")),
@@ -366,9 +408,29 @@ _HARD_TRIGGERS: list[_Trigger] = [
     ),
     # ---------------------------------------------------------------- gas_co
     # "gas" near smell/leak/smells (within 40 chars either direction)
-    *_make_proximity("gas_co", r"\bgas\b", r"(smell|leak|smells|leaking)"),
-    # "leak" near "gas" (reverse order proximity)
-    *_make_proximity("gas_co", r"\bleak(s|ing)?\b", r"gas"),
+    #
+    # CONFIRMED DEFECT (found building the #35/#36 eval harness, #144-class):
+    # E2's canonical eval message -- "the kitchen has smelled like gas since
+    # I got home an hour ago", lifted verbatim from eval-scenarios-v1.md --
+    # did NOT trip Tier-0, even though emergency-prefilter.md mandates E1/E2
+    # must. Root cause: the proximity word list had "smell"/"smells" (present
+    # tense) and "leak"/"leaking" but never the PAST tense "smelled" at all
+    # (confirmed empirically: `prefilter.check("... has smelled like gas
+    # ...").hard_hit` was False; `"... smells like gas"` was True). Same
+    # hand-copied-alternation-drift lesson as #144: fixed by completing
+    # "smell"'s full base/3rd-person/past/progressive set (smell, smells,
+    # smelled, smelling) plus "smelt" (British/Canadian spelling variant --
+    # equally valid tenant phrasing), and "leak"'s missing past tense
+    # (leaked), alongside "leaks" (3rd person) which was also absent.
+    *_make_proximity(
+        "gas_co",
+        r"\bgas\b",
+        r"(smell|smells|smelled|smelt|smelling|leak|leaks|leaking|leaked)",
+    ),
+    # "leak" near "gas" (reverse order proximity) — anchor pattern itself
+    # extended the same way: \bleak(s|ing)?\b never matched "leaked" (no
+    # word boundary between "leak" and "ed" within the same token).
+    *_make_proximity("gas_co", r"\bleak(s|ing|ed)?\b", r"gas"),
     # carbon monoxide (spelled out)
     _SimpleTrigger("gas_co", _re(r"\bcarbon\s+monoxide\b")),
     # CO alarm / CO detector
@@ -411,16 +473,23 @@ _HARD_TRIGGERS: list[_Trigger] = [
         suppressible=False,
     ),
     # --------------------------------------------------------------- water
-    # flood / flooding
-    _SimpleTrigger("water", _re(r"\bflood(ing)?\b")),
-    # burst pipe (both word orders)
+    # flood / flooding / flooded — "flooded" (past tense) was missing;
+    # "the basement flooded last night" is at least as common a tenant
+    # phrasing as "flooding" (#144-class tense-completeness sweep).
+    _SimpleTrigger("water", _re(r"\bflood(ing|ed)?\b")),
+    # burst pipe (both word orders) — "burst" is already tense-invariant
+    # (present and past share the same form), so no completion needed here.
     _SimpleTrigger("water", _re(r"\bburst\s+pipe\b")),
     _SimpleTrigger("water", _re(r"\bpipe\b.{0,20}\bburst\b")),
-    # "water" near active-flow words (within 60 chars either direction)
+    # "water" near active-flow words (within 60 chars either direction).
+    # "pouring"/"gushing"/"coming through" were progressive-only — missing
+    # the simple past ("water poured through the ceiling all night", "water
+    # gushed out of the wall", "water came through the ceiling") is the same
+    # class of gap as gas_co's "smelled" miss (#144-class tense sweep).
     *_make_proximity(
         "water",
         r"\bwater\b",
-        r"(pouring|gushing|coming\s+through|through\s+the\s+ceiling)",
+        r"(pouring|poured|gushing|gushed|coming\s+through|came\s+through|through\s+the\s+ceiling)",
         window=60,
     ),
     # water + electrical contact (rubric: water on electrical = EMERGENCY)
@@ -455,9 +524,22 @@ _HARD_TRIGGERS: list[_Trigger] = [
     _SimpleTrigger("person", _re(r"\bheart\s+attack\b")),
     _SimpleTrigger("person", _re(r"\bseizure\b")),
     _SimpleTrigger("person", _re(r"\bnot\s+breathing\b")),
-    # overdose(d) / collapsed — strong medical emergency signals
-    _SimpleTrigger("person", _re(r"\boverdose(d)?\b")),
-    _SimpleTrigger("person", _re(r"\bcollapsed\b")),
+    # overdose / collapsed — strong medical emergency signals.
+    # "overdose(d)?" was missing the progressive "overdosing" ("he's
+    # overdosing right now") -- same tense-completeness gap as gas_co's
+    # "smelled" miss (#144-class sweep). Root "overdos" + e/ed/ing covers
+    # overdose/overdosed/overdosing (dropping the "e" before "-ing" is
+    # standard English spelling, not a new word).
+    _SimpleTrigger("person", _re(r"\boverdos(?:e|ed|ing)\b")),
+    # "collapsed" had ONLY the past tense -- base "collapse" ("he might
+    # collapse"), 3rd person "collapses", and progressive "collapsing"
+    # ("she's collapsing") were all missing entirely, not merely one
+    # inflection short. Root "collaps" + e/es/ed/ing (NOT "collapse" +
+    # "ing", which would misspell "collapseing" -- English drops the
+    # terminal "e" before "-ing", same subtlety as "overdos" + "ing" above;
+    # caught by the base-vs-head verification matrix, which found this
+    # exact regex mistake before it shipped).
+    _SimpleTrigger("person", _re(r"\bcollaps(?:e|es|ed|ing)\b")),
     # Elevator entrapment — both word orders + gap form
     _SimpleTrigger("person", _re(r"\belevator\s+(entrapment|stuck|trapped)\b")),
     _SimpleTrigger("person", _re(r"\btrapped\s+in\s+(the\s+|an\s+)?elevator\b")),
@@ -713,7 +795,11 @@ _SOFT_PATTERNS: list[_Soft] = [
     _Soft("no_heat", _re(r"\bno\s+heat\b")),
     _Soft("no_heat", _re(r"\bheat\s+(is\s+)?(out|off|not\s+working|broken)\b")),
     _Soft("freezing", _re(r"\bfreezing\b")),
-    _Soft("sparks", _re(r"\bspark(s|ing)?\b")),
+    # "sparked" (past tense) was missing -- the SAME alternation as "leak"
+    # below already correctly includes "ed"; "sparks" had drifted out of
+    # sync with it (#144-class tense-completeness sweep, found building the
+    # #35/#36 eval harness).
+    _Soft("sparks", _re(r"\bspark(s|ing|ed)?\b")),
     # "leak" — a contained drip/leak; burst pipe and flood are HARD water.
     _Soft("leak", _re(r"\bleak(s|ing|ed)?\b")),
     _Soft("locked_out", _re(r"\blocked\s+out\b")),

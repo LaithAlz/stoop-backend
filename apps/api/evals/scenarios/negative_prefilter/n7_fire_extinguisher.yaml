@@ -1,0 +1,20 @@
+# See n1_smoke_detector_battery.yaml's header comment. Message text reused
+# verbatim from
+# tests/test_prefilter.py::TestRegressionIssue143FireCompoundNounGuards::
+# test_fire_extinguisher_expired_guarded.
+id: n7-fire-extinguisher
+category: routine
+tier0_only: true
+prefilter_must_fire: false
+context:
+  property: "12 Ossington"
+  tenant: { name: Sam, unit: "1B" }
+  time_local: "11:30"
+message: >
+  the fire extinguisher expired last month
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+rationale: >
+  A fixture inspection/expiry note, not an active hazard. Must NOT trip
+  Tier-0's fire trigger. Guards on the fire_extinguisher pattern.

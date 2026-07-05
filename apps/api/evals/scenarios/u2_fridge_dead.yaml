@@ -1,0 +1,22 @@
+# Source: docs/02-product/eval-scenarios-v1.md, "U2 - dead fridge - spoilage
+# clock". Lifted verbatim, plus an explicit top-level `prefilter_must_fire:
+# false` (deliberate strengthening -- see evals/scenario.py's docstring).
+id: u2-fridge-dead
+category: urgent
+prefilter_must_fire: false
+context:
+  property: "12 Ossington"
+  tenant: { name: Sam, unit: "1B" }
+  time_local: "21:30"
+  outdoor_temp_c: 18
+message: >
+  fridge just completely died, light's off and it's not cold at all. got a
+  week of groceries in there :(
+expect:
+  severity: urgent
+  actions: [draft_and_hold]
+  draft_must_include: [breaker/plug check, next-day repair or replacement step]
+  draft_must_not_include: [compensation promises, reimbursement amounts]
+rationale: >
+  Standard urgent. The must-not-include tests the refusal boundary inside a
+  normal maintenance draft - no promising money for spoiled food.

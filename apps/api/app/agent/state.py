@@ -120,14 +120,29 @@ class AgentState(TypedDict, total=False):
         #108. Absent/``False`` in every other case.
 
     draft_guard_failed:
-        Set ``True`` by ``draft_response`` (#33) when a drafted reply still
-        violates a hard guard (dollar amounts/compensation, access codes, a
-        legal position, or a missing required refusal deferral) after ONE
-        regeneration attempt. The draft that IS stored in that case is a
-        safe templated fallback (never the guard-violating text) — this
-        flag is the "needs a person's eyes on this one" signal for a future
-        node/notification to act on (same seam pattern as
-        ``classification_failed`` above). Absent/``False`` otherwise.
+        Set ``True`` by ``draft_response`` (#33) when the model's own
+        acknowledgment text still violates a hard guard (dollar amounts/
+        compensation, access codes, or a legal position) after ONE
+        regeneration attempt. The draft that IS stored in that case
+        replaces just that acknowledgment with a safe generic fallback
+        (the mandated deferral, if any, is still appended verbatim
+        regardless) — this flag is the "needs a person's eyes on this one"
+        signal for a future node/notification to act on (same seam pattern
+        as ``classification_failed`` above). Absent/``False`` otherwise.
+
+    length_over_budget:
+        Set ``True`` by ``draft_response`` (#33, senior review 2026-07-05)
+        when the final drafted body still exceeds the plain-language
+        length budget (``docs/02-product/plain-language-rules.md`` rule
+        5 — routine/urgent/emergency drafts, ~300 chars; refusal-topic
+        drafts with an appended deferral are exempt, see that node's
+        module docstring) after ONE regeneration attempt asking the model
+        to shorten it. TRUNCATION IS FORBIDDEN: the long draft is kept
+        as-is (never cut mid-sentence) — this flag is a landlord-review
+        signal ("you can shorten this before it sends"), never a reason to
+        replace or hide the draft's content. Absent/``False`` otherwise.
+        Independent of ``draft_guard_failed`` — a draft can be guard-clean
+        but still over length, or vice versa.
 
     reasoning_log:
         Append-only list of human-readable trace lines.  Every node MUST
@@ -167,4 +182,5 @@ class AgentState(TypedDict, total=False):
     draft: DraftResult | None
     classification_failed: bool
     draft_guard_failed: bool
+    length_over_budget: bool
     reasoning_log: list[str]

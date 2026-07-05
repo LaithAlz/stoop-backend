@@ -18,6 +18,38 @@ message, never the frozen system prompt (the same "system is frozen, the
 per-request user content is dynamic by nature" distinction
 ``classify_severity.py`` relies on for its own context injection).
 
+Severity-aware next-step guidance (paid eval gate finding, 2026-07-05)
+-----------------------------------------------------------------------
+The real gate's E-class/U-class drafts consistently missed two GENERAL,
+topic-derived elements the rubric itself implies but the frozen system
+prompt (understandably, being generic) never spells out per-severity:
+
+- **URGENT** drafts need exactly ONE relevant self-help check when the
+  issue is heating- or appliance/electrical-adjacent (severity-rubric-
+  v1.md's own URGENT list: no heat, dead fridge/stove — a breaker trip or
+  an unplugged cord are the obvious first things to rule out), PLUS a
+  genuinely concrete next-step commitment — a clock time or a tight,
+  bounded window, never "soon"/"this week"/a bare "tomorrow morning"
+  (plain-language-rules.md rule 4: "concrete over relative ... never
+  'soon'"). A security-adjacent issue (broken lock/door/window) gets the
+  bounded-window commitment WITHOUT a self-help check — there is nothing
+  for a tenant to "self-help" about a compromised lock; the rubric's own
+  urgency there is about a fast, bounded repair window instead.
+- **EMERGENCY** drafts need an explicit STRUCTURE: the safety instruction
+  first (matching whatever rules fired), then briefly what the landlord is
+  doing right now, then a concrete bounded next step — tight, no filler.
+- **Refusal topic `access_codes`** drafts need to offer the legitimate
+  alternative (the tenant can arrange access themselves) alongside the
+  deferral, not just redirect to the landlord.
+
+:func:`_urgent_next_step_guidance` derives which topic applies from the
+tenant's message text AND ``rules_fired`` (both already available, no new
+inputs) using keyword categories lifted from severity-rubric-v1.md's own
+URGENT bullet list — never from eval-scenario wording. This is GENERAL
+product behavior (every URGENT/EMERGENCY draft gets it, not just the
+scenarios that happened to fail), per this task's explicit instruction not
+to key guidance to eval text.
+
 Refusal-deferral templates: code APPENDS, the model never weaves them in
 (deferral architecture ruling, senior review 2026-07-05)
 -------------------------------------------------------------------------
@@ -106,27 +138,53 @@ for "did this draft actually violate a hard rule"; these guards are the
 first line of defense that ships with this issue, not a replacement for
 that grader.
 
-**Plain-language exception, documented:** appending the canned deferral
-can push a routine reply past the "≤2 SMS segments (~300 chars)" guidance
-in ``docs/02-product/plain-language-rules.md`` when the deferral text
-itself is long (e.g. ``legal_rent_ltb``'s multi-sentence template). This
-is an intentional, documented exception — correctness (never omitting
-the mandated deferral) outweighs strict segment-length adherence on the
-comparatively rare messages that touch a refusal topic; ``#35``'s eval
-grader enforces the length budget on ordinary replies, not refusal-topic
-ones.
+Length discipline: regenerate once, then flag — TRUNCATION IS FORBIDDEN
+(paid eval gate finding, 2026-07-05)
+-------------------------------------------------------------------------
+``docs/02-product/plain-language-rules.md`` rule 5: routine/urgent/
+emergency drafts get a ~300-char budget (:data:`_LENGTH_BUDGET_CHARS`);
+refusal-topic drafts are the documented exception (see below) because the
+mandated deferral can legitimately push them longer. The real gate's
+E-class drafts blew this budget (380/377 chars) even with NO refusal
+topic involved — a plain quality miss, not a safety one, but still worth
+fixing deterministically rather than hoping the model self-polices:
+
+1. **Proactive**: ``_build_user_content`` always tells the model its
+   available character budget (:func:`_available_ack_chars`) — accounting
+   for the length of whatever deferral text WILL be appended afterward, so
+   the model's own portion is asked to leave room for it, even though the
+   post-check below never enforces the combined length when a deferral is
+   present (see point 3).
+2. **Reactive**: the SAME 2-attempt loop that already retries on a hard
+   -guard violation ALSO retries once when the model's (guard-clean)
+   acknowledgment exceeds the budget (:func:`_length_retry_note`) — one
+   extra regeneration, not a second independent budget on top of the
+   shared 20s deadline (see "20s END-TO-END budget" below).
+3. **Documented exception**: a message with any refusal flag is EXEMPT
+   from the length check entirely (mirrors the guard-side "Plain-language
+   exception" this module already had) — correctness (never omitting the
+   mandated deferral) outweighs segment-length there.
+4. **Truncation is forbidden.** If the guard-clean acknowledgment is STILL
+   over budget after the one regeneration attempt (or the retry was
+   skipped because the shared deadline ran out), THIS NODE NEVER CUTS THE
+   TEXT. The long draft is kept exactly as generated, and
+   ``state["length_over_budget"] = True`` is set — a landlord-review
+   signal ("you can shorten this before it sends"), completely
+   independent of ``draft_guard_failed`` (a draft can be guard-clean but
+   long, or short but guard-violating — two different dimensions, tracked
+   separately, see the post-loop decision logic in :func:`draft_response`).
 
 Cost accounting (audit_log 'drafted' payload)
 --------------------------------------------------
 Every real Anthropic call this node makes (the initial attempt AND any
-regeneration) contributes its ``tokens_in``/``tokens_out`` to a running
-total — both calls cost real money even when the first one is rejected by
-a guard. ``model`` records the last call's reported model id (``None`` if
-every attempt failed at the transport level with no response at all).
-All four (``model``, ``tokens_in``, ``tokens_out``, ``cost_cents``) are
-added to the existing ``'drafted'`` ``audit_log`` payload alongside
-``draft_id``, ``refusal_templates_used``, and ``guard_failed`` — never a
-message body.
+regeneration, whether guard- or length-driven) contributes its
+``tokens_in``/``tokens_out`` to a running total — every call costs real
+money even when its output is rejected. ``model`` records the last call's
+reported model id (``None`` if every attempt failed at the transport level
+with no response at all). All four (``model``, ``tokens_in``,
+``tokens_out``, ``cost_cents``) are added to the existing ``'drafted'``
+``audit_log`` payload alongside ``draft_id``, ``refusal_templates_used``,
+and ``guard_failed`` — never a message body.
 
 Reported gap: the EMERGENCY safety instruction
 --------------------------------------------------
@@ -136,11 +194,13 @@ separately) before any other content." No canned safety-instruction text
 exists ANYWHERE in this codebase yet (no per-category template comparable
 to ``REFUSAL_TEMPLATES``) — the actual safety SMS to the tenant is
 ``app/agent/emergency.py``'s #108 seam, which is still a no-op stub today.
-This node does NOT fabricate that text; if it is ever invoked with
-``severity=EMERGENCY`` it drafts the best reply it can from the same
-dynamic context (severity/rules/modifier are still passed through), simply
-without a safety-instruction block to prepend. Flagged in the issue report
-for the spec owner — likely #108's deliverable, not #33's.
+This node does NOT fabricate that text; the dynamic-content STRUCTURE
+guidance above (safety first, then landlord status, then a concrete next
+step) tells the model how to organize its OWN reply, but the model is
+still the one writing the actual safety content from ``rules_fired`` —
+there is no separate, pre-approved safety template being injected.
+Flagged in the issue report for the spec owner — likely #108's
+deliverable, not #33's.
 
 Reported gap: ``drafts.status`` vocabulary vs. the issue text
 -----------------------------------------------------------------
@@ -172,11 +232,15 @@ Same shared-deadline arithmetic as ``classify_intent.py`` /
 ``classify_severity.py`` (``app/integrations/anthropic.py``'s
 ``new_deadline`` / ``attempt_timeout``): ONE 20-second deadline for the
 initial attempt and its single regeneration TOGETHER, not 20 seconds each.
-The regeneration attempt here is triggered by EITHER a transport failure
-OR a hard-guard violation (see "Hard guards" above) — either way it draws
-from the same shared deadline; a regeneration that would fall below the
-2-second floor is skipped entirely and treated exactly like a second
-failure (the safe fallback draft is used, ``draft_guard_failed=True``).
+The regeneration attempt here is triggered by EITHER a transport failure,
+a hard-guard violation, OR a length-budget violation (see "Hard guards" /
+"Length discipline" above) — whichever fires first on a given attempt;
+either way it draws from the SAME shared deadline. A regeneration that
+would fall below the 2-second floor is skipped entirely: a guard violation
+in that state falls back to the safe generic draft
+(``draft_guard_failed=True``); a pure length violation (guards were clean)
+keeps the long draft as generated (``length_over_budget=True``) — see the
+post-loop decision logic in :func:`draft_response`.
 
 DB access
 ---------
@@ -210,7 +274,7 @@ from app.agent.prompts.v1 import (
     build_draft_system_prompt,
     get_refusal_deferral,
 )
-from app.agent.schemas import CaseContext, DraftResult, RefusalFlag, SeverityResult
+from app.agent.schemas import CaseContext, DraftResult, RefusalFlag, Severity, SeverityResult
 from app.agent.state import AgentState
 from app.agent.tools import DRAFT_MESSAGE_TOOL
 from app.db.session import get_admin_session
@@ -244,6 +308,64 @@ _PLAIN_LANGUAGE_REMINDER: str = (
     "- Ask at most ONE question, if any.\n"
     "- Routine replies: 2 SMS segments or fewer (about 300 characters).\n"
     "- Calm, warm, certain tone — never scolding, never panicked."
+)
+
+# ---------------------------------------------------------------------------
+# Severity-aware next-step guidance (see module docstring). Topic keywords
+# lifted from severity-rubric-v1.md's own URGENT bullet list, never from
+# eval-scenario text -- this is general product behavior.
+# ---------------------------------------------------------------------------
+
+_SECURITY_TOPIC_RE = re.compile(r"\b(?:lock|deadbolt|door|window|latch)\w*\b", re.IGNORECASE)
+_HEATING_TOPIC_RE = re.compile(r"\b(?:heat|heater|furnace|thermostat)\w*\b", re.IGNORECASE)
+_APPLIANCE_ELECTRICAL_TOPIC_RE = re.compile(
+    r"\b(?:fridge|refrigerator|freezer|oven|stove|outlet|plug(?:ged|ging)?|appliance|"
+    r"power|electrical|breaker)\w*\b",
+    re.IGNORECASE,
+)
+
+_CONCRETE_NEXT_STEP_GUIDANCE: str = (
+    'a specific, bounded next step -- a clock time (e.g. "9am tomorrow") or a tight '
+    'window (e.g. "within 24 hours"), never a vague word like "soon", "this week", or '
+    'a bare "tomorrow morning" with no time attached'
+)
+
+
+def _urgent_next_step_guidance(topic_text: str) -> str:
+    """Topic-derived next-step guidance for URGENT severity — see module
+    docstring "Severity-aware next-step guidance". *topic_text* is the
+    tenant message plus the classifier's own ``rules_fired`` text (both
+    already available to this node; no new inputs)."""
+    if _SECURITY_TOPIC_RE.search(topic_text):
+        return (
+            "This is a security issue (lock/door/window). Commit to "
+            f"{_CONCRETE_NEXT_STEP_GUIDANCE} for the repair -- a compromised lock "
+            "needs a fast, bounded window, not a self-help check."
+        )
+    if _HEATING_TOPIC_RE.search(topic_text) or _APPLIANCE_ELECTRICAL_TOPIC_RE.search(topic_text):
+        return (
+            "Include ONE quick self-help check the tenant can try right now, "
+            "relevant to this issue (e.g. whether it's plugged in properly, or "
+            "whether a breaker has tripped) -- just one, not a list -- AND commit to "
+            f"{_CONCRETE_NEXT_STEP_GUIDANCE}."
+        )
+    return f"Commit to {_CONCRETE_NEXT_STEP_GUIDANCE}."
+
+
+_EMERGENCY_STRUCTURE_GUIDANCE: str = (
+    "Structure this EMERGENCY reply in order: (1) the safety instruction(s) first -- "
+    "the concrete thing the tenant should do right now, matching the rules that fired "
+    "above; (2) then, briefly, what you (the landlord) are doing right now; (3) commit "
+    f"to {_CONCRETE_NEXT_STEP_GUIDANCE}. Keep it tight -- no filler, no repeated "
+    "reassurance."
+)
+
+_ACCESS_ALTERNATIVE_GUIDANCE: str = (
+    "For the access-code topic specifically: besides the brief acknowledgment, mention "
+    "that the tenant can arrange this themselves directly (e.g. meeting the person in "
+    "person, or another arrangement that doesn't need a code from you) -- a legitimate "
+    "alternative to relying on you for access, not a workaround for sharing the code "
+    "itself."
 )
 
 # ---------------------------------------------------------------------------
@@ -329,6 +451,55 @@ _LEGAL_POSITION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Length budget (see module docstring "Length discipline").
+# ---------------------------------------------------------------------------
+
+_LENGTH_BUDGET_CHARS: int = 300
+"""plain-language-rules.md rule 5: "routine replies ≤2 SMS segments (~300
+chars)" — applied uniformly to routine/urgent/emergency drafts (the doc's
+separate "≤3 short numbered lines" for "emergency safety messages" refers
+to the #108 safety-SMS template, a different artifact than this node's own
+approval-gated follow-up reply — see "Reported gap: the EMERGENCY safety
+instruction"). Refusal-topic drafts are exempt entirely, see
+:func:`_available_ack_chars` / the module docstring "Documented
+exception"."""
+
+_MIN_ACK_CHARS_FLOOR: int = 60
+"""Even the longest REFUSAL_TEMPLATES entry (~223 chars) must never drive
+the model's suggested acknowledgment budget down to something that can't
+fit a single short sentence."""
+
+
+def _combined_deferral_text(refusal_flags: list[RefusalFlag]) -> str:
+    """The exact text :func:`_append_deferrals` will append — joined, not
+    yet prefixed with the separating space. Empty string when there are no
+    refusal flags."""
+    if not refusal_flags:
+        return ""
+    return " ".join(get_refusal_deferral(flag.value) for flag in refusal_flags)
+
+
+def _available_ack_chars(refusal_flags: list[RefusalFlag]) -> int:
+    """How many characters the model's OWN acknowledgment should aim for,
+    accounting for the deferral text that will be appended afterward (see
+    module docstring "Length discipline", point 1) — a proactive hint, not
+    an enforced cap (enforcement is skipped entirely when refusal_flags is
+    non-empty; see :data:`_LENGTH_BUDGET_CHARS`'s "Documented exception")."""
+    deferral_text = _combined_deferral_text(refusal_flags)
+    if not deferral_text:
+        return _LENGTH_BUDGET_CHARS
+    return max(_MIN_ACK_CHARS_FLOOR, _LENGTH_BUDGET_CHARS - len(deferral_text) - 1)
+
+
+def _length_retry_note(available_chars: int) -> str:
+    return (
+        "\n\nIMPORTANT: your previous reply was too long. Shorten it to under "
+        f"{available_chars} characters total (every character counts on a phone "
+        "screen) while keeping the key information. Revise and resend the FULL reply."
+    )
+
+
 _SELECT_MESSAGE_SQL = text("SELECT body FROM messages WHERE id = :message_id")
 _SELECT_TENANT_NAME_SQL = text("SELECT name FROM tenants WHERE id = :tenant_id")
 
@@ -401,10 +572,10 @@ def _append_deferrals(ack_body: str, refusal_flags: list[RefusalFlag]) -> str:
     every flag on the classification — code-appended, never model-
     generated (see module docstring "Refusal-deferral templates"). A no-op
     when there are no refusal flags."""
-    if not refusal_flags:
+    deferral_text = _combined_deferral_text(refusal_flags)
+    if not deferral_text:
         return ack_body
-    deferrals = [get_refusal_deferral(flag.value) for flag in refusal_flags]
-    return f"{ack_body.rstrip()} {' '.join(deferrals)}"
+    return f"{ack_body.rstrip()} {deferral_text}"
 
 
 def _build_user_content(
@@ -425,6 +596,16 @@ def _build_user_content(
         lines.append(f"Modifier applied: {severity_result.modifier}")
     if house_rules:
         lines.append(f"\nProperty house rules (use only what's relevant):\n{house_rules}")
+
+    # Severity-aware structural guidance -- see module docstring
+    # "Severity-aware next-step guidance". Topic derived from the message +
+    # rules_fired, never from eval-scenario wording.
+    if severity_result.severity is Severity.EMERGENCY:
+        lines.append(f"\n{_EMERGENCY_STRUCTURE_GUIDANCE}")
+    elif severity_result.severity is Severity.URGENT:
+        topic_text = f"{body} {' '.join(severity_result.rules_fired)}"
+        lines.append(f"\n{_urgent_next_step_guidance(topic_text)}")
+
     if refusal_flags:
         topics = ", ".join(flag.value.replace("_", " ") for flag in refusal_flags)
         lines.append(
@@ -437,6 +618,15 @@ def _build_user_content(
             "yourself, and do NOT quote, paraphrase, or summarize any standard policy "
             "language."
         )
+        if RefusalFlag.access_codes in refusal_flags:
+            lines.append(_ACCESS_ALTERNATIVE_GUIDANCE)
+
+    available_chars = _available_ack_chars(refusal_flags)
+    lines.append(
+        f"\nKeep your reply to at most {available_chars} characters (SMS -- every "
+        "character counts)."
+    )
+
     lines.append(f"\n{_PLAIN_LANGUAGE_REMINDER}")
     return "\n".join(lines)
 
@@ -498,8 +688,16 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
         refusal_flags=severity_result.refusal_flags,
     )
 
+    # Documented exception (see module docstring "Length discipline"): a
+    # refusal-flagged message never has its length enforced -- the
+    # mandated deferral legitimately makes it longer, and correctness
+    # outweighs segment-length there.
+    enforce_length_budget = not severity_result.refusal_flags
+    available_chars = _available_ack_chars(severity_result.refusal_flags)
+
     ack_body: str | None = None
-    violations: list[str] = []
+    last_candidate_body: str | None = None
+    last_violations: list[str] = []
     call_errors: list[str] = []
     user_content = base_user_content
     deadline = anthropic_mod.new_deadline()
@@ -536,33 +734,62 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
         last_model = call_result.model
 
         violations = _check_hard_guards(body=candidate.body)
-        if not violations:
+        too_long = enforce_length_budget and len(candidate.body) > _LENGTH_BUDGET_CHARS
+        last_candidate_body = candidate.body
+        last_violations = violations
+
+        if not violations and not too_long:
             ack_body = candidate.body
             break
 
-        log.warning(
-            "draft_response_guard_violation",
-            message_id=str(message_id),
-            attempt=attempt,
-            violations=violations,
-        )
-        user_content = base_user_content + _violation_retry_note(violations)
+        if violations:
+            log.warning(
+                "draft_response_guard_violation",
+                message_id=str(message_id),
+                attempt=attempt,
+                violations=violations,
+            )
+            user_content = base_user_content + _violation_retry_note(violations)
+        else:
+            log.warning(
+                "draft_response_length_violation",
+                message_id=str(message_id),
+                attempt=attempt,
+                length=len(candidate.body),
+            )
+            user_content = base_user_content + _length_retry_note(available_chars)
 
     guard_failed = False
+    length_over_budget = False
     if ack_body is None:
-        guard_failed = True
-        ack_body = _GENERIC_SAFE_FALLBACK
-        reasoning_log.append(
-            "I wasn't confident this draft was safe to send as-is, so I used a safer "
-            "standard reply instead — worth a look before it goes out."
-        )
-        log.error(
-            "draft_response_guard_failed_after_retry",
-            message_id=str(message_id),
-            case_id=str(case_context.case_id),
-            violations=violations,
-            call_errors=call_errors,
-        )
+        if last_candidate_body is not None and not last_violations:
+            # Guards were clean -- the ONLY remaining problem was length.
+            # TRUNCATION IS FORBIDDEN: keep the long draft, flag it instead.
+            ack_body = last_candidate_body
+            length_over_budget = True
+            reasoning_log.append(
+                "This reply came out longer than usual — you can shorten it before it goes out."
+            )
+            log.warning(
+                "draft_response_length_over_budget_kept",
+                message_id=str(message_id),
+                case_id=str(case_context.case_id),
+                length=len(ack_body),
+            )
+        else:
+            guard_failed = True
+            ack_body = _GENERIC_SAFE_FALLBACK
+            reasoning_log.append(
+                "I wasn't confident this draft was safe to send as-is, so I used a safer "
+                "standard reply instead — worth a look before it goes out."
+            )
+            log.error(
+                "draft_response_guard_failed_after_retry",
+                message_id=str(message_id),
+                case_id=str(case_context.case_id),
+                violations=last_violations,
+                call_errors=call_errors,
+            )
     else:
         reasoning_log.append("I've drafted a reply for you to review.")
 
@@ -642,6 +869,7 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
     return {
         "draft": draft_result,
         "draft_guard_failed": guard_failed,
+        "length_over_budget": length_over_budget,
         "reasoning_log": reasoning_log,
     }
 
