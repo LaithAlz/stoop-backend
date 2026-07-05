@@ -73,7 +73,7 @@ billing (Train 2).
 | Layer | Choice | Why (and why not the alternative) |
 |---|---|---|
 | Backend | Python 3.12, FastAPI, async SQLAlchemy 2.0, Pydantic v2, Alembic | Founder is fluent; best ecosystem for the agent layer. All-TS on Cloudflare was considered and rejected: founder has no Cloudflare experience and wants to learn LangGraph (Python-first). |
-| Agent | LangGraph + Anthropic SDK, `AsyncPostgresSaver` checkpointer | Deliberate learning goal, not just resume-driven: checkpointed state machines, interrupts (approval gates), and eval workflows are the actual curriculum. `classify_severity` calls the Anthropic SDK directly (not a wrapper) for full control of the rubric prompt. |
+| Agent | LangGraph + Anthropic SDK, `AsyncPostgresSaver` checkpointer | Deliberate learning goal, not just resume-driven: checkpointed state machines, interrupts (approval gates), and eval workflows are the actual curriculum. Every node owns its own prompt and tool-choice decisions in full — `classify_severity`, `classify_intent`, and `draft_response` all build their own system/user content and never delegate that to shared code; `integrations/anthropic.py` is a thin transport helper (timeout/tool-choice plumbing only), which is what "no wrapper" means in practice (see `engineering-decisions.md` §7). |
 | Observability (LLM) | LangSmith from the first node | Tracing + eval datasets. Production misclassifications feed the eval corpus (see §9). |
 | Database | Supabase Postgres, RLS at milestone 2 | One Postgres for app state, agent checkpoints, and audit log. RLS is the multi-tenant isolation mechanism, enforced by `app.current_landlord_id` session variable. |
 | Auth | **Supabase Auth** (replaces Clerk) | Already paying for Supabase; same JWT/JWKS verification pattern; one fewer vendor, dashboard, and bill. See ADR-1. |
@@ -167,8 +167,8 @@ irreversible, so the irreversibility is buffered in UX, not pretended away.
             │ classify_intent│  maintenance / admin / question / other
             └──────┬─────────┘
             ┌──────▼─────────┐
-            │ classify_      │  rubric embedded verbatim; Anthropic SDK
-            │ severity       │  direct; returns severity + cited reasons
+            │ classify_      │  rubric embedded verbatim; own prompt via a
+            │ severity       │  thin transport helper; severity + cited reasons
             └──────┬─────────┘
         emergency? │
        ┌───────────┴───────────┐
@@ -274,9 +274,12 @@ These are architecture-level guarantees, enforced in code and tested in evals:
   apology; at 1,000 it's a flooded unit and a churn story. The eval corpus is
   how classification quality scales with the customer base — and it cannot be
   shortcut by a competitor.
-- **Cost metering from message one.** `integrations/anthropic.py` records
-  tokens + model + cost per message into the message row. Unit economics
-  ($19/door vs. LLM cost per door) must be a query, not a guess.
+- **Cost metering from message one.** `integrations/anthropic.py` estimates
+  tokens + model + cost per LLM call; `classify_severity`/`draft_response`
+  record it in the `audit_log` `classified`/`drafted` payloads (`messages`
+  is append-only; its cost columns are deprecated, schema-v1 v1.6 — see
+  `engineering-decisions.md` §3/§7). Unit economics ($19/door vs. LLM cost
+  per door) must be a query, not a guess.
 - **Sentry** for both apps; structured JSON logs with `request_id` on Fly.
 
 ### Analytics & feature flags (ADR-5)
@@ -391,3 +394,18 @@ Original phases optimized for completeness; milestones optimize for
 time-to-first-paying-landlord. See `release-train.md` (rewritten) for the
 mapping. Mobile app, Inngest, and multi-region drop off the critical path
 entirely.
+
+**ADR-6 — Supabase platform constraints govern role design** (2026-07-05)
+Live testing against Supabase during migrations 0004/0005 surfaced platform
+facts no design doc predicted: `postgres` and `service_role` are not
+superusers but do carry `rolbypassrls=TRUE`; `pg_has_role(..., 'MEMBER')`
+is unsound as an idempotency guard on Postgres 16+ (a `CREATEROLE`-privileged
+creator holds implicit ADMIN OPTION on any role it just created); and
+`GRANT <role> TO CURRENT_USER` terminates the connection outright on live
+Supabase, reproduced over both pooler modes. These facts, not preference,
+shaped the role design: the `auth.users` lifecycle trigger functions are
+`SECURITY DEFINER` owned by the migrating role rather than a dedicated app
+role (0004), and RLS is `ENABLE`d but never `FORCE`d, since `FORCE` only
+changes owner-subject behavior and `app_role` is never the table owner
+(0005). Full inventory of the live-verified facts and their consequences:
+`engineering-decisions.md` §1–§2.
