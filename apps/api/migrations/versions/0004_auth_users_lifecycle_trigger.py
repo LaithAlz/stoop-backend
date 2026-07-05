@@ -79,35 +79,79 @@ row from this trigger alone; that gap is intentionally left to the lazy
 net" that "complements" this trigger. Scope discipline: adding upsert
 semantics to the email-update path was not asked for and is not added here.
 
-ISOLATION -- dedicated NOLOGIN role owns the functions
----------------------------------------------------------
-``landlord_sync_role`` is a ``NOLOGIN`` role, created if absent, granted
-only ``SELECT, INSERT, UPDATE`` on ``landlords`` (no other table, no
-``DELETE`` -- ``SELECT`` is required too, since ``ON CONFLICT DO UPDATE``
-and the WHERE-filtered ``UPDATE``s reference existing column values).
-All three trigger functions are ``SECURITY DEFINER`` with ``SET
-search_path = public, pg_temp`` (the standard Postgres privilege-escalation
-guard for ``SECURITY DEFINER`` -- per the "Common gotchas" section of
-docs/03-engineering/issue-specs/015-auth-user-lifecycle.md: "SECURITY
-DEFINER + explicit set search_path -- without the search_path pin this is
-a privilege-escalation foot-gun"), and are then
-``ALTER FUNCTION ... OWNER TO landlord_sync_role``. Each function also has
-``EXECUTE`` revoked from ``PUBLIC`` (defense-in-depth -- a trigger function
-can't usefully be invoked directly via SQL anyway since Postgres rejects a
-direct call with "trigger functions can only be called as triggers," and
-``CREATE TRIGGER``/the trigger manager itself never needs the invoking
-session to hold ``EXECUTE`` on the function; only removes a no-op grant).
-A ``SECURITY DEFINER``
-function always executes with its **owner's** privileges, never the
-caller's -- so on live Supabase, GoTrue's own connection (or whatever role
-the direct DB connection uses) never itself needs write access to
-``landlords``; it only needs the (ordinary, already-required) privilege to
-insert/update/delete ``auth.users`` rows, which triggers this function via
-the owner's rights. This also means the functions are deliberately NOT
-owned by the migration-running role (``postgres`` on Supabase, ``stoop``
-locally) -- owning a ``SECURITY DEFINER`` function by a superuser-ish role
-is the classic privilege-escalation footgun the 015 spec's gotchas call
-out; a narrowly-scoped, login-disabled role is the safer owner.
+OWNERSHIP MODEL -- redesigned after a live Supabase dry-run
+------------------------------------------------------------------------
+An earlier version of this migration created a dedicated ``NOLOGIN``
+``landlord_sync_role``, transferred function ownership to it, and revoked
+``PUBLIC`` ``EXECUTE`` -- on the theory that a ``SECURITY DEFINER``
+function should be owned by the narrowest role possible rather than the
+migration-running role. A live Supabase dry-run proved that design
+impossible on Supabase's actual platform, in three independent ways
+(reproduced by the orchestrator; every probe ran inside a transaction
+that was rolled back -- the live database was left clean at revision
+0003, and no probe role/object was left behind):
+
+1. Even after fixing the CREATE-TRIGGER-before-ownership-transfer
+   statement ordering (correct in isolation, but never actually reached),
+   ``ALTER FUNCTION ... OWNER TO landlord_sync_role`` itself failed on
+   live Supabase with ``must be able to SET ROLE "landlord_sync_role"``.
+2. The guard this migration used to decide whether the migrating role
+   already had the required membership -- ``pg_has_role(current_user,
+   ..., 'MEMBER')`` -- is unsound on Postgres 16+: a ``CREATEROLE``
+   -privileged creator holds *implicit ADMIN OPTION* on any role it just
+   created, which makes ``pg_has_role(..., 'MEMBER')`` return ``TRUE``
+   before any actual membership ``GRANT`` ever ran. The self-grant guard
+   was therefore always skipped, silently, in exactly the environment it
+   needed to fire.
+3. Attempting to fix #2 directly -- ``GRANT landlord_sync_role TO
+   CURRENT_USER`` issued as ``postgres`` -- is not just denied, it
+   **terminates the connection mid-operation** on live Supabase. This is
+   platform-level role protection, reproduced independently over both the
+   Supavisor transaction pooler (port 6543) and the session pooler (port
+   5432).
+
+DECISION: ``landlord_sync_role`` is removed entirely. All three
+``SECURITY DEFINER`` functions remain owned by whichever role runs this
+migration (``postgres`` on live Supabase, ``stoop`` locally) -- this is
+*Supabase's own documented pattern* for exactly this use case (their
+canonical ``handle_new_user()`` example, referenced in the 015 spec
+hints, is owned by the migrating role, not a separately-provisioned one).
+
+TRADEOFF -- what this costs, and why it's acceptable for #15
+------------------------------------------------------------------------
+Because the functions are no longer owned by a narrowly-scoped role, each
+one now executes (as ``SECURITY DEFINER``) with the **migrating role's
+full rights** -- on live Supabase, an admin-tier surface, not just
+``SELECT/INSERT/UPDATE`` on ``landlords``. The **only** containment left
+is the function body itself:
+
+- every statement is fixed/static -- no dynamic SQL, no ``EXECUTE
+  format(...)``, nothing built from untrusted input, ever;
+- ``SET search_path = public, pg_temp`` stays pinned on all three
+  functions -- the classic ``SECURITY DEFINER`` search-path-injection
+  guard is independent of who owns the function and still fully applies;
+- ``REVOKE EXECUTE ... FROM PUBLIC`` still runs, still *after* ``CREATE
+  TRIGGER`` (the one piece of the earlier statement-ordering fix that
+  remains in this file, for consistency/lowest-risk-by-default even
+  though it's no longer load-bearing here: since the function's owner
+  never changes, the creating role always retains implicit ``EXECUTE`` on
+  it regardless of when ``PUBLIC`` is revoked).
+
+Issue #15's acceptance criterion ("function owned by a role that can
+write ``landlords`` but is not the app's request role") is still
+satisfied: the app's request role is -- and will remain, once RLS lands
+(#22) -- the ``authenticated``/``app_role`` request-scoped role the API
+connects as for ordinary traffic, categorically different from and far
+more restricted than the migration-running admin role. The migrating
+role was never "the app's request role" in the sense #15 means; it is
+Supabase's own project-admin role, used only for schema changes.
+
+Least-privilege function ownership (a dedicated role narrower than the
+full migrating-role admin surface) is **deferred to #22**, where the
+complete role model (``app_role``/``authenticated``, RLS policies, and
+whatever grants a ``SECURITY DEFINER`` trigger function can safely take
+on) gets designed against these now-known platform constraints, instead
+of guessed at here and broken again on the next live dry-run.
 
 EXCEPTION SAFETY -- never block sign-up/update/delete
 ----------------------------------------------------------
@@ -143,17 +187,11 @@ attach locally.
 DOWNGRADE
 ---------
 Reverses upgrade() in dependency order: triggers, then functions, then
-(guarded) the ``landlord_sync_role`` grant + role, then (guarded by the
-marker comment) the shim ``auth`` schema. ``landlords.deleted_at`` is left
-alone (this migration did not add it).
-
-``landlord_sync_role`` itself is only actually dropped if ``pg_shdepend``
-shows no remaining cluster-wide dependents (see the long comment in
-``downgrade()``) -- because roles are cluster-global, a sibling database
-that also applied 0004 would otherwise make an unconditional ``DROP ROLE``
-fail and roll back the whole downgrade. When that guard trips, the
-NOLOGIN, now-privilege-free role is left in place; that's safe, not a
-security gap.
+(guarded by the marker comment) the shim ``auth`` schema.
+``landlords.deleted_at`` is left alone (this migration did not add it).
+``DROP FUNCTION`` needs no special role handling now: each function is
+owned by the same migrating role that is running this ``downgrade()``
+(or a superuser), so ordinary ownership is always sufficient.
 """
 
 from __future__ import annotations
@@ -168,19 +206,10 @@ down_revision: str | None = "0003"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
-# NOTE: the literal marker text below ("stoop-local-shim (migration 0004)")
-# is duplicated verbatim in the upgrade()/downgrade() SQL strings rather
-# than interpolated via an f-string/`.format()` — ruff (S608) flags
-# string-built SQL as a possible injection vector even when, as here, the
-# interpolated value is a fixed module-level constant, never external
-# input. Keeping the raw literal inline avoids the false positive while
-# staying byte-identical across both call sites (grep for it if it ever
-# needs to change).
-
 
 def upgrade() -> None:
-    """Create the local auth.users shim (guarded), the sync role, the
-    SECURITY DEFINER functions, and the auth.users triggers."""
+    """Create the local auth.users shim (guarded) and the SECURITY DEFINER
+    functions + auth.users triggers, owned by the migrating role."""
 
     # ── local/CI test shim: auth schema + minimal auth.users table ──────────
     # Guarded: only runs when `auth` does not already exist (never true on
@@ -214,26 +243,11 @@ def upgrade() -> None:
         """
     )
 
-    # ── dedicated NOLOGIN role: owns the trigger functions, can write only
-    # landlords.INSERT/UPDATE. Guarded (CREATE ROLE has no IF NOT EXISTS). ──
-    op.execute(
-        """
-        DO $$
-        BEGIN
-          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'landlord_sync_role') THEN
-            CREATE ROLE landlord_sync_role NOLOGIN;
-          END IF;
-        END $$;
-        """
-    )
-    # SELECT is required in addition to INSERT/UPDATE: the ON CONFLICT DO
-    # UPDATE clause reads the existing `landlords.full_name` (for the
-    # COALESCE) and both trigger functions filter their UPDATE with a WHERE
-    # auth_user_id = ... clause -- Postgres requires SELECT privilege on any
-    # column referenced that way, not just the ones being written.
-    op.execute("GRANT SELECT, INSERT, UPDATE ON landlords TO landlord_sync_role")
-
     # ── AFTER INSERT: upsert landlords row; skip if email is blank ─────────
+    # Owned by the migrating role (see docstring "OWNERSHIP MODEL") --
+    # SECURITY DEFINER means it always runs with that role's rights,
+    # regardless of who/what actually fires the INSERT on auth.users
+    # (GoTrue's own service role in production).
     op.execute(
         """
         CREATE OR REPLACE FUNCTION public.handle_auth_user_created()
@@ -275,7 +289,14 @@ def upgrade() -> None:
         $$;
         """
     )
-    op.execute("ALTER FUNCTION public.handle_auth_user_created() OWNER TO landlord_sync_role")
+    op.execute("DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users")
+    op.execute(
+        """
+        CREATE TRIGGER on_auth_user_created
+          AFTER INSERT ON auth.users
+          FOR EACH ROW EXECUTE FUNCTION public.handle_auth_user_created()
+        """
+    )
     # Defense-in-depth (safety review): a trigger function can't usefully be
     # called directly via SQL anyway, but revoke the default PUBLIC EXECUTE
     # grant so it isn't even listed as callable.
@@ -318,10 +339,20 @@ def upgrade() -> None:
         $$;
         """
     )
-    op.execute("ALTER FUNCTION public.handle_auth_user_email_updated() OWNER TO landlord_sync_role")
+    op.execute("DROP TRIGGER IF EXISTS on_auth_user_email_updated ON auth.users")
+    op.execute(
+        """
+        CREATE TRIGGER on_auth_user_email_updated
+          AFTER UPDATE OF email ON auth.users
+          FOR EACH ROW
+          WHEN (NEW.email IS DISTINCT FROM OLD.email)
+          EXECUTE FUNCTION public.handle_auth_user_email_updated()
+        """
+    )
     op.execute("REVOKE EXECUTE ON FUNCTION public.handle_auth_user_email_updated() FROM PUBLIC")
 
     # ── AFTER DELETE / AFTER UPDATE OF deleted_at: soft-delete, never hard ─
+    # Two triggers share this one function.
     op.execute(
         """
         CREATE OR REPLACE FUNCTION public.handle_auth_user_soft_delete()
@@ -362,28 +393,6 @@ def upgrade() -> None:
         $$;
         """
     )
-    op.execute("ALTER FUNCTION public.handle_auth_user_soft_delete() OWNER TO landlord_sync_role")
-    op.execute("REVOKE EXECUTE ON FUNCTION public.handle_auth_user_soft_delete() FROM PUBLIC")
-
-    # ── triggers on auth.users ───────────────────────────────────────────────
-    op.execute("DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users")
-    op.execute(
-        """
-        CREATE TRIGGER on_auth_user_created
-          AFTER INSERT ON auth.users
-          FOR EACH ROW EXECUTE FUNCTION public.handle_auth_user_created()
-        """
-    )
-
-    op.execute("DROP TRIGGER IF EXISTS on_auth_user_email_updated ON auth.users")
-    op.execute(
-        """
-        CREATE TRIGGER on_auth_user_email_updated
-          AFTER UPDATE OF email ON auth.users
-          FOR EACH ROW EXECUTE FUNCTION public.handle_auth_user_email_updated()
-        """
-    )
-
     op.execute("DROP TRIGGER IF EXISTS on_auth_user_deleted ON auth.users")
     op.execute(
         """
@@ -392,7 +401,6 @@ def upgrade() -> None:
           FOR EACH ROW EXECUTE FUNCTION public.handle_auth_user_soft_delete()
         """
     )
-
     op.execute("DROP TRIGGER IF EXISTS on_auth_user_deleted_at_updated ON auth.users")
     op.execute(
         """
@@ -403,12 +411,14 @@ def upgrade() -> None:
           EXECUTE FUNCTION public.handle_auth_user_soft_delete()
         """
     )
+    op.execute("REVOKE EXECUTE ON FUNCTION public.handle_auth_user_soft_delete() FROM PUBLIC")
 
 
 def downgrade() -> None:
-    """Exactly reverse upgrade(): drop triggers, functions, the sync role
-    (guarded), and the shim auth schema (guarded by its marker comment).
-    landlords.deleted_at is left untouched -- this migration never added it.
+    """Exactly reverse upgrade(): drop triggers, functions, and the shim
+    auth schema (guarded by its marker comment). landlords.deleted_at is
+    left untouched -- this migration never added it. No role handling: the
+    functions were never owned by anything but the migrating role.
     """
 
     op.execute("DROP TRIGGER IF EXISTS on_auth_user_deleted_at_updated ON auth.users")
@@ -419,42 +429,6 @@ def downgrade() -> None:
     op.execute("DROP FUNCTION IF EXISTS public.handle_auth_user_soft_delete()")
     op.execute("DROP FUNCTION IF EXISTS public.handle_auth_user_email_updated()")
     op.execute("DROP FUNCTION IF EXISTS public.handle_auth_user_created()")
-
-    # Guarded: revoke + drop only if the role exists (safe on a repeated
-    # downgrade). Privileges granted to a role must be revoked before it can
-    # be dropped.
-    #
-    # ``landlord_sync_role`` is a CLUSTER-GLOBAL object (roles aren't
-    # per-database) -- if a sibling database in the same Postgres cluster
-    # also has migration 0004 applied, that other database's grants/function
-    # ownership still reference this role after our local REVOKE above
-    # finishes, and an unconditional DROP ROLE fails ("role ... cannot be
-    # dropped because some objects depend on it"), rolling back this entire
-    # downgrade (reproduced via safety review: pg_shdepend showed 4
-    # dependent objects in another database). ``pg_shdepend`` records every
-    # shared (cluster-wide) dependency on a role across ALL databases, so
-    # checking it -- not just this database's local state -- after our own
-    # REVOKE is the only reliable "is anything else still using this role"
-    # test. If something else still is, we deliberately leave the harmless
-    # NOLOGIN, no-privilege role in place rather than fail the downgrade;
-    # it grants nothing and can't log in, so leaving it behind is a no-op
-    # from a security standpoint.
-    op.execute(
-        """
-        DO $$
-        BEGIN
-          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'landlord_sync_role') THEN
-            REVOKE SELECT, INSERT, UPDATE ON landlords FROM landlord_sync_role;
-            IF NOT EXISTS (
-              SELECT 1 FROM pg_shdepend
-              WHERE refobjid = 'landlord_sync_role'::regrole
-            ) THEN
-              DROP ROLE landlord_sync_role;
-            END IF;
-          END IF;
-        END $$;
-        """
-    )
 
     # Guarded shim teardown: only drop `auth` if it carries our marker
     # comment -- never touch a real Supabase `auth` schema.

@@ -9,15 +9,16 @@ on ``auth.users`` that sync sign-up / email-change / delete into
 ``landlords``. See the migration module docstring
 (``migrations/versions/0004_auth_users_lifecycle_trigger.py``) for the full
 design rationale (email-edge-case normalization consistent with #161, the
-dedicated NOLOGIN owner role, the guarded local ``auth`` schema shim).
+"OWNERSHIP MODEL" section explaining why there is no dedicated owner role,
+the guarded local ``auth`` schema shim).
 
 These tests verify, against the local docker-compose Postgres (which has no
 real Supabase ``auth`` schema, so migration 0004 creates the guarded shim):
 
 1. The shim ``auth`` schema/table, the three functions (SECURITY DEFINER,
-   pinned search_path), the four triggers, and the ``landlord_sync_role``
-   isolation (NOLOGIN, owns the functions, holds exactly SELECT/INSERT/
-   UPDATE on ``landlords``) all exist as designed after ``upgrade head``.
+   pinned search_path, owned by the migrating role, PUBLIC EXECUTE
+   revoked), and the four triggers all exist as designed after
+   ``upgrade head``.
 2. INSERT into auth.users with a real email -> a landlords row appears with
    the correct auth_user_id/email/full_name.
 3. Idempotency: a landlords row that already exists for an auth_user_id
@@ -26,7 +27,10 @@ real Supabase ``auth`` schema, so migration 0004 creates the guarded shim):
    same-value UPDATE fired twice does not error or duplicate.
 4. INSERT with a blank/whitespace email -> no landlords row (the #161-style
    edge case; landlords.email stays NOT NULL).
-5. UPDATE OF email -> propagates to the matching landlords row.
+5. UPDATE OF email -> propagates to the matching landlords row; a same
+   -value UPDATE (no actual change) never fires the trigger at all (the
+   ``WHEN (NEW.email IS DISTINCT FROM OLD.email)`` guard) -- proven via an
+   unchanged ``updated_at``, not just "still correct".
 6. UPDATE OF email to '' -> landlords.email is left unchanged (documented
    choice, never overwrite with blank).
 7. DELETE FROM auth.users -> landlords.deleted_at is set, row still present
@@ -37,15 +41,31 @@ real Supabase ``auth`` schema, so migration 0004 creates the guarded shim):
    upsert) then its auth user deleted -> soft-deleted.
 10. The EXCEPTION WHEN OTHERS guard (never block sign-up/update/delete) is
     present in the migration source for all three functions.
-11. Behavioral proof of that guard: revoking INSERT on landlords from
-    landlord_sync_role and then inserting into auth.users still SUCCEEDS
-    (sign-up is never blocked) and creates no landlords row (the internal
-    failure was swallowed, not silently successful) -- not just a
-    source-grep, an actual forced failure at runtime.
-12. Downgrade to 0003 removes the triggers/functions/role and the shim
-    ``auth`` schema; re-upgrade to head restores everything (full
-    round-trip) -- runs last per the mutation-order convention documented
-    in test_migrations_0003.py / test_migrations_core.py.
+11. Behavioral proof of that guard: a temporary BEFORE INSERT trigger on
+    ``public.landlords`` that always RAISEs forces
+    ``handle_auth_user_created()`` into its exception path at runtime; the
+    auth.users INSERT still SUCCEEDS (sign-up is never blocked) and no
+    landlords row is created (the forced failure was swallowed, not
+    silently successful) -- not just a source-grep, an actual forced
+    failure at runtime. (An earlier version of this test used ``REVOKE
+    INSERT ... FROM landlord_sync_role`` as the failure lever; that role no
+    longer exists -- see migration docstring "OWNERSHIP MODEL" -- so this
+    uses a same-table trigger instead.)
+12. Downgrade to 0003 removes the triggers/functions/shim; re-upgrade to
+    head restores everything (full round-trip) -- runs last per the
+    mutation-order convention documented in test_migrations_0003.py /
+    test_migrations_core.py.
+
+A privilege-ordering proof test existed in an earlier revision of this
+file (exercising a genuine non-superuser role via ``SET ROLE`` to prove
+two ACL rules an ``ALTER FUNCTION ... OWNER TO`` ownership-transfer step
+depended on). That step no longer exists in the migration -- the live
+Supabase dry-run proved the whole ownership-transfer design impossible
+on the platform (see migration docstring "OWNERSHIP MODEL") -- so that
+test was removed rather than kept as a hollow shell: with no ownership
+transfer, "the creating role owns what it just created" is true by
+construction and untestable-as-a-risk, and the ALTER-FUNCTION-OWNER-TO
+ACL rules it proved no longer apply to anything this migration does.
 
 Every test that touches data uses its own connection wrapped in an explicit
 transaction that is always rolled back at teardown (the ``conn`` fixture)
@@ -214,7 +234,7 @@ async def _count_landlords(conn: AsyncConnection, auth_user_id: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 1. Object existence -- shim schema/table, functions, triggers, role
+# 1. Object existence -- shim schema/table, functions, triggers, ownership
 # ---------------------------------------------------------------------------
 
 
@@ -308,16 +328,27 @@ async def test_triggers_registered_on_auth_users(db: AsyncEngine) -> None:
 
 
 @pytest.mark.integration
-async def test_landlord_sync_role_isolation(db: AsyncEngine) -> None:
-    """landlord_sync_role must be NOLOGIN, own all three functions, and hold
-    exactly SELECT/INSERT/UPDATE on landlords (no DELETE, no other table)."""
+async def test_functions_owned_by_migrating_role_with_public_execute_revoked(
+    db: AsyncEngine,
+) -> None:
+    """Ownership model (migration docstring "OWNERSHIP MODEL"): all three
+    trigger functions are owned by whichever role ran the migration -- the
+    connection's own session user (`stoop` locally, `postgres` on live
+    Supabase) -- NOT a separately-provisioned role. An earlier
+    `landlord_sync_role` design (dedicated NOLOGIN owner role) proved
+    impossible on live Supabase: `ALTER FUNCTION ... OWNER TO
+    landlord_sync_role` failed outright, the membership-guard this
+    migration used was unsound on PG16+ (implicit ADMIN OPTION for a
+    CREATEROLE creator), and the only fix for that -- self-granting
+    membership -- terminates the connection on live Supabase (platform
+    role protection). See the migration docstring for the full writeup and
+    the accepted tradeoff.
+
+    PUBLIC's default EXECUTE grant is still revoked on all three functions
+    (defense-in-depth, unchanged by the redesign).
+    """
     async with db.connect() as connection:
-        can_login = (
-            await connection.execute(
-                text("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'landlord_sync_role'")
-            )
-        ).scalar_one()
-        assert can_login is False, "landlord_sync_role must not be able to log in"
+        session_user = (await connection.execute(text("SELECT current_user"))).scalar_one()
 
         owners = (
             (
@@ -335,22 +366,26 @@ async def test_landlord_sync_role_isolation(db: AsyncEngine) -> None:
             .scalars()
             .all()
         )
-        assert owners == ["landlord_sync_role"], "all three functions must share this owner"
+        assert owners == [session_user], (
+            f"all three functions must be owned by the migrating role ({session_user!r}), "
+            f"got {owners!r}"
+        )
 
-        expected_privs = [
-            ("select", True),
-            ("insert", True),
-            ("update", True),
-            ("delete", False),
-        ]
-        for priv, expected in expected_privs:
-            has_priv = (
+        for fn_name in [
+            "handle_auth_user_created",
+            "handle_auth_user_email_updated",
+            "handle_auth_user_soft_delete",
+        ]:
+            can_execute = (
                 await connection.execute(
-                    text("SELECT has_table_privilege('landlord_sync_role', 'landlords', :priv)"),
-                    {"priv": priv},
+                    text(
+                        "SELECT has_function_privilege('public', oid, 'EXECUTE') "
+                        "FROM pg_proc WHERE proname = :name"
+                    ),
+                    {"name": fn_name},
                 )
             ).scalar_one()
-            assert has_priv is expected, f"landlord_sync_role {priv} privilege should be {expected}"
+            assert can_execute is False, f"PUBLIC must not retain EXECUTE on {fn_name}"
 
 
 @pytest.mark.integration
@@ -378,40 +413,61 @@ async def test_insert_trigger_exception_path_never_blocks_signup(
     top-listed risk: "a trigger failure on auth.users insert can block
     sign-up entirely."
 
-    Revokes INSERT on `landlords` from `landlord_sync_role` (the function's
-    owner) so `handle_auth_user_created()`'s own INSERT fails internally
-    with a real permission-denied error, then asserts:
+    Forces `handle_auth_user_created()` into its EXCEPTION WHEN OTHERS
+    path via a temporary `BEFORE INSERT` trigger on `public.landlords`
+    that always RAISEs. (An earlier version of this test used `REVOKE
+    INSERT ... FROM landlord_sync_role` as the failure lever; that role no
+    longer exists -- see migration docstring "OWNERSHIP MODEL" -- the
+    functions are now owned by the migrating role itself, which always
+    has whatever privileges it needs on `landlords`, so there is no lower
+    -privileged grant left to strip. A same-table trigger that
+    unconditionally raises is the reliable lever instead.)
 
+    Asserts:
     (a) the auth.users INSERT itself still SUCCEEDS (sign-up is never
         blocked -- the whole point of the EXCEPTION WHEN OTHERS guard);
     (b) no landlords row was created (the swallowed error means nothing
         was written, not a silently-successful write).
 
-    The REVOKE is issued inside this test's transaction (the `conn`
-    fixture, which always rolls back at teardown) -- GRANT/REVOKE are
-    transactional DDL in Postgres, so the original grant is restored
-    automatically when that rollback happens. The `finally` re-GRANT below
-    is a defensive backstop in case a future harness variant makes grants
-    outlive the transaction.
+    The temporary function + trigger are created and dropped inside this
+    test's transaction (the `conn` fixture, which always rolls back at
+    teardown) -- the explicit `DROP`s in the `finally` block are a
+    defensive backstop on top of that rollback, not a substitute for it.
     """
+    suffix = uuid.uuid4().hex[:8]
+    fn_name = f"raise_on_landlord_insert_{suffix}"
+    trg_name = f"raise_on_landlord_insert_trg_{suffix}"
     user_id = str(uuid.uuid4())
-    try:
-        await conn.execute(text("REVOKE INSERT ON landlords FROM landlord_sync_role"))
 
-        # Must NOT raise: the trigger's own EXCEPTION WHEN OTHERS must
-        # swallow the internal "permission denied for table landlords"
-        # error and let the auth.users INSERT succeed regardless.
+    await conn.execute(
+        text(
+            f"CREATE FUNCTION public.{fn_name}() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN "
+            "RAISE EXCEPTION 'forced failure for "
+            "test_insert_trigger_exception_path_never_blocks_signup'; "
+            "END $$"
+        )
+    )
+    await conn.execute(
+        text(
+            f"CREATE TRIGGER {trg_name} BEFORE INSERT ON public.landlords "
+            f"FOR EACH ROW EXECUTE FUNCTION public.{fn_name}()"
+        )
+    )
+    try:
+        # Must NOT raise: handle_auth_user_created()'s own EXCEPTION WHEN
+        # OTHERS must swallow the forced failure from the BEFORE INSERT
+        # trigger above and let the auth.users INSERT succeed regardless.
         await _insert_auth_user(conn, user_id=user_id, email="blocked@example.com")
 
         assert await _count_landlords(conn, user_id) == 0, (
-            "no landlords row should exist -- the trigger's internal INSERT "
-            "failed (permission denied) and was swallowed by its own "
+            "no landlords row should exist -- the forced BEFORE INSERT "
+            "failure was swallowed by handle_auth_user_created()'s own "
             "exception handler, not silently succeeded"
         )
     finally:
-        # Defensive backstop -- see docstring. Harmless no-op if the
-        # transaction rollback already restored the grant.
-        await conn.execute(text("GRANT INSERT ON landlords TO landlord_sync_role"))
+        await conn.execute(text(f"DROP TRIGGER IF EXISTS {trg_name} ON public.landlords"))
+        await conn.execute(text(f"DROP FUNCTION IF EXISTS public.{fn_name}()"))
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +564,51 @@ async def test_update_email_propagates_to_landlord(conn: AsyncConnection) -> Non
     row = await _get_landlord(conn, user_id)
     assert row is not None
     assert row["email"] == "new@example.com"
+
+
+@pytest.mark.integration
+async def test_update_email_to_same_value_does_not_bump_updated_at(
+    conn: AsyncConnection,
+) -> None:
+    """Setting auth.users.email to its CURRENT value must not fire the
+    trigger at all -- the `WHEN (NEW.email IS DISTINCT FROM OLD.email)`
+    guard (mirroring the deleted_at trigger's precise guard, added per
+    safety-review advisory) means a no-op assignment never bumps
+    landlords.updated_at. `UPDATE OF email` alone (without a WHEN clause)
+    would fire on any UPDATE that lists the email column, whether or not
+    the value actually changed."""
+    user_id = str(uuid.uuid4())
+    await _insert_auth_user(conn, user_id=user_id, email="stable@example.com")
+
+    async def _updated_at() -> object:
+        result = await conn.execute(
+            text("SELECT updated_at FROM landlords WHERE auth_user_id = :auth_user_id"),
+            {"auth_user_id": user_id},
+        )
+        return result.scalar_one()
+
+    before_updated_at = await _updated_at()
+
+    # A measurable gap: if the WHEN guard failed to suppress the trigger,
+    # `updated_at = now()` inside the function body would produce a
+    # strictly later timestamp than `before_updated_at`.
+    await conn.execute(text("SELECT pg_sleep(0.05)"))
+
+    await conn.execute(
+        text("UPDATE auth.users SET email = :email WHERE id = :id"),
+        {"email": "stable@example.com", "id": user_id},
+    )
+
+    row = await _get_landlord(conn, user_id)
+    assert row is not None
+    assert row["email"] == "stable@example.com"
+
+    after_updated_at = await _updated_at()
+    assert after_updated_at == before_updated_at, (
+        "updated_at changed after a same-value email UPDATE -- the WHEN "
+        "(NEW.email IS DISTINCT FROM OLD.email) guard should have "
+        "prevented the trigger from firing at all"
+    )
 
 
 @pytest.mark.integration
@@ -611,11 +712,13 @@ async def test_landlord_from_lazy_upsert_then_auth_delete_is_soft_deleted(
 
 
 @pytest.mark.integration
-async def test_downgrade_to_0003_removes_triggers_functions_role_and_shim(
+async def test_downgrade_to_0003_removes_triggers_functions_and_shim(
     db: AsyncEngine,
 ) -> None:
     """Downgrading to 0003 must remove the triggers, the three functions,
-    landlord_sync_role, and the shim auth schema (it carries our marker)."""
+    and the shim auth schema (it carries our marker). No role handling is
+    involved -- the functions were never owned by anything but the
+    migrating role."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: _alembic("downgrade", "0003"))
 
@@ -624,11 +727,6 @@ async def test_downgrade_to_0003_removes_triggers_functions_role_and_shim(
             text("SELECT nspname FROM pg_namespace WHERE nspname = 'auth'")
         )
         assert not schema_result.fetchall(), "shim auth schema should be dropped"
-
-        role_result = await connection.execute(
-            text("SELECT rolname FROM pg_roles WHERE rolname = 'landlord_sync_role'")
-        )
-        assert not role_result.fetchall(), "landlord_sync_role should be dropped"
 
         func_result = await connection.execute(
             text(
@@ -644,7 +742,7 @@ async def test_downgrade_to_0003_removes_triggers_functions_role_and_shim(
 @pytest.mark.integration
 async def test_reupgrade_restores_0004_state(db: AsyncEngine) -> None:
     """After downgrade to 0003 + re-upgrade to head, 0004 state is restored:
-    shim schema, role, functions, and triggers all exist again, and the
+    shim schema, functions, and triggers all exist again, and the
     end-to-end insert flow works."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: _alembic("upgrade", "head"))
