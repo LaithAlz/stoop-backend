@@ -1,9 +1,15 @@
 """Request-ID middleware.
 
 Reads ``X-Request-ID`` from the incoming request (or generates a fresh
-``uuid4`` when absent), binds it to structlog's contextvars so that every
-log line emitted during the request carries ``request_id``, and echoes it
-back in the ``X-Request-ID`` response header.
+``req_<hex32>`` id when absent), binds it to structlog's contextvars so
+that every log line emitted during the request carries ``request_id``,
+and echoes it back in the ``X-Request-ID`` response header.
+
+The ``req_`` prefix + 32-char hex body matches the example in
+``docs/03-engineering/api-contracts.md``'s error envelope. A well-formed
+client-supplied id is honored and echoed back **as-is** (no prefix added)
+so it still works as the caller's own correlation id; the prefix only
+applies to ids this service generates itself.
 
 Also binds ``request_path`` and ``request_method`` so that log lines
 contain enough context to grep/filter without touching request headers
@@ -29,8 +35,15 @@ from starlette.types import ASGIApp
 # header and into every log line for the request. Restrict it to a safe
 # charset and length so it can't be used for HTTP response-splitting (CRLF),
 # log bloat, or control-character injection. Anything else is discarded and
-# a fresh uuid4 is generated instead.
+# a fresh ``req_<hex32>`` id is generated instead. The bound (1, 128)
+# comfortably accommodates our own generated format (``req_`` + 32 hex
+# chars = 36) as well as reasonable client-supplied correlation ids.
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def _generate_request_id() -> str:
+    """A fresh server-generated id: ``req_`` + 32 lowercase hex chars."""
+    return f"req_{uuid.uuid4().hex}"
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -38,7 +51,8 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
     Lifecycle per request:
       1. Clear any stale contextvars from a previous request on this worker.
-      2. Read a well-formed ``X-Request-ID`` header, else generate a ``uuid4``.
+      2. Read a well-formed ``X-Request-ID`` header, else generate a
+         ``req_<hex32>`` id.
       3. Bind ``request_id``, ``request_path``, ``request_method`` to
          structlog contextvars.
       4. Call the next handler.
@@ -58,10 +72,14 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         structlog.contextvars.clear_contextvars()
 
         # Step 2 — read the client-supplied request ID if it is well-formed,
-        # otherwise generate a fresh uuid4. Untrusted values are never echoed
-        # or logged verbatim.
+        # otherwise generate a fresh req_<hex32> id. Untrusted values are
+        # never echoed or logged verbatim. A well-formed client id is used
+        # AS-IS (no req_ prefix added) — it is the caller's own correlation
+        # id, not one we minted.
         supplied = request.headers.get("X-Request-ID")
-        request_id = supplied if supplied and _REQUEST_ID_RE.match(supplied) else str(uuid.uuid4())
+        request_id = (
+            supplied if supplied and _REQUEST_ID_RE.match(supplied) else _generate_request_id()
+        )
 
         # Step 3 — bind to contextvars (NOT headers — headers contain JWTs).
         structlog.contextvars.bind_contextvars(

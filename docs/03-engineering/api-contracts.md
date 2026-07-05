@@ -14,6 +14,9 @@
   { "error": { "code": "draft_stale", "message": "Human-readable.", "request_id": "req_…" } }
   ```
   Codes are stable snake_case strings; messages may change freely.
+  `request_id` is server-generated as `req_` + 32 hex chars unless the
+  caller supplies a well-formed `X-Request-ID` request header, in which
+  case that value is honored and echoed back unchanged (not re-prefixed).
 - IDs are uuids as strings. Timestamps ISO-8601 UTC (`2026-06-11T14:02:00Z`).
 - **Pagination**: `?limit=` (default 25, max 100) + `?cursor=`; responses
   carry `"next_cursor": string|null`. Lists are newest-first.

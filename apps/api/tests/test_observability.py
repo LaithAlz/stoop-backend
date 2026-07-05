@@ -14,6 +14,7 @@ Network-free design:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import uuid
 from typing import Any
@@ -128,7 +129,10 @@ async def test_request_id_echoed_in_response() -> None:
 
 @pytest.mark.unit
 async def test_missing_request_id_is_generated() -> None:
-    """When X-Request-ID is absent, the middleware generates a valid uuid4."""
+    """When X-Request-ID is absent, the middleware generates a ``req_<hex32>`` id.
+
+    Matches the error-envelope example in ``docs/03-engineering/api-contracts.md``.
+    """
     from app.main import app
 
     async with httpx.AsyncClient(
@@ -138,8 +142,9 @@ async def test_missing_request_id_is_generated() -> None:
 
     generated = response.headers.get("x-request-id")
     assert generated is not None, "X-Request-ID not present in response"
-    parsed = uuid.UUID(generated)
-    assert parsed.version == 4
+    assert re.fullmatch(r"req_[0-9a-f]{32}", generated), (
+        f"generated request_id {generated!r} does not match req_<hex32>"
+    )
 
 
 @pytest.mark.unit
@@ -154,6 +159,61 @@ async def test_supplied_request_id_preserved() -> None:
         response = await client.get("/healthz", headers={"X-Request-ID": my_id})
 
     assert response.headers.get("x-request-id") == my_id
+
+
+@pytest.mark.unit
+async def test_supplied_request_id_not_prefixed() -> None:
+    """A well-formed client-supplied id is honored as-is — never given a
+    ``req_`` prefix. The prefix only applies to server-generated ids."""
+    from app.main import app
+
+    my_id = "already-has-no-prefix"
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/healthz", headers={"X-Request-ID": my_id})
+
+    echoed = response.headers.get("x-request-id")
+    assert echoed == my_id, "client-supplied id must round-trip unchanged, never re-prefixed"
+    assert echoed != f"req_{my_id}"
+
+
+@pytest.mark.unit
+async def test_error_envelope_request_id_matches_response_header() -> None:
+    """The error envelope's ``request_id`` is the same value as the
+    ``X-Request-ID`` response header, and (when server-generated) matches
+    the ``req_<hex32>`` format from ``api-contracts.md``."""
+    from app.main import app
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/v1/auth-test")
+
+    assert response.status_code == 401
+    header_id = response.headers.get("x-request-id")
+    body_id = response.json()["error"]["request_id"]
+
+    assert header_id is not None
+    assert header_id == body_id
+    assert re.fullmatch(r"req_[0-9a-f]{32}", header_id)
+
+
+@pytest.mark.unit
+async def test_error_envelope_honors_supplied_request_id() -> None:
+    """A well-formed client-supplied X-Request-ID flows through to the
+    error envelope unchanged, for log correlation on the caller's side."""
+    from app.main import app
+
+    my_id = "caller-correlation-id-123"
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/v1/auth-test", headers={"X-Request-ID": my_id})
+
+    assert response.status_code == 401
+    assert response.headers.get("x-request-id") == my_id
+    assert response.json()["error"]["request_id"] == my_id
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +490,7 @@ async def test_logging_integration_does_not_capture_events() -> None:
 
 @pytest.mark.unit
 async def test_malformed_request_id_is_rejected() -> None:
-    """A client X-Request-ID with illegal chars/length is replaced by a uuid4.
+    """A malformed client X-Request-ID is replaced by a generated req_<hex32> id.
 
     Guards against HTTP response-splitting (CRLF), log forging, and log bloat
     from an unbounded attacker-controlled value.
@@ -450,8 +510,8 @@ async def test_malformed_request_id_is_rejected() -> None:
         echoed = response.headers.get("x-request-id")
         assert echoed is not None
         assert echoed != bad, "malformed X-Request-ID must not be echoed verbatim"
-        # the replacement is a valid uuid4
-        assert uuid.UUID(echoed).version == 4
+        # the replacement is a freshly generated req_<hex32> id
+        assert re.fullmatch(r"req_[0-9a-f]{32}", echoed)
 
 
 # ---------------------------------------------------------------------------
