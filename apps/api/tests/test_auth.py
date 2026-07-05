@@ -39,6 +39,8 @@ Security properties tested
    Supabase's JWKS endpoint is erroring (issue #134 safety review, B1)
 22 kid miss + degenerate empty-keys 200 response does NOT clobber a
    known-good cache (issue #134 safety review, A1)
+23 EC coordinate with a leading zero byte still verifies (regression for a
+   latent ``_b64url`` fixed-width encoding bug found via issue #145)
 """
 
 from __future__ import annotations
@@ -75,10 +77,22 @@ _JWKS_URL = "https://test.supabase.co/auth/v1/.well-known/jwks.json"
 _KID = "test-kid-001"
 
 
-def _b64url(n: int) -> str:
-    """Encode an integer as an unpadded url-safe base64 string (for JWK coords)."""
-    byte_length = (n.bit_length() + 7) // 8
-    return base64.urlsafe_b64encode(n.to_bytes(byte_length, "big")).rstrip(b"=").decode()
+# P-256 coordinates are always 32 bytes. Per RFC 7518 §6.2.1, the "x"/"y"
+# octet strings MUST be the curve's FULL fixed width, with any leading zero
+# octets preserved — NOT the minimal encoding of the integer's bit length.
+_P256_COORD_BYTES = 32
+
+
+def _b64url(n: int, length: int) -> str:
+    """Encode an integer as a fixed-width, unpadded url-safe base64 string.
+
+    ``length`` must be the curve's coordinate byte width (e.g. 32 for
+    P-256) so that a coordinate whose leading byte happens to be zero is
+    still encoded at the correct width instead of being silently
+    shortened — a shortened encoding fails JWK parsing (``PyJWKSet``)
+    despite the ``kid`` matching.
+    """
+    return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
 
 
 def _make_keypair() -> tuple[EllipticCurvePrivateKey, EllipticCurvePublicKey]:
@@ -96,8 +110,8 @@ def _public_key_to_jwks(public: EllipticCurvePublicKey, kid: str) -> dict[str, A
             {
                 "kty": "EC",
                 "crv": "P-256",
-                "x": _b64url(nums.x),
-                "y": _b64url(nums.y),
+                "x": _b64url(nums.x, _P256_COORD_BYTES),
+                "y": _b64url(nums.y, _P256_COORD_BYTES),
                 "kid": kid,
                 "use": "sig",
                 "alg": "ES256",
@@ -858,4 +872,60 @@ async def test_degenerate_empty_keys_response_does_not_clobber_cache(
     assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
     assert call_count == 2, (
         f"expected exactly 2 fetches (prime + one degenerate attempt), got {call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 23 — EC coordinate with a leading zero byte still verifies
+#
+# Regression test for a latent ``_b64url`` encoding bug found while
+# diagnosing issue #145's residual flake. Per RFC 7518 §6.2.1, a JWK EC
+# coordinate's octet string MUST be the curve's full FIXED width (32 bytes
+# for P-256), with any leading zero octets preserved. The old ``_b64url``
+# derived the byte length from ``n.bit_length()``, which silently produced
+# a one-byte-short encoding whenever a coordinate's top byte happened to be
+# zero (~0.78% of random P-256 keypairs: ``1 - (255/256)**2``) —
+# ``PyJWKSet.from_dict`` then failed to parse that key and ``verify_jwt``
+# raised ``invalid_token`` even though the ``kid`` matched textually.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_leading_zero_byte_coordinate_still_verifies() -> None:
+    """A keypair whose ``x`` or ``y`` has a leading zero byte must still
+    verify successfully via the standard path.
+
+    Generates keypairs until one lands below ``2**248`` (i.e. its top byte,
+    bits 248-255, is zero) for ``x`` or ``y``, bounded at 2000 attempts so
+    the test can never hang — at ~0.78% per keypair, the odds of exhausting
+    2000 independent attempts without a hit are astronomically small
+    (~(0.9922)**2000, well under 1e-6), so a skip should never actually
+    trigger in practice; it exists purely as a non-flaky escape hatch.
+    """
+    max_attempts = 2000
+    leading_zero_threshold = 2**248  # below this, the top byte is 0x00
+
+    found: tuple[EllipticCurvePrivateKey, EllipticCurvePublicKey] | None = None
+    attempts_used = max_attempts
+    for attempt in range(1, max_attempts + 1):
+        candidate = _make_keypair()
+        nums = candidate[1].public_numbers()
+        if nums.x < leading_zero_threshold or nums.y < leading_zero_threshold:
+            found = candidate
+            attempts_used = attempt
+            break
+
+    if found is None:
+        pytest.skip(f"could not generate a leading-zero-byte coordinate in {max_attempts} attempts")
+
+    private, public = found
+    jwks = _public_key_to_jwks(public, _KID)
+    token = _mint_token(private)
+
+    async with _make_jwks_router(jwks):
+        user = await verify_jwt(token)
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111"), (
+        f"found a leading-zero-byte coordinate after {attempts_used} attempt(s) "
+        "but verification did not return the expected identity"
     )
