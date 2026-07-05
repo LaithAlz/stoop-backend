@@ -6,7 +6,7 @@ import { SeverityBadge } from "@/components/stoop/SeverityBadge";
 import { queue, properties } from "@/lib/mock-app";
 import { autonomyModes, getPropertyConfig, propertyConfigs } from "@/lib/mock-property";
 
-export const Route = createFileRoute("/app/properties/$id")({
+export const Route = createFileRoute("/app/properties_/$id")({
   head: ({ params }) => ({
     meta: [{ title: "Property — Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/properties/${params.id}` }],

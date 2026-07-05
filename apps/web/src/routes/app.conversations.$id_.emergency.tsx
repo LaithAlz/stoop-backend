@@ -10,7 +10,7 @@ import {
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
 import { queue } from "@/lib/mock-app";
 
-export const Route = createFileRoute("/app/conversations/$id/emergency")({
+export const Route = createFileRoute("/app/conversations/$id_/emergency")({
   head: () => ({
     meta: [{ title: "Emergency — Stoop." }, { name: "robots", content: "noindex" }],
   }),

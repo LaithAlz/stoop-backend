@@ -19,7 +19,7 @@ import {
 } from "@/lib/mock-property";
 import { cn } from "@/lib/utils";
 
-export const Route = createFileRoute("/app/properties/$id/trust")({
+export const Route = createFileRoute("/app/properties_/$id_/trust")({
   head: ({ params }) => ({
     meta: [{ title: "Trust dashboard — Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/properties/${params.id}/trust` }],
