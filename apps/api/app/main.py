@@ -6,6 +6,9 @@ Usage:
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 import fastapi
 import structlog
 import structlog.contextvars
@@ -13,6 +16,7 @@ from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.db.session import verify_request_engine_role_separation
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthError
 from app.middleware.request_id import RequestIDMiddleware
@@ -20,6 +24,23 @@ from app.observability import configure_logging, init_sentry
 from app.routers import health, me
 
 log = structlog.get_logger(__name__)
+
+
+@asynccontextmanager
+async def _lifespan(_app: fastapi.FastAPI) -> AsyncIterator[None]:
+    """Startup self-check (#22 safety review item 13b).
+
+    ``verify_request_engine_role_separation`` proves — not just assumes —
+    that the request-path engine is genuinely isolated from the admin
+    engine whenever ``APP_DATABASE_URL`` is set. Raising here (before
+    ``yield``) aborts FastAPI/uvicorn startup entirely: refusing to serve
+    any traffic is the correct failure mode for "RLS role separation was
+    configured wrong," which is worse silently than not configuring it at
+    all. See ``app/db/session.py``'s module docstring for the full
+    rationale.
+    """
+    await verify_request_engine_role_separation()
+    yield
 
 
 def _auth_error_handler(_request: Request, exc: AuthError) -> JSONResponse:
@@ -84,6 +105,11 @@ def create_app() -> fastapi.FastAPI:
       5. include health router (always)
       6. include auth-test router (always — for manual JWT verification)
       7. include debug router (non-production only)
+
+    ``lifespan=_lifespan`` runs ``verify_request_engine_role_separation``
+    once at ASGI startup (#22 safety review item 13b) — see that
+    function's docstring (``app/db/session.py``) for what it checks and
+    why. A no-op when ``APP_DATABASE_URL`` is unset.
     """
     configure_logging()
     init_sentry()
@@ -92,6 +118,7 @@ def create_app() -> fastapi.FastAPI:
         title="Stoop API",
         description="AI-powered tenant-maintenance handling for landlords.",
         version="0.1.0",
+        lifespan=_lifespan,
     )
 
     application.add_middleware(RequestIDMiddleware)

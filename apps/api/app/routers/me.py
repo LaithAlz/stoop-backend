@@ -52,6 +52,23 @@ NOT-NULL invariant is preserved instead of surfacing as a 500
 ``NotNullViolation`` or (worse) silently overwriting an existing landlord's
 real email with an empty string via the ``ON CONFLICT ... SET email =
 EXCLUDED.email`` upsert.
+
+Session: ``get_admin_session``, deliberately not ``get_session``/
+``require_landlord`` (#22 safety review, BLOCKING item)
+------------------------------------------------------------------------
+This upsert MUST run on the admin engine, unscoped by RLS. Empirically
+reproduced: under an RLS-scoped (``app_role``) session, BOTH the
+brand-new-row INSERT and the existing-row ``ON CONFLICT DO UPDATE`` are
+rejected by ``landlords``' ``WITH CHECK`` policy — a freshly
+``gen_random_uuid()``'d ``id`` can never equal a GUC value that would have
+to be set BEFORE that id exists, and ``require_landlord`` itself can't run
+here for the same reason (it looks up the ``landlords`` row this endpoint
+is the one that creates). This is exactly why ``GET /v1/me`` uses
+``require_user`` (not ``require_landlord``) for auth AND
+``get_admin_session`` (not ``get_session``) for its session — provisioning
+is pre-identity and deliberately unscoped. Every OTHER, landlord-scoped
+endpoint (#53 onward) must use ``require_landlord`` + the ordinary request
+-path session instead — see ``app/db/session.py``'s module docstring.
 """
 
 from __future__ import annotations
@@ -67,7 +84,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import get_session
+from app.db.session import get_admin_session
 from app.deps import require_user
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthUser
@@ -126,7 +143,7 @@ _UPSERT_SQL = text(
 @router.get("/me", response_model=MeResponse)
 async def get_me(
     user: Annotated[AuthUser, Depends(require_user)],
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_admin_session)],
 ) -> MeResponse:
     """Return the authenticated landlord's profile, creating it on first call.
 

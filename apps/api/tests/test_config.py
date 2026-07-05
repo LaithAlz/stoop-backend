@@ -44,6 +44,150 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.unit
+def test_app_database_url_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``app_database_url`` (#22) is optional — unset by default, and its
+    absence must not break Settings construction (local dev/CI/production
+    before the one-time operator step in app/db/session.py's docstring)."""
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+    )
+    assert s.app_database_url is None
+
+
+@pytest.mark.unit
+def test_app_database_url_can_be_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When set, ``app_database_url`` is carried through unmodified."""
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+    )
+    assert s.app_database_url == "postgresql+asyncpg://app_role:secret@h:6543/db"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("blank_value", ["", "   ", "\t\n"], ids=["empty", "spaces", "tab_newline"])
+def test_app_database_url_whitespace_only_normalizes_to_none(
+    monkeypatch: pytest.MonkeyPatch, blank_value: str
+) -> None:
+    """A whitespace-only (or empty-string) APP_DATABASE_URL must normalize
+    to None (#22 safety review item 13a) — treated identically to unset,
+    not as a truthy-but-garbage value that would sail past the production
+    boot gate and fail later at create_async_engine with an obscure
+    parse error instead."""
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        app_database_url=blank_value,
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+    )
+    assert s.app_database_url is None
+
+
+@pytest.mark.unit
+def test_production_with_whitespace_only_app_database_url_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The boot gate must fire for a whitespace-only APP_DATABASE_URL in
+    production, exactly as if it were unset (#22 safety review item 13a)."""
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            environment="production",
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            app_database_url="   ",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+        )
+
+    assert "APP_DATABASE_URL" in str(exc_info.value)
+
+
+@pytest.mark.unit
+def test_production_without_app_database_url_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boot gate (#22 safety review item 3): ENVIRONMENT=production with no
+    APP_DATABASE_URL must refuse to construct Settings at all, not silently
+    fall back to the admin engine for every request forever."""
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            environment="production",
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+        )
+
+    message = str(exc_info.value)
+    assert "APP_DATABASE_URL" in message
+    # No secrets ever appear in this message — it only fires on absence.
+    assert "postgresql" not in message.lower()
+
+
+@pytest.mark.unit
+def test_production_with_app_database_url_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The boot gate does not fire once APP_DATABASE_URL is actually set."""
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        environment="production",
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+    )
+    assert s.is_production is True
+    assert s.app_database_url == "postgresql+asyncpg://app_role:secret@h:6543/db"
+
+
+@pytest.mark.unit
+def test_non_production_without_app_database_url_is_fine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The boot gate is production-only — dev/staging without
+    APP_DATABASE_URL must NOT raise (the documented fallback behavior)."""
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    for env in ("dev", "staging"):
+        s = Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            environment=env,  # type: ignore[arg-type]
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+        )
+        assert s.app_database_url is None
+
+
+@pytest.mark.unit
 def test_is_production_property(monkeypatch: pytest.MonkeyPatch) -> None:
     """is_production returns True only for environment='production'."""
     monkeypatch.delenv("ENVIRONMENT", raising=False)
@@ -52,6 +196,10 @@ def test_is_production_property(monkeypatch: pytest.MonkeyPatch) -> None:
         _env_file=None,
         environment="production",
         database_url="postgresql+asyncpg://u:p@h:5432/db",
+        # Required alongside environment="production" — the #22 boot gate
+        # (see test_production_without_app_database_url_raises) would
+        # otherwise refuse to construct this Settings instance at all.
+        app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
         supabase_url="https://x.supabase.co",
         supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
         supabase_jwt_issuer="https://x.supabase.co/auth/v1",

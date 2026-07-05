@@ -41,6 +41,16 @@
 `PATCH /v1/me` — body: any of `full_name`, `phone`, `timezone`,
 `voice_profile`. Emergency notifications are not a settable preference.
 
+`GET/PATCH /v1/me` use `require_user` directly (the provisioning path — a
+brand-new auth user has no `landlords` row yet, and this lazily creates
+one) and do not check `deleted_at`. Every OTHER authenticated endpoint
+(#53 onward) uses the `require_landlord` dependency (#22) instead, which
+looks up the caller's `landlords` row **excluding soft-deleted rows**
+(`deleted_at IS NULL`) and 403s with the stable code `account_deleted` —
+same error envelope — if none is found (closes half of #135 part 1; the
+other half, `/v1/me` itself staying reachable for a soft-deleted account,
+is out of scope here).
+
 ## Properties
 
 `GET /v1/properties` → `{ "items": [Property], "next_cursor": null }`
