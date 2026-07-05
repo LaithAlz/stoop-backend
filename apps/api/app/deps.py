@@ -164,6 +164,16 @@ async def require_landlord(
     silently inherit this landlord's id. ``is_local = true`` guarantees the
     setting never outlives the transaction that ``get_session`` commits or
     rolls back at request teardown (``app/db/session.py``).
+
+    WARNING for #53-57 authors: a mid-handler ``await session.commit()``
+    ends the CURRENT transaction — and with it, this GUC (``SET LOCAL`` is
+    scoped to the transaction, not the session; see above). Any query the
+    same handler runs AFTER that commit executes on a new, unscoped
+    transaction and fails closed to zero rows (matching ``NULL`` under
+    RLS) — silent and confusing to debug, not an error. Do not call
+    ``session.commit()`` inside a handler that used ``require_landlord``;
+    ``get_session``'s teardown commit (``app/db/session.py``) is the only
+    commit that should ever happen for that session.
     """
     result = await session.execute(_LANDLORD_LOOKUP_SQL, {"auth_user_id": str(user.user_id)})
     row = result.mappings().one_or_none()

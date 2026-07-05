@@ -100,11 +100,19 @@ providing ZERO isolation: every policy would be in place and every query
 would still see everything, and nobody would notice until a real
 cross-landlord data leak. This function is called once at FastAPI startup
 (``app/main.py``'s lifespan) to catch exactly that: when
-``app_database_url`` is set, it queries the REQUEST engine's OWN
-``current_user`` and ``rolbypassrls`` and refuses to let the app start
-serving traffic if either check fails. When ``app_database_url`` is
-unset, this is a no-op — the existing fallback WARNING above already
-covers that (documented, safe-for-now) state.
+``app_database_url`` is set, it queries BOTH engines for their own
+SERVER-reported ``current_user`` (comparing server-reported identity to
+server-reported identity — NOT the request role against the admin
+engine's client-side connection-string username, which is a different
+string under Supavisor and would silently never match; see the
+function's own docstring "#22 safety review item 14" for the real bug
+this fixes) plus the request role's ``rolbypassrls``, and refuses to let
+the app start serving traffic if either check fails. Connection failures
+on either engine are wrapped into a labeled, secret-free
+``RoleSeparationVerificationError`` (item 16) rather than propagating a
+bare traceback. When ``app_database_url`` is unset, this is a no-op — the
+existing fallback WARNING above already covers that (documented,
+safe-for-now) state.
 
 Design decisions
 ----------------
@@ -406,26 +414,48 @@ async def verify_request_engine_role_separation() -> None:
     role-separated from the admin engine — don't just trust that setting
     it was enough.
 
-    Runs one query on the REQUEST engine:
+    Queries BOTH engines for their own SERVER-side identity —
     ``SELECT current_user, rolbypassrls FROM pg_roles WHERE rolname =
-    current_user``. Refuses to let the app start serving traffic
+    current_user`` on the request engine, and plain ``SELECT current_user``
+    on the admin engine — and refuses to let the app start serving traffic
     (raises ``RoleSeparationVerificationError``) if EITHER:
 
-    - ``rolbypassrls`` is true for that role — RLS would be silently
-      skipped for every request, exactly as if role separation had never
-      been configured (this is precisely the ``postgres``/``service_role``
-      situation on live Supabase — see migration 0005's "LIVE ROLE FACTS"
-      — so pointing ``APP_DATABASE_URL`` at either of those by mistake
-      must be caught here, not discovered later via a data leak); or
-    - ``current_user`` is the SAME role the admin engine connects as — a
-      copy-paste error (``APP_DATABASE_URL`` accidentally set to the same
-      value as ``DATABASE_URL``) that would make ``request_engine`` and
-      ``engine`` behaviorally identical.
+    - ``rolbypassrls`` is true for the request role — RLS would be
+      silently skipped for every request, exactly as if role separation
+      had never been configured (this is precisely the
+      ``postgres``/``service_role`` situation on live Supabase — see
+      migration 0005's "LIVE ROLE FACTS" — so pointing ``APP_DATABASE_URL``
+      at either of those by mistake must be caught here, not discovered
+      later via a data leak); or
+    - the request role's SERVER-reported ``current_user`` equals the admin
+      role's SERVER-reported ``current_user`` — a copy-paste error
+      (``APP_DATABASE_URL`` accidentally set to the same value as
+      ``DATABASE_URL``) that would make ``request_engine`` and ``engine``
+      behaviorally identical.
 
-    A clear structured log line precedes the raise. No secrets in it: role
-    names (``current_user`` values) are Postgres identifiers, not
-    credentials — never the connection string, host, or password, which
-    never reach this function's logging or exception message.
+    BOTH SIDES OF THE COMPARISON MUST BE SERVER-REPORTED (#22 safety
+    review item 14 — a real bug in an earlier revision, fixed before ship):
+    comparing the request role's server-reported ``current_user`` against
+    the ADMIN engine's CLIENT-SIDE connection-string username
+    (``engine.url.username``) looks plausible but is wrong under Supavisor:
+    the client-side username is ``role.project-ref`` (e.g.
+    ``postgres.abcdef123``), while Postgres itself reports the bare role
+    (``postgres``) as ``current_user`` — those two strings never match
+    even when it genuinely IS the same role, so the "same role as admin"
+    check would silently never fire in the actual deployment topology.
+    Querying ``SELECT current_user`` on the admin engine too and comparing
+    bare-role-to-bare-role is the only apples-to-apples comparison.
+
+    Connection-level failures (bad password, network unreachable) on
+    EITHER engine are caught and re-raised as
+    ``RoleSeparationVerificationError`` with a labeled, secret-free message
+    (#22 safety review item 16) — so an operator paged at 2am sees "the
+    role-separation self-check could not connect," not a bare asyncpg
+    traceback with no context. The original exception is chained
+    (``raise ... from exc``) for full diagnostics in the server-side log/
+    traceback; only this function's OWN constructed message (and the
+    structured log line) are guaranteed secret-free — never the
+    connection string, host, or password.
 
     When ``app_database_url`` is unset, this is a deliberate no-op — the
     module-level fallback WARNING (logged once at import time, above)
@@ -441,15 +471,33 @@ async def verify_request_engine_role_separation() -> None:
     if not settings.app_database_url:
         return
 
-    async with request_engine.connect() as connection:
-        row = (
-            await connection.execute(
-                text("SELECT current_user, rolbypassrls FROM pg_roles WHERE rolname = current_user")
-            )
-        ).one()
-    request_user, request_bypassrls = row[0], bool(row[1])
+    try:
+        async with request_engine.connect() as connection:
+            request_row = (
+                await connection.execute(
+                    text(
+                        "SELECT current_user, rolbypassrls FROM pg_roles "
+                        "WHERE rolname = current_user"
+                    )
+                )
+            ).one()
+        async with engine.connect() as admin_connection:
+            admin_row = (await admin_connection.execute(text("SELECT current_user"))).one()
+    except Exception as exc:
+        log.error(
+            "rls_role_separation_self_check_connect_failed",
+            exc_type=type(exc).__name__,
+        )
+        raise RoleSeparationVerificationError(
+            "The role-separation self-check could not connect to the "
+            "request engine or the admin engine to verify RLS role "
+            "separation -- refusing to start. Check APP_DATABASE_URL / "
+            "DATABASE_URL connectivity and credentials (see app/db/"
+            "session.py's module docstring)."
+        ) from exc
 
-    admin_user = engine.url.username
+    request_user, request_bypassrls = request_row[0], bool(request_row[1])
+    admin_user = admin_row[0]
 
     if request_bypassrls or request_user == admin_user:
         log.error(
