@@ -235,6 +235,28 @@
 > 5. `pending_resolved_at` is cleared (`NULL`) on every path that resolves,
 >    reopens, or re-proposes a case — a resolved/reopened case must never
 >    carry a stale pending-resolution deadline forward.
+>
+> **v1.6 amendments (2026-07-05)** — no migration required; a schema
+> contradiction found and resolved during #32's implementation
+> (`classify_severity`), same class as the `messages.twilio_status`
+> precedent above (v1.1 amendments):
+> 1. `messages.classification` / `tokens_in` / `tokens_out` / `model` /
+>    `llm_cost_cents` are DEPRECATED — never written. `messages` is
+>    append-only (rule #2) and the row is INSERTED by the webhook handler
+>    BEFORE classification ever runs, so populating these columns after
+>    the fact would require an UPDATE on an append-only table — the same
+>    contradiction the `twilio_status` deprecation above already resolved
+>    for delivery status. Columns stay listed above (migration 0002
+>    already shipped them) until their DROP in a future migration (not yet
+>    scheduled/numbered).
+> 2. The canonical classification record is instead an `audit_log` row:
+>    `actor='agent'`, `action='classified'` (existing vocabulary),
+>    `payload = {message_id, case_id, severity, rules_fired, modifier,
+>    refusal_flags, model, tokens_in, tokens_out, cost_cents,
+>    prompt_version}` — see `app/agent/nodes/classify_severity.py`'s
+>    module docstring for the full rationale and
+>    `docs/03-engineering/api-contracts.md`'s `GET /v1/cases/{id}` timeline
+>    example, which this payload shape extends.
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
@@ -381,12 +403,21 @@ CREATE TABLE messages (
                                                      --  message_status_events; DROP scheduled
                                                      --  in migration 0003
   prefilter       jsonb,                             -- PrefilterResult snapshot (#107)
-  classification  jsonb,                             -- {severity, rules_fired, modifier,
+  classification  jsonb,                             -- DEPRECATED v1.6: never written; this row
+                                                     --  is inserted BEFORE classification runs
+                                                     --  (append-only). Canonical record is
+                                                     --  audit_log 'classified' (#32). DROP
+                                                     --  scheduled in a future migration. Shape
+                                                     --  was {severity, rules_fired, modifier,
                                                      --  refusal_flags, reasoning}
-  tokens_in       integer,
-  tokens_out      integer,
-  model           text,
-  llm_cost_cents  numeric(10,4),
+  tokens_in       integer,                           -- DEPRECATED v1.6: never written; see
+                                                     --  `classification` above
+  tokens_out      integer,                           -- DEPRECATED v1.6: never written; see
+                                                     --  `classification` above
+  model           text,                              -- DEPRECATED v1.6: never written; see
+                                                     --  `classification` above
+  llm_cost_cents  numeric(10,4),                      -- DEPRECATED v1.6: never written; see
+                                                     --  `classification` above
   sms_cost_cents  numeric(10,4),
   created_at      timestamptz NOT NULL DEFAULT now()
 );

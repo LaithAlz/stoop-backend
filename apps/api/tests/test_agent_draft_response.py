@@ -1,0 +1,1174 @@
+"""Integration tests for ``app/agent/nodes/draft_response.py`` (#33).
+
+Marker: ``integration`` — requires a running Postgres instance (docker
+-compose) + ``alembic upgrade head``, same as ``tests/test_agent_nodes.py``.
+The Anthropic SDK itself is ALWAYS mocked (``app.integrations.anthropic
+.get_client`` monkeypatched) — no real API calls anywhere in this suite.
+
+Run with:
+    export DATABASE_URL=postgresql+asyncpg://stoop:stoop@localhost:5432/stoop
+    uv run pytest tests/test_agent_draft_response.py -m integration -v
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from collections.abc import AsyncGenerator
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from anthropic.types import ToolUseBlock
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+
+import app.agent.nodes.draft_response as node_mod
+import app.db.session as db_mod
+from app.agent.nodes.draft_response import draft_response
+from app.agent.prompts.v1 import REFUSAL_TEMPLATES
+from app.agent.schemas import CaseContext, RefusalFlag, Severity, SeverityResult
+from app.agent.state import AgentState
+from app.integrations import anthropic as anthropic_mod
+
+_DB_URL_DEFAULT = "postgresql+asyncpg://stoop:stoop@localhost:5432/stoop"
+
+
+def _get_db_url() -> str:
+    url = os.environ.get("DATABASE_URL", _DB_URL_DEFAULT)
+    return re.sub(r"^postgresql(\+\w+)?://", "postgresql+asyncpg://", url)
+
+
+def _alembic(*args: str) -> None:
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "alembic", *args],
+        capture_output=True,
+        text=True,
+        cwd=os.path.join(os.path.dirname(__file__), ".."),
+        env={**os.environ, "DATABASE_URL": _get_db_url()},
+    )
+    if result.returncode != 0:
+        cmd = " ".join(args)
+        raise RuntimeError(
+            f"alembic {cmd!r} failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+        )
+
+
+@pytest.fixture(scope="session", autouse=False)
+def _migrate_once() -> None:  # type: ignore[misc]
+    _alembic("upgrade", "head")
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_engine(_migrate_once: None) -> AsyncGenerator[AsyncEngine, None]:
+    engine = create_async_engine(_get_db_url(), echo=False)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def db_session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
+    async with AsyncSession(db_engine) as session:
+        yield session
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def dispose_app_engine() -> AsyncGenerator[None, None]:
+    await db_mod.engine.dispose()
+    yield
+    await db_mod.engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _reset_anthropic_client() -> None:
+    anthropic_mod.reset_client_for_tests()
+    yield
+    anthropic_mod.reset_client_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Seeding helpers (duplicated per project convention)
+# ---------------------------------------------------------------------------
+
+
+def _fresh_phone() -> str:
+    return f"+1416{uuid.uuid4().int % 10_000_000:07d}"
+
+
+async def _insert_landlord(
+    session: AsyncSession, *, voice_profile: dict[str, object] | None = None
+) -> str:
+    landlord_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO landlords (id, auth_user_id, email, voice_profile) "
+            "VALUES (:id, :auth_id, :email, CAST(:voice_profile AS jsonb))"
+        ),
+        {
+            "id": landlord_id,
+            "auth_id": str(uuid.uuid4()),
+            "email": f"{landlord_id}@example.com",
+            "voice_profile": json.dumps(voice_profile) if voice_profile is not None else None,
+        },
+    )
+    await session.commit()
+    return landlord_id
+
+
+async def _insert_property(
+    session: AsyncSession, landlord_id: str, *, house_rules: str | None = "No pets."
+) -> str:
+    property_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO properties (id, landlord_id, label, address_line1, city, house_rules) "
+            "VALUES (:id, :landlord_id, 'Test Property', '123 Test St', 'Toronto', :house_rules)"
+        ),
+        {"id": property_id, "landlord_id": landlord_id, "house_rules": house_rules},
+    )
+    await session.commit()
+    return property_id
+
+
+async def _insert_tenant(
+    session: AsyncSession, landlord_id: str, property_id: str, *, name: str | None = "Maria"
+) -> str:
+    tenant_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO tenants (id, landlord_id, property_id, phone, name) "
+            "VALUES (:id, :landlord_id, :property_id, :phone, :name)"
+        ),
+        {
+            "id": tenant_id,
+            "landlord_id": landlord_id,
+            "property_id": property_id,
+            "phone": _fresh_phone(),
+            "name": name,
+        },
+    )
+    await session.commit()
+    return tenant_id
+
+
+async def _insert_case(
+    session: AsyncSession, *, landlord_id: str, property_id: str, tenant_id: str
+) -> str:
+    case_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO cases (id, landlord_id, property_id, tenant_id, status, "
+            "langgraph_thread_id) "
+            "VALUES (:id, :landlord_id, :property_id, :tenant_id, 'open', :thread_id)"
+        ),
+        {
+            "id": case_id,
+            "landlord_id": landlord_id,
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "thread_id": str(uuid.uuid4()),
+        },
+    )
+    await session.commit()
+    return case_id
+
+
+async def _insert_message(
+    session: AsyncSession, *, landlord_id: str, property_id: str, tenant_id: str, body: str
+) -> str:
+    message_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO messages "
+            "(id, landlord_id, property_id, tenant_id, direction, party, body, twilio_sid) "
+            "VALUES (:id, :landlord_id, :property_id, :tenant_id, 'inbound', 'tenant', :body, "
+            " :twilio_sid)"
+        ),
+        {
+            "id": message_id,
+            "landlord_id": landlord_id,
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "body": body,
+            "twilio_sid": f"SM{uuid.uuid4().hex}",
+        },
+    )
+    await session.commit()
+    return message_id
+
+
+async def _insert_pending_draft(
+    session: AsyncSession, *, landlord_id: str, case_id: str, body: str = "old draft"
+) -> str:
+    row = (
+        (
+            await session.execute(
+                text(
+                    "INSERT INTO drafts (landlord_id, case_id, recipient, body, prompt_version, "
+                    "status) VALUES (:landlord_id, :case_id, 'tenant', :body, 'v1', 'pending') "
+                    "RETURNING id"
+                ),
+                {"landlord_id": landlord_id, "case_id": case_id, "body": body},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    await session.commit()
+    draft_id: str = str(row["id"])
+    return draft_id
+
+
+async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
+    await session.execute(
+        text("DELETE FROM audit_log WHERE landlord_id = :lid"), {"lid": landlord_id}
+    )
+    await session.execute(text("DELETE FROM drafts WHERE landlord_id = :lid"), {"lid": landlord_id})
+    await session.execute(text("DELETE FROM cases WHERE landlord_id = :lid"), {"lid": landlord_id})
+    await session.execute(
+        text("DELETE FROM messages WHERE landlord_id = :lid"), {"lid": landlord_id}
+    )
+    await session.execute(
+        text("DELETE FROM tenants WHERE landlord_id = :lid"), {"lid": landlord_id}
+    )
+    await session.execute(
+        text("DELETE FROM properties WHERE landlord_id = :lid"), {"lid": landlord_id}
+    )
+    await session.execute(text("DELETE FROM landlords WHERE id = :lid"), {"lid": landlord_id})
+    await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Fake Anthropic client
+# ---------------------------------------------------------------------------
+
+
+def _fake_message(*, body: str, refusal_templates_used: list[str] | None = None) -> SimpleNamespace:
+    tool_input: dict[str, Any] = {"body": body}
+    if refusal_templates_used is not None:
+        tool_input["refusal_templates_used"] = refusal_templates_used
+    block = ToolUseBlock(id="toolu_test", input=tool_input, name="draft_message", type="tool_use")
+    usage = SimpleNamespace(input_tokens=150, output_tokens=40)
+    return SimpleNamespace(content=[block], usage=usage, model="claude-sonnet-5")
+
+
+class _FakeMessages:
+    def __init__(self, *, responses: list[Any] | None = None, delay: float = 0.0) -> None:
+        self._responses = list(responses or [])
+        self._delay = delay
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class _FakeClient:
+    def __init__(self, messages: _FakeMessages) -> None:
+        self.messages = messages
+
+
+def _patch_client(monkeypatch: pytest.MonkeyPatch, fake_messages: _FakeMessages) -> None:
+    monkeypatch.setattr(anthropic_mod, "get_client", lambda: _FakeClient(fake_messages))
+
+
+def _routine_severity(refusal_flags: list[RefusalFlag] | None = None) -> SeverityResult:
+    return SeverityResult(
+        severity=Severity.ROUTINE,
+        rules_fired=[],
+        modifier=None,
+        refusal_flags=refusal_flags or [],
+        reasoning=["Minor issue."],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_draft_response_double_timeout_shares_one_end_to_end_deadline(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both attempts time out; the retry still fires (enough budget
+    remains) and total elapsed stays bounded by the SHARED deadline --
+    never 2x independent per-attempt budgets (spec-guardian ruling)."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="hello",
+    )
+
+    monkeypatch.setattr(anthropic_mod, "CLASSIFICATION_BUDGET_SECONDS", 0.3)
+    monkeypatch.setattr(anthropic_mod, "FIRST_ATTEMPT_TIMEOUT_CAP_SECONDS", 0.1)
+    monkeypatch.setattr(anthropic_mod, "MIN_RETRY_BUDGET_SECONDS", 0.05)
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(body="draft one", refusal_templates_used=[]),
+            _fake_message(body="draft two", refusal_templates_used=[]),
+        ],
+        delay=1.0,
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        start = time.monotonic()
+        update = await draft_response(state)
+        elapsed = time.monotonic() - start
+
+        assert update["draft_guard_failed"] is True  # both attempts failed -> safe fallback
+        assert len(fake_messages.calls) == 2
+        assert elapsed < 0.6
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_retry_skipped_when_budget_exhausted(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the first attempt's timeout already consumes the (tiny) shared
+    budget down to below the retry floor, the regeneration attempt is
+    skipped entirely -- only ONE call is ever made."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="hello",
+    )
+
+    monkeypatch.setattr(anthropic_mod, "CLASSIFICATION_BUDGET_SECONDS", 0.1)
+    monkeypatch.setattr(anthropic_mod, "FIRST_ATTEMPT_TIMEOUT_CAP_SECONDS", 0.1)
+    monkeypatch.setattr(anthropic_mod, "MIN_RETRY_BUDGET_SECONDS", 0.5)
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(body="draft one", refusal_templates_used=[]),
+            _fake_message(body="draft two", refusal_templates_used=[]),
+        ],
+        delay=1.0,
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is True
+        assert len(fake_messages.calls) == 1
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_success_inserts_pending_draft_and_audit(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await _insert_landlord(
+        db_session, voice_profile={"tone": "warm, direct", "samples": ["Hey! No worries."]}
+    )
+    property_id = await _insert_property(db_session, landlord_id, house_rules="No smoking.")
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id, name="Maria")
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="kitchen faucet has a slow drip",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                body="Hi Maria — thanks for the heads up, I'll get someone out this week.",
+                refusal_templates_used=[],
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+                house_rules="No smoking.",
+                voice_profile={"tone": "warm, direct", "samples": ["Hey! No worries."]},
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        assert "Maria" in update["draft"].body
+        assert any("drafted a reply" in line for line in update["reasoning_log"])
+
+        draft_rows = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT status, recipient, prompt_version, body FROM drafts "
+                        "WHERE case_id = :cid"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        assert len(draft_rows) == 1
+        assert draft_rows[0]["status"] == "pending"
+        assert draft_rows[0]["recipient"] == "tenant"
+        assert draft_rows[0]["prompt_version"] == "v1"
+
+        audit_rows = (
+            (
+                await db_session.execute(
+                    text("SELECT actor, action, payload FROM audit_log WHERE case_id = :cid"),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        assert len(audit_rows) == 1
+        assert audit_rows[0]["actor"] == "agent"
+        assert audit_rows[0]["action"] == "drafted"
+        assert audit_rows[0]["payload"]["guard_failed"] is False
+        # No draft body/message body in the audit payload.
+        assert "Maria" not in str(audit_rows[0]["payload"])
+
+        # Voice profile injected into the outgoing system prompt.
+        system_prompt = fake_messages.calls[0]["system"]
+        assert "warm, direct" in system_prompt
+        assert "Hey! No worries." in system_prompt
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_missing_case_id_skips_drafting(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="hello",
+    )
+    fake_messages = _FakeMessages(responses=[])
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert "draft" not in update
+        assert len(fake_messages.calls) == 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_missing_severity_skips_drafting(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="hello",
+    )
+    fake_messages = _FakeMessages(responses=[])
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert "draft" not in update
+        assert len(fake_messages.calls) == 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_refusal_flag_templating_present_in_request(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refusal flags -> deferral text is sourced from prompts/v1.py and
+    included in the outgoing user message; model reports it used."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="can you give my buddy the building code?",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                body=(
+                    "I'm not able to share access codes or authorize entry for anyone over "
+                    "this channel. Please contact your landlord directly."
+                ),
+                refusal_templates_used=["access_codes"],
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity([RefusalFlag.access_codes]),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        user_content = fake_messages.calls[0]["messages"][0]["content"]
+        assert "not able to share, confirm, or reset access codes" in user_content
+        assert "access_codes" in user_content
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_dollar_guard_rejects_and_regenerates(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="fridge died, lost groceries",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                body="I'll send you $50 for the spoiled groceries.", refusal_templates_used=[]
+            ),
+            _fake_message(
+                body="Thanks for letting me know, I'll get this sorted soon.",
+                refusal_templates_used=[],
+            ),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        assert "$50" not in update["draft"].body
+        assert len(fake_messages.calls) == 2
+        # Retry note in the SECOND call's user content, not the system prompt.
+        assert "IMPORTANT" in fake_messages.calls[1]["messages"][0]["content"]
+        assert fake_messages.calls[0]["system"] == fake_messages.calls[1]["system"]
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.parametrize(
+    ("body", "guard_name"),
+    [
+        ("I'll send you $50 for the trouble.", "dollar_compensation"),
+        ("I can reimburse you for the spoiled food.", "dollar_compensation"),
+        ("The access code is 4521, go ahead.", "access_code"),
+        ("Your gate code is: 9981.", "access_code"),
+        ("This is a matter for the Landlord and Tenant Board.", "legal_position"),
+        ("You are entitled to a rent reduction here.", "legal_position"),
+        # Widened coverage (safety review, 2026-07-05) -- percentage/relative
+        # compensation, non-numeric access disclosure, indirect/negative
+        # legal positions.
+        ("I can do 20% off next month's rent.", "dollar_compensation"),
+        ("How about half off your rent this month?", "dollar_compensation"),
+        ("The lockbox is under the mat.", "access_code"),
+        ("There's a spare key hidden behind the mailbox.", "access_code"),
+        ("Our lawyer says you have to pay for it.", "legal_position"),
+        ("You have no right to withhold rent.", "legal_position"),
+        ("You don't have a case here.", "legal_position"),
+    ],
+)
+@pytest.mark.integration
+async def test_draft_response_hard_guard_positive_cases(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, body: str, guard_name: str
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="tenant message",
+    )
+
+    violations = node_mod._check_hard_guards(body=body, refusal_flags=[], refusal_templates_used=[])
+    assert guard_name in violations
+
+    # Also exercise the full node: BOTH attempts violate -> safe fallback used.
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(body=body, refusal_templates_used=[]),
+            _fake_message(body=body, refusal_templates_used=[]),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is True
+        assert update["draft"].body != body
+        assert any("safer standard reply" in line for line in update["reasoning_log"])
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Thanks for letting me know, I'll take a look this week.",
+        "Tony can come by Thursday morning between 8 and 11.",
+        "No worries at all, I'll follow up soon.",
+    ],
+)
+@pytest.mark.unit
+def test_draft_response_hard_guard_negative_cases(body: str) -> None:
+    """Clean, ordinary replies must never trip a hard guard (false-positive
+    check)."""
+    violations = node_mod._check_hard_guards(body=body, refusal_flags=[], refusal_templates_used=[])
+    assert violations == []
+
+
+# ---------------------------------------------------------------------------
+# Guard/deferral self-collision fix (HIGH, safety review 2026-07-05):
+# mandated REFUSAL_TEMPLATES text must never trip its OWN guard, and every
+# template + the generic fallback must stay clean under the WIDENED guards.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("flag_value", [flag.value for flag in RefusalFlag])
+def test_draft_response_every_refusal_template_stays_clean_under_widened_guards(
+    flag_value: str,
+) -> None:
+    template_text = REFUSAL_TEMPLATES[flag_value]
+    violations = node_mod._check_hard_guards(
+        body=template_text,
+        refusal_flags=[RefusalFlag(flag_value)],
+        refusal_templates_used=[RefusalFlag(flag_value)],
+    )
+    assert violations == []
+
+
+@pytest.mark.unit
+def test_draft_response_generic_fallback_stays_clean_under_widened_guards() -> None:
+    violations = node_mod._check_hard_guards(
+        body=node_mod._GENERIC_SAFE_FALLBACK, refusal_flags=[], refusal_templates_used=[]
+    )
+    assert violations == []
+
+
+@pytest.mark.unit
+def test_draft_response_strip_mandated_templates_removes_exact_template_text() -> None:
+    template_text = REFUSAL_TEMPLATES["cost_compensation"]
+    body = f"Hi Maria, {template_text} Talk soon!"
+    scrubbed = node_mod._strip_mandated_templates(body)
+    assert template_text not in scrubbed
+    assert "Hi Maria," in scrubbed
+    assert "Talk soon!" in scrubbed
+
+
+@pytest.mark.integration
+async def test_draft_response_cost_compensation_deferral_verbatim_is_accepted(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (guard/deferral self-collision, HIGH): a draft that
+    includes the mandated cost_compensation deferral VERBATIM must be
+    accepted on the first attempt -- no guard failure, no fallback, no
+    second call."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="can you cover the cost of my ruined couch from the leak?",
+    )
+
+    deferral_text = REFUSAL_TEMPLATES["cost_compensation"]
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                body=f"Thanks for flagging this. {deferral_text}",
+                refusal_templates_used=["cost_compensation"],
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity([RefusalFlag.cost_compensation]),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        assert len(fake_messages.calls) == 1  # accepted first try -- no retry, no fallback
+        assert deferral_text in update["draft"].body
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_legal_rent_ltb_deferral_verbatim_is_accepted(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same regression as cost_compensation, for legal_rent_ltb (whose
+    template text contains "Landlord and Tenant Board", which would
+    otherwise trip its own legal_position guard)."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="I think I'm owed a rent reduction, taking this to the LTB otherwise",
+    )
+
+    deferral_text = REFUSAL_TEMPLATES["legal_rent_ltb"]
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                body=f"I hear you. {deferral_text}",
+                refusal_templates_used=["legal_rent_ltb"],
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity([RefusalFlag.legal_rent_ltb]),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        assert len(fake_messages.calls) == 1
+        assert deferral_text in update["draft"].body
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_template_plus_genuine_violation_still_rejected(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mandated deferral is present AND the model ALSO added a genuine
+    violation ("I'll take $200 off") -- the genuine violation must still
+    be caught; the whitelist only protects the mandated text itself."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the leak ruined my couch, can you cover it?",
+    )
+
+    deferral_text = REFUSAL_TEMPLATES["cost_compensation"]
+    violating_body = f"{deferral_text} Actually, I'll take $200 off next month's rent."
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(body=violating_body, refusal_templates_used=["cost_compensation"]),
+            _fake_message(body=violating_body, refusal_templates_used=["cost_compensation"]),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity([RefusalFlag.cost_compensation]),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is True
+        assert len(fake_messages.calls) == 2
+        assert update["draft"].body != violating_body
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_missing_refusal_deferral_is_a_guard_violation(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal flag is set on the classification but the model didn't
+    report using its deferral template -> treated as a guard violation."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="can you give my buddy the code",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            # First attempt: engages the topic without the required deferral.
+            _fake_message(body="Sure, I can help with that!", refusal_templates_used=[]),
+            # Second attempt: still doesn't report using the deferral.
+            _fake_message(body="Let me look into it for you.", refusal_templates_used=[]),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity([RefusalFlag.access_codes]),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is True
+        # Fallback body is the canned access_codes deferral template itself.
+        assert "not able to share, confirm, or reset access codes" in update["draft"].body
+        assert update["draft"].refusal_templates_used == [RefusalFlag.access_codes]
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_stale_then_insert_respects_partial_unique_index(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    old_draft_id = await _insert_pending_draft(
+        db_session, landlord_id=landlord_id, case_id=case_id, body="earlier draft"
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="also, the hallway light is out",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[_fake_message(body="Got it, thanks for the update!", refusal_templates_used=[])]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+        assert update["draft_guard_failed"] is False
+
+        rows = (
+            (
+                await db_session.execute(
+                    text("SELECT id, status FROM drafts WHERE case_id = :cid ORDER BY created_at"),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        assert len(rows) == 2
+        assert str(rows[0]["id"]) == old_draft_id
+        assert rows[0]["status"] == "stale"
+        assert rows[1]["status"] == "pending"
+
+        # Exactly one 'pending' draft ever exists for the case -- the
+        # partial unique index (uq_drafts_one_pending) is never violated.
+        pending_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM drafts WHERE case_id = :cid AND status = 'pending'"),
+                {"cid": case_id},
+            )
+        ).scalar_one()
+        assert pending_count == 1
+
+        stale_audit = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT action, payload FROM audit_log WHERE case_id = :cid "
+                        "AND action = 'draft_stale'"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert stale_audit["payload"]["draft_id"] == old_draft_id
+
+        drafted_audit_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM audit_log WHERE case_id = :cid AND action = 'drafted'"),
+                {"cid": case_id},
+            )
+        ).scalar_one()
+        assert drafted_audit_count == 1
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_no_stale_draft_when_none_pending(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the hallway light is out",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[_fake_message(body="Thanks, I'll take care of it!", refusal_templates_used=[])]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        await draft_response(state)
+
+        rows = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM drafts WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert rows == 1
+
+        stale_audit_count = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE case_id = :cid AND action = 'draft_stale'"
+                ),
+                {"cid": case_id},
+            )
+        ).scalar_one()
+        assert stale_audit_count == 0
+    finally:
+        await _cleanup(db_session, landlord_id)

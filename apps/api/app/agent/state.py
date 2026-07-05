@@ -106,6 +106,29 @@ class AgentState(TypedDict, total=False):
         (emergency branch may skip it in favour of templated safety
         instructions).
 
+    classification_failed:
+        Set ``True`` by ``classify_severity`` (#32) ONLY when the Anthropic
+        call fails twice (initial attempt + one retry — timeout, API error,
+        or Pydantic validation failure) within the 20 s per-attempt budget
+        (``docs/02-product/emergency-prefilter.md``'s "Classification
+        budget"). ``severity`` is left unset in that case — there is NO
+        silent fallback severity, ever. This is a SEAM: #109 (the degraded-
+        mode protocol) is not built yet, so today this flag is set, logged,
+        and left for a future graph (#34) to route to that protocol — see
+        ``app/agent/nodes/classify_severity.py``'s module docstring, which
+        documents the seam the same way ``app/agent/emergency.py`` does for
+        #108. Absent/``False`` in every other case.
+
+    draft_guard_failed:
+        Set ``True`` by ``draft_response`` (#33) when a drafted reply still
+        violates a hard guard (dollar amounts/compensation, access codes, a
+        legal position, or a missing required refusal deferral) after ONE
+        regeneration attempt. The draft that IS stored in that case is a
+        safe templated fallback (never the guard-violating text) — this
+        flag is the "needs a person's eyes on this one" signal for a future
+        node/notification to act on (same seam pattern as
+        ``classification_failed`` above). Absent/``False`` otherwise.
+
     reasoning_log:
         Append-only list of human-readable trace lines.  Every node MUST
         append at least one entry describing what it observed and decided.
@@ -142,4 +165,6 @@ class AgentState(TypedDict, total=False):
     intent: IntentResult | None
     severity: SeverityResult | None
     draft: DraftResult | None
+    classification_failed: bool
+    draft_guard_failed: bool
     reasoning_log: list[str]
