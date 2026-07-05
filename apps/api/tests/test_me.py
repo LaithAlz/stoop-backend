@@ -732,6 +732,203 @@ async def test_me_existing_landlord_empty_string_email_does_not_overwrite_stored
         await _cleanup(db_session, sub)
 
 
+# ---------------------------------------------------------------------------
+# Soft-delete guard (issue #135 part 1) — resurrection is NOT allowed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_me_soft_deleted_landlord_returns_403_account_deleted_row_untouched(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """A soft-deleted landlord (``deleted_at`` set) presenting an
+    otherwise-valid, still-unexpired JWT must be rejected with 403
+    ``account_deleted`` — resurrection is not allowed (issue #135 part 1,
+    consistent with ``require_landlord``'s semantics for every other
+    endpoint). ``email`` AND ``updated_at`` must be byte-identical before
+    and after the rejected attempt: the upsert's ``ON CONFLICT ... WHERE
+    deleted_at IS NULL`` guard must suppress the UPDATE atomically, not
+    merely raise after already mutating the row.
+
+    Seeds the soft-delete with a direct ``UPDATE landlords SET deleted_at``
+    (the ``db_session`` fixture connects with no RLS scoping, i.e. as an
+    admin/operator would) rather than driving it through the real
+    ``auth.users`` trigger chain — that variant is covered separately by
+    ``test_me_soft_deleted_landlord_via_auth_trigger_...`` below.
+    """
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="soon-deleted@example.com")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed_response = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            # Soft-delete directly, as an admin/operator (or migration
+            # 0004's trigger) would — never a hard delete.
+            await db_session.execute(
+                text("UPDATE landlords SET deleted_at = now() WHERE auth_user_id = :uid"),
+                {"uid": sub},
+            )
+            await db_session.commit()
+
+            row_before = (
+                (
+                    await db_session.execute(
+                        text("SELECT email, updated_at FROM landlords WHERE auth_user_id = :uid"),
+                        {"uid": sub},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+
+            response = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    try:
+        assert seed_response.status_code == 200, seed_response.text
+        assert response.status_code == 403, response.text
+        body = response.json()
+        assert "error" in body
+        error = body["error"]
+        assert error["code"] == "account_deleted"
+        assert "message" in error
+        assert "request_id" in error
+
+        # Same stable code+message as require_landlord's account_deleted.
+        assert error["message"] == "This account is no longer active."
+
+        # Never leaks the token or the sub.
+        assert token not in error["message"]
+        assert sub not in error["message"]
+
+        row_after = (
+            (
+                await db_session.execute(
+                    text("SELECT email, updated_at FROM landlords WHERE auth_user_id = :uid"),
+                    {"uid": sub},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row_after["email"] == row_before["email"] == "soon-deleted@example.com"
+        assert row_after["updated_at"] == row_before["updated_at"], (
+            "Row must be untouched — updated_at changed after a rejected "
+            "account_deleted attempt (resurrection must never mutate "
+            "email/updated_at)"
+        )
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_me_soft_deleted_landlord_via_auth_trigger_returns_403_row_untouched(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """Same guard, but seeded through the REAL migration-0004 ``auth.users``
+    lifecycle trigger chain instead of a direct ``landlords`` mutation —
+    exercises the actual path a live Supabase soft-delete would take:
+
+    1. ``INSERT INTO auth.users`` (the local shim migration 0004 creates)
+       fires ``on_auth_user_created`` -> provisions the ``landlords`` row.
+    2. ``UPDATE auth.users SET deleted_at = now()`` fires
+       ``on_auth_user_deleted_at_updated`` -> soft-deletes the matching
+       ``landlords`` row.
+
+    Only then is ``GET /v1/me`` called with a JWT for the same ``sub`` —
+    must still be 403 ``account_deleted``, row untouched. Uses the direct
+    path (``db_session`` against the shim ``auth.users`` table) rather than
+    a real GoTrue call since none exists in this harness — cheap because
+    the shim table already exists post-migration and ``db_session`` can
+    reach it directly, same as ``tests/test_migrations_0004.py``.
+    """
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="trigger-seeded@example.com")
+
+    await db_session.execute(
+        text("INSERT INTO auth.users (id, email) VALUES (:id, :email)"),
+        {"id": sub, "email": "trigger-seeded@example.com"},
+    )
+    await db_session.execute(
+        text("UPDATE auth.users SET deleted_at = now() WHERE id = :id"),
+        {"id": sub},
+    )
+    await db_session.commit()
+
+    row_before = (
+        (
+            await db_session.execute(
+                text(
+                    "SELECT email, updated_at, deleted_at FROM landlords WHERE auth_user_id = :uid"
+                ),
+                {"uid": sub},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    assert row_before["email"] == "trigger-seeded@example.com"
+    assert row_before["deleted_at"] is not None, (
+        "precondition: the auth.users trigger chain must have already "
+        "soft-deleted the landlords row before GET /v1/me is ever called"
+    )
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    try:
+        assert response.status_code == 403, response.text
+        body = response.json()
+        assert body["error"]["code"] == "account_deleted"
+        assert body["error"]["message"] == "This account is no longer active."
+        assert "request_id" in body["error"]
+
+        row_after = (
+            (
+                await db_session.execute(
+                    text("SELECT email, updated_at FROM landlords WHERE auth_user_id = :uid"),
+                    {"uid": sub},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row_after["email"] == row_before["email"]
+        assert row_after["updated_at"] == row_before["updated_at"]
+    finally:
+        await db_session.execute(text("DELETE FROM auth.users WHERE id = :id"), {"id": sub})
+        await db_session.commit()
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.unit
+def test_account_deleted_message_shared_with_require_landlord() -> None:
+    """Regression pin: ``routers/me.py`` must import
+    ``app.deps.ACCOUNT_DELETED_MESSAGE`` rather than re-declare its own
+    literal copy, so the two ``account_deleted`` call sites (``GET /v1/me``
+    and ``require_landlord``) can never silently drift apart.
+    """
+    import app.deps as deps_mod
+    import app.routers.me as me_mod
+
+    assert me_mod.ACCOUNT_DELETED_MESSAGE is deps_mod.ACCOUNT_DELETED_MESSAGE
+    assert deps_mod.ACCOUNT_DELETED_MESSAGE == "This account is no longer active."
+
+
 @pytest.mark.unit
 def test_get_me_uses_admin_session_not_request_session() -> None:
     """Regression pin (#22 safety review, BLOCKING item 1): ``GET /v1/me``
