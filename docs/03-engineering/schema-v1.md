@@ -22,6 +22,89 @@
 >    command-channel replies. Deployed migration 0002 shipped the
 >    narrower `CHECK (party IN ('tenant','vendor'))`; 0003 relaxes it to
 >    the version shown below.
+>
+> **v1.2 amendments (2026-07-05)** — migration 0005 implements these (#22),
+> the M2 isolation mechanism referenced by the `landlord_id` conventions
+> note above. Live role facts verified against Supabase during the safety
+> review: `postgres` and `service_role` are NOT superusers but DO hold
+> `rolbypassrls = TRUE`; `authenticated`, `anon`, `authenticator` all have
+> `rolbypassrls = FALSE`.
+> 1. New Postgres role `app_role` (`NOLOGIN`) — created by the migration
+>    with **no password, ever**, followed by a defensive unconditional
+>    `ALTER ROLE app_role NOLOGIN` (guards a stale LOGIN-enabled role of
+>    the same name surviving a re-migration). A human operator sets a
+>    password later, once, directly against the target database
+>    (`ALTER ROLE app_role LOGIN PASSWORD '...'`), only right before the
+>    `APP_DATABASE_URL` Fly secret is set and only BEFORE any tenant data
+>    exists (see `app/db/session.py`'s module docstring for the full
+>    request-engine design this enables). `app/config.py` refuses to boot
+>    at all when `ENVIRONMENT=production` and `APP_DATABASE_URL` is unset —
+>    this step cannot be silently skipped in production.
+> 2. Row-Level Security — `ENABLE ROW LEVEL SECURITY` ONLY (no `FORCE`) on
+>    **every** table in this document except `alembic_version`, one
+>    `FOR ALL TO app_role` policy per table, keyed off
+>    `current_setting('app.current_landlord_id', true)::uuid` (the
+>    `true` is `missing_ok`, so an unset session variable reads back as
+>    SQL `NULL` — zero rows visible, zero rows writable; fail closed):
+>    - Direct `landlord_id` match: `properties`, `vendors`, `tenants`,
+>      `cases`, `messages`, `drafts`, `trust_metrics`, `audit_log`,
+>      `notifications`, `push_tokens`.
+>    - `landlords` itself: keyed on `id`, not `landlord_id` (it has none).
+>    - `message_cases` (no `landlord_id`): `EXISTS` join through
+>      `cases.id = message_cases.case_id`.
+>    - `message_status_events` (no `landlord_id`, v1.1): `EXISTS` join
+>      through `messages.id = message_status_events.message_id`.
+>
+>    **Why no `FORCE`:** `FORCE` only changes whether the TABLE OWNER
+>    (the migrating/admin role) is also subject to RLS — it does nothing
+>    for `app_role`, which was never the owner of anything and is fully
+>    subject to RLS the moment `ENABLE` runs. The owner/admin path is a
+>    DELIBERATE service path: `GET /v1/me`'s provisioning upsert
+>    (`get_admin_session`), the migration-0004 auth trigger, and future
+>    webhook ingestion (#40) all need to write unscoped by any GUC. `FORCE`
+>    would have bound that path to RLS too — a no-op today given
+>    `postgres`/`service_role`'s `rolbypassrls = TRUE`, but fragile: in any
+>    environment where the owner lacked that attribute, `FORCE` would
+>    silently swallow the auth-lifecycle trigger's writes (its own
+>    exception handler treats an RLS violation like any other error and
+>    swallows it, per its "never block sign-up" contract) — a silent
+>    sign-up lockout with no error surfaced anywhere. Dropping `FORCE`
+>    removes this failure class categorically instead of depending on a
+>    role attribute this migration doesn't control.
+> 3. Append-only enforcement (rule #2) actually lands:
+>    `REVOKE UPDATE, DELETE ON messages, audit_log, message_status_events
+>    FROM app_role` — migrations 0002/0003 each documented this as
+>    deferred to #22; this is that closure. `app_role` otherwise gets
+>    ordinary `SELECT/INSERT/UPDATE/DELETE` on every other table, `USAGE`
+>    on schema `public`, and `USAGE` on the two identity-column sequences
+>    (`audit_log.id`, `message_status_events.id`).
+> 4. Belt-and-braces against the Supabase Data API bypass channel, two
+>    layers (both guarded — those PostgREST roles exist only on live
+>    Supabase, silently skipped locally):
+>    - `REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated`
+>      — closes every table that exists right now.
+>    - `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES
+>      FROM anon, authenticated` — closes every table the MIGRATING ROLE
+>      creates in `public` in the future (every later migration runs as
+>      that same role). **Standing note:** this does NOT cover a table in
+>      a different schema, or one created by a different role (e.g. via
+>      Supabase Studio) — any new schema or differently-owned table needs
+>      the same explicit treatment; it is not automatically inherited.
+>    The Data API should ALSO be disabled in the Supabase dashboard — a
+>    human step, not something a migration can reach.
+> 5. LangGraph checkpoint tables (`AsyncPostgresSaver.setup()`, #24) don't
+>    exist yet — they will live in a dedicated schema reached only via the
+>    admin engine, never `app_role`; their isolation lands with the graph
+>    work itself, not with this migration.
+> 6. `alembic_version` carries no RLS (migrations-only); the local-only
+>    `auth.users` shim (migration 0004, #15) is untouched.
+> 7. **Forward note for #40 (Twilio webhook ingestion):** the write path
+>    that persists inbound messages MUST use the admin engine
+>    (`get_admin_session`), never an RLS-scoped session — if landlord/
+>    property resolution fails or races, an RLS-scoped session would
+>    silently reject or misfile the INSERT instead of storing it, exactly
+>    the catastrophic direction never-break rule #1 (the emergency line is
+>    never gated) forbids. See `app/db/session.py`'s module docstring.
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
@@ -309,12 +392,17 @@ CREATE TABLE push_tokens (
   `ALTER ... DROP/ADD CONSTRAINT`, not an enum migration dance.
 - Append-only enforcement is part of the migration, not a convention:
   `REVOKE UPDATE, DELETE ON messages, audit_log, message_status_events
-  FROM <app role>`.
+  FROM <app role>` — implemented by migration 0005 (`app_role`, v1.2
+  amendments above).
 - The undo window is data, not a sleep: dashboard approve sets
   `drafts.scheduled_send_at = now() + 5s` (#44); approve-by-SMS sets
   `now() + 5 minutes` (#122, per `plain-language-rules.md` — SMS has no
   undo bar). Same mechanism either way: the sender only sends rows whose
   time has come and whose status is still `approved`.
-- RLS (#22) keys every policy off `landlord_id` matched to
-  `current_setting('app.current_landlord_id')`.
+- RLS (#22, migration 0005) keys every policy off `landlord_id` (or,
+  where a table has none, an `EXISTS` join to one that does — see the
+  v1.2 amendments above) matched to
+  `current_setting('app.current_landlord_id', true)::uuid`, `TO app_role`.
+  `require_landlord` (`app/deps.py`) is what actually sets that session
+  variable, per request, via `set_config(..., true)`.
 - Money columns are `numeric` cents, never floats.

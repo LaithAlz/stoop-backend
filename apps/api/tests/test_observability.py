@@ -529,7 +529,13 @@ async def test_debug_endpoints_not_registered_in_production(
     so that ``create_app()`` sees ``is_production=True``.  This avoids
     module-reload side-effects while still exercising the gating logic.
     """
-    prod_settings = _make_fresh_settings(environment="production")
+    # app_database_url is required alongside environment="production" since
+    # the #22 boot gate (app/config.py) — otherwise Settings construction
+    # itself raises ValidationError before this test can even get going.
+    prod_settings = _make_fresh_settings(
+        environment="production",
+        app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
+    )
 
     from app.main import create_app
 

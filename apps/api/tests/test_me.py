@@ -730,3 +730,52 @@ async def test_me_existing_landlord_empty_string_email_does_not_overwrite_stored
         )
     finally:
         await _cleanup(db_session, sub)
+
+
+@pytest.mark.unit
+def test_get_me_uses_admin_session_not_request_session() -> None:
+    """Regression pin (#22 safety review, BLOCKING item 1): ``GET /v1/me``
+    MUST depend on ``get_admin_session``, never ``get_session``/
+    ``require_landlord``. Empirically reproduced: under an RLS-scoped
+    session, both the brand-new-row INSERT and the existing-row
+    ``ON CONFLICT DO UPDATE`` upsert are rejected by ``landlords``' own
+    ``WITH CHECK`` policy (a freshly generated ``id`` can never equal a GUC
+    set before that id exists) — provisioning is structurally
+    incompatible with RLS scoping. See ``routers/me.py`` and
+    ``app/db/session.py`` module docstrings for the full rationale.
+
+    Inspects the live dependency wiring (not just the import statement) so
+    a future edit that swaps the ``Depends(...)`` annotation without
+    touching the import fails this test too. ``session`` is typed as
+    ``Annotated[AsyncSession, Depends(...)]`` — the ``Depends`` marker
+    lives in the annotation's metadata, not the parameter's plain
+    ``.default`` (which is ``inspect.Parameter.empty`` for an
+    ``Annotated``-only dependency). ``me.py`` has
+    ``from __future__ import annotations`` (PEP 563), so annotations are
+    strings at definition time — ``eval_str=True`` resolves them back to
+    real objects (``Annotated[...]`` etc.) using the function's own module
+    globals, otherwise ``.annotation`` here would just be a string with no
+    ``__metadata__`` to inspect.
+    """
+    import inspect
+
+    from fastapi.params import Depends
+
+    from app.db.session import get_admin_session, get_session
+    from app.routers.me import get_me
+
+    session_param = inspect.signature(get_me, eval_str=True).parameters["session"]
+    depends_markers = [
+        meta
+        for meta in getattr(session_param.annotation, "__metadata__", ())
+        if isinstance(meta, Depends)
+    ]
+    assert len(depends_markers) == 1, (
+        f"expected exactly one Depends(...) marker on `session`, found {depends_markers!r}"
+    )
+    dependency = depends_markers[0].dependency
+
+    assert dependency is get_admin_session, (
+        f"GET /v1/me's session dependency must be get_admin_session, got {dependency!r}"
+    )
+    assert dependency is not get_session

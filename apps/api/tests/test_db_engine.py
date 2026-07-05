@@ -108,6 +108,46 @@ def test_app_engine_connect_args_have_unique_name_func() -> None:
 
 
 @pytest.mark.unit
+def test_request_engine_falls_back_to_admin_engine_when_app_database_url_unset() -> None:
+    """When ``settings.app_database_url`` is unset (the test env's default —
+    see ``tests/conftest.py``'s placeholder env, which never sets
+    ``APP_DATABASE_URL``), request-path sessions must fall back to the
+    admin engine/session factory rather than silently having no request
+    engine at all (#22)."""
+    assert db_mod.request_engine is db_mod.engine
+    assert db_mod.RequestSessionFactory is db_mod.AsyncSessionFactory
+
+
+@pytest.mark.unit
+def test_get_session_uses_request_session_factory() -> None:
+    """``get_session`` must be wired to ``RequestSessionFactory`` (not a
+    hardcoded reference to ``AsyncSessionFactory``) so that setting
+    ``APP_DATABASE_URL`` in production actually changes what ``get_session``
+    yields, without touching ``get_session`` itself."""
+    import inspect
+
+    source = inspect.getsource(db_mod.get_session)
+    assert "RequestSessionFactory" in source
+    assert "AsyncSessionFactory()" not in source
+
+
+@pytest.mark.unit
+def test_get_admin_session_uses_admin_session_factory_always() -> None:
+    """``get_admin_session`` (#22 safety review, BLOCKING item 1) must be
+    wired to ``AsyncSessionFactory`` (the admin engine) — ALWAYS,
+    regardless of ``APP_DATABASE_URL`` — never ``RequestSessionFactory``.
+    ``GET /v1/me``'s provisioning upsert (``routers/me.py``) depends on
+    this: it must keep bypassing RLS even after the production operator
+    step flips ``RequestSessionFactory`` over to a dedicated ``app_role``
+    engine."""
+    import inspect
+
+    source = inspect.getsource(db_mod.get_admin_session)
+    assert "AsyncSessionFactory" in source
+    assert "RequestSessionFactory" not in source
+
+
+@pytest.mark.unit
 def test_pooler_connect_args_constant_pinned() -> None:
     """``_ASYNCPG_POOLER_CONNECT_ARGS`` — the constant reused by the app
     engine — must keep exactly the three pooler-compat keys.
