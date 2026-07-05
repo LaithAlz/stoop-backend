@@ -487,6 +487,14 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         "app/agent/nodes/identify_property.py",
         "app/agent/nodes/load_context.py",
         "app/agent/nodes/identify_case.py",
+        # #31/#32/#33: same background/graph context, same pre-identity
+        # rationale as the #30/#110 nodes above — classify_intent/
+        # classify_severity/draft_response each open their own admin
+        # session to read the message row and (severity/draft) write their
+        # audit_log/drafts rows.
+        "app/agent/nodes/classify_intent.py",
+        "app/agent/nodes/classify_severity.py",
+        "app/agent/nodes/draft_response.py",
         # #110: sweep_cases() (the time-driven case-lifecycle sweep) is a
         # future scheduled-job entrypoint with the same pre-identity
         # rationale — see its own docstring "The scheduler seam".
