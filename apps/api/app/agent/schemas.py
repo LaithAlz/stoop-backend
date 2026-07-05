@@ -16,6 +16,7 @@ Design rules:
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -236,6 +237,18 @@ class CaseContext(BaseModel):
 
     ``vulnerable_occupant`` comes from ``tenants.vulnerable_occupant`` and
     triggers the VULNERABLE-OCCUPANT MODIFIER in ``classify_severity``.
+
+    Fields added for #30 (``load_context``) — every one is a verbatim
+    projection of a schema-v1.md column/jsonb blob, never re-shaped:
+
+    ``quiet_hours`` / ``heating_season`` / ``backup_contact`` — the
+    ``properties`` jsonb columns of the same name (``quiet_hours``/
+    ``heating_season`` carry NOT NULL defaults at the DB level; ``None``
+    here just means "not loaded yet", not "the property has none").
+
+    ``voice_profile`` — ``landlords.voice_profile`` (nullable jsonb:
+    ``{tone: text, samples: text[]}``), injected into ``draft_response``'s
+    prompt so replies sound like the landlord, not a generic bot.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -246,6 +259,10 @@ class CaseContext(BaseModel):
     landlord_id: UUID | None = None
     house_rules: str | None = None
     vulnerable_occupant: VulnerableOccupant | None = None
+    quiet_hours: dict[str, Any] | None = None
+    heating_season: dict[str, Any] | None = None
+    backup_contact: dict[str, Any] | None = None
+    voice_profile: dict[str, Any] | None = None
 
 
 class ChannelMessage(BaseModel):
@@ -267,3 +284,33 @@ class ChannelMessage(BaseModel):
     role: str = Field(pattern=r"^(user|assistant)$")
     body: str
     timestamp: str
+
+
+class OpenCaseSummary(BaseModel):
+    """A lightweight summary of one of the tenant's OPEN cases (#30/#110).
+
+    Not a DB model — a read-side projection of a ``cases`` row extracted by
+    ``load_context`` for ``identify_case``'s routing decision (conversation-
+    model.md's ambiguity rule needs to know how many open cases exist and
+    which is most recently active) and for the future ``classify_intent``/
+    ``classify_severity`` prompts (so the model can see what's already
+    open before deciding whether a message continues one of them).
+
+    "Open" here means any ``cases.status`` conversation-model.md treats as
+    still active work: ``open``, ``awaiting_approval``, ``awaiting_tenant``,
+    ``reopened`` — it deliberately EXCLUDES ``resolved`` (resolved cases are
+    matched, if at all, via the separate reopen-window logic in
+    ``app/agent/case_lifecycle.py``, not via this list).
+
+    ``last_activity_at`` is an ISO-8601 UTC string, same convention as
+    ``ChannelMessage.timestamp``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    case_id: UUID
+    status: str
+    severity: str | None = None
+    intent: str | None = None
+    title: str | None = None
+    last_activity_at: str
