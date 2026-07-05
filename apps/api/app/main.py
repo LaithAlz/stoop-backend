@@ -15,7 +15,7 @@ import structlog.contextvars
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 
-from app.agent.checkpointer import setup_checkpointer
+from app.agent.checkpointer import close_checkpointer, setup_checkpointer
 from app.config import settings
 from app.db.session import verify_request_engine_role_separation
 from app.errors import AppError
@@ -54,6 +54,9 @@ async def _lifespan(_app: fastapi.FastAPI) -> AsyncIterator[None]:
     await verify_request_engine_role_separation()
     await setup_checkpointer()
     yield
+    # Shutdown symmetry: close the checkpointer's dedicated psycopg pool so
+    # a graceful stop doesn't abandon open sockets/worker tasks.
+    await close_checkpointer()
 
 
 def _auth_error_handler(_request: Request, exc: AuthError) -> JSONResponse:

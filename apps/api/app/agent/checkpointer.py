@@ -220,8 +220,29 @@ async def setup_checkpointer() -> None:
     log.info("checkpointer_setup_complete", schema=LANGGRAPH_SCHEMA)
 
 
+async def close_checkpointer() -> None:
+    """Close the checkpointer pool and forget it (shutdown symmetry).
+
+    Called after ``yield`` in the app lifespan. Also the seam
+    ``tests/conftest.py``'s autouse reset uses between tests: the pool (and
+    psycopg_pool's internal ``asyncio.Lock`` + background worker tasks) are
+    bound to the event loop that opened them, and this repo runs one event
+    loop PER TEST — a module-global pool surviving across tests is exactly
+    the cross-loop singleton shape that caused the #141 flaky-401 incident.
+    Idempotent; safe to call when the pool was never opened.
+    """
+    global _pool
+    if _pool is not None:
+        try:
+            await _pool.close()
+        except Exception:  # pragma: no cover - close is best-effort
+            log.warning("checkpointer_pool_close_failed")
+        _pool = None
+
+
 __all__: list[str] = [
     "LANGGRAPH_SCHEMA",
+    "close_checkpointer",
     "get_checkpointer",
     "setup_checkpointer",
 ]
