@@ -13,6 +13,7 @@ from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.errors import AppError
 from app.integrations.supabase_auth import AuthError
 from app.middleware.request_id import RequestIDMiddleware
 from app.observability import configure_logging, init_sentry
@@ -47,6 +48,26 @@ def _auth_error_handler(_request: Request, exc: AuthError) -> JSONResponse:
     )
 
 
+def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
+    """Convert an ``AppError`` into its declared status code + the standard envelope.
+
+    Same envelope shape and ``request_id`` sourcing as ``_auth_error_handler``,
+    but for business-rule (non-auth) failures that need a status other than
+    401 — e.g. 403 ``email_required`` on ``GET /v1/me``.
+    """
+    request_id: str | None = structlog.contextvars.get_contextvars().get("request_id")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "request_id": request_id,
+            }
+        },
+    )
+
+
 def create_app() -> fastapi.FastAPI:
     """App factory — returns a fully configured FastAPI application.
 
@@ -59,6 +80,7 @@ def create_app() -> fastapi.FastAPI:
       2. init_sentry()        — no-op unless SENTRY_DSN is set
       3. add RequestIDMiddleware
       4. register AuthError exception handler (401 → standard envelope)
+      4b. register AppError exception handler (status_code → standard envelope)
       5. include health router (always)
       6. include auth-test router (always — for manual JWT verification)
       7. include debug router (non-production only)
@@ -79,6 +101,13 @@ def create_app() -> fastapi.FastAPI:
     application.add_exception_handler(
         AuthError,
         _auth_error_handler,  # type: ignore[arg-type]
+    )
+
+    # Register the AppError handler so any router can raise AppError with an
+    # arbitrary status code and get the standard envelope without boilerplate.
+    application.add_exception_handler(
+        AppError,
+        _app_error_handler,  # type: ignore[arg-type]
     )
 
     application.include_router(health.router)

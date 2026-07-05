@@ -34,6 +34,24 @@ PII / logging discipline
 ------------------------
 ``auth_user_id`` (a UUID) is bound to the structlog context for correlation.
 Email and full_name are never logged — never-break rule #5.
+
+Email-required guard (issue #135 part 2)
+-----------------------------------------
+``landlords.email`` is ``NOT NULL`` (schema-v1.md) but the JWT ``email``
+claim is optional (``AuthUser.email: str | None`` — e.g. a phone-only
+Supabase signup, or an existing landlord whose token loses the claim).
+GoTrue also has no ``omitempty`` on that claim, so a real phone-only signup
+emits ``"email": ""`` (present, empty) rather than an absent claim;
+``supabase_auth.verify_jwt`` normalizes that (and whitespace-only / non-
+string values) to ``None`` at the verification boundary, and this handler's
+``if not user.email`` check is belt-and-suspenders on top of it. Before any
+DB call, a verified identity with no usable email is rejected with a 403
+``email_required`` via the standard error envelope (``app.errors.
+AppError``) — fail-closed, nothing is written, and the ``landlords.email``
+NOT-NULL invariant is preserved instead of surfacing as a 500
+``NotNullViolation`` or (worse) silently overwriting an existing landlord's
+real email with an empty string via the ``ON CONFLICT ... SET email =
+EXCLUDED.email`` upsert.
 """
 
 from __future__ import annotations
@@ -51,6 +69,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
 from app.deps import require_user
+from app.errors import AppError
 from app.integrations.supabase_auth import AuthUser
 
 log = structlog.get_logger(__name__)
@@ -117,10 +136,33 @@ async def get_me(
 
     Returns 200 regardless of whether the row was just created or already
     existed — the caller always receives a profile, never a 201 redirect.
+
+    Raises
+    ------
+    AppError
+        403 ``email_required`` if the verified identity has no ``email``
+        claim — checked BEFORE any DB call (see module docstring). Applies
+        equally to a brand-new phone-only signup and to an existing
+        landlord row whose current token has lost the email claim.
     """
     # Bind the UUID to the structlog context so downstream log lines are
     # correlated.  We log the UUID only — never email, full_name, or the token.
     structlog.contextvars.bind_contextvars(auth_user_id=str(user.user_id))
+
+    if not user.email:
+        # Fail-closed, before any DB call: `landlords.email` is NOT NULL but
+        # this verified token carries no usable email claim (phone-only
+        # signup, or an existing landlord whose token lost the claim).
+        # `verify_jwt` already normalizes empty/whitespace/non-string email
+        # claims to None (issue #135 safety review); `not user.email` here
+        # is belt-and-suspenders against that normalization, not a
+        # substitute for it. Nothing is written; the message is generic and
+        # contains no token material.
+        raise AppError(
+            403,
+            "email_required",
+            "An email address is required to use the dashboard.",
+        )
 
     result = await session.execute(
         _UPSERT_SQL,

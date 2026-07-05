@@ -32,6 +32,9 @@
   "price_cohort": "early_access", "subscription_tier": "free",
   "subscription_status": "none", "created_at": "…" }
 ```
+- 403 `email_required` if the verified token has no `email` claim
+  (phone-only signup case) — checked before any write; fail-closed.
+
 `PATCH /v1/me` — body: any of `full_name`, `phone`, `timezone`,
 `voice_profile`. Emergency notifications are not a settable preference.
 

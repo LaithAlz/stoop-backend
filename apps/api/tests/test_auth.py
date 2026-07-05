@@ -158,7 +158,7 @@ def _mint_token(
     iss: str = _ISSUER,
     aud: str = "authenticated",
     role: str = "authenticated",
-    email: str = "alice@example.com",
+    email: str | int = "alice@example.com",
     full_name: str | None = "Alice Landlord",
     exp_offset: int | None = 3600,
 ) -> str:
@@ -265,6 +265,77 @@ async def test_valid_token_without_user_metadata_yields_none_full_name(
 
     assert user.full_name is None
     assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+
+
+# ---------------------------------------------------------------------------
+# Test 1b — email claim normalization (issue #135 safety review)
+#
+# GoTrue serializes the JWT `email` claim from a Go string with no
+# `omitempty`, so a real phone-only signup emits `"email": ""` (present,
+# empty) rather than omitting the claim entirely. `verify_jwt` must
+# normalize an empty, whitespace-only, or non-string `email` claim to
+# `None` at the verification boundary so every caller of `AuthUser.email`
+# gets one consistent "no email" signal — a bare `.get("email")` would let
+# `""` sail past an `is None` check downstream (e.g. GET /v1/me's guard).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_empty_string_email_claim_normalizes_to_none(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+) -> None:
+    """A present-but-empty ``"email": ""`` claim must normalize to None."""
+    token = _mint_token(private_key, email="")
+
+    async with _make_jwks_router(jwks_payload):
+        user = await verify_jwt(token)
+
+    assert user.email is None
+
+
+@pytest.mark.unit
+async def test_whitespace_only_email_claim_normalizes_to_none(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+) -> None:
+    """A whitespace-only ``"email": "   "`` claim must normalize to None."""
+    token = _mint_token(private_key, email="   ")
+
+    async with _make_jwks_router(jwks_payload):
+        user = await verify_jwt(token)
+
+    assert user.email is None
+
+
+@pytest.mark.unit
+async def test_non_string_email_claim_normalizes_to_none(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+) -> None:
+    """A malformed/junk (non-string) ``email`` claim must normalize to None
+    rather than propagating a non-string value into ``AuthUser.email``."""
+    token = _mint_token(private_key, email=12345)
+
+    async with _make_jwks_router(jwks_payload):
+        user = await verify_jwt(token)
+
+    assert user.email is None
+
+
+@pytest.mark.unit
+async def test_real_email_claim_passes_through_unchanged(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+) -> None:
+    """A real, non-empty email claim must still pass through untouched —
+    the normalization above must not alter a legitimate email address."""
+    token = _mint_token(private_key, email="real.landlord@example.com")
+
+    async with _make_jwks_router(jwks_payload):
+        user = await verify_jwt(token)
+
+    assert user.email == "real.landlord@example.com"
 
 
 # ---------------------------------------------------------------------------
