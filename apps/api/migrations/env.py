@@ -7,6 +7,17 @@ Key design decisions:
 - ``target_metadata = None`` until ORM models exist (Phase 1 has none).
   Update this once models land (#9+).
 - We run in async mode using ``AsyncEngine`` + ``run_sync`` per Alembic docs.
+- Supavisor transaction-mode pooler (Supabase port 6543) compatibility: the
+  online-migration engine passes the same ``connect_args`` as the app engine
+  (``app/db/session.py``) — see that module's docstring for the full
+  rationale. Short version: Supavisor's transaction mode shares physical
+  server connections across client sessions, and asyncpg's default
+  sequential prepared-statement names collide across sessions sharing a
+  backend (``DuplicatePreparedStatementError``). Disabling the dialect's
+  statement cache and generating a UUID-based name per prepared statement
+  makes every statement single-use and collision-free. This is harmless
+  against a direct/local Postgres connection (e.g. docker-compose, port
+  5432) — it only forgoes a cache and randomises statement names.
 """
 
 from __future__ import annotations
@@ -16,6 +27,7 @@ import re
 import sys
 from logging.config import fileConfig
 from pathlib import Path
+from uuid import uuid4
 
 from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -85,6 +97,61 @@ def get_url() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Supavisor / PgBouncer transaction-mode pooler compatibility.
+#
+# Why: Supabase's connection pooler (Supavisor, port 6543, "transaction"
+# mode) shares a small set of physical server connections across many client
+# sessions, handing the same logical connection a *different* physical
+# backend between transactions. asyncpg's SQLAlchemy dialect by default
+# caches prepared statements per DBAPI connection and names them
+# sequentially, so two sessions sharing a backend can independently reach
+# the same generated name, raising
+# ``asyncpg.exceptions.DuplicatePreparedStatementError``. Setting
+# ``prepared_statement_cache_size=0`` makes every ``PREPARE`` a single,
+# throwaway statement, and ``prepared_statement_name_func`` gives each one a
+# globally-unique (uuid4-based) name — collision-free even when Supavisor
+# routes two sessions to the same backend. This is the recipe documented in
+# the installed SQLAlchemy version's asyncpg dialect docstring
+# (``sqlalchemy/dialects/postgresql/asyncpg.py``, "Prepared Statement Cache"
+# and "Prepared Statement Name with PGBouncer" sections — the SQLAlchemy
+# dialect's own kwarg is ``prepared_statement_cache_size``, not
+# ``statement_cache_size``).
+#
+# A THIRD, separate knob is also required: plain ``statement_cache_size=0``
+# (no ``prepared_`` prefix) is asyncpg's OWN driver-level cache (forwarded
+# verbatim to ``asyncpg.connect()``), distinct from the SQLAlchemy dialect's
+# cache above. Confirmed necessary by live testing against the real pooler:
+# with only the two SQLAlchemy-level knobs, ``pool_pre_ping``-style pings
+# (``connection.fetchrow(";")``, asyncpg's raw convenience method) still
+# collided, since they bypass the dialect's ``_prepare()`` and use asyncpg's
+# own cache/auto-naming. This module doesn't set ``pool_pre_ping`` itself,
+# but disabling this here too keeps the two engines' pooler-compat config
+# identical and covers any asyncpg-internal calls Alembic itself may trigger.
+#
+# Duplicated here (rather than imported from ``app.db.session``) so Alembic
+# keeps working in migration-only contexts where ``app.config.settings``
+# cannot be constructed (see ``get_url()`` above) — this module must not
+# require the full app settings to import.
+#
+# Harmless against a direct/local Postgres connection (e.g. docker-compose,
+# port 5432): it only disables opportunistic performance caches and
+# randomises statement names; correctness is unaffected either way.
+# ---------------------------------------------------------------------------
+
+
+def _asyncpg_prepared_statement_name() -> str:
+    """Generate a globally-unique prepared-statement name for every PREPARE."""
+    return f"__asyncpg_{uuid4()}__"
+
+
+_ASYNCPG_POOLER_CONNECT_ARGS: dict[str, object] = {
+    "prepared_statement_cache_size": 0,
+    "prepared_statement_name_func": _asyncpg_prepared_statement_name,
+    "statement_cache_size": 0,
+}
+
+
+# ---------------------------------------------------------------------------
 # Offline migration (generate SQL without a live DB connection).
 # ---------------------------------------------------------------------------
 
@@ -109,7 +176,14 @@ def run_migrations_offline() -> None:
 
 async def run_async_migrations() -> None:
     """Create an async engine and run migrations inside a connection."""
-    connectable = create_async_engine(get_url(), echo=False)
+    connectable = create_async_engine(
+        get_url(),
+        echo=False,
+        # Supavisor/PgBouncer transaction-mode pooler compatibility — see
+        # the module docstring and the comment above
+        # ``_ASYNCPG_POOLER_CONNECT_ARGS``.
+        connect_args=_ASYNCPG_POOLER_CONNECT_ARGS,
+    )
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
