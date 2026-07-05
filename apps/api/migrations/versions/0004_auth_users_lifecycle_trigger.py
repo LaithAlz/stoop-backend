@@ -138,20 +138,26 @@ is the function body itself:
   it regardless of when ``PUBLIC`` is revoked).
 
 Issue #15's acceptance criterion ("function owned by a role that can
-write ``landlords`` but is not the app's request role") is still
-satisfied: the app's request role is -- and will remain, once RLS lands
-(#22) -- the ``authenticated``/``app_role`` request-scoped role the API
-connects as for ordinary traffic, categorically different from and far
-more restricted than the migration-running admin role. The migrating
-role was never "the app's request role" in the sense #15 means; it is
-Supabase's own project-admin role, used only for schema changes.
+write ``landlords`` but is not the app's request role") is **not
+currently satisfied, and is deliberately deferred to #22** rather than
+claimed here: today, the API itself connects to Postgres as the same
+role that owns these functions (``postgres`` on live Supabase; there is
+no separate ``app_role``/``authenticated`` Postgres login role yet --
+that request-scoped role is created by #22's RLS work, not by anything
+that exists today). Calling the criterion "satisfied" before that role
+exists would be describing a future state as a present fact. This is a
+platform-forced tradeoff, not a design choice: sections 1-3 above are why
+the originally-intended dedicated-role design (which *would* have
+satisfied this criterion today) is impossible on Supabase as currently
+provisioned.
 
 Least-privilege function ownership (a dedicated role narrower than the
-full migrating-role admin surface) is **deferred to #22**, where the
-complete role model (``app_role``/``authenticated``, RLS policies, and
-whatever grants a ``SECURITY DEFINER`` trigger function can safely take
-on) gets designed against these now-known platform constraints, instead
-of guessed at here and broken again on the next live dry-run.
+full migrating-role admin surface, satisfying #15's criterion for real)
+is **deferred to #22**, where the complete role model
+(``app_role``/``authenticated``, RLS policies, and whatever grants a
+``SECURITY DEFINER`` trigger function can safely take on) gets designed
+against these now-known platform constraints, instead of guessed at here
+and broken again on the next live dry-run.
 
 EXCEPTION SAFETY -- never block sign-up/update/delete
 ----------------------------------------------------------

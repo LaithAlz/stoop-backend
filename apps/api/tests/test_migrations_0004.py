@@ -23,14 +23,22 @@ real Supabase ``auth`` schema, so migration 0004 creates the guarded shim):
    the correct auth_user_id/email/full_name.
 3. Idempotency: a landlords row that already exists for an auth_user_id
    (e.g. seeded by the lazy ``GET /v1/me`` upsert) is updated, not
-   duplicated, when the matching auth.users INSERT trigger fires; and a
-   same-value UPDATE fired twice does not error or duplicate.
+   duplicated, when the matching auth.users INSERT trigger fires; and two
+   *different*-value email updates fired back-to-back apply cleanly, with
+   no duplicate row (an earlier version of this test fired the SAME value
+   twice, which is dead weight under the WHEN guard below -- see #5).
 4. INSERT with a blank/whitespace email -> no landlords row (the #161-style
    edge case; landlords.email stays NOT NULL).
 5. UPDATE OF email -> propagates to the matching landlords row; a same
    -value UPDATE (no actual change) never fires the trigger at all (the
-   ``WHEN (NEW.email IS DISTINCT FROM OLD.email)`` guard) -- proven via an
-   unchanged ``updated_at``, not just "still correct".
+   ``WHEN (NEW.email IS DISTINCT FROM OLD.email)`` guard) -- proven via a
+   divergence lever (a manually-set sentinel value on ``landlords.email``
+   survives untouched only if the trigger is genuinely suppressed; if it
+   fired, it would clobber the sentinel back), NOT via an ``updated_at``
+   timestamp comparison: within one transaction, ``now()`` is
+   ``transaction_timestamp()``, frozen for the whole transaction, so that
+   comparison is a tautology (verified empirically -- see the test's own
+   docstring for the mutation-testing evidence).
 6. UPDATE OF email to '' -> landlords.email is left unchanged (documented
    choice, never overwrite with blank).
 7. DELETE FROM auth.users -> landlords.deleted_at is set, row still present
@@ -510,25 +518,38 @@ async def test_insert_is_idempotent_against_a_preexisting_landlord_row(
 
 
 @pytest.mark.integration
-async def test_repeated_same_value_email_update_is_idempotent(conn: AsyncConnection) -> None:
-    """Firing the email-update trigger twice with the same value must not
-    error and must not duplicate rows."""
+async def test_repeated_different_value_email_updates_apply_cleanly(
+    conn: AsyncConnection,
+) -> None:
+    """Firing the email-update trigger twice in a row, each with a
+    genuinely different value, must apply cleanly each time -- no error,
+    no duplicate landlords row, final state reflects the last update.
+
+    (An earlier version of this test fired the SAME value twice. Under the
+    `WHEN (NEW.email IS DISTINCT FROM OLD.email)` guard the trigger never
+    fires at all for a same-value UPDATE, which made that version dead
+    weight -- it passed whether or not the underlying UPDATE logic was
+    even reachable. See
+    `test_update_email_to_same_value_does_not_refire_trigger` for the
+    guard's own behavior; this test instead exercises genuinely repeated
+    *firing* of the trigger.)
+    """
     user_id = str(uuid.uuid4())
     await _insert_auth_user(conn, user_id=user_id, email="stable@example.com")
 
     await conn.execute(
         text("UPDATE auth.users SET email = :email WHERE id = :id"),
-        {"email": "stable@example.com", "id": user_id},
+        {"email": "first-change@example.com", "id": user_id},
     )
     await conn.execute(
         text("UPDATE auth.users SET email = :email WHERE id = :id"),
-        {"email": "stable@example.com", "id": user_id},
+        {"email": "second-change@example.com", "id": user_id},
     )
 
     assert await _count_landlords(conn, user_id) == 1
     row = await _get_landlord(conn, user_id)
     assert row is not None
-    assert row["email"] == "stable@example.com"
+    assert row["email"] == "second-change@example.com"
 
 
 @pytest.mark.integration
@@ -567,32 +588,53 @@ async def test_update_email_propagates_to_landlord(conn: AsyncConnection) -> Non
 
 
 @pytest.mark.integration
-async def test_update_email_to_same_value_does_not_bump_updated_at(
+async def test_update_email_to_same_value_does_not_refire_trigger(
     conn: AsyncConnection,
 ) -> None:
     """Setting auth.users.email to its CURRENT value must not fire the
     trigger at all -- the `WHEN (NEW.email IS DISTINCT FROM OLD.email)`
     guard (mirroring the deleted_at trigger's precise guard, added per
-    safety-review advisory) means a no-op assignment never bumps
-    landlords.updated_at. `UPDATE OF email` alone (without a WHEN clause)
-    would fire on any UPDATE that lists the email column, whether or not
-    the value actually changed."""
+    safety-review advisory). `UPDATE OF email` alone (without a WHEN
+    clause) would fire on any UPDATE that lists the email column, whether
+    or not the value actually changed.
+
+    Divergence-lever design (NOT a timestamp comparison -- see below for
+    why): after inserting with email "stable@example.com", we directly
+    `UPDATE landlords SET email = 'divergent@example.com'` -- bypassing
+    the trigger entirely, so `landlords.email` and `auth.users.email` now
+    deliberately disagree. We then fire a same-value UPDATE on
+    `auth.users.email` (still "stable@example.com", i.e. no actual change
+    from auth.users' point of view). If the WHEN guard correctly suppresses
+    the trigger, the sentinel value survives untouched. If the guard were
+    missing (or broken), the trigger WOULD fire and its `UPDATE
+    public.landlords SET email = v_email ... WHERE auth_user_id = ...`
+    would clobber the sentinel back to "stable@example.com" -- a real,
+    directly observable behavioral difference either way.
+
+    Why not compare `updated_at` before/after instead (as an earlier
+    version of this test did): within a single Postgres transaction,
+    `now()` is `transaction_timestamp()`, which is **frozen for the entire
+    transaction** -- every call returns the exact same value, regardless of
+    real wall-clock time elapsed (a `pg_sleep()` between calls does not
+    change this). Since every statement in this test runs inside one
+    transaction (the `conn` fixture, rolled back at teardown), comparing
+    `landlords.updated_at` before and after the same-value UPDATE is a
+    tautology: it is byte-identical whether or not the trigger fired,
+    because `updated_at = now()` inside the trigger body would produce the
+    same frozen timestamp as the original INSERT. This was verified
+    empirically: with the WHEN guard temporarily removed, the old
+    timestamp-based version of this test stayed green.
+    """
     user_id = str(uuid.uuid4())
     await _insert_auth_user(conn, user_id=user_id, email="stable@example.com")
 
-    async def _updated_at() -> object:
-        result = await conn.execute(
-            text("SELECT updated_at FROM landlords WHERE auth_user_id = :auth_user_id"),
-            {"auth_user_id": user_id},
-        )
-        return result.scalar_one()
-
-    before_updated_at = await _updated_at()
-
-    # A measurable gap: if the WHEN guard failed to suppress the trigger,
-    # `updated_at = now()` inside the function body would produce a
-    # strictly later timestamp than `before_updated_at`.
-    await conn.execute(text("SELECT pg_sleep(0.05)"))
+    await conn.execute(
+        text(
+            "UPDATE landlords SET email = 'divergent@example.com' "
+            "WHERE auth_user_id = :auth_user_id"
+        ),
+        {"auth_user_id": user_id},
+    )
 
     await conn.execute(
         text("UPDATE auth.users SET email = :email WHERE id = :id"),
@@ -601,13 +643,12 @@ async def test_update_email_to_same_value_does_not_bump_updated_at(
 
     row = await _get_landlord(conn, user_id)
     assert row is not None
-    assert row["email"] == "stable@example.com"
-
-    after_updated_at = await _updated_at()
-    assert after_updated_at == before_updated_at, (
-        "updated_at changed after a same-value email UPDATE -- the WHEN "
-        "(NEW.email IS DISTINCT FROM OLD.email) guard should have "
-        "prevented the trigger from firing at all"
+    assert row["email"] == "divergent@example.com", (
+        "landlords.email was overwritten -- the WHEN (NEW.email IS "
+        "DISTINCT FROM OLD.email) guard should have suppressed the "
+        "trigger entirely for a same-value auth.users.email UPDATE; had "
+        "it fired, it would have clobbered this sentinel value back to "
+        "'stable@example.com'"
     )
 
 
