@@ -209,6 +209,97 @@ def test_severity_result_coercion_still_validates_enum_membership() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SeverityResult single-key wrapper unwrapping (paid eval gate finding,
+# 2026-07-05: the model sometimes nests the payload under an extra key --
+# observed live: {"severity_result": {...}} and {"severity_input": {...}})
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_severity_result_unwraps_severity_result_wrapper_key() -> None:
+    """Observed live wrapper shape #1: {"severity_result": {...}}."""
+    result = SeverityResult.model_validate(
+        {
+            "severity_result": {
+                "severity": "EMERGENCY",
+                "rules_fired": ["Gas smell"],
+                "refusal_flags": [],
+                "reasoning": "Gas smell reported; tenant told to leave and call 911 from outside.",
+            }
+        }
+    )
+    assert result.severity == Severity.EMERGENCY
+    assert result.rules_fired == ["Gas smell"]
+    # The wrapper unwrap AND the str -> list coercion both fired here --
+    # they compose (model-level unwrap runs before field-level coercion).
+    assert result.reasoning == [
+        "Gas smell reported; tenant told to leave and call 911 from outside."
+    ]
+
+
+@pytest.mark.unit
+def test_severity_result_unwraps_severity_input_wrapper_key() -> None:
+    """Observed live wrapper shape #2: {"severity_input": {...}}."""
+    result = SeverityResult.model_validate(
+        {
+            "severity_input": {
+                "severity": "ROUTINE",
+                "rules_fired": [],
+                "refusal_flags": ["legal_rent_ltb"],
+                "reasoning": ["Tenant asked about rent receipts."],
+            }
+        }
+    )
+    assert result.severity == Severity.ROUTINE
+    assert result.refusal_flags == [RefusalFlag.legal_rent_ltb]
+
+
+@pytest.mark.unit
+def test_severity_result_flat_payload_untouched_by_unwrap() -> None:
+    """A correct, already-flat payload -- including one where only a
+    SINGLE field is set (the tricky edge case: a single-key dict whose one
+    key IS a real field name) -- must never be treated as a wrapper."""
+    result = SeverityResult.model_validate({"severity": "ROUTINE"})
+    assert result.severity == Severity.ROUTINE
+    assert result.rules_fired == []
+    assert result.refusal_flags == []
+    assert result.reasoning == []
+
+
+@pytest.mark.unit
+def test_severity_result_nonsense_single_key_dict_still_fails() -> None:
+    """A single-key dict whose inner dict has NO recognized field names is
+    a genuinely wrong payload -- it must NOT be unwrapped, and must still
+    fail validation loudly (never silently "rescued")."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate({"some_random_key": {"totally": "unrelated", "data": 1}})
+
+
+@pytest.mark.unit
+def test_severity_result_single_key_dict_with_non_dict_value_not_unwrapped() -> None:
+    """A single-key dict whose value is NOT a dict at all (e.g. a bare
+    string) must not be treated as a wrapper either."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate({"severity_result": "EMERGENCY"})
+
+
+@pytest.mark.unit
+def test_severity_result_wrapper_plus_bare_string_reasoning_compose() -> None:
+    """Both robustness layers fire together: the payload is wrapped AND
+    its inner ``reasoning`` is a bare string -- both must be corrected."""
+    result = SeverityResult.model_validate(
+        {
+            "severity_result": {
+                "severity": "ROUTINE",
+                "reasoning": "Tenant references a past dispute; flagged for landlord review.",
+            }
+        }
+    )
+    assert result.severity == Severity.ROUTINE
+    assert result.reasoning == ["Tenant references a past dispute; flagged for landlord review."]
+
+
+# ---------------------------------------------------------------------------
 # IntentResult round-trip + validation
 # ---------------------------------------------------------------------------
 
@@ -251,6 +342,29 @@ def test_intent_result_summary_unbounded_but_nonempty() -> None:
         IntentResult(intent=Intent.other, is_new_issue=True, summary="")
 
 
+@pytest.mark.unit
+def test_intent_result_unwraps_wrapper_key() -> None:
+    """IntentResult mirrors SeverityResult's wrapper-unwrap defensively --
+    see that class's docstring "Robustness"."""
+    result = IntentResult.model_validate(
+        {
+            "intent_result": {
+                "intent": "admin",
+                "is_new_issue": True,
+                "summary": "Rent receipts for March to May",
+            }
+        }
+    )
+    assert result.intent == Intent.admin
+    assert result.summary == "Rent receipts for March to May"
+
+
+@pytest.mark.unit
+def test_intent_result_nonsense_single_key_dict_still_fails() -> None:
+    with pytest.raises(ValidationError):
+        IntentResult.model_validate({"some_key": {"unrelated": "data"}})
+
+
 # ---------------------------------------------------------------------------
 # DraftResult round-trip + validation
 # ---------------------------------------------------------------------------
@@ -283,6 +397,22 @@ def test_draft_result_rejects_empty_body() -> None:
     """DraftResult body must not be empty (min_length=1)."""
     with pytest.raises(ValidationError):
         DraftResult(body="")
+
+
+@pytest.mark.unit
+def test_draft_result_unwraps_wrapper_key() -> None:
+    """DraftResult mirrors SeverityResult's wrapper-unwrap defensively --
+    see that class's docstring "Robustness"."""
+    result = DraftResult.model_validate(
+        {"draft_result": {"body": "Thanks for letting me know, I'll follow up soon."}}
+    )
+    assert result.body == "Thanks for letting me know, I'll follow up soon."
+
+
+@pytest.mark.unit
+def test_draft_result_nonsense_single_key_dict_still_fails() -> None:
+    with pytest.raises(ValidationError):
+        DraftResult.model_validate({"some_key": {"unrelated": "data"}})
 
 
 @pytest.mark.unit

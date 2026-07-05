@@ -19,7 +19,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -99,6 +99,54 @@ class Intent(StrEnum):
 # ---------------------------------------------------------------------------
 
 
+def _unwrap_single_key_wrapper(data: object, known_fields: set[str]) -> object:
+    """Shared logic behind ``SeverityResult``/``IntentResult``/
+    ``DraftResult``'s model-level "unwrap a single-key wrapper dict"
+    before-validator.
+
+    Paid eval gate finding, 2026-07-05: the model sometimes nests its tool
+    input under an extra wrapper key instead of returning the flat shape
+    the tool schema asks for -- observed live: ``{"severity_result": {...
+    actual fields ...}}`` and ``{"severity_input": {...}}``. Same
+    "model-output-shape variance" class as ``SeverityResult``'s
+    ``_coerce_singular_to_list`` (a bare string instead of a one-item
+    list) -- both are the model failing to hit the EXACT forced-tool
+    shape while still clearly containing the intended answer.
+
+    Unwraps ONLY when ALL of the following hold, so a genuinely wrong
+    payload still fails validation normally rather than being silently
+    "rescued" into some other shape:
+
+    - *data* is a dict with EXACTLY one key (a flat payload that
+      legitimately has every-other-field-at-default and only one field
+      SET still has that field as a TOP-LEVEL key, e.g.
+      ``{"severity": "ROUTINE"}`` -- that key IS a known field name, so
+      the very next check below already leaves it untouched);
+    - that one key is NOT itself a recognized field name of the target
+      model (a real flat payload's single set field always passes this
+      check without being touched -- see above);
+    - the value under that key is ITSELF a dict;
+    - that inner dict contains AT LEAST ONE recognized field name (e.g.
+      ``'severity'``) -- a single-key dict whose inner dict has NO
+      recognized field names is left completely alone; it is a genuinely
+      malformed payload, not a wrapper, and must still raise the normal
+      ``missing``/``extra_forbidden`` validation errors.
+
+    When all hold, returns the INNER dict (the unwrapped payload);
+    otherwise returns *data* completely unchanged.
+    """
+    if not isinstance(data, dict) or len(data) != 1:
+        return data
+    ((outer_key, inner_value),) = data.items()
+    if outer_key in known_fields:
+        return data
+    if not isinstance(inner_value, dict):
+        return data
+    if not (set(inner_value) & known_fields):
+        return data
+    return inner_value
+
+
 class SeverityResult(BaseModel):
     """Output of the classify_severity node.
 
@@ -128,6 +176,14 @@ class SeverityResult(BaseModel):
     coercing a bare string into a single-item list before Pydantic's own
     list/enum validation runs -- a real list (or ``None``, for fields that
     allow it) passes through unchanged.
+
+    A LATER gate run (same day) surfaced a second, model-level variance:
+    the whole payload nested under an extra wrapper key (``{"severity_
+    result": {...}}`` / ``{"severity_input": {...}}``) instead of the flat
+    shape. ``_unwrap_wrapper`` (below) unwraps that BEFORE the field-level
+    coercion above ever runs -- see :func:`_unwrap_single_key_wrapper` for
+    the exact, deliberately-narrow conditions (a genuinely wrong payload
+    still fails validation normally).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -137,6 +193,12 @@ class SeverityResult(BaseModel):
     modifier: str | None = None
     refusal_flags: list[RefusalFlag] = Field(default_factory=list)
     reasoning: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_wrapper(cls, data: object) -> object:
+        """See class docstring "Robustness" / :func:`_unwrap_single_key_wrapper`."""
+        return _unwrap_single_key_wrapper(data, set(cls.model_fields))
 
     @field_validator("rules_fired", "refusal_flags", "reasoning", mode="before")
     @classmethod
@@ -165,6 +227,13 @@ class IntentResult(BaseModel):
     impose none here; keeping it short for the approval-card header is a
     prompt instruction, not a hard validation cap that could reject a valid
     classification).
+
+    Robustness (paid eval gate finding, 2026-07-05): ``classify_intent``
+    shares ``call_tool_forced``'s single-flat-object tool shape with
+    ``classify_severity``, so it carries the identical "model nests its
+    answer under an extra wrapper key" risk ``SeverityResult`` observed
+    live (see that class's own docstring) — mirrored here defensively,
+    even though this exact model hasn't shown the failure yet.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -172,6 +241,12 @@ class IntentResult(BaseModel):
     intent: Intent
     is_new_issue: bool
     summary: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_wrapper(cls, data: object) -> object:
+        """See class docstring "Robustness" / :func:`_unwrap_single_key_wrapper`."""
+        return _unwrap_single_key_wrapper(data, set(cls.model_fields))
 
 
 class DraftResult(BaseModel):
@@ -183,12 +258,22 @@ class DraftResult(BaseModel):
     ``refusal_templates_used`` records which canned refusal-deferral phrases
     were injected into the draft body (from ``prompts/v1.py``
     REFUSAL_TEMPLATES).  Empty when the message had no refusal topics.
+
+    Robustness (paid eval gate finding, 2026-07-05): same wrapper-key
+    mirror as ``IntentResult`` above — see ``SeverityResult``'s docstring
+    for the finding this defends against.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     body: str = Field(min_length=1)
     refusal_templates_used: list[RefusalFlag] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_wrapper(cls, data: object) -> object:
+        """See class docstring "Robustness" / :func:`_unwrap_single_key_wrapper`."""
+        return _unwrap_single_key_wrapper(data, set(cls.model_fields))
 
 
 class PrefilterResult(BaseModel):

@@ -50,6 +50,31 @@ product behavior (every URGENT/EMERGENCY draft gets it, not just the
 scenarios that happened to fail), per this task's explicit instruction not
 to key guidance to eval text.
 
+EMERGENCY: numbered-list safety instructions (gate run 5 finding,
+2026-07-05)
+--------------------------------------------------------------------------
+``e1-water-electrical`` kept hard-failing the judge's must-include/must-
+not-include checks even after the length fix landed (its draft was ~260
+chars, well under budget, ``length_over_budget=false`` — so "too long" was
+NOT the actual cause, contrary to the initial hypothesis; investigated
+against the recorded draft body + judge reasoning directly, per this
+round's instruction). The draft crammed 5-6 distinct instructions
+("turn off power... stay away from the water... don't touch the ceiling
+light... calling a plumber... 9am tomorrow... text me if it gets worse")
+into ONE dense run-on paragraph. ``docs/02-product/plain-language-rules.md``
+rule 2 — a requirement this module's EMERGENCY guidance had never actually
+encoded — is explicit: **"In an emergency, instructions come as a numbered
+list, most important first, max three steps."** :data:`_EMERGENCY_
+STRUCTURE_GUIDANCE` now spells this out literally (numbered list, most-
+important-first, at most 3 steps, one action per line, no piggy-backed
+reassurance on a safety line) — a genuine, previously-missed, doc-mandated
+requirement, not a scenario-specific patch; every EMERGENCY draft gets it,
+regardless of which rules fired. Separating each instruction onto its own
+numbered line is also, independently, the most direct way to make "does
+this draft include X" unambiguous to ANY reader (human or judge) — a dense
+paragraph is exactly the shape that makes a specific sentence hard to
+isolate.
+
 Refusal-deferral templates: code APPENDS, the model never weaves them in
 (deferral architecture ruling, senior review 2026-07-05)
 -------------------------------------------------------------------------
@@ -354,10 +379,15 @@ def _urgent_next_step_guidance(topic_text: str) -> str:
 
 _EMERGENCY_STRUCTURE_GUIDANCE: str = (
     "Structure this EMERGENCY reply in order: (1) the safety instruction(s) first -- "
-    "the concrete thing the tenant should do right now, matching the rules that fired "
-    "above; (2) then, briefly, what you (the landlord) are doing right now; (3) commit "
-    f"to {_CONCRETE_NEXT_STEP_GUIDANCE}. Keep it tight -- no filler, no repeated "
-    "reassurance."
+    "the concrete thing(s) the tenant should do right now, matching the rules that "
+    "fired above. Per docs/02-product/plain-language-rules.md rule 2, format these as "
+    'a short NUMBERED LIST ("1. ...", "2. ...") -- most important step first, AT MOST '
+    "3 steps, ONE distinct action per line -- never combine two actions on one line and "
+    "never pad a step with extra reassurance or explanation; (2) then, on its own line "
+    "(not part of the numbered list), briefly what you (the landlord) are doing right "
+    "now; (3) then, on its own line, commit to "
+    f"{_CONCRETE_NEXT_STEP_GUIDANCE}. Keep it tight -- no filler, no repeated "
+    "reassurance, nothing beyond these lines."
 )
 
 _ACCESS_ALTERNATIVE_GUIDANCE: str = (

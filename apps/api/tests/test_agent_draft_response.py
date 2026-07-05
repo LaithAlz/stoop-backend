@@ -1384,6 +1384,29 @@ def test_build_user_content_emergency_gets_structure_guidance() -> None:
 
 
 @pytest.mark.unit
+def test_build_user_content_emergency_requires_numbered_list_max_three_steps() -> None:
+    """Gate run 5 finding: e1's draft crammed 5-6 instructions into one
+    dense paragraph even though it was well under the length budget --
+    plain-language-rules.md rule 2 ("instructions come as a numbered
+    list, most important first, max three steps") was never actually
+    encoded in the EMERGENCY guidance until now."""
+    content = node_mod._build_user_content(
+        body="water is coming through the ceiling light",
+        tenant_name="Dev",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.EMERGENCY, rules_fired=["Active, uncontained water"]
+        ),
+        refusal_flags=[],
+    )
+    assert "NUMBERED LIST" in content
+    assert "AT MOST" in content
+    assert "3 steps" in content
+    assert "most important" in content.lower()
+    assert "plain-language-rules.md rule 2" in content
+
+
+@pytest.mark.unit
 def test_build_user_content_routine_gets_no_severity_specific_structure_guidance() -> None:
     content = node_mod._build_user_content(
         body="dripping faucet",
