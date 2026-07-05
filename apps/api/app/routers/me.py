@@ -159,9 +159,9 @@ async def get_me(
         # substitute for it. Nothing is written; the message is generic and
         # contains no token material.
         raise AppError(
-            403,
-            "email_required",
-            "An email address is required to use the dashboard.",
+            status_code=403,
+            code="email_required",
+            message="An email address is required to use the dashboard.",
         )
 
     result = await session.execute(
