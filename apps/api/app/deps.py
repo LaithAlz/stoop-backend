@@ -56,6 +56,16 @@ from app.db.session import get_session
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthError, AuthUser, verify_jwt
 
+# Shared with ``routers/me.py``'s own soft-delete guard (issue #135 part 1)
+# -- both call sites respond to the same underlying condition ("no live
+# landlords row for this auth_user_id": soft-deleted, or never provisioned)
+# and must present byte-identical wording. Declared here (where the
+# ``account_deleted`` contract for the request-scoped surface is defined)
+# and imported by ``me.py`` rather than re-declared there, so the two can
+# never silently drift apart.
+ACCOUNT_DELETED_CODE = "account_deleted"
+ACCOUNT_DELETED_MESSAGE = "This account is no longer active."
+
 
 async def require_user(request: Request) -> AuthUser:
     """Extract and verify the Supabase JWT from the ``Authorization`` header.
@@ -181,8 +191,8 @@ async def require_landlord(
     if row is None:
         raise AppError(
             status_code=403,
-            code="account_deleted",
-            message="This account is no longer active.",
+            code=ACCOUNT_DELETED_CODE,
+            message=ACCOUNT_DELETED_MESSAGE,
         )
 
     landlord = Landlord(id=row["id"])

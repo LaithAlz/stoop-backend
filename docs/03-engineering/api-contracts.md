@@ -37,19 +37,29 @@
 ```
 - 403 `email_required` if the verified token has no `email` claim
   (phone-only signup case) — checked before any write; fail-closed.
+- 403 `account_deleted` if the `landlords` row matching this auth_user_id
+  has `deleted_at` set (soft-deleted via migration 0004's `auth.users`
+  lifecycle trigger) — resurrection is not allowed. Same stable code and
+  static message as `require_landlord`'s `account_deleted` (below). The
+  upsert's `ON CONFLICT ... WHERE deleted_at IS NULL` guard makes the
+  check atomic with the write itself — no separate pre-SELECT race — and
+  nothing is mutated (`email`/`updated_at` untouched) before the error is
+  returned. Closes #135 part 1.
 
 `PATCH /v1/me` — body: any of `full_name`, `phone`, `timezone`,
 `voice_profile`. Emergency notifications are not a settable preference.
 
 `GET/PATCH /v1/me` use `require_user` directly (the provisioning path — a
 brand-new auth user has no `landlords` row yet, and this lazily creates
-one) and do not check `deleted_at`. Every OTHER authenticated endpoint
-(#53 onward) uses the `require_landlord` dependency (#22) instead, which
-looks up the caller's `landlords` row **excluding soft-deleted rows**
-(`deleted_at IS NULL`) and 403s with the stable code `account_deleted` —
-same error envelope — if none is found (closes half of #135 part 1; the
-other half, `/v1/me` itself staying reachable for a soft-deleted account,
-is out of scope here).
+one), not `require_landlord`. `GET /v1/me`'s own upsert now filters
+`deleted_at` itself (see the `account_deleted` note above), atomically
+with the write. Every OTHER authenticated endpoint (#53 onward) uses the
+`require_landlord` dependency (#22) instead, which looks up the caller's
+`landlords` row **excluding soft-deleted rows** (`deleted_at IS NULL`) and
+403s with the same stable code `account_deleted` — same error envelope —
+if none is found. #135 part 1 is now fully closed: both `require_landlord`
+(every other endpoint) and `GET /v1/me` itself reject a soft-deleted
+account instead of silently resurrecting or exposing it.
 
 ## Properties
 

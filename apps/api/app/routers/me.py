@@ -53,6 +53,41 @@ NOT-NULL invariant is preserved instead of surfacing as a 500
 real email with an empty string via the ``ON CONFLICT ... SET email =
 EXCLUDED.email`` upsert.
 
+Soft-delete guard (issue #135 part 1 -- resurrection is NOT allowed)
+--------------------------------------------------------------------
+Consistent with ``require_landlord`` (``app/deps.py``): once migration
+0004's ``auth.users`` lifecycle trigger sets ``landlords.deleted_at``, a
+still-valid JWT for that ``auth_user_id`` must never resurrect the row.
+The upsert's ``ON CONFLICT (auth_user_id) DO UPDATE`` clause carries an
+additional ``WHERE landlords.deleted_at IS NULL`` guard so the suppression
+is atomic with the write itself -- no separate pre-``SELECT``-then-write
+race window. Either the conflicting row is live and the ``UPDATE`` (email
+refresh, ``full_name`` COALESCE, ``updated_at`` bump) proceeds exactly as
+before, or the row is soft-deleted and Postgres treats the whole statement
+as a no-op for that row (``RETURNING`` yields nothing, the same as an
+ordinary ``ON CONFLICT DO NOTHING``) -- there is no half-deleted/half-live
+in-between state, ever.
+
+When ``RETURNING`` comes back empty, a follow-up read-only ``SELECT
+deleted_at`` distinguishes "soft-deleted" (the expected cause) from
+"should be structurally unreachable" before responding -- fail closed by
+confirming instead of assuming. The response is 403 ``account_deleted``,
+the *exact same* code and static message ``require_landlord`` uses
+(``app.deps.ACCOUNT_DELETED_MESSAGE``, imported here rather than
+re-declared, so the two call sites can never drift apart). Nothing is
+mutated either way -- not ``email``, not ``updated_at`` -- verified by
+regression tests asserting both are byte-identical before and after a
+rejected attempt.
+
+This closes the gap migration 0004's own module docstring calls out by
+name (its "NOTE -- this soft-delete is best-effort bookkeeping, not yet a
+security boundary ... Closing that gap is #135 part 1's job" -- that note
+describes a real historical gap, not a currently-open one; it is left
+as-is in that already-merged migration file rather than edited after the
+fact, per the boundary noted in issue #135's remaining-work description).
+``docs/03-engineering/api-contracts.md``'s ``/v1/me`` section carries the
+matching ``account_deleted`` note.
+
 Session: ``get_admin_session``, deliberately not ``get_session``/
 ``require_landlord`` (#22 safety review, BLOCKING item)
 ------------------------------------------------------------------------
@@ -85,7 +120,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_admin_session
-from app.deps import require_user
+from app.deps import ACCOUNT_DELETED_CODE, ACCOUNT_DELETED_MESSAGE, require_user
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthUser
 
@@ -130,10 +165,17 @@ _UPSERT_SQL = text(
       SET email      = EXCLUDED.email,
           full_name  = COALESCE(EXCLUDED.full_name, landlords.full_name),
           updated_at = now()
+      WHERE landlords.deleted_at IS NULL
     RETURNING id, email, full_name, timezone, voice_profile, price_cohort,
               subscription_tier, subscription_status, created_at
     """
 )
+
+# Follow-up, read-only check used ONLY when the upsert above returns no row
+# (issue #135 part 1 -- see module docstring "Soft-delete guard"). Never
+# writes anything; just distinguishes "the WHERE clause suppressed an
+# UPDATE against a soft-deleted row" from anything else.
+_DELETED_CHECK_SQL = text("SELECT deleted_at FROM landlords WHERE auth_user_id = :auth_user_id")
 
 # ---------------------------------------------------------------------------
 # Endpoint
@@ -161,6 +203,15 @@ async def get_me(
         claim — checked BEFORE any DB call (see module docstring). Applies
         equally to a brand-new phone-only signup and to an existing
         landlord row whose current token has lost the email claim.
+
+        403 ``account_deleted`` if the matching ``landlords`` row has
+        ``deleted_at`` set (soft-deleted via migration 0004's ``auth.users``
+        lifecycle trigger) — resurrection is not allowed (issue #135 part
+        1, consistent with ``require_landlord``; see module docstring
+        "Soft-delete guard"). The row is left completely untouched: the
+        upsert's ``WHERE landlords.deleted_at IS NULL`` guard suppresses
+        the update atomically, so this is never a partial
+        half-deleted/half-live mutation before the error is raised.
     """
     # Bind the UUID to the structlog context so downstream log lines are
     # correlated.  We log the UUID only — never email, full_name, or the token.
@@ -189,7 +240,41 @@ async def get_me(
             "full_name": user.full_name,
         },
     )
-    row = result.mappings().one()
+    row = result.mappings().one_or_none()
+
+    if row is None:
+        # ON CONFLICT fired (a landlords row already exists for this
+        # auth_user_id) but the `WHERE landlords.deleted_at IS NULL` guard
+        # suppressed the UPDATE -- RETURNING yields nothing for a
+        # suppressed conflict, exactly like an ordinary `DO NOTHING`. The
+        # only way that happens is a soft-deleted row (module docstring
+        # "Soft-delete guard"). Confirm via a read-only SELECT before
+        # deciding how to respond -- fail closed by confirming, not
+        # assuming -- and nothing further is written either way.
+        deleted_row = (
+            (await session.execute(_DELETED_CHECK_SQL, {"auth_user_id": str(user.user_id)}))
+            .mappings()
+            .one_or_none()
+        )
+
+        if deleted_row is not None and deleted_row["deleted_at"] is not None:
+            raise AppError(
+                status_code=403,
+                code=ACCOUNT_DELETED_CODE,
+                message=ACCOUNT_DELETED_MESSAGE,
+            )
+
+        # Structurally unreachable in practice: the upsert's WHERE clause
+        # only ever suppresses the UPDATE when a conflicting row exists
+        # with deleted_at IS NOT NULL, and deleted_at is never cleared once
+        # set (migration 0004's trigger never resurrects). Reaching here
+        # means an invariant broke between the upsert statement and this
+        # SELECT -- fail loudly instead of silently returning no profile.
+        raise RuntimeError(
+            "GET /v1/me upsert returned no row and no soft-deleted "
+            "landlord row was found for this auth_user_id -- invariant "
+            "violation"
+        )
 
     log.info("me_upserted", landlord_id=str(row["id"]))
 
