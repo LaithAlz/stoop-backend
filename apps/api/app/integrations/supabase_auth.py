@@ -1,9 +1,12 @@
 """Supabase JWT verification — JWKS-backed, asymmetric (ES256 / RS256 only).
 
 Security properties enforced here:
-- JWKS fetched asynchronously via httpx; cached for 24 h in a module-level
-  dict protected by an asyncio.Lock (concurrency-safe on a single Python
-  process; each Fly machine has its own cache).
+- JWKS fetched asynchronously via httpx; cached for 24 h in the module-level
+  ``_JwksState`` singleton, protected by its asyncio.Lock (concurrency-safe
+  on a single Python process; each Fly machine has its own cache). Three
+  independent rate limiters bound upstream fetches: a kid-miss forced-refresh
+  window, a degenerate-200 cooldown, and a fetch-exception cooldown — see
+  ``_JwksState`` and the three ``*_SECONDS`` constants.
 - Explicit algorithm allowlist: ["ES256", "RS256"] only.  NEVER accepts
   "alg: none" or any HS* symmetric algorithm — prevents alg-confusion
   attacks (where an attacker signs HS256 using the public key as the
