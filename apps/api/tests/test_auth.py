@@ -70,6 +70,30 @@ Security properties tested
 30 a body of {} (the "keys" field entirely absent) on the
    _refresh_jwks_on_kid_miss path is treated exactly like {"keys": []} —
    does not clobber a known-good cache (issue #147 follow-up)
+31 fetch-exception cooldown bounds a fast-5xx storm: N verifies against a
+   cold cache that only ever raises drive exactly 1 routine fetch attempt,
+   with no kid-miss cascade (cold cache means _get_jwks itself raises,
+   never reaching _find_signing_key) (issue #158)
+32 fetch-exception cooldown recovers within its (5s) window: an exception
+   followed by a clock advance past the window and a good response
+   succeeds (issue #158)
+33 the fetch-exception cooldown and the degenerate-fetch cooldown are
+   independent stamps: an exception does not arm the degenerate cooldown,
+   and a degenerate 200 does not (re-)arm the exception cooldown (issue
+   #158 safety review)
+34 a successful (non-raising) fetch clears the fetch-exception cooldown
+   stamp, so a later, separate transient blip starts its own fresh
+   cooldown (issue #158)
+35 mutation-kill: the exception-cooldown stamp is set on OBSERVATION, not
+   on ATTEMPT — a callable respx side_effect asserts the stamp is still
+   None mid-fetch (before the outcome is known); also simulates a slow
+   fetch (clock advanced past the window from inside the callable) and
+   proves the cooldown is still correctly engaged immediately afterward
+   (issue #158, spec-guardian BLOCKING mutation-kill + latency-variant)
+36 mutation-kill: a request skipped by the ACTIVE exception cooldown must
+   NOT re-stamp it — proven by advancing the clock past the ORIGINAL
+   stamp's window (but still inside a would-be re-armed one) and asserting
+   a real fetch fires (issue #158, safety-advisory mutation-kill)
 """
 
 from __future__ import annotations
@@ -216,7 +240,7 @@ def jwks_payload(public_key: EllipticCurvePublicKey) -> dict[str, Any]:
 @pytest.fixture(autouse=True)
 def reset_jwks_cache() -> None:
     """Reset the module-level JWKS cache before each test."""
-    auth_mod._jwks_cache = None  # noqa: SLF001
+    auth_mod._jwks_state.cache = None  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------
@@ -837,8 +861,8 @@ async def test_forced_refresh_allowed_again_after_window_expires(
         with pytest.raises(AuthError):
             await verify_jwt(token_still_unknown)  # fetch #2 (forced refresh, still a miss)
 
-        assert auth_mod._last_forced_refresh is not None
-        stale_stamp = auth_mod._last_forced_refresh
+        assert auth_mod._jwks_state.last_forced_refresh is not None
+        stale_stamp = auth_mod._jwks_state.last_forced_refresh
 
         # Advance the clock past the rate-limit window using the _now seam
         # (never sleep()).
@@ -908,8 +932,8 @@ async def test_failed_forced_refresh_still_consumes_rate_limit_window(
         assert exc_info.value.code == "invalid_token"
 
         call_count_within_window = route.call_count
-        assert auth_mod._last_forced_refresh is not None
-        stale_stamp = auth_mod._last_forced_refresh
+        assert auth_mod._jwks_state.last_forced_refresh is not None
+        stale_stamp = auth_mod._jwks_state.last_forced_refresh
 
         # Advance the clock past the rate-limit window (never sleep()):
         # a new attempt is allowed again, and this one succeeds.
@@ -1080,15 +1104,17 @@ async def test_cold_cache_degenerate_keys_fails_closed_without_caching(
 
         # Cache must still be cold — nothing was cached from the degenerate
         # attempts above.
-        assert auth_mod._jwks_cache is None  # noqa: SLF001
+        assert auth_mod._jwks_state.cache is None  # noqa: SLF001
 
         # Advance past the degenerate-fetch cooldown window so the second
         # call's routine fetch isn't skipped by the cooldown (a separate
         # mechanism from the no-cache guard under test here).
-        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
-        stale_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+        assert auth_mod._jwks_state.last_degenerate_fetch is not None  # noqa: SLF001
+        stale_stamp = auth_mod._jwks_state.last_degenerate_fetch  # noqa: SLF001
         monkeypatch.setattr(
-            auth_mod, "_now", lambda: stale_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0
+            auth_mod,
+            "_now",
+            lambda: stale_stamp + auth_mod._DEGENERATE_FETCH_COOLDOWN_SECONDS + 1.0,
         )
 
         user = await verify_jwt(token)  # fetch #3: real keys, no longer degenerate
@@ -1145,8 +1171,8 @@ async def test_warm_cache_ttl_expired_degenerate_refetch_keeps_stale_cache(
     async with router:
         await verify_jwt(token_original)  # fetch #1 — primes the cache
 
-        assert auth_mod._jwks_cache is not None  # noqa: SLF001
-        original_fetched_at = auth_mod._jwks_cache[1]  # noqa: SLF001
+        assert auth_mod._jwks_state.cache is not None  # noqa: SLF001
+        original_fetched_at = auth_mod._jwks_state.cache[1]  # noqa: SLF001
 
         # Advance the clock past the 24h TTL (never sleep()) so the routine
         # path considers the cache expired and refetches.
@@ -1163,14 +1189,14 @@ async def test_warm_cache_ttl_expired_degenerate_refetch_keeps_stale_cache(
         assert route.call_count == 2
 
         # fetched_at must be untouched by the degenerate attempt.
-        assert auth_mod._jwks_cache is not None  # noqa: SLF001
-        assert auth_mod._jwks_cache[1] == original_fetched_at  # noqa: SLF001
+        assert auth_mod._jwks_state.cache is not None  # noqa: SLF001
+        assert auth_mod._jwks_state.cache[1] == original_fetched_at  # noqa: SLF001
 
         # The degenerate-fetch cooldown (issue #147 follow-up) was stamped
         # by the fetch #2 attempt above; capture it so the next clock
         # advance clears both that cooldown AND the (still-expired) TTL.
-        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
-        degenerate_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+        assert auth_mod._jwks_state.last_degenerate_fetch is not None  # noqa: SLF001
+        degenerate_stamp = auth_mod._jwks_state.last_degenerate_fetch  # noqa: SLF001
 
         # Advance the clock only slightly further than the cooldown window
         # (measured from the degenerate stamp) — NOT merely +2.0s from the
@@ -1182,7 +1208,7 @@ async def test_warm_cache_ttl_expired_degenerate_refetch_keeps_stale_cache(
         monkeypatch.setattr(
             auth_mod,
             "_now",
-            lambda: degenerate_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0,
+            lambda: degenerate_stamp + auth_mod._DEGENERATE_FETCH_COOLDOWN_SECONDS + 1.0,
         )
         await verify_jwt(token_original)
         call_count = route.call_count
@@ -1212,17 +1238,17 @@ async def test_degenerate_fetch_cooldown_bounds_repeated_verifies(
 
     Call-count accounting for the FIRST (failing) ``verify_jwt`` call:
       fetch #1 — routine ``_get_jwks`` path, cold cache, degenerate.
-                 Stamps ``_last_degenerate_fetch``.
+                 Stamps ``_jwks_state.last_degenerate_fetch``.
       fetch #2 — ``_find_signing_key`` misses on the empty result, which
                  (unavoidably, given the existing kid-miss mechanism)
                  triggers ``_refresh_jwks_on_kid_miss``; also degenerate.
-                 Stamps ``_last_forced_refresh``.
+                 Stamps ``_jwks_state.last_forced_refresh``.
     Both cooldowns are now active. Several MORE ``verify_jwt`` calls,
     still within the window, must add ZERO further fetches: the routine
     path's cooldown check short-circuits before fetching, and (since
-    ``_jwks_cache`` is still ``None``) ``_find_signing_key`` misses again,
-    landing on the also-rate-limited kid-miss fallback — no fetch there
-    either. Total across all of these: still 2.
+    ``_jwks_state.cache`` is still ``None``) ``_find_signing_key`` misses
+    again, landing on the also-rate-limited kid-miss fallback — no fetch
+    there either. Total across all of these: still 2.
 
     Only once the clock advances past the window does the next verify
     drive a fresh fetch (fetch #3, a real JWKS this time).
@@ -1263,10 +1289,12 @@ async def test_degenerate_fetch_cooldown_bounds_repeated_verifies(
         # Advance the clock past both cooldown windows (they were stamped
         # within microseconds of each other, in the same failing call) so
         # the next verify fetches again.
-        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
-        stale_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+        assert auth_mod._jwks_state.last_degenerate_fetch is not None  # noqa: SLF001
+        stale_stamp = auth_mod._jwks_state.last_degenerate_fetch  # noqa: SLF001
         monkeypatch.setattr(
-            auth_mod, "_now", lambda: stale_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0
+            auth_mod,
+            "_now",
+            lambda: stale_stamp + auth_mod._DEGENERATE_FETCH_COOLDOWN_SECONDS + 1.0,
         )
 
         user = await verify_jwt(token)  # fetch #3: cooldown expired, real keys
@@ -1321,23 +1349,23 @@ async def test_degenerate_fetch_cooldown_stamp_cleared_on_recovery(
         # --- Recovery: advance past the cooldown window, queue a good
         # response. The routine path fetches again and succeeds directly
         # (no kid-miss needed — the good JWKS contains the matching kid). ---
-        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
-        incident_1_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+        assert auth_mod._jwks_state.last_degenerate_fetch is not None  # noqa: SLF001
+        incident_1_stamp = auth_mod._jwks_state.last_degenerate_fetch  # noqa: SLF001
         monkeypatch.setattr(
             auth_mod,
             "_now",
-            lambda: incident_1_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0,
+            lambda: incident_1_stamp + auth_mod._DEGENERATE_FETCH_COOLDOWN_SECONDS + 1.0,
         )
         user = await verify_jwt(token)
         assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
         assert route.call_count == 3
-        assert auth_mod._last_degenerate_fetch is None  # noqa: SLF001
+        assert auth_mod._jwks_state.last_degenerate_fetch is None  # noqa: SLF001
 
         # --- Force the routine path to refetch: jump past the FRESH 24h
         # TTL (relative to the recovery fetch) so a second, separate
         # degenerate incident can begin. ---
-        assert auth_mod._jwks_cache is not None  # noqa: SLF001
-        recovered_fetched_at = auth_mod._jwks_cache[1]  # noqa: SLF001
+        assert auth_mod._jwks_state.cache is not None  # noqa: SLF001
+        recovered_fetched_at = auth_mod._jwks_state.cache[1]  # noqa: SLF001
         incident_2_time = recovered_fetched_at + auth_mod._JWKS_TTL_SECONDS + 1.0
         monkeypatch.setattr(auth_mod, "_now", lambda: incident_2_time)
 
@@ -1347,7 +1375,7 @@ async def test_degenerate_fetch_cooldown_stamp_cleared_on_recovery(
         user = await verify_jwt(token)
         assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
         assert route.call_count == 4
-        assert auth_mod._last_degenerate_fetch == incident_2_time  # noqa: SLF001
+        assert auth_mod._jwks_state.last_degenerate_fetch == incident_2_time  # noqa: SLF001
 
         # --- Behavioral proof the new cooldown is genuinely fresh (not
         # leftover from incident 1, and not permanently disabled after
@@ -1382,7 +1410,7 @@ async def test_second_verify_within_window_hits_kid_miss_rate_limited_fallback(
     cache whose routine fetch AND kid-miss forced-refresh are BOTH
     degenerate, followed by a second ``verify_jwt`` call still inside both
     rate-limit windows, must land on ``_refresh_jwks_on_kid_miss``'s
-    rate-limited fallback with ``_jwks_cache`` still ``None`` — the branch
+    rate-limited fallback with ``_jwks_state.cache`` still ``None`` — the branch
     whose comment previously (incorrectly) called it unreachable in
     production.
 
@@ -1405,7 +1433,7 @@ async def test_second_verify_within_window_hits_kid_miss_rate_limited_fallback(
             await verify_jwt(token)
         assert exc_info.value.code == "invalid_token"
         assert route.call_count == 2
-        assert auth_mod._jwks_cache is None  # noqa: SLF001
+        assert auth_mod._jwks_state.cache is None  # noqa: SLF001
 
         # Second verify, still within BOTH the degenerate-fetch cooldown
         # and the forced-refresh rate-limit window: the routine path skips
@@ -1457,12 +1485,14 @@ async def test_missing_keys_field_treated_as_degenerate_on_routine_path(
         with pytest.raises(AuthError) as exc_info:
             await verify_jwt(token)
         assert exc_info.value.code == "invalid_token"
-        assert auth_mod._jwks_cache is None  # noqa: SLF001
+        assert auth_mod._jwks_state.cache is None  # noqa: SLF001
 
-        assert auth_mod._last_degenerate_fetch is not None  # noqa: SLF001
-        stale_stamp = auth_mod._last_degenerate_fetch  # noqa: SLF001
+        assert auth_mod._jwks_state.last_degenerate_fetch is not None  # noqa: SLF001
+        stale_stamp = auth_mod._jwks_state.last_degenerate_fetch  # noqa: SLF001
         monkeypatch.setattr(
-            auth_mod, "_now", lambda: stale_stamp + auth_mod._FORCED_REFRESH_WINDOW_SECONDS + 1.0
+            auth_mod,
+            "_now",
+            lambda: stale_stamp + auth_mod._DEGENERATE_FETCH_COOLDOWN_SECONDS + 1.0,
         )
 
         user = await verify_jwt(token)
@@ -1515,4 +1545,395 @@ async def test_missing_keys_field_treated_as_degenerate_on_kid_miss_path(
     assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
     assert call_count == 2, (
         f"expected exactly 2 fetches (prime + one {{}} attempt), got {call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 31 — fetch-exception cooldown bounds a fast-5xx storm (issue #158)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_fetch_exception_cooldown_bounds_fast_5xx_storm(
+    private_key: EllipticCurvePrivateKey,
+) -> None:
+    """A fast-5xx Supabase incident hit by many requests with a COLD cache
+    must drive at most ONE routine fetch ATTEMPT per fetch-exception-
+    cooldown window (issue #158) — not one attempt per inbound request.
+
+    Because the cache is cold, the cooldown short-circuit branch in
+    ``_get_jwks`` has no stale cache to fall back on, so it raises directly
+    out of ``_get_jwks`` — never reaching ``_find_signing_key`` / the
+    kid-miss forced-refresh path at all. So there is no kid-miss cascade to
+    account for in this specific (cold-cache) scenario: only the single
+    routine fetch attempt.
+
+    Only 1 canned response is wired, so a second fetch attempt would raise
+    on the exhausted side_effect iterator instead of this test's own
+    assertion — a built-in tripwire.
+    """
+    token = _mint_token(private_key)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(500),  # fetch #1: routine, cold cache, raises
+        ]
+    )
+
+    async with router:
+        for _ in range(5):
+            with pytest.raises(AuthError) as exc_info:
+                await verify_jwt(token)
+            assert exc_info.value.code == "invalid_token"
+
+        call_count = route.call_count
+
+    assert call_count == 1, (
+        f"expected the fast-5xx storm bounded at exactly 1 routine fetch "
+        f"attempt across 5 verify_jwt calls, got {call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 32 — fetch-exception cooldown recovers within its window (issue #158)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_fetch_exception_cooldown_recovers_within_window(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient fetch exception must not block recovery beyond the 5s
+    fetch-exception cooldown — once the window passes, a good response
+    succeeds (issue #158). Deliberately NOT the 60s degenerate/forced-
+    refresh window: reusing that window was considered and rejected because
+    it would impose a 60s no-retry delay on the only path that can warm a
+    cold cache after a merely transient blip.
+    """
+    token = _mint_token(private_key)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(500),  # fetch #1: routine, cold cache, raises
+            httpx.Response(200, json=jwks_payload),  # fetch #2: after cooldown, succeeds
+        ]
+    )
+
+    async with router:
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+
+        assert auth_mod._jwks_state.last_fetch_exception is not None  # noqa: SLF001
+        stale_stamp = auth_mod._jwks_state.last_fetch_exception  # noqa: SLF001
+
+        # Advance the clock past the (short) exception-cooldown window only
+        # (never sleep()) — this must be enough, unlike the 60s windows.
+        monkeypatch.setattr(
+            auth_mod,
+            "_now",
+            lambda: stale_stamp + auth_mod._FETCH_EXCEPTION_COOLDOWN_SECONDS + 1.0,
+        )
+
+        user = await verify_jwt(token)
+        call_count = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count == 2, (
+        f"expected exactly 2 fetches (the initial exception + the post-"
+        f"cooldown retry), got {call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 33 — the fetch-exception cooldown and the degenerate-fetch cooldown
+# are independent stamps (issue #158 safety review)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_exception_and_degenerate_cooldowns_are_independent_stamps(
+    private_key: EllipticCurvePrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The routine path's fetch-exception cooldown and its degenerate-200
+    cooldown are independent stamps (issue #158 safety review): observing
+    an EXCEPTION must not arm the DEGENERATE cooldown, and observing a
+    DEGENERATE 200 must not (re-)arm the EXCEPTION cooldown. A refactor
+    that collapsed the two into a single stamp would make this fail.
+    """
+    token = _mint_token(private_key)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(500),  # fetch #1: routine, cold cache, raises
+            httpx.Response(200, json={"keys": []}),  # fetch #2: routine, degenerate 200
+        ]
+    )
+
+    async with router:
+        with pytest.raises(AuthError):
+            await verify_jwt(token)
+
+        assert auth_mod._jwks_state.last_fetch_exception is not None  # noqa: SLF001
+        assert auth_mod._jwks_state.last_degenerate_fetch is None, (  # noqa: SLF001
+            "an exception must not arm the separate degenerate-200 cooldown"
+        )
+        exception_stamp = auth_mod._jwks_state.last_fetch_exception  # noqa: SLF001
+
+        # Advance past the (shorter) exception cooldown ONLY, so the second
+        # verify actually reaches the network instead of being short-
+        # circuited by the still-cold cache + exception cooldown.
+        monkeypatch.setattr(
+            auth_mod,
+            "_now",
+            lambda: exception_stamp + auth_mod._FETCH_EXCEPTION_COOLDOWN_SECONDS + 1.0,
+        )
+
+        with pytest.raises(AuthError):
+            await verify_jwt(token)
+
+        # A degenerate 200 arms its own cooldown independently of the
+        # exception cooldown above (which this same non-raising fetch also
+        # happens to clear — see test_..._clears_exception_cooldown_stamp
+        # for that specific behavior in isolation).
+        assert auth_mod._jwks_state.last_degenerate_fetch is not None, (  # noqa: SLF001
+            "a degenerate 200 must arm its own cooldown independently"
+        )
+
+        call_count = route.call_count
+
+    assert call_count == 2, (
+        f"expected both fetches to actually happen (the exception cooldown "
+        f"must not have suppressed the second, degenerate-200 attempt), "
+        f"got {call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 34 — a successful fetch clears the fetch-exception cooldown stamp
+# (issue #158)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_successful_fetch_clears_exception_cooldown_stamp(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful (non-raising) fetch clears the fetch-exception-cooldown
+    stamp so a LATER, separate transient blip starts its own fresh cooldown
+    rather than inheriting stale state (issue #158; mirrors the degenerate-
+    cooldown's clear-on-recovery behavior from issue #147 follow-up).
+    """
+    token = _mint_token(private_key)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(500),  # fetch #1: routine, cold cache, raises
+            httpx.Response(200, json=jwks_payload),  # fetch #2: after cooldown, succeeds
+        ]
+    )
+
+    async with router:
+        with pytest.raises(AuthError):
+            await verify_jwt(token)
+
+        assert auth_mod._jwks_state.last_fetch_exception is not None  # noqa: SLF001
+        stale_stamp = auth_mod._jwks_state.last_fetch_exception  # noqa: SLF001
+        monkeypatch.setattr(
+            auth_mod,
+            "_now",
+            lambda: stale_stamp + auth_mod._FETCH_EXCEPTION_COOLDOWN_SECONDS + 1.0,
+        )
+
+        user = await verify_jwt(token)
+        call_count = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+
+    assert auth_mod._jwks_state.last_fetch_exception is None, (  # noqa: SLF001
+        "a successful fetch must clear the exception-cooldown stamp"
+    )
+    assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Test 35 — mutation-kill: stamp is set on OBSERVATION, not on ATTEMPT
+# (issue #158, spec-guardian BLOCKING) + latency-variant kill
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_exception_cooldown_stamped_on_observation_not_on_attempt(
+    private_key: EllipticCurvePrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation-kill (issue #158, spec-guardian BLOCKING): the fetch-
+    exception cooldown must be stamped on OBSERVATION (only once
+    ``_fetch_jwks`` has actually raised), never on the bare ATTEMPT
+    (before the fetch is even made) — the opposite choice from
+    ``_refresh_jwks_on_kid_miss``'s forced-refresh window.
+
+    Uses a CALLABLE respx side_effect that runs MID-FETCH (i.e. while
+    ``_get_jwks`` is still awaiting ``_fetch_jwks``, having already passed
+    the point where a stamp-on-attempt implementation would have set the
+    stamp). The observed value is captured into a list rather than
+    asserted directly inside the callable — an ``assert`` failing inside a
+    respx side effect would otherwise be swallowed by
+    ``verify_jwt``'s own generic ``except Exception`` handling and silently
+    turn into an ordinary ``AuthError``, defeating the point of this test.
+
+    Also simulates a SLOW fetch: the callable advances the monkeypatched
+    ``_now`` seam by more than the cooldown window *before* returning the
+    failing response. A "latency variant" mutation that stamps using a
+    stale pre-fetch clock reading (captured before the slow call) rather
+    than a fresh post-fetch one would make the cooldown read as already-
+    expired the instant it's set — this test's final assertion (the
+    cooldown is still active immediately after, so a second verify must
+    NOT drive a second network call) catches exactly that.
+    """
+    token = _mint_token(private_key)
+
+    call_started_at = auth_mod._now()
+    slow_fetch_completed_at = call_started_at + auth_mod._FETCH_EXCEPTION_COOLDOWN_SECONDS + 1.0
+
+    observed_stamp_mid_fetch: list[float | None] = []
+
+    def _slow_failing_fetch(request: httpx.Request) -> httpx.Response:
+        # Mid-fetch: capture (do NOT assert here — see docstring) whether
+        # the exception-cooldown stamp has already been armed.
+        observed_stamp_mid_fetch.append(auth_mod._jwks_state.last_fetch_exception)
+        # Simulate a fetch that takes longer than the cooldown window.
+        monkeypatch.setattr(auth_mod, "_now", lambda: slow_fetch_completed_at)
+        return httpx.Response(500)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(side_effect=_slow_failing_fetch)
+
+    async with router:
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+
+        # The stamp must have been ``None`` at the moment of the attempt —
+        # a stamp-on-attempt mutant would have set it before this point.
+        assert observed_stamp_mid_fetch == [None], (
+            "exception-cooldown stamp was already armed mid-fetch — must "
+            "be stamped on OBSERVATION (after the outcome), not on ATTEMPT"
+        )
+
+        # The stamp must be set now, AFTER the failed fetch was observed,
+        # and must reflect the POST-latency clock reading (the moment the
+        # exception was actually observed) — not a stale pre-fetch one.
+        assert (
+            auth_mod._jwks_state.last_fetch_exception == slow_fetch_completed_at  # noqa: SLF001
+        )
+
+        # Immediately after (clock unchanged from the slow-fetch
+        # completion time), the cooldown must still be ACTIVE: a second
+        # verify must be short-circuited (no cache to fall back on, cold
+        # cache), NOT drive a second real network call. A latency-variant
+        # mutant that stamped a stale, earlier reading would already
+        # consider this window expired and re-invoke the callable.
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+
+        call_count = route.call_count
+
+    assert call_count == 1, (
+        f"expected the cooldown to still be active immediately after a "
+        f"slow failing fetch — stamped at the OBSERVED (post-latency) "
+        f"time, not a stale pre-fetch time — got {call_count} network calls"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 36 — mutation-kill: a skipped request must not re-stamp the
+# exception cooldown (issue #158, safety advisory)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_skipped_request_does_not_re_stamp_exception_cooldown(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation-kill (issue #158, safety advisory): a request that hits the
+    ACTIVE exception cooldown and is skipped (no fetch attempted) must NOT
+    re-stamp ``last_fetch_exception`` — only a REAL observed outcome (a
+    fresh exception, or a clearing success) may move the stamp. If a skip
+    silently re-armed the window, a steady trickle of requests arriving
+    just inside it would keep sliding the window forward forever, turning
+    a bounded cooldown into an unbounded one.
+
+    Timeline (``t0`` = the real failed fetch's observation time, ``window``
+    = ``_FETCH_EXCEPTION_COOLDOWN_SECONDS``):
+      - ``t0``            : real fetch, fails, stamps the cooldown at ``t0``.
+      - ``t0 + delta``     (``delta < window``): still inside the window —
+        skipped, no fetch. A re-stamping mutant would move the stamp to
+        ``t0 + delta`` here.
+      - ``t0 + window + epsilon`` (``epsilon < delta``): past the ORIGINAL
+        window (measured from ``t0``) but still inside a would-be
+        RE-STAMPED window (measured from ``t0 + delta``, since
+        ``t0 + window + epsilon < t0 + delta + window`` exactly because
+        ``epsilon < delta``). The correct implementation must fetch again
+        here; a re-stamping mutant would still (wrongly) skip.
+    """
+    token = _mint_token(private_key)
+    window = auth_mod._FETCH_EXCEPTION_COOLDOWN_SECONDS
+    delta = window * 0.4  # delta < window
+    epsilon = window * 0.2  # epsilon < delta
+
+    t0 = auth_mod._now()
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    route = router.get(_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(500),  # fetch #1 at t0: real failure, stamps t0
+            httpx.Response(200, json=jwks_payload),  # fetch #2: real retry after expiry
+        ]
+    )
+
+    async with router:
+        monkeypatch.setattr(auth_mod, "_now", lambda: t0)
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+        assert route.call_count == 1
+        assert auth_mod._jwks_state.last_fetch_exception == t0  # noqa: SLF001
+
+        # Still within the window: must be skipped (no fetch), and must
+        # NOT re-stamp the cooldown.
+        monkeypatch.setattr(auth_mod, "_now", lambda: t0 + delta)
+        with pytest.raises(AuthError) as exc_info:
+            await verify_jwt(token)
+        assert exc_info.value.code == "invalid_token"
+        assert route.call_count == 1, "a skipped request must not drive a fetch"
+        assert auth_mod._jwks_state.last_fetch_exception == t0, (  # noqa: SLF001
+            "a skipped request must not re-stamp the exception cooldown"
+        )
+
+        # Past the ORIGINAL window (measured from t0), but still inside a
+        # re-stamped one (measured from t0 + delta): a real fetch must
+        # fire here if the stamp was correctly left untouched above.
+        monkeypatch.setattr(auth_mod, "_now", lambda: t0 + window + epsilon)
+        user = await verify_jwt(token)
+        call_count = route.call_count
+
+    assert user.user_id == UUID("11111111-1111-1111-1111-111111111111")
+    assert call_count == 2, (
+        f"expected the cooldown to have expired relative to its ORIGINAL "
+        f"t0 stamp (not silently re-armed by the skipped request), got "
+        f"{call_count} fetch(es) — a re-stamp-on-skip mutation would keep "
+        "this window alive and suppress this fetch"
     )
