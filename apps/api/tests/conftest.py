@@ -53,10 +53,17 @@ def _reset_jwks_auth_state() -> Iterator[None]:
     that timestamp set, and a later test within the same rate-limit window
     would see its own forced refresh silently skipped, causing an
     order-dependent flake (the same class of bug that caused #141).
+
+    Also resets ``_last_degenerate_fetch`` (the routine-path degenerate-
+    fetch cooldown stamp, #147 follow-up) for the same reason — otherwise a
+    test that observes a degenerate JWKS body leaves that timestamp set,
+    and a later test within the same window would see its own routine
+    fetch silently skipped.
     """
     import app.integrations.supabase_auth as auth_mod
 
     auth_mod._jwks_cache = None  # noqa: SLF001
     auth_mod._jwks_lock = asyncio.Lock()  # noqa: SLF001
     auth_mod._last_forced_refresh = None  # noqa: SLF001
+    auth_mod._last_degenerate_fetch = None  # noqa: SLF001
     yield

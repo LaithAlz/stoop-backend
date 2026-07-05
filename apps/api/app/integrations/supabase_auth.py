@@ -65,6 +65,17 @@ _jwks_lock = asyncio.Lock()
 # means no forced refresh has happened yet in this process.
 _last_forced_refresh: float | None = None
 
+# Monotonic timestamp of the last time the ROUTINE ``_get_jwks`` fetch path
+# observed a degenerate/empty ``{"keys": []}`` (or ``{}``) 200 response
+# (issue #147 follow-up). Distinct from ``_last_forced_refresh`` above,
+# which rate-limits the separate kid-miss forced-refresh path. ``None``
+# means no degenerate response has been observed on the routine path yet
+# (or the most recent one has been superseded by a successful, non-empty
+# fetch — see ``_get_jwks``). Bounds a sustained Supabase degenerate-200
+# incident to one serialized upstream fetch per ``_FORCED_REFRESH_WINDOW_SECONDS``
+# window instead of one fetch per request for the whole incident.
+_last_degenerate_fetch: float | None = None
+
 
 def _now() -> float:
     """Monotonic clock used for cache/rate-limit bookkeeping.
@@ -148,7 +159,7 @@ async def _get_jwks() -> dict[str, Any]:
     Thread-safety: asyncio.Lock ensures only one coroutine performs a fetch
     at a time; others wait then use the freshly-cached result.
     """
-    global _jwks_cache  # noqa: PLW0603
+    global _jwks_cache, _last_degenerate_fetch  # noqa: PLW0603
 
     # Fast path (no lock): check if we have a fresh cache.
     if _jwks_cache is not None:
@@ -163,7 +174,71 @@ async def _get_jwks() -> dict[str, Any]:
             if _now() - fetched_at < _JWKS_TTL_SECONDS:
                 return data
 
+        # Degenerate-fetch cooldown (issue #147 follow-up): if a recent
+        # fetch on THIS (routine) path already came back with a
+        # degenerate/empty body within the last _FORCED_REFRESH_WINDOW_SECONDS,
+        # skip hitting Supabase again this time. Mirrors the kid-miss rate
+        # limit (_last_forced_refresh / _refresh_jwks_on_kid_miss) but closes
+        # a gap specific to this path: without it, a sustained Supabase
+        # degenerate-200 incident would drive one serialized upstream fetch
+        # per request for every cold/TTL-expired cache, for as long as the
+        # incident lasted. Falls back to the stale cache if one exists (a
+        # stale real key set beats an empty one), else fails closed with an
+        # empty key set.
+        now = _now()
+        if (
+            _last_degenerate_fetch is not None
+            and now - _last_degenerate_fetch < _FORCED_REFRESH_WINDOW_SECONDS
+        ):
+            if _jwks_cache is not None:
+                return _jwks_cache[0]
+            return {"keys": []}
+
         data = await _fetch_jwks()
+
+        if not data.get("keys"):
+            # Stamp the cooldown on the DEGENERATE OBSERVATION (i.e. only
+            # once we know the fetch actually came back empty), not on the
+            # bare attempt. This is the opposite choice from
+            # _refresh_jwks_on_kid_miss's rate limit, which stamps BEFORE
+            # attempting the fetch specifically so that upstream errors/
+            # exceptions still consume its window (see that function's
+            # docstring). Here, a raised exception from ``_fetch_jwks``
+            # propagates as today (uncaught by this guard, no cooldown
+            # consumed) — this cooldown targets confirmed degenerate 200s
+            # only, not generic fetch failures.
+            _last_degenerate_fetch = _now()
+
+            # Same cache-write guard as _refresh_jwks_on_kid_miss (see its
+            # docstring), applied here for parity (issue #147): a fetch that
+            # succeeds (HTTP 200) but returns a degenerate/empty
+            # ``{"keys": []}`` body must not be cached as-is.
+            #
+            # - Stale-but-nonempty cache exists (``_jwks_cache is not None``
+            #   here means it was too old to satisfy the TTL check above): a
+            #   stale real key set beats an empty one, so keep it and return
+            #   it. Deliberately do NOT refresh ``fetched_at`` — the existing
+            #   (already-expired) stamp stands, so the very next call falls
+            #   through the fast-path check and retries the fetch instead of
+            #   being stuck with this degenerate data for a fresh 24h TTL.
+            #   Invariant deviation (safety advisory): combined with the
+            #   cooldown above, during a SUSTAINED degenerate window this
+            #   stale-but-real key set may keep being served for longer than
+            #   the nominal 24h TTL — a deliberate availability tradeoff,
+            #   bounded by Supabase's incident eventually clearing.
+            # - Cache is cold (``None``): there is nothing to fall back to.
+            #   Return the degenerate data as-is WITHOUT caching it, so
+            #   verification fails closed on *this* request only (no signing
+            #   key will match an empty JWKS) and the next request retries
+            #   the fetch from scratch rather than being stuck with a cached
+            #   empty key set for 24h.
+            if _jwks_cache is not None:
+                return _jwks_cache[0]
+            return data
+
+        # Non-degenerate fetch: clear the cooldown stamp so recovery from a
+        # prior degenerate incident is instant, not bounded by the window.
+        _last_degenerate_fetch = None
         _jwks_cache = (data, _now())
         return data
 
@@ -226,6 +301,15 @@ async def _refresh_jwks_on_kid_miss() -> dict[str, Any]:
             # rather than attempting another fetch.
             if _jwks_cache is not None:
                 return _jwks_cache[0]
+            # Reachable (issue #147 follow-up corrected this comment: it is
+            # NOT unreachable). _jwks_cache being None here means no real
+            # keys have EVER been cached in this process — a persistent
+            # degenerate upstream (routine _get_jwks fetches keep observing
+            # empty bodies too, per its own no-cache guard) combined with a
+            # kid-miss landing inside this function's rate-limit window
+            # lands right here. There's nothing to fall back to; fail
+            # closed with an empty key set (the caller's _find_signing_key
+            # then raises its own invalid_token as normal).
             return {"keys": []}
 
         # Stamp BEFORE attempting the fetch — see docstring: the window
