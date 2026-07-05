@@ -71,10 +71,22 @@ def _get_db_url() -> str:
 # Key helpers (mirrored from test_auth.py to keep tests self-contained)
 # ---------------------------------------------------------------------------
 
+# P-256 coordinates are always 32 bytes. Per RFC 7518 §6.2.1, the "x"/"y"
+# octet strings MUST be the curve's FULL fixed width, with any leading zero
+# octets preserved — NOT the minimal encoding of the integer's bit length.
+_P256_COORD_BYTES = 32
 
-def _b64url(n: int) -> str:
-    byte_length = (n.bit_length() + 7) // 8
-    return base64.urlsafe_b64encode(n.to_bytes(byte_length, "big")).rstrip(b"=").decode()
+
+def _b64url(n: int, length: int) -> str:
+    """Encode an integer as a fixed-width, unpadded url-safe base64 string.
+
+    ``length`` must be the curve's coordinate byte width (e.g. 32 for
+    P-256) so that a coordinate whose leading byte happens to be zero is
+    still encoded at the correct width instead of being silently
+    shortened — a shortened encoding fails JWK parsing (``PyJWKSet``)
+    despite the ``kid`` matching.
+    """
+    return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
 
 
 def _make_keypair() -> tuple[EllipticCurvePrivateKey, EllipticCurvePublicKey]:
@@ -89,8 +101,8 @@ def _public_key_to_jwks(public: EllipticCurvePublicKey, kid: str) -> dict[str, A
             {
                 "kty": "EC",
                 "crv": "P-256",
-                "x": _b64url(nums.x),
-                "y": _b64url(nums.y),
+                "x": _b64url(nums.x, _P256_COORD_BYTES),
+                "y": _b64url(nums.y, _P256_COORD_BYTES),
                 "kid": kid,
                 "use": "sig",
                 "alg": "ES256",
@@ -444,17 +456,31 @@ async def test_me_concurrent_first_calls_no_duplicate_key(
     token = _mint_token(private_key, sub=sub, email="concurrent@example.com")
 
     async def _call_me() -> httpx.Response:
-        # Each coroutine needs its own JWKS mock context and ASGI client.
-        with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
-            mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
-            async with httpx.AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                return await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+        # Each coroutine shares the single respx context opened below (per
+        # issue #145) — it must NOT open its own nested respx.mock context.
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            return await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
 
     # Reset cache just before firing so both coroutines start with a cold cache.
     auth_mod._jwks_cache = None  # noqa: SLF001
-    r1, r2 = await asyncio.gather(_call_me(), _call_me())
+
+    # A single respx.MockRouter wraps BOTH coroutines and the gather call
+    # itself (per issue #145): two coroutines each opening their own
+    # respx.mock context against the same JWKS URL on a cold cache can
+    # unmock/mis-route the second fetch depending on interleaving, causing a
+    # spurious invalid_token 401. The property under test is the DB upsert
+    # (concurrent first calls -> no duplicate-key error, one landlord row),
+    # so we deliberately do NOT pre-warm the cache with a call before the
+    # concurrent pair. Depending on how the two coroutines interleave around
+    # ``_jwks_lock``, the JWKS route may be hit once or twice (both are
+    # correct) — its call count is intentionally not asserted.
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    router.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+    async with router:
+        r1, r2 = await asyncio.gather(_call_me(), _call_me())
 
     try:
         assert r1.status_code == 200, f"First concurrent call failed: {r1.text}"
