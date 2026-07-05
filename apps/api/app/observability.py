@@ -13,6 +13,7 @@ Safety rules enforced here:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import TYPE_CHECKING, Any
 
@@ -149,3 +150,41 @@ def init_sentry(transport: Any | None = None) -> None:
         ],
         traces_sample_rate=0.1 if settings.is_production else 1.0,
     )
+
+
+def init_langsmith_tracing() -> None:
+    """Export the ``LANGSMITH_*`` env vars the ``langsmith``/LangChain/
+    LangGraph SDKs read ambiently, if (and only if) a LangSmith API key is
+    configured (#26).
+
+    Deliberately a no-op when ``settings.langsmith_api_key`` is ``None`` —
+    there is no LangSmith account yet (see ``app/config.py``'s
+    ``langsmith_api_key`` docstring) — mirroring ``init_sentry()``'s
+    "absence of credentials must never break startup" pattern exactly.
+    When unset, NOT ONE of the ``LANGSMITH_*`` env vars below is ever
+    exported, so the ``langsmith`` SDK's own ambient env-var detection
+    (``langsmith.utils.tracing_is_enabled``) finds nothing and tracing
+    stays fully inert — no network calls, no import-time surprises.
+
+    When set, this exports the three env vars the SDK reads directly
+    (there is no Python-level "enable tracing" call to make instead — the
+    ``langsmith``/``langchain-core`` SDKs are entirely env-var driven for
+    this):
+    - ``LANGSMITH_TRACING=true`` — the modern name for what used to be
+      ``LANGCHAIN_TRACING_V2`` (the SDK still recognizes the old name; we
+      only ever set the current one).
+    - ``LANGSMITH_API_KEY`` — never logged (never-break rule #5 concerns
+      JWTs/phone numbers/message bodies specifically, but the same
+      "secrets are never logged" discipline applies to every credential
+      this app holds).
+    - ``LANGSMITH_PROJECT`` — only set when ``settings.langsmith_project``
+      is itself configured; otherwise the SDK falls back to its own
+      "default" project, exactly as if this line were never run.
+    """
+    if not settings.langsmith_api_key:
+        return
+
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_API_KEY"] = settings.langsmith_api_key
+    if settings.langsmith_project:
+        os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project

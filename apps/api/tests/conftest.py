@@ -26,6 +26,7 @@ _PLACEHOLDER_ENV: dict[str, str] = {
     "SUPABASE_JWT_ISSUER": "https://test.supabase.co/auth/v1",
     "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
     "TWILIO_AUTH_TOKEN": "test-twilio-auth-token",
+    "ANTHROPIC_API_KEY": "test-anthropic-api-key",
 }
 
 for _key, _value in _PLACEHOLDER_ENV.items():

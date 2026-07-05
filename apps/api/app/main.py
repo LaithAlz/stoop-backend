@@ -15,12 +15,13 @@ import structlog.contextvars
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 
+from app.agent.checkpointer import setup_checkpointer
 from app.config import settings
 from app.db.session import verify_request_engine_role_separation
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthError
 from app.middleware.request_id import RequestIDMiddleware
-from app.observability import configure_logging, init_sentry
+from app.observability import configure_logging, init_langsmith_tracing, init_sentry
 from app.routers import health, me
 from app.routers.webhooks import twilio as webhooks_twilio
 
@@ -29,7 +30,7 @@ log = structlog.get_logger(__name__)
 
 @asynccontextmanager
 async def _lifespan(_app: fastapi.FastAPI) -> AsyncIterator[None]:
-    """Startup self-check (#22 safety review item 13b).
+    """Startup self-checks (#22 safety review item 13b; #24).
 
     ``verify_request_engine_role_separation`` proves — not just assumes —
     that the request-path engine is genuinely isolated from the admin
@@ -39,8 +40,19 @@ async def _lifespan(_app: fastapi.FastAPI) -> AsyncIterator[None]:
     configured wrong," which is worse silently than not configuring it at
     all. See ``app/db/session.py``'s module docstring for the full
     rationale.
+
+    ``setup_checkpointer()`` runs AFTER that check, unconditionally
+    (#24) — it idempotently creates/migrates the LangGraph checkpoint
+    tables in the dedicated ``langgraph`` schema (see
+    ``app/agent/checkpointer.py``'s module docstring). Fail-closed: a
+    failure here RAISES and aborts startup, same as the role-separation
+    check above — the agent graph cannot run without checkpoint tables,
+    so serving traffic with a broken checkpoint store is worse than not
+    starting at all. Cheap to run on every process start even when the
+    graph/Anthropic key goes unused this deploy.
     """
     await verify_request_engine_role_separation()
+    await setup_checkpointer()
     yield
 
 
@@ -98,8 +110,9 @@ def create_app() -> fastapi.FastAPI:
     works without any lazy initialisation.
 
     Startup order:
-      1. configure_logging()  — structlog JSON setup
-      2. init_sentry()        — no-op unless SENTRY_DSN is set
+      1. configure_logging()        — structlog JSON setup
+      2. init_sentry()              — no-op unless SENTRY_DSN is set
+      2b. init_langsmith_tracing()  — no-op unless LANGSMITH_API_KEY is set
       3. add RequestIDMiddleware
       4. register AuthError exception handler (401 → standard envelope)
       4b. register AppError exception handler (status_code → standard envelope)
@@ -111,12 +124,14 @@ def create_app() -> fastapi.FastAPI:
       7. include debug router (non-production only)
 
     ``lifespan=_lifespan`` runs ``verify_request_engine_role_separation``
-    once at ASGI startup (#22 safety review item 13b) — see that
-    function's docstring (``app/db/session.py``) for what it checks and
-    why. A no-op when ``APP_DATABASE_URL`` is unset.
+    then ``setup_checkpointer()`` once at ASGI startup (#22 safety review
+    item 13b; #24) — see that function's docstring for what each checks
+    and why. The role-separation check is a no-op when ``APP_DATABASE_URL``
+    is unset; checkpoint setup always runs.
     """
     configure_logging()
     init_sentry()
+    init_langsmith_tracing()
 
     application = fastapi.FastAPI(
         title="Stoop API",
