@@ -460,18 +460,25 @@ def test_guc_setter_pattern_catches_every_shape(snippet: str) -> None:
 
 
 # Files allowed to reference get_admin_session (#22 safety review item 12):
-# its definition (app/db/session.py) and its sole caller today
-# (app/routers/me.py — GET /v1/me's pre-identity provisioning upsert).
-# EXTEND THIS DELIBERATELY, not by loosening the grep: the next legitimate
-# addition is #40's Twilio webhook ingestion (a genuine admin-engine
-# caller per the rule-#1 forward note in app/db/session.py's docstring) —
-# add "app/routers/webhooks/twilio.py" (or wherever #40 lands) here WHEN
-# that code ships, with a comment explaining why, not as a side effect of
-# some unrelated change.
+# its definition (app/db/session.py) and its callers, each a genuine
+# pre-identity/service-path admin-engine use (see that module's docstring).
+# EXTEND THIS DELIBERATELY, not by loosening the grep.
 _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
     {
         "app/db/session.py",
         "app/routers/me.py",
+        # #40: Twilio inbound webhooks (POST /webhooks/twilio/sms,
+        # /webhooks/twilio/status) — no landlord JWT exists here to
+        # resolve a `landlord_id` GUC from; persisting an inbound tenant
+        # message MUST use the admin engine or an RLS mis-scope could
+        # silently reject/misfile it (session.py's "#40, forward note").
+        "app/routers/webhooks/twilio.py",
+        # #40: the BackgroundTasks callback (app.agent.graph_entry.
+        # enqueue_classification) scheduled by the SMS webhook runs AFTER
+        # the request's own dependency stack (and its get_admin_session)
+        # has already exited/closed — it must open its own admin session
+        # for the same pre-identity reason the webhook router does.
+        "app/agent/graph_entry.py",
     }
 )
 

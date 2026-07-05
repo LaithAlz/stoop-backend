@@ -105,6 +105,45 @@
 >    silently reject or misfile the INSERT instead of storing it, exactly
 >    the catastrophic direction never-break rule #1 (the emergency line is
 >    never gated) forbids. See `app/db/session.py`'s module docstring.
+>
+> **v1.3 amendments (2026-07-05)** — migration 0006 implements this
+> (consolidated safety review, #40/#152, item 1 — a cross-process
+> concurrency hole, reproduced 3/3 with genuinely overlapping
+> transactions): an application-level `WHERE NOT EXISTS` check-then-insert
+> is NOT safe across processes/connections — two truly concurrent webhook
+> redeliveries of the same Twilio `MessageSid` can each pass the existence
+> check before either commits its `INSERT`, so both insert an
+> `emergency_call`/`needs_eyes` notification (duplicate escalations,
+> unbounded under a replay storm). The only cross-process-safe fix is a
+> real Postgres unique constraint the database itself enforces:
+> 1. New partial unique expression index on `notifications`:
+>    ```sql
+>    CREATE UNIQUE INDEX uq_notifications_message_dedupe
+>      ON notifications ((payload ->> 'message_id'), type)
+>      WHERE type IN ('emergency_call', 'needs_eyes');
+>    ```
+>    Partial + expression: only `emergency_call`/`needs_eyes` rows are
+>    covered by the uniqueness constraint — every other `type`
+>    (`emergency_sms`, `draft_ready`, `recap`) is unaffected and may repeat
+>    freely, exactly as before. A row whose `payload` has no `message_id`
+>    key extracts SQL `NULL` via `->>`; ordinary SQL `NULL` semantics mean
+>    Postgres unique indexes never treat two `NULL`s as equal, so any
+>    number of such rows coexist without colliding — the dedupe key only
+>    ever constrains rows that actually carry a `message_id` (every
+>    `emergency_call`/`needs_eyes` row the webhook handler writes today).
+>    The webhook's own `INSERT` switches from an application-level
+>    existence check to `ON CONFLICT ((payload ->> 'message_id'), type)
+>    WHERE type IN ('emergency_call', 'needs_eyes') DO NOTHING RETURNING
+>    id` — Postgres's own conflict detection at the index level, safe
+>    across arbitrarily many concurrent connections.
+> 2. **Durability note:** `emergency_call`/`needs_eyes` `notifications`
+>    rows are the durable idempotency anchor the webhook's `ON CONFLICT`
+>    inference depends on — they must NEVER be deleted. Any future
+>    retention/archival job must exclude `notifications` rows of these two
+>    types (or exclude `notifications` entirely) from deletion; deleting
+>    one would silently reopen the exact duplicate-escalation hole this
+>    migration closes (a redelivered `MessageSid` would no longer find a
+>    conflicting row and would re-fire the emergency protocol).
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
@@ -369,6 +408,13 @@ CREATE TABLE notifications (
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_notifications_sweep ON notifications (status, next_attempt_at);
+-- v1.3 (migration 0006): cross-process-safe idempotency for the Twilio
+-- webhook's emergency_call/needs_eyes artifact creation (ON CONFLICT
+-- target) -- see the v1.3 amendments note above for the full rationale.
+-- NEVER deleted: notifications of these two types anchor this dedupe.
+CREATE UNIQUE INDEX uq_notifications_message_dedupe
+  ON notifications ((payload ->> 'message_id'), type)
+  WHERE type IN ('emergency_call', 'needs_eyes');
 
 -- ───────────────────────── push_tokens ───────────────────────
 CREATE TABLE push_tokens (

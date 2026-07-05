@@ -43,6 +43,7 @@ def _make_fresh_settings(**overrides: Any) -> Settings:
         "supabase_jwks_url": "https://test.supabase.co/auth/v1/.well-known/jwks.json",
         "supabase_jwt_issuer": "https://test.supabase.co/auth/v1",
         "supabase_service_role_key": "test-key",
+        "twilio_auth_token": "test-twilio-auth-token",
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[call-arg]
@@ -529,12 +530,14 @@ async def test_debug_endpoints_not_registered_in_production(
     so that ``create_app()`` sees ``is_production=True``.  This avoids
     module-reload side-effects while still exercising the gating logic.
     """
-    # app_database_url is required alongside environment="production" since
-    # the #22 boot gate (app/config.py) — otherwise Settings construction
-    # itself raises ValidationError before this test can even get going.
+    # app_database_url AND public_base_url are both required alongside
+    # environment="production" (the #22 and #40/#152 boot gates in
+    # app/config.py) — otherwise Settings construction itself raises
+    # ValidationError before this test can even get going.
     prod_settings = _make_fresh_settings(
         environment="production",
         app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
+        public_base_url="https://api.stoop.example",
     )
 
     from app.main import create_app
