@@ -356,6 +356,9 @@ class DraftCheck:
     cost_cents: float
     latency_s: float
     retries: int = 0
+    """Sum of rate-limit/overload backoff retries across the draft attempt
+    (s) AND the judge call -- same diagnostic-only semantics as
+    ``ClassificationSample.retries``."""
     length_over_budget: bool = False
     """Mirrors ``app/agent/nodes/draft_response.py``'s own
     ``state["length_over_budget"]`` (senior review, 2026-07-05): the
@@ -366,9 +369,6 @@ class DraftCheck:
     scenario a pass/fail; this field just explains WHY a still-too-long
     body happened (regeneration was attempted and failed to shorten it, as
     opposed to never having been attempted at all)."""
-    """Sum of rate-limit/overload backoff retries across the draft attempt
-    (s) AND the judge call -- same diagnostic-only semantics as
-    ``ClassificationSample.retries``."""
     failures: list[str] = field(default_factory=list)
 
     @property
