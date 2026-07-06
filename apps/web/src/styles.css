@@ -58,6 +58,48 @@
   --font-display: "Fraunces", ui-serif, Georgia, serif;
   --font-body: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
   --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+
+  /* Clarity v3 (docs/mockups/07-clarity-redesign.html) — additive,
+     app-screen-only tokens. Rolling out screen-by-screen; nothing above
+     this line changes so Heritage marketing pages and not-yet-rebuilt
+     app screens keep rendering exactly as before. */
+  --color-clarity-page-bg: var(--clarity-page-bg);
+  --color-clarity-bg: var(--clarity-bg);
+  --color-clarity-surface: var(--clarity-surface);
+  --color-clarity-panel: var(--clarity-panel);
+  --color-clarity-line: var(--clarity-line);
+  --color-clarity-line-strong: var(--clarity-line-strong);
+  --color-clarity-ink: var(--clarity-ink);
+  --color-clarity-ink-dim: var(--clarity-ink-dim);
+
+  --color-clarity-brand: var(--clarity-brand);
+  --color-clarity-brand-deep: var(--clarity-brand-deep);
+  --color-clarity-brand-soft: var(--clarity-brand-soft);
+  --color-clarity-brand-border: var(--clarity-brand-border);
+  --color-clarity-brand-on: var(--clarity-brand-on);
+
+  --color-clarity-whenever: var(--clarity-whenever);
+  --color-clarity-whenever-deep: var(--clarity-whenever-deep);
+  --color-clarity-whenever-ink: var(--clarity-whenever-ink);
+  --color-clarity-wait: var(--clarity-wait);
+  --color-clarity-wait-deep: var(--clarity-wait-deep);
+  --color-clarity-wait-ink: var(--clarity-wait-ink);
+  --color-clarity-emergency: var(--clarity-emergency);
+  --color-clarity-emergency-deep: var(--clarity-emergency-deep);
+  --color-clarity-emergency-ink: var(--clarity-emergency-ink);
+
+  --font-clarity-serif: var(--clarity-serif);
+  --font-clarity-sans: var(--clarity-sans);
+  --font-clarity-mono: var(--clarity-mono);
+
+  --radius-clarity-sm: var(--clarity-r-sm);
+  --radius-clarity-md: var(--clarity-r-md);
+  --radius-clarity-lg: var(--clarity-r-lg);
+  --radius-clarity-plaque: var(--clarity-r-plaque);
+
+  --shadow-clarity-card: 0 2px 6px -4px rgba(30, 27, 22, 0.22);
+  --shadow-clarity-banner: 0 3px 8px -3px rgba(30, 27, 22, 0.4);
+  --ease-clarity: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 :root {
@@ -101,6 +143,64 @@
   --ring: var(--brand);
 }
 
+/* ============================================================
+ * Clarity v3 — docs/mockups/07-clarity-redesign.html
+ *
+ * The design authority for app screens going forward (Heritage above
+ * stays the contract for marketing pages and any app screen not yet
+ * rebuilt). Palette is the brass-plaque/superintendent's-log material:
+ * warm off-white canvas, deep forest brand, three enamel severities
+ * read as plain words (Emergency / Can't wait / Whenever). Type is
+ * three system-only voices — no new font requests, no CDNs:
+ *   --clarity-serif  Stoop's own speech + display headings
+ *   --clarity-sans   tenant text + UI chrome
+ *   --clarity-mono   timestamps / wayfinding, small uppercase caps
+ * Radius is a fixed three-step scale plus one plaque step — never a
+ * full pill on a card/button/badge. Shadows are whisper-only; the one
+ * gradient in the system is the enamel bevel (severity plaques, and
+ * the emergency banner/call button that share its material).
+ * ============================================================ */
+:root {
+  --clarity-page-bg: #eae6d9;
+  --clarity-bg: #fdfbf6;
+  --clarity-surface: #fcfaf3;
+  --clarity-panel: #ffffff;
+  --clarity-line: #e2dfd1;
+  --clarity-line-strong: #c7c0ac;
+  --clarity-ink: #1e1b16;
+  --clarity-ink-dim: #5b564c;
+
+  --clarity-brand: #2d4a3e;
+  --clarity-brand-deep: #1e332a;
+  --clarity-brand-soft: #e7ece6;
+  --clarity-brand-border: #b7cbbe;
+  --clarity-brand-on: #fbfbf6;
+
+  --clarity-whenever: #1f7a4c;
+  --clarity-whenever-deep: #155c38;
+  --clarity-whenever-ink: #eaf6ee;
+
+  --clarity-wait: #8b5a1e;
+  --clarity-wait-deep: #6b4113;
+  --clarity-wait-ink: #fcefdd;
+
+  --clarity-emergency: #963226;
+  --clarity-emergency-deep: #711b12;
+  --clarity-emergency-ink: #fbeae6;
+
+  --clarity-serif:
+    ui-serif, "Iowan Old Style", "Palatino Linotype", Charter, Georgia, "Times New Roman", serif;
+  --clarity-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  --clarity-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+
+  --clarity-r-sm: 8px;
+  --clarity-r-md: 14px;
+  --clarity-r-lg: 16px;
+  --clarity-r-plaque: 6px;
+}
+
 /* Dark tokens — reserved for the emergency screen only. */
 .dark {
   --background: oklch(0.15 0.02 27);
@@ -140,9 +240,137 @@
     -webkit-font-smoothing: antialiased;
   }
 
+  /* Matches docs/mockups/07-clarity-redesign.html's global focus ring
+     (line ~64): outline 3px solid var(--brand), outline-offset 3px,
+     border-radius 6px. Same brand green as Heritage, so this applies
+     everywhere — marketing pages included — not just Clarity screens. */
   :focus-visible {
-    outline: 2px solid var(--color-brand);
-    outline-offset: 2px;
-    border-radius: 4px;
+    outline: 3px solid var(--color-brand);
+    outline-offset: 3px;
+    border-radius: 6px;
   }
+}
+
+/* Respect the OS-level motion preference everywhere, not just Clarity
+   screens — matches docs/mockups/07-clarity-redesign.html's global rule. */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ============================================================
+ * Clarity v3 — bespoke component treatments
+ *
+ * Everything else in Clarity is composed from Tailwind utilities
+ * against the --clarity-* tokens above. These three are the pieces
+ * the mockup calls out as genuinely bespoke material (enamel plaque
+ * bevel + rivets, the marginalia double-rule, the perforated undo
+ * ticket) — reproduced near-verbatim from the mockup's own CSS.
+ * ============================================================ */
+.clarity-plaque {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 16px;
+  border-radius: var(--clarity-r-plaque);
+  font: 800 12px/1 var(--clarity-sans);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    inset 0 -2px 3px rgba(0, 0, 0, 0.16),
+    0 1px 2px rgba(0, 0, 0, 0.14);
+}
+.clarity-plaque::before,
+.clarity-plaque::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.32);
+  box-shadow:
+    inset 0 1px 1px rgba(0, 0, 0, 0.5),
+    0 0.5px 0 rgba(255, 255, 255, 0.35);
+}
+.clarity-plaque::before {
+  left: 5px;
+}
+.clarity-plaque::after {
+  right: 5px;
+}
+.clarity-plaque--emergency {
+  background: linear-gradient(180deg, var(--clarity-emergency), var(--clarity-emergency-deep));
+  color: var(--clarity-emergency-ink);
+}
+.clarity-plaque--wait {
+  background: linear-gradient(180deg, var(--clarity-wait), var(--clarity-wait-deep));
+  color: var(--clarity-wait-ink);
+}
+.clarity-plaque--whenever {
+  background: linear-gradient(180deg, var(--clarity-whenever), var(--clarity-whenever-deep));
+  color: var(--clarity-whenever-ink);
+}
+.clarity-plaque--sm {
+  padding: 5px 12px 5px 14px;
+  font-size: 10.5px;
+}
+
+.clarity-margin-note {
+  position: relative;
+  transform: rotate(-0.35deg);
+}
+.clarity-margin-note::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(45, 74, 62, 0.35);
+}
+
+.clarity-ticket {
+  position: relative;
+}
+.clarity-ticket::before,
+.clarity-ticket::after {
+  content: "";
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  height: 9px;
+  background-image: radial-gradient(circle, var(--clarity-bg) 3px, transparent 3.2px);
+  background-size: 14px 9px;
+  background-repeat: repeat-x;
+  background-position: 0 0;
+}
+.clarity-ticket::before {
+  top: -5px;
+}
+.clarity-ticket::after {
+  bottom: -5px;
+}
+
+/* The emergency banner and the emergency takeover's "call now" button
+   share the plaque's enamel material (the mockup's own choice — same
+   family of gradient, not a new one), so they get the same treatment
+   as a named class rather than fighting for a Tailwind gradient utility
+   name across Tailwind versions. */
+.clarity-emergency-gradient {
+  background: linear-gradient(180deg, var(--clarity-emergency), var(--clarity-emergency-deep));
 }

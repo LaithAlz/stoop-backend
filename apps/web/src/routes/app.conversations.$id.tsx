@@ -186,7 +186,7 @@ function ConversationPage() {
           <div ref={bottomRef} />
         </main>
 
-        <AppTabBar active="queue" queueCount={queue.length} />
+        <AppTabBar active="conversations" queueCount={queue.length} />
       </div>
 
       <Sheet open={rejectOpen} onOpenChange={setRejectOpen}>
