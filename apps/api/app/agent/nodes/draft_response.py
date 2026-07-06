@@ -373,8 +373,10 @@ log = structlog.get_logger(__name__)
 # templates". Rule-#8-clean copy: short, plain, no jargon.
 # ---------------------------------------------------------------------------
 
+# Two sentences: copy-guardian (2026-07-06) counted the em-dash version as
+# one 19-word sentence, over plain-language rule 1's 15-word cap.
 _GENERIC_SAFE_FALLBACK: str = (
-    "Thanks for letting me know — I've passed this along to your landlord, who will "
+    "Thanks for letting me know. I've passed this along to your landlord, who will "
     "follow up with you directly."
 )
 
