@@ -63,8 +63,11 @@ evals/        scenarios/*.yaml + runner (format: docs/02-product/eval-scenarios-
   version, add `v{n+1}`.
 - Every node appends a human-readable line to `state.reasoning_log` —
   it is shown to landlords on the approval card, not just debugging.
-- `classify_severity` calls the Anthropic SDK directly, temperature 0,
-  output validated by Pydantic; record tokens/cost on the message row.
+- `classify_severity` calls the Anthropic SDK directly, deterministic-intent
+  (temperature is deprecated on claude-sonnet-5; determinism enforced by
+  the eval gate), output validated by Pydantic; record tokens/cost in the
+  audit_log `classified`/`drafted` payloads (`messages` is append-only;
+  its cost columns are deprecated, schema-v1 v1.6).
 - The Tier-0 prefilter (`prefilter.py`, pure functions, no I/O) runs in
   the webhook handler **before** the graph. The agent may escalate past a
   Tier-0 miss; it may never de-escalate a Tier-0 fire.
@@ -88,7 +91,8 @@ evals/        scenarios/*.yaml + runner (format: docs/02-product/eval-scenarios-
 - Markers: `unit` (default), `integration` (DB via docker-compose),
   `eval` (real API, never in default runs, in CI only for prompt/rubric/
   eval changes — #73).
-- Eval scoring per `eval-scenarios-v1.md`: 3 samples, temp 0, flaky = fail;
+- Eval scoring per `eval-scenarios-v1.md`: 3 samples, deterministic-intent
+  (temperature deprecated on claude-sonnet-5, not settable), flaky = fail;
   E-class/F-class failures block merge.
 - New production misclassification ⇒ new eval YAML in the same week.
 - RLS isolation tests (#23) must cover every table in `schema-v1.md`.
