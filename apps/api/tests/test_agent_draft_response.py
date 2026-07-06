@@ -1485,6 +1485,36 @@ def test_build_user_content_emergency_heating_topic_gets_unsafe_heat_source_warn
 
 
 @pytest.mark.unit
+def test_build_user_content_refusal_ack_forbids_handoff_duplication_and_signoff() -> None:
+    """Gate run 6 triage: f1's combined draft read as two texts glued
+    together -- the model's ack said "passed this to the landlord, he'll
+    follow up ... talk soon" and then the appended deferral template said
+    the hand-off AGAIN. The instruction itself mandated that duplication
+    ("ONE brief, neutral sentence noting you've passed it along"). The
+    refusal guidance now forbids the ack from stating the hand-off,
+    promising follow-up, or signing off, because the appended note owns
+    all of that."""
+    content = node_mod._build_user_content(
+        body="last winter the heat was broken for weeks, I want a rent reduction or LTB",
+        tenant_name="Maria",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.ROUTINE, rules_fired=["Refusal topic: rent reduction / LTB"]
+        ),
+        refusal_flags=[RefusalFlag.legal_rent_ltb],
+    )
+    assert "must NOT say you've passed" in content
+    assert "must NOT promise follow-up" in content
+    assert "must NOT sign off" in content
+    assert "more text follows yours" in content
+    # The old duplication-mandating instruction is gone.
+    assert "sentence noting you've passed it along" not in content
+    # The core prohibitions survive the rewrite.
+    assert "pre-approved note" in content
+    assert "paraphrase" in content
+
+
+@pytest.mark.unit
 def test_build_user_content_emergency_non_heating_topic_gets_no_heat_source_warning() -> None:
     content = node_mod._build_user_content(
         body="water is coming through the ceiling light",

@@ -146,10 +146,16 @@ violation.
 Fixed by SEPARATING drafting from deferral entirely:
 
 1. The DYNAMIC user content (see ``_build_user_content``) tells the model
-   NOT to address a flagged topic at all — at most ONE brief, neutral
-   sentence noting it's been passed along, never a policy explanation, and
-   explicitly NOT to write, quote, or paraphrase any deferral language
-   itself (a separate note is appended automatically).
+   NOT to address a flagged topic at all — a short, warm acknowledgment of
+   the tenant's message ONLY, never a policy explanation, and explicitly
+   NOT to write, quote, or paraphrase any deferral language itself (a
+   separate note is appended automatically). Because the appended template
+   ALREADY tells the tenant the topic was passed to the landlord for
+   direct follow-up, the model is told NOT to say "passed it along" / "will
+   follow up" itself and NOT to sign off ("talk soon") — eval gate 6
+   (2026-07-05) showed the combined draft otherwise reads as two disjoint
+   texts glued together (hand-off stated twice, sign-off mid-message),
+   which the judge correctly failed against the plain-language rules.
 2. The model's OWN acknowledgment text is guard-checked (see "Hard
    guards" below) — REJECTED and regenerated once if it violates, exactly
    as before.
@@ -751,12 +757,15 @@ def _build_user_content(
         lines.append(
             f"\nThis message touches on a topic the landlord handles directly, not you: "
             f"{topics}. Do NOT explain, negotiate, discuss specifics, or take any position "
-            "on this topic. At most, include ONE brief, neutral sentence noting you've "
-            "passed it along and the landlord will follow up directly -- do not go further "
-            "than that. A separate, pre-approved note about this topic will be appended to "
-            "your reply automatically after you write it -- do NOT write that note "
-            "yourself, and do NOT quote, paraphrase, or summarize any standard policy "
-            "language."
+            "on this topic. A separate, pre-approved note about this topic will be "
+            "appended to your reply automatically after you write it. That note already "
+            "tells the tenant the topic has been passed to the landlord, who will follow "
+            "up with them directly -- so your own sentences must NOT say you've passed "
+            "anything along, must NOT promise follow-up, and must NOT sign off (no 'talk "
+            "soon', no closing line -- more text follows yours). Write ONLY a short, warm "
+            "acknowledgment that you received their message, one or two short sentences, "
+            "and do NOT write, quote, paraphrase, or summarize any standard policy "
+            "language yourself."
         )
         if RefusalFlag.access_codes in refusal_flags:
             lines.append(_ACCESS_ALTERNATIVE_GUIDANCE)
