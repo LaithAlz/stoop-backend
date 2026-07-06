@@ -275,7 +275,9 @@
 >    classification record (v1.6), so the landlord-facing summary belongs
 >    on it. Code change (write the key) is tracked to land before or with
 >    #56; rows written before it lack the key — readers treat a missing
->    `summary` as null and fall back to joining `rules_fired`.
+>    `summary` as `null` (`/v1/queue` then returns `why: null`; any
+>    friendlier fallback copy is a client concern, never synthesized from
+>    `rules_fired` at the data layer).
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
