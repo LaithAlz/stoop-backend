@@ -258,6 +258,25 @@
 >    `docs/03-engineering/api-contracts.md`'s `GET /v1/cases/{id}` timeline
 >    example, which this payload shape extends.
 
+> **v1.7 amendment (2026-07-06)** — no migration required; found while
+> amending the `/v1/queue` contract for the dashboard (PR #182 review):
+> 1. The `audit_log` `'classified'` payload gains a **`summary`** key —
+>    the ONE warm plain-English severity sentence the agent already
+>    composes into `reasoning_log` (e.g. "No heat on a cold night with a
+>    baby in the unit can't wait, so I treated it as urgent."). Payload
+>    shape is now `{message_id, case_id, severity, summary, rules_fired,
+>    modifier, refusal_flags, model, tokens_in, tokens_out, cost_cents,
+>    prompt_version}`.
+> 2. Why: `reasoning_log` lives only in transient graph state and opaque
+>    checkpoint blobs — nothing durable/queryable serves the approval
+>    card's margin note (`why` in `GET /v1/queue`). This REVISES
+>    `classify_severity.py`'s "never duplicated into the audit trail"
+>    ruling for exactly this one sentence: the audit row is the canonical
+>    classification record (v1.6), so the landlord-facing summary belongs
+>    on it. Code change (write the key) is tracked to land before or with
+>    #56; rows written before it lack the key — readers treat a missing
+>    `summary` as null and fall back to joining `rules_fired`.
+
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
 CREATE TABLE landlords (

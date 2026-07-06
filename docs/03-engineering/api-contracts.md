@@ -111,18 +111,23 @@ emergency-followup → urgent (oldest first) → routine (oldest first):
 **v1.1 amendments (2026-07-06 — fields the Clarity dashboard rebuild
 needs; PR #181 review):**
 
-- **`why`** (new, required): ONE warm plain-English sentence for the
-  card's margin note — the classify-severity summary line the agent
-  already writes to `reasoning_log` (landlord-visible by rule).
-  `reasoning` (the terse rule-fragment array) stays as the expandable
-  audit trail; the two serve different surfaces and BOTH ship.
+- **`why`** (new, required, nullable): ONE warm plain-English sentence
+  for the card's margin note. Durable source: the `summary` key on the
+  `audit_log` `'classified'` payload (schema-v1 **v1.7** amendment —
+  `reasoning_log` itself is transient graph state and cannot be queried).
+  Rows classified before the key ships have no summary → `why: null`,
+  and the dashboard falls back to its generic margin-note copy.
+  `reasoning` (the terse rule-fragment array, from the same payload's
+  `rules_fired`) stays as the expandable audit trail; the two serve
+  different surfaces and BOTH ship.
 - **`title` is the emergency-banner headline.** Agent-written plain
   English per case, never client-side template copy — the dashboard must
   not hardcode incident wording (PR #181 shipped a hardcoded "reported a
   flood" once; never again).
-- **`has_media` / `media_note`** (new): `media_note` is an agent-written
-  plain-English note ("Sent a photo of the ceiling"), `null` until MMS
-  lands (#46). Full media objects stay on `GET /v1/cases/{id}` only —
+- **`has_media` / `media_note`** (new; both always present —
+  `has_media` defaults `false`, `media_note` nullable): `media_note` is
+  an agent-written plain-English note ("Sent a photo of the ceiling"),
+  `null` until MMS lands (#46). Full media objects stay on `GET /v1/cases/{id}` only —
   the queue card carries at most the note.
 - **`counts.awaiting_tenant`** (new): number of cases in
   `awaiting_tenant` status. NOT included in `counts.total` — `total`
@@ -137,6 +142,10 @@ needs; PR #181 review):**
 - **Undo countdowns derive from `undo_until`** (returned by approve),
   never a client-local constant — server time owns the window ("the undo
   window is data").
+- **Ordering/pagination:** `/v1/queue` is deliberately UNPAGINATED and
+  oldest-first per severity tier — an exception to the newest-first +
+  cursor convention above, because the queue is bounded by open cases,
+  not message volume (`conversation-model.md`, "queue ordering").
 - **Auto-handled feed: deferred, slot reserved.** The dashboard's
   "I handled this myself" note requires the trust ladder (#60); nothing
   auto-sends today (rule 3). Endpoint to be specified WITH #60
@@ -146,6 +155,14 @@ needs; PR #181 review):**
 ## Cases
 
 `GET /v1/cases?status=&severity=&property_id=` → `{ items: [CaseSummary], next_cursor }`
+
+`CaseSummary` (pinned 2026-07-06 — the "waiting on tenants" footnote and
+all case lists read this shape):
+```json
+{ "id": "…", "title": "No heat — Unit 2", "status": "awaiting_tenant",
+  "severity": "urgent", "tenant_name": "Maria", "unit": "2",
+  "property_label": "41 Palmerston", "last_activity_at": "…" }
+```
 `GET /v1/cases/{id}` → full timeline (messages + audit entries interleaved,
 oldest-first):
 ```json
