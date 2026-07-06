@@ -99,11 +99,49 @@ emergency-followup → urgent (oldest first) → routine (oldest first):
     "tenant_name": "Maria", "unit": "2", "received_at": "…",
     "tenant_message": "hey sorry to text so late…",
     "draft_body": "Hi Maria — so sorry…", "draft_recipient": "tenant",
+    "why": "No heat on a cold night with a baby in the unit can't wait, so I treated it as urgent.",
     "reasoning": ["no heat + overnight + infant present", "Ontario bylaw ≥21°C", "…"],
-    "refusal_flags": []
+    "refusal_flags": [],
+    "has_media": false, "media_note": null
   }],
-  "counts": { "total": 3, "emergency": 0, "urgent": 1, "routine": 2 } }
+  "counts": { "total": 3, "emergency": 0, "urgent": 1, "routine": 2,
+              "awaiting_tenant": 1 } }
 ```
+
+**v1.1 amendments (2026-07-06 — fields the Clarity dashboard rebuild
+needs; PR #181 review):**
+
+- **`why`** (new, required): ONE warm plain-English sentence for the
+  card's margin note — the classify-severity summary line the agent
+  already writes to `reasoning_log` (landlord-visible by rule).
+  `reasoning` (the terse rule-fragment array) stays as the expandable
+  audit trail; the two serve different surfaces and BOTH ship.
+- **`title` is the emergency-banner headline.** Agent-written plain
+  English per case, never client-side template copy — the dashboard must
+  not hardcode incident wording (PR #181 shipped a hardcoded "reported a
+  flood" once; never again).
+- **`has_media` / `media_note`** (new): `media_note` is an agent-written
+  plain-English note ("Sent a photo of the ceiling"), `null` until MMS
+  lands (#46). Full media objects stay on `GET /v1/cases/{id}` only —
+  the queue card carries at most the note.
+- **`counts.awaiting_tenant`** (new): number of cases in
+  `awaiting_tenant` status. NOT included in `counts.total` — `total`
+  counts action-needed cards only; `awaiting_tenant` feeds the
+  "N waiting on tenants" line.
+- **The "waiting on tenants" footnote** (named cases, not just a count)
+  is served by the EXISTING `GET /v1/cases?status=awaiting_tenant&limit=3`
+  — no new field; the dashboard makes a second read.
+- **Which id drives which action:** `draft_id` → approve / undo / reject
+  / edit-and-send; `case_id` → full view + conversation navigation.
+  Clients must not conflate them into one key.
+- **Undo countdowns derive from `undo_until`** (returned by approve),
+  never a client-local constant — server time owns the window ("the undo
+  window is data").
+- **Auto-handled feed: deferred, slot reserved.** The dashboard's
+  "I handled this myself" note requires the trust ladder (#60); nothing
+  auto-sends today (rule 3). Endpoint to be specified WITH #60
+  (working name `GET /v1/activity?kind=auto_sent`) — until then the
+  dashboard renders no handled note from live data.
 
 ## Cases
 
