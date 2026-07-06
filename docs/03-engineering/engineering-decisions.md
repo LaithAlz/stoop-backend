@@ -1,6 +1,6 @@
 # Engineering Decisions — `apps/api`
 
-> **Status:** Living reference, started 2026-07-05. Covers PRs #123–#175.
+> **Status:** Living reference, started 2026-07-05. Covers PRs #123–#177.
 > This is the durable record of *why* — every load-bearing backend decision
 > that isn't self-evident from reading the diff. `architecture.md` says what
 > the system is; `schema-v1.md` says what the tables are; this doc says why
@@ -593,6 +593,58 @@ too), but the two are never conflated inside the scoring itself.
 **Where:** `apps/api/evals/runner.py` (`ScenarioInfraError`,
 `run_scenario`), `apps/api/evals/scoring.py` (`ScenarioResult.errored`,
 `GateVerdict.errored_scenario_ids` / `release_blocked`).
+
+**The harness merged green — PR #177, gate 9 = 20/20.** The gate arc that
+got there: 14/20 → 19/20 (judge verdict inversion fixed at three layers —
+when a judge fails a draft, ALWAYS cross-check its prose reasoning against
+its boolean checklist before believing either; disagreement = eval-infra
+bug, not product bug) → 18/20 (f1 root-caused to the frozen v1
+`legal_rent_ltb` template's own 29-word legalistic copy, which
+`plain-language-rules.md` binds) → **prompts v2** → 18/20 (f1 failed on the
+single word "soon", rule 4 concrete-over-relative; e4 hit a third
+output-shape variance) → **20/20, `release_blocked=false`**, baseline
+committed as `evals/results/v1-baseline.json` (the one sanctioned
+`.gitignore` exception).
+**Where:** PR #177; `apps/api/evals/results/v1-baseline.json`.
+
+**Prompts v2 — a templates-only version bump, founder-approved
+2026-07-06.** The eval judge repeatedly failed v1's refusal-template copy
+against the product's own plain-language rules; fixing customer-facing
+template text is a prompt version bump (human-gated). `prompts/v2.py`
+changes ONLY `REFUSAL_TEMPLATES` (legal_rent_ltb + impersonation rewritten,
+access_codes + cost_compensation plained, other_tenants byte-identical);
+the classify/draft system prompts are **re-exported from v1 by reference**,
+so they cannot drift from what the baseline measured — pinned by an
+`is`-identity test. No template makes a time commitment: a concrete time in
+a refusal deferral would be a false commitment on the landlord's behalf.
+**Where:** `apps/api/app/agent/prompts/v2.py`;
+`apps/api/tests/test_agent_schemas.py`
+(`test_prompts_v2_changes_exactly_the_founder_approved_templates`).
+
+**Model-output shape coercions fail CLOSED — the boolean-modifier
+ruling.** Three observed variance classes are absorbed at the schema
+boundary (single-key wrapper; `refusal_flags` as a per-flag boolean dict;
+an invented `vulnerable_occupant_modifier_applied` bool). Safety review
+caught the first absorb of the third class being fail-open: `modifier`
+never re-derives severity, so accepting `ROUTINE` + `true` would have
+turned "validation error → retry → `classification_failed` → landlord
+notification" into a silent under-classification on the one path where
+silence kills. Ruling: `False` is absorbed (asserts nothing); `True` is
+absorbed only when severity is already EMERGENCY; anything else raises.
+Companion trap: Pydantic executes multiple `mode="before"` model
+validators in REVERSE definition order — compose shape normalizations into
+ONE validator with explicit sequencing, and keep a composition test.
+**Where:** `apps/api/app/agent/schemas.py` (`_unwrap_wrapper` docstring),
+`apps/api/tests/test_agent_schemas.py`
+(`test_severity_result_boolean_modifier_true_below_emergency_fails_closed`,
+`test_severity_result_wrapper_plus_gate8_variances_compose`).
+
+**Bare `pytest` can never spend money.** `[tool.pytest.ini_options]`
+carries `addopts = "-m 'not eval'"` (senior review, PR #177): the default
+command structurally cannot reach the paid gate; an explicit CLI `-m eval`
+still overrides it (last `-m` wins), which is how the gate is deliberately
+run — by the orchestrator, with founder authorization, never unilaterally.
+**Where:** `apps/api/pyproject.toml` (`addopts`).
 
 **The E2 catch — the harness's origin story, precisely attributed.**
 Building the harness surfaced a real Tier-0 false negative:
