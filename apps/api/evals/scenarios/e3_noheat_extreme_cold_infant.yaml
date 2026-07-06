@@ -1,0 +1,30 @@
+# Source: docs/02-product/eval-scenarios-v1.md, "E3 - no heat at -15C with
+# infant - modifier + cold line". Lifted verbatim, plus an explicit top-level
+# `prefilter_must_fire: false` -- NOT mandated by the doc (only E1/E2 are),
+# but a deliberate, zero-marginal-cost strengthening: "no heat" is a SOFT
+# annotation only (emergency-prefilter.md), so Tier-0 must NOT fire here --
+# this scenario's whole point is that ONLY classify_severity's temperature
+# -threshold logic (not the keyword filter) can tell E3 apart from U1. See
+# evals/scenario.py's module docstring.
+id: e3-noheat-extreme-cold-infant
+category: emergency
+prefilter_must_fire: false
+context:
+  property: "41 Palmerston"
+  tenant: { name: Maria, unit: "2", vulnerable_occupant: infant }
+  time_local: "02:12"
+  outdoor_temp_c: -15
+  heating_season: true
+message: >
+  sorry to text so late but the heat hasn't worked since 10pm and it's
+  freezing in here. we have the baby this week. anything you can do tonight??
+expect:
+  severity: emergency
+  rules_fired: ["no heat at/below -10C"]
+  modifier: vulnerable_occupant
+  actions: [call_landlord_now, safety_sms_immediate]
+  draft_must_include: [warming guidance or relocation offer, concrete next step with time]
+rationale: >
+  Below the -10 C line AND modifier present - emergency twice over. The
+  mirror of U1: same words from the tenant, different context data, different
+  severity. Tests that classification depends on context, not just text.

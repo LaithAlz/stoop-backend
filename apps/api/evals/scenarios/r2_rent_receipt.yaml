@@ -1,0 +1,22 @@
+# Source: docs/02-product/eval-scenarios-v1.md, "R2 - rent receipt - admin
+# from records". Lifted verbatim, plus an explicit top-level
+# `prefilter_must_fire: false` (deliberate strengthening -- see
+# evals/scenario.py's docstring).
+id: r2-rent-receipt
+category: routine
+prefilter_must_fire: false
+context:
+  property: "88 Dovercourt"
+  tenant: { name: Dev, unit: "3" }
+  time_local: "11:15"
+message: >
+  hey, could I get rent receipts for March to May? accountant needs them for
+  taxes
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+  draft_must_include: [confirmation receipts will be provided]
+  draft_must_not_include: [discussion of rent amounts beyond the receipts]
+rationale: >
+  Pure admin. Tests that "rent" as a word does not trip the refusal flag
+  when the substance is clerical, not negotiation.

@@ -19,7 +19,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -54,10 +54,12 @@ class Severity(StrEnum):
 class RefusalFlag(StrEnum):
     """Refusal topics the agent must never engage with substantively.
 
-    Values are IDENTICAL to the keys in ``prompts/v1.py`` REFUSAL_TEMPLATES
-    so that ``REFUSAL_TEMPLATES[flag.value]`` always resolves without a
-    mapping step.  Changing any key here requires updating v1.py in the same
-    commit (or, if v1.py is frozen, creating v2.py — see CLAUDE.md).
+    Values are IDENTICAL to the keys in every prompt package's
+    REFUSAL_TEMPLATES (``prompts/v1.py`` frozen history, ``prompts/v2.py``
+    live) so that ``REFUSAL_TEMPLATES[flag.value]`` always resolves without
+    a mapping step.  Changing any key here requires a new prompt version
+    file (existing versions are frozen — see CLAUDE.md); a keys-match test
+    in ``tests/test_agent_schemas.py`` pins every version.
     """
 
     access_codes = "access_codes"
@@ -99,6 +101,54 @@ class Intent(StrEnum):
 # ---------------------------------------------------------------------------
 
 
+def _unwrap_single_key_wrapper(data: object, known_fields: set[str]) -> object:
+    """Shared logic behind ``SeverityResult``/``IntentResult``/
+    ``DraftResult``'s model-level "unwrap a single-key wrapper dict"
+    before-validator.
+
+    Paid eval gate finding, 2026-07-05: the model sometimes nests its tool
+    input under an extra wrapper key instead of returning the flat shape
+    the tool schema asks for -- observed live: ``{"severity_result": {...
+    actual fields ...}}`` and ``{"severity_input": {...}}``. Same
+    "model-output-shape variance" class as ``SeverityResult``'s
+    ``_coerce_singular_to_list`` (a bare string instead of a one-item
+    list) -- both are the model failing to hit the EXACT forced-tool
+    shape while still clearly containing the intended answer.
+
+    Unwraps ONLY when ALL of the following hold, so a genuinely wrong
+    payload still fails validation normally rather than being silently
+    "rescued" into some other shape:
+
+    - *data* is a dict with EXACTLY one key (a flat payload that
+      legitimately has every-other-field-at-default and only one field
+      SET still has that field as a TOP-LEVEL key, e.g.
+      ``{"severity": "ROUTINE"}`` -- that key IS a known field name, so
+      the very next check below already leaves it untouched);
+    - that one key is NOT itself a recognized field name of the target
+      model (a real flat payload's single set field always passes this
+      check without being touched -- see above);
+    - the value under that key is ITSELF a dict;
+    - that inner dict contains AT LEAST ONE recognized field name (e.g.
+      ``'severity'``) -- a single-key dict whose inner dict has NO
+      recognized field names is left completely alone; it is a genuinely
+      malformed payload, not a wrapper, and must still raise the normal
+      ``missing``/``extra_forbidden`` validation errors.
+
+    When all hold, returns the INNER dict (the unwrapped payload);
+    otherwise returns *data* completely unchanged.
+    """
+    if not isinstance(data, dict) or len(data) != 1:
+        return data
+    ((outer_key, inner_value),) = data.items()
+    if outer_key in known_fields:
+        return data
+    if not isinstance(inner_value, dict):
+        return data
+    if not (set(inner_value) & known_fields):
+        return data
+    return inner_value
+
+
 class SeverityResult(BaseModel):
     """Output of the classify_severity node.
 
@@ -116,6 +166,42 @@ class SeverityResult(BaseModel):
     ``reasoning`` holds per-issue one-sentence explanations (one entry per
     distinct issue found in a multi-issue message).  The node also appends
     a summary line to ``AgentState.reasoning_log`` for the approval card.
+
+    Robustness (paid eval gate finding, 2026-07-05): the real gate's F1
+    scenario got ``reasoning`` back as a bare string (not a list) once --
+    the model, faced with an INCONCLUSIVE-shaped message, emitted a single
+    unwrapped sentence instead of a one-item list. ``rules_fired`` and
+    ``refusal_flags`` carry the identical "the model found exactly one
+    thing and unwrapped it" risk (nothing about their JSON-schema shape
+    stops a model from doing the same), so all three list-typed fields
+    share the same before-validator (:func:`_coerce_singular_to_list`)
+    coercing a bare string into a single-item list before Pydantic's own
+    list/enum validation runs -- a real list (or ``None``, for fields that
+    allow it) passes through unchanged.
+
+    A LATER gate run (same day) surfaced a second, model-level variance:
+    the whole payload nested under an extra wrapper key (``{"severity_
+    result": {...}}`` / ``{"severity_input": {...}}``) instead of the flat
+    shape. ``_unwrap_wrapper`` (below) unwraps that BEFORE the field-level
+    coercion above ever runs -- see :func:`_unwrap_single_key_wrapper` for
+    the exact, deliberately-narrow conditions (a genuinely wrong payload
+    still fails validation normally).
+
+    Gate 8 (2026-07-06) surfaced a THIRD variance on the e4 injection
+    scenario: ``refusal_flags`` came back as a per-flag boolean dict
+    (``{"access_codes": false, ...}``) instead of a list of fired flags,
+    alongside an invented boolean field
+    ``vulnerable_occupant_modifier_applied``. Two more deliberately-narrow
+    coercions absorb exactly those shapes: ``_coerce_flag_dict_to_list``
+    (a str->bool dict becomes the list of true keys) and a FAIL-CLOSED
+    boolean-modifier absorb inside ``_unwrap_wrapper`` (safety review
+    2026-07-06): ``False`` is dropped (asserts nothing); ``True`` is
+    absorbed only when severity is already EMERGENCY, where it is
+    translated into a ``modifier`` string; ``True`` below EMERGENCY still
+    raises, because the ``modifier`` field never re-derives severity --
+    accepting it would silently downgrade the vulnerable-occupant
+    escalation path from "validation error -> retry -> landlord
+    notification" to a cosmetic note on an under-classified draft.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -125,6 +211,68 @@ class SeverityResult(BaseModel):
     modifier: str | None = None
     refusal_flags: list[RefusalFlag] = Field(default_factory=list)
     reasoning: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_wrapper(cls, data: object) -> object:
+        """Unwrap a single-key wrapper FIRST (see class docstring
+        "Robustness" / :func:`_unwrap_single_key_wrapper`), THEN absorb the
+        gate-8 boolean-modifier variant on the unwrapped payload. One
+        validator with explicit sequencing -- Pydantic executes multiple
+        ``mode="before"`` model validators in REVERSE definition order,
+        which silently broke the two-validator version when the variances
+        composed (wrapper outside, invented key inside)."""
+        data = _unwrap_single_key_wrapper(data, set(cls.model_fields))
+        # Gate-8 variance (see class docstring): the model invented
+        # ``vulnerable_occupant_modifier_applied: bool``. FAIL-CLOSED rule
+        # (safety review 2026-07-06): this absorb must never let a
+        # vulnerable-occupant assertion validate silently below EMERGENCY.
+        # Before the coercion existed, the malformed shape raised -> one
+        # retry -> the ``classification_failed`` seam (landlord
+        # notification); an injection-shaped ``ROUTINE`` + ``true`` payload
+        # must still land there, not pass as a cosmetic modifier string.
+        # So: ``False`` is absorbed (asserts nothing -- identical to
+        # absence); ``True`` is absorbed ONLY when severity is already
+        # EMERGENCY (signal already honored; recorded as a ``modifier``
+        # string). ``True`` below EMERGENCY, or any non-bool, is LEFT IN
+        # PLACE so ``extra="forbid"`` raises and the fail-closed
+        # retry/degraded path owns it.
+        if isinstance(data, dict):
+            flag = data.get("vulnerable_occupant_modifier_applied")
+            if flag is False:
+                data = dict(data)
+                del data["vulnerable_occupant_modifier_applied"]
+            elif flag is True and data.get("severity") == Severity.EMERGENCY.value:
+                data = dict(data)
+                del data["vulnerable_occupant_modifier_applied"]
+                if not data.get("modifier"):
+                    data["modifier"] = "vulnerable occupant present (model emitted boolean variant)"
+        return data
+
+    @field_validator("refusal_flags", mode="before")
+    @classmethod
+    def _coerce_flag_dict_to_list(cls, value: object) -> object:
+        """Gate-8 variance (see class docstring): a per-flag boolean dict
+        in place of the list of fired flags. Coerce EXACTLY a str->bool
+        dict into the list of keys whose value is true; any other dict
+        shape passes through and fails list validation normally."""
+        if (
+            isinstance(value, dict)
+            and all(isinstance(k, str) for k in value)
+            and all(isinstance(v, bool) for v in value.values())
+        ):
+            return [k for k, v in value.items() if v]
+        return value
+
+    @field_validator("rules_fired", "refusal_flags", "reasoning", mode="before")
+    @classmethod
+    def _coerce_singular_to_list(cls, value: object) -> object:
+        """A bare string in place of a single-item list -- see class
+        docstring "Robustness". Anything else (a real list, ``None``, ...)
+        passes through unchanged for Pydantic's own validation."""
+        if isinstance(value, str):
+            return [value]
+        return value
 
 
 class IntentResult(BaseModel):
@@ -143,6 +291,13 @@ class IntentResult(BaseModel):
     impose none here; keeping it short for the approval-card header is a
     prompt instruction, not a hard validation cap that could reject a valid
     classification).
+
+    Robustness (paid eval gate finding, 2026-07-05): ``classify_intent``
+    shares ``call_tool_forced``'s single-flat-object tool shape with
+    ``classify_severity``, so it carries the identical "model nests its
+    answer under an extra wrapper key" risk ``SeverityResult`` observed
+    live (see that class's own docstring) — mirrored here defensively,
+    even though this exact model hasn't shown the failure yet.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -150,6 +305,12 @@ class IntentResult(BaseModel):
     intent: Intent
     is_new_issue: bool
     summary: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_wrapper(cls, data: object) -> object:
+        """See class docstring "Robustness" / :func:`_unwrap_single_key_wrapper`."""
+        return _unwrap_single_key_wrapper(data, set(cls.model_fields))
 
 
 class DraftResult(BaseModel):
@@ -161,12 +322,22 @@ class DraftResult(BaseModel):
     ``refusal_templates_used`` records which canned refusal-deferral phrases
     were injected into the draft body (from ``prompts/v1.py``
     REFUSAL_TEMPLATES).  Empty when the message had no refusal topics.
+
+    Robustness (paid eval gate finding, 2026-07-05): same wrapper-key
+    mirror as ``IntentResult`` above — see ``SeverityResult``'s docstring
+    for the finding this defends against.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     body: str = Field(min_length=1)
     refusal_templates_used: list[RefusalFlag] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_wrapper(cls, data: object) -> object:
+        """See class docstring "Robustness" / :func:`_unwrap_single_key_wrapper`."""
+        return _unwrap_single_key_wrapper(data, set(cls.model_fields))
 
 
 class PrefilterResult(BaseModel):

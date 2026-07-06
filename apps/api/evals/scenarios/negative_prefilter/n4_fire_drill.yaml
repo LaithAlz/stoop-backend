@@ -1,0 +1,18 @@
+# See n1_smoke_detector_battery.yaml's header comment. Message text reused
+# verbatim from tests/test_prefilter.py::TestGuards::test_fire_drill_at_2pm.
+id: n4-fire-drill
+category: routine
+tier0_only: true
+prefilter_must_fire: false
+context:
+  property: "12 Ossington"
+  tenant: { name: Sam, unit: "1B" }
+  time_local: "13:45"
+message: >
+  fire drill at 2pm today
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+rationale: >
+  A scheduled fire drill is not a fire. Must NOT trip Tier-0's fire trigger
+  even though the word "fire" is present. Guards on the fire_drill pattern.

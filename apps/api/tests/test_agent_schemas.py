@@ -63,17 +63,50 @@ def test_severity_rejects_lowercase_token() -> None:
 
 @pytest.mark.unit
 def test_refusal_flag_values_match_prompt_keys() -> None:
-    """RefusalFlag values must be identical to REFUSAL_TEMPLATES keys in v1.py."""
-    from app.agent.prompts.v1 import REFUSAL_TEMPLATES
+    """RefusalFlag values must be identical to REFUSAL_TEMPLATES keys in
+    EVERY prompt package version (v1 frozen, v2 live)."""
+    from app.agent.prompts.v1 import REFUSAL_TEMPLATES as TEMPLATES_V1
+    from app.agent.prompts.v2 import REFUSAL_TEMPLATES as TEMPLATES_V2
 
     flag_values = {f.value for f in RefusalFlag}
-    template_keys = set(REFUSAL_TEMPLATES.keys())
-    assert flag_values == template_keys, (
-        f"RefusalFlag values and REFUSAL_TEMPLATES keys diverged.\n"
-        f"  RefusalFlag : {sorted(flag_values)}\n"
-        f"  REFUSAL_TEMPLATES: {sorted(template_keys)}\n"
-        "Update schemas.py or prompts/v1.py so they match."
-    )
+    for version, templates in (("v1", TEMPLATES_V1), ("v2", TEMPLATES_V2)):
+        template_keys = set(templates.keys())
+        assert flag_values == template_keys, (
+            f"RefusalFlag values and {version} REFUSAL_TEMPLATES keys diverged.\n"
+            f"  RefusalFlag : {sorted(flag_values)}\n"
+            f"  REFUSAL_TEMPLATES: {sorted(template_keys)}\n"
+            f"Update schemas.py or prompts/{version}.py so they match."
+        )
+
+
+@pytest.mark.unit
+def test_prompts_v2_changes_exactly_the_founder_approved_templates() -> None:
+    """Pin the founder-approved v2 diff (2026-07-06): four templates
+    rewritten for plain-language conformance, other_tenants byte-identical
+    to v1, and the system-prompt builders re-exported unchanged from v1."""
+    from app.agent.prompts import v1, v2
+
+    assert v2.PROMPT_VERSION == "v2"
+    assert v1.PROMPT_VERSION == "v1"
+    changed = {
+        key
+        for key in v1.REFUSAL_TEMPLATES
+        if v1.REFUSAL_TEMPLATES[key] != v2.REFUSAL_TEMPLATES[key]
+    }
+    assert changed == {
+        "access_codes",
+        "legal_rent_ltb",
+        "cost_compensation",
+        "impersonation",
+    }
+    assert v2.REFUSAL_TEMPLATES["other_tenants"] == v1.REFUSAL_TEMPLATES["other_tenants"]
+    # Byte-identical by construction: v2 re-exports the frozen v1 builders.
+    assert v2.get_classify_system_prompt is v1.get_classify_system_prompt
+    assert v2.build_draft_system_prompt is v1.build_draft_system_prompt
+    # The v1 legalistic phrasing that failed eval gates 5-7 is gone from v2.
+    assert "Landlord and Tenant Board" not in v2.REFUSAL_TEMPLATES["legal_rent_ltb"]
+    assert "on their behalf" not in v2.REFUSAL_TEMPLATES["legal_rent_ltb"]
+    assert "on their behalf" not in v2.REFUSAL_TEMPLATES["impersonation"]
 
 
 @pytest.mark.unit
@@ -151,6 +184,272 @@ def test_severity_result_rejects_invalid_severity() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SeverityResult singular -> list coercion (paid eval gate finding,
+# 2026-07-05: F1's real run got `reasoning` back as a bare string once)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_severity_result_coerces_bare_reasoning_string_to_list() -> None:
+    result = SeverityResult.model_validate(
+        {
+            "severity": "ROUTINE",
+            "reasoning": "Tenant references a past dispute; flagged for landlord review.",
+        }
+    )
+    assert result.reasoning == ["Tenant references a past dispute; flagged for landlord review."]
+
+
+@pytest.mark.unit
+def test_severity_result_coerces_bare_rules_fired_string_to_list() -> None:
+    result = SeverityResult.model_validate(
+        {"severity": "URGENT", "rules_fired": "No heat (outdoor temp above -10C)"}
+    )
+    assert result.rules_fired == ["No heat (outdoor temp above -10C)"]
+
+
+@pytest.mark.unit
+def test_severity_result_coerces_bare_refusal_flag_string_to_list() -> None:
+    result = SeverityResult.model_validate({"severity": "ROUTINE", "refusal_flags": "access_codes"})
+    assert result.refusal_flags == [RefusalFlag.access_codes]
+
+
+@pytest.mark.unit
+def test_severity_result_real_list_input_unaffected_by_coercion() -> None:
+    """The coercion must never touch an already-correct list -- this is a
+    before-validator safety net, not a behavior change for the normal
+    (already-a-list) case."""
+    result = SeverityResult.model_validate(
+        {
+            "severity": "EMERGENCY",
+            "rules_fired": ["a", "b"],
+            "refusal_flags": ["legal_rent_ltb"],
+            "reasoning": ["one", "two"],
+        }
+    )
+    assert result.rules_fired == ["a", "b"]
+    assert result.refusal_flags == [RefusalFlag.legal_rent_ltb]
+    assert result.reasoning == ["one", "two"]
+
+
+@pytest.mark.unit
+def test_severity_result_coercion_still_validates_enum_membership() -> None:
+    """A bare, but INVALID, refusal-flag string still raises -- the
+    coercion only unwraps the string into a list; it does not bypass
+    normal enum validation."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate({"severity": "ROUTINE", "refusal_flags": "not_a_real_flag"})
+
+
+# ---------------------------------------------------------------------------
+# SeverityResult single-key wrapper unwrapping (paid eval gate finding,
+# 2026-07-05: the model sometimes nests the payload under an extra key --
+# observed live: {"severity_result": {...}} and {"severity_input": {...}})
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_severity_result_unwraps_severity_result_wrapper_key() -> None:
+    """Observed live wrapper shape #1: {"severity_result": {...}}."""
+    result = SeverityResult.model_validate(
+        {
+            "severity_result": {
+                "severity": "EMERGENCY",
+                "rules_fired": ["Gas smell"],
+                "refusal_flags": [],
+                "reasoning": "Gas smell reported; tenant told to leave and call 911 from outside.",
+            }
+        }
+    )
+    assert result.severity == Severity.EMERGENCY
+    assert result.rules_fired == ["Gas smell"]
+    # The wrapper unwrap AND the str -> list coercion both fired here --
+    # they compose (model-level unwrap runs before field-level coercion).
+    assert result.reasoning == [
+        "Gas smell reported; tenant told to leave and call 911 from outside."
+    ]
+
+
+@pytest.mark.unit
+def test_severity_result_unwraps_severity_input_wrapper_key() -> None:
+    """Observed live wrapper shape #2: {"severity_input": {...}}."""
+    result = SeverityResult.model_validate(
+        {
+            "severity_input": {
+                "severity": "ROUTINE",
+                "rules_fired": [],
+                "refusal_flags": ["legal_rent_ltb"],
+                "reasoning": ["Tenant asked about rent receipts."],
+            }
+        }
+    )
+    assert result.severity == Severity.ROUTINE
+    assert result.refusal_flags == [RefusalFlag.legal_rent_ltb]
+
+
+@pytest.mark.unit
+def test_severity_result_flat_payload_untouched_by_unwrap() -> None:
+    """A correct, already-flat payload -- including one where only a
+    SINGLE field is set (the tricky edge case: a single-key dict whose one
+    key IS a real field name) -- must never be treated as a wrapper."""
+    result = SeverityResult.model_validate({"severity": "ROUTINE"})
+    assert result.severity == Severity.ROUTINE
+    assert result.rules_fired == []
+    assert result.refusal_flags == []
+    assert result.reasoning == []
+
+
+@pytest.mark.unit
+def test_severity_result_nonsense_single_key_dict_still_fails() -> None:
+    """A single-key dict whose inner dict has NO recognized field names is
+    a genuinely wrong payload -- it must NOT be unwrapped, and must still
+    fail validation loudly (never silently "rescued")."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate({"some_random_key": {"totally": "unrelated", "data": 1}})
+
+
+@pytest.mark.unit
+def test_severity_result_single_key_dict_with_non_dict_value_not_unwrapped() -> None:
+    """A single-key dict whose value is NOT a dict at all (e.g. a bare
+    string) must not be treated as a wrapper either."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate({"severity_result": "EMERGENCY"})
+
+
+@pytest.mark.unit
+def test_severity_result_gate8_e4_payload_flag_dict_plus_boolean_modifier() -> None:
+    """Reproduces the EXACT gate-8 e4 infra failure (2026-07-06):
+    refusal_flags as a per-flag boolean dict + the invented
+    vulnerable_occupant_modifier_applied bool. Both coercions must absorb
+    it into a valid, semantically-identical result."""
+    result = SeverityResult.model_validate(
+        {
+            "severity": "EMERGENCY",
+            "rules_fired": ["Active fire (Q1: YES)"],
+            "refusal_flags": {
+                "access_codes": False,
+                "legal_rent_ltb": False,
+                "cost_compensation": False,
+                "other_tenants": False,
+                "impersonation": False,
+            },
+            "vulnerable_occupant_modifier_applied": False,
+            "reasoning": ["Tenant reports active fire."],
+        }
+    )
+    assert result.severity == Severity.EMERGENCY
+    assert result.refusal_flags == []
+    assert result.modifier is None
+
+
+@pytest.mark.unit
+def test_severity_result_flag_dict_with_true_values_coerces_to_fired_flags() -> None:
+    result = SeverityResult.model_validate(
+        {
+            "severity": "ROUTINE",
+            "refusal_flags": {
+                "legal_rent_ltb": True,
+                "cost_compensation": True,
+                "other_tenants": False,
+            },
+        }
+    )
+    assert result.refusal_flags == [RefusalFlag.legal_rent_ltb, RefusalFlag.cost_compensation]
+
+
+@pytest.mark.unit
+def test_severity_result_flag_dict_with_non_bool_values_still_fails() -> None:
+    """Narrowness: a dict whose values are not all bools is NOT coerced --
+    it must fail list validation loudly."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate(
+            {"severity": "ROUTINE", "refusal_flags": {"legal_rent_ltb": "yes"}}
+        )
+
+
+@pytest.mark.unit
+def test_severity_result_boolean_modifier_true_at_emergency_becomes_modifier() -> None:
+    """True at EMERGENCY is safe to absorb: the severity already honors the
+    signal, so it is recorded as a modifier string."""
+    result = SeverityResult.model_validate(
+        {"severity": "EMERGENCY", "vulnerable_occupant_modifier_applied": True}
+    )
+    assert result.modifier is not None
+    assert "vulnerable occupant" in result.modifier
+
+
+@pytest.mark.unit
+def test_severity_result_boolean_modifier_true_below_emergency_fails_closed() -> None:
+    """Safety review 2026-07-06: a True vulnerable-occupant assertion on a
+    below-EMERGENCY severity must NOT validate -- modifier never re-derives
+    severity, so absorbing it would turn the fail-closed path (validation
+    error -> retry -> classification_failed -> landlord notification) into
+    a silent under-classification. The exact e4-injection-shaped payload
+    the safety reviewer reproduced must raise."""
+    for severity in ("ROUTINE", "URGENT"):
+        with pytest.raises(ValidationError):
+            SeverityResult.model_validate(
+                {"severity": severity, "vulnerable_occupant_modifier_applied": True}
+            )
+
+
+@pytest.mark.unit
+def test_severity_result_boolean_modifier_true_never_overwrites_real_modifier() -> None:
+    result = SeverityResult.model_validate(
+        {
+            "severity": "EMERGENCY",
+            "modifier": "vulnerable-occupant bump: infant",
+            "vulnerable_occupant_modifier_applied": True,
+        }
+    )
+    assert result.modifier == "vulnerable-occupant bump: infant"
+
+
+@pytest.mark.unit
+def test_severity_result_boolean_modifier_non_bool_value_still_fails() -> None:
+    """Narrowness: only an exact bool is absorbed; anything else keeps the
+    unknown key and fails extra="forbid" loudly."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate(
+            {"severity": "ROUTINE", "vulnerable_occupant_modifier_applied": "true"}
+        )
+
+
+@pytest.mark.unit
+def test_severity_result_wrapper_plus_gate8_variances_compose() -> None:
+    """All three variance classes at once: wrapper key OUTSIDE, flag dict
+    + boolean modifier INSIDE. Unwrap runs first, then the coercions."""
+    result = SeverityResult.model_validate(
+        {
+            "severity_result": {
+                "severity": "EMERGENCY",
+                "refusal_flags": {"access_codes": False},
+                "vulnerable_occupant_modifier_applied": True,
+            }
+        }
+    )
+    assert result.severity == Severity.EMERGENCY
+    assert result.refusal_flags == []
+    assert result.modifier is not None and "vulnerable occupant" in result.modifier
+
+
+@pytest.mark.unit
+def test_severity_result_wrapper_plus_bare_string_reasoning_compose() -> None:
+    """Both robustness layers fire together: the payload is wrapped AND
+    its inner ``reasoning`` is a bare string -- both must be corrected."""
+    result = SeverityResult.model_validate(
+        {
+            "severity_result": {
+                "severity": "ROUTINE",
+                "reasoning": "Tenant references a past dispute; flagged for landlord review.",
+            }
+        }
+    )
+    assert result.severity == Severity.ROUTINE
+    assert result.reasoning == ["Tenant references a past dispute; flagged for landlord review."]
+
+
+# ---------------------------------------------------------------------------
 # IntentResult round-trip + validation
 # ---------------------------------------------------------------------------
 
@@ -193,6 +492,29 @@ def test_intent_result_summary_unbounded_but_nonempty() -> None:
         IntentResult(intent=Intent.other, is_new_issue=True, summary="")
 
 
+@pytest.mark.unit
+def test_intent_result_unwraps_wrapper_key() -> None:
+    """IntentResult mirrors SeverityResult's wrapper-unwrap defensively --
+    see that class's docstring "Robustness"."""
+    result = IntentResult.model_validate(
+        {
+            "intent_result": {
+                "intent": "admin",
+                "is_new_issue": True,
+                "summary": "Rent receipts for March to May",
+            }
+        }
+    )
+    assert result.intent == Intent.admin
+    assert result.summary == "Rent receipts for March to May"
+
+
+@pytest.mark.unit
+def test_intent_result_nonsense_single_key_dict_still_fails() -> None:
+    with pytest.raises(ValidationError):
+        IntentResult.model_validate({"some_key": {"unrelated": "data"}})
+
+
 # ---------------------------------------------------------------------------
 # DraftResult round-trip + validation
 # ---------------------------------------------------------------------------
@@ -225,6 +547,22 @@ def test_draft_result_rejects_empty_body() -> None:
     """DraftResult body must not be empty (min_length=1)."""
     with pytest.raises(ValidationError):
         DraftResult(body="")
+
+
+@pytest.mark.unit
+def test_draft_result_unwraps_wrapper_key() -> None:
+    """DraftResult mirrors SeverityResult's wrapper-unwrap defensively --
+    see that class's docstring "Robustness"."""
+    result = DraftResult.model_validate(
+        {"draft_result": {"body": "Thanks for letting me know, I'll follow up soon."}}
+    )
+    assert result.body == "Thanks for letting me know, I'll follow up soon."
+
+
+@pytest.mark.unit
+def test_draft_result_nonsense_single_key_dict_still_fails() -> None:
+    with pytest.raises(ValidationError):
+        DraftResult.model_validate({"some_key": {"unrelated": "data"}})
 
 
 @pytest.mark.unit

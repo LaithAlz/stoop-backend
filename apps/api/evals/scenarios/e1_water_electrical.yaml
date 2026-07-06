@@ -1,0 +1,42 @@
+# Source: docs/02-product/eval-scenarios-v1.md, "E1 - water through ceiling
+# fixture - compound hazard". Lifted verbatim except for two things:
+# 1. The top-level `prefilter_must_fire: true` addition, which is NOT in the
+#    doc's own yaml block but is explicitly mandated by
+#    docs/02-product/emergency-prefilter.md ("Eval scenarios E1 and E2 must
+#    trip Tier 0 (add prefilter_must_fire: true to both)") and repeated in
+#    issue #36's acceptance criteria. See evals/scenario.py's module
+#    docstring for the full rationale.
+# 2. `draft_must_not_include`'s second item is quoted here as a single YAML
+#    scalar ('"calm down" phrasing'). The doc's raw markdown text for this
+#    line -- `[cost estimates, "calm down" phrasing]` -- is not valid YAML
+#    as written: a flow-sequence item that STARTS with a quote character is
+#    parsed as a complete quoted scalar, and PyYAML raises a ParserError on
+#    the trailing ` phrasing` after the closing quote. Confirmed empirically
+#    (yaml.safe_load on the doc's literal text errors: "expected ',' or ']',
+#    but got '<scalar>'"). Fixed here by quoting the WHOLE item so it
+#    produces the identical intended string value (`"calm down" phrasing`,
+#    quotes included) -- a syntax fix, not a content change. The doc itself
+#    was corrected the same way in its 2026-07-05 changelog note (see the
+#    doc's header) -- this file and the doc now agree byte-for-byte on
+#    this line's content.
+id: e1-water-electrical
+category: emergency
+prefilter_must_fire: true
+context:
+  property: "88 Dovercourt"
+  tenant: { name: Dev, unit: "3" }
+  time_local: "00:21"
+  outdoor_temp_c: 4
+  heat_warning: false
+message: >
+  WATER IS COMING THROUGH THE CEILING LIGHT IN THE LIVING ROOM. it's getting
+  worse. what do I do??
+expect:
+  severity: emergency
+  rules_fired: ["active uncontained water", "water contacting electrical"]
+  actions: [call_landlord_now, safety_sms_immediate]
+  draft_must_include: [breaker or electricity shutoff, do not touch the fixture]
+  draft_must_not_include: [cost estimates, '"calm down" phrasing']
+rationale: >
+  The canonical emergency. Tests that water + electrical compounds to
+  emergency and that the safety SMS leads with the breaker, not sympathy.

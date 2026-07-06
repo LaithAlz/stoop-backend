@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 import app.agent.nodes.draft_response as node_mod
 import app.db.session as db_mod
 from app.agent.nodes.draft_response import draft_response
-from app.agent.prompts.v1 import REFUSAL_TEMPLATES
+from app.agent.prompts.v2 import REFUSAL_TEMPLATES
 from app.agent.schemas import CaseContext, RefusalFlag, Severity, SeverityResult
 from app.agent.state import AgentState
 from app.integrations import anthropic as anthropic_mod
@@ -295,6 +295,16 @@ def _routine_severity(refusal_flags: list[RefusalFlag] | None = None) -> Severit
     )
 
 
+def _severity_result(severity: Severity, *, rules_fired: list[str] | None = None) -> SeverityResult:
+    return SeverityResult(
+        severity=severity,
+        rules_fired=rules_fired or [],
+        modifier=None,
+        refusal_flags=[],
+        reasoning=["Reasoning."],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -475,7 +485,7 @@ async def test_draft_response_success_inserts_pending_draft_and_audit(
         assert len(draft_rows) == 1
         assert draft_rows[0]["status"] == "pending"
         assert draft_rows[0]["recipient"] == "tenant"
-        assert draft_rows[0]["prompt_version"] == "v1"
+        assert draft_rows[0]["prompt_version"] == "v2"
 
         audit_rows = (
             (
@@ -717,6 +727,12 @@ async def test_draft_response_dollar_guard_rejects_and_regenerates(
         ("Our lawyer says you have to pay for it.", "legal_position"),
         ("You have no right to withhold rent.", "legal_position"),
         ("You don't have a case here.", "legal_position"),
+        # Life-safety class (gate run 5 triage, 2026-07-05): oven/stovetop/
+        # open-flame-as-heat-source, hedged or not.
+        ("Use space heaters or the oven (off) for warmth", "unsafe_heat_source"),
+        ("You could turn on the oven for heat tonight.", "unsafe_heat_source"),
+        ("Try the stovetop to warm up the kitchen.", "unsafe_heat_source"),
+        ("Light some candles to stay warm until then.", "unsafe_heat_source"),
     ],
 )
 @pytest.mark.integration
@@ -776,6 +792,11 @@ async def test_draft_response_hard_guard_positive_cases(
         "Thanks for letting me know, I'll take a look this week.",
         "Tony can come by Thursday morning between 8 and 11.",
         "No worries at all, I'll follow up soon.",
+        # A broken oven/stove (repair topic, not a heat-source suggestion)
+        # must never trip the new unsafe_heat_source guard.
+        "Sorry to hear the oven is broken, someone will look at it tomorrow.",
+        "The stove is dead -- I'll get a repair person out by 9am.",
+        "Use a space heater and extra blankets to stay warm tonight.",
     ],
 )
 @pytest.mark.unit
@@ -1086,10 +1107,13 @@ async def test_draft_response_appended_deferral_may_exceed_segment_guidance_by_d
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Plain-language exception, documented (module docstring): appending
-    the legal_rent_ltb deferral can push the final draft past the ~300
-    -char "<=2 SMS segments" routine guidance -- this is an intentional
+    mandated deferral(s) can push the final draft past the ~300-char
+    "<=2 SMS segments" routine guidance -- this is an intentional
     trade-off (never omit the mandated deferral), not a bug, and this node
-    performs NO truncation to force the length budget."""
+    performs NO truncation to force the length budget. (Under prompts v2
+    the single legal_rent_ltb template is short enough that ONE flag no
+    longer exceeds the budget, so this test appends TWO flags -- the
+    multi-flag case is exactly where the exception still bites.)"""
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -1119,20 +1143,27 @@ async def test_draft_response_appended_deferral_may_exceed_segment_guidance_by_d
                 tenant_id=uuid.UUID(tenant_id),
                 case_id=uuid.UUID(case_id),
             ),
-            "severity": _routine_severity([RefusalFlag.legal_rent_ltb]),
+            "severity": _routine_severity(
+                [RefusalFlag.legal_rent_ltb, RefusalFlag.cost_compensation]
+            ),
             "reasoning_log": [],
         }
         update = await draft_response(state)
 
         assert update["draft_guard_failed"] is False
-        final_len = len(update["draft"].body)
+        body = update["draft"].body
+        final_len = len(body)
         # Document the exception explicitly rather than asserting a length
         # cap: this draft is EXPECTED to exceed the ~300-char routine
-        # guidance once the deferral is appended, and that is by design.
+        # guidance once both deferrals are appended, and that is by design.
         assert final_len > 300, (
-            "expected the appended legal_rent_ltb deferral to exceed the routine "
-            f"~300-char guidance (documented exception); got {final_len} chars"
+            "expected the appended legal_rent_ltb + cost_compensation deferrals to "
+            f"exceed the routine ~300-char guidance (documented exception); got "
+            f"{final_len} chars"
         )
+        # And NO truncation happened: both templates are present verbatim.
+        assert REFUSAL_TEMPLATES["legal_rent_ltb"] in body
+        assert REFUSAL_TEMPLATES["cost_compensation"] in body
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -1282,5 +1313,585 @@ async def test_draft_response_no_stale_draft_when_none_pending(
             )
         ).scalar_one()
         assert stale_audit_count == 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Severity-aware next-step guidance (senior review, 2026-07-05) -- pure
+# _build_user_content tests, no DB/Anthropic needed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_build_user_content_urgent_heating_topic_gets_self_help_and_time_guidance() -> None:
+    content = node_mod._build_user_content(
+        body="the heat hasn't worked since 10pm and it's getting really cold",
+        tenant_name="Maria",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.URGENT, rules_fired=["No heat (outdoor temperature above -10C)"]
+        ),
+        refusal_flags=[],
+    )
+    assert "self-help check" in content
+    assert "breaker" in content.lower()
+    assert "bounded" in content.lower()
+
+
+@pytest.mark.unit
+def test_build_user_content_urgent_appliance_topic_gets_self_help_and_time_guidance() -> None:
+    content = node_mod._build_user_content(
+        body="fridge just completely died, light's off and it's not cold at all",
+        tenant_name="Sam",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.URGENT, rules_fired=["Refrigerator dead (food spoilage clock is running)"]
+        ),
+        refusal_flags=[],
+    )
+    assert "plugged in" in content
+    assert "breaker" in content.lower()
+
+
+@pytest.mark.unit
+def test_build_user_content_one_question_hard_cap_is_explicit() -> None:
+    """Gate run 5 triage: u2's draft asked two questions despite the
+    original "at most ONE question" line -- the reminder now spells out
+    the exact failure pattern (an "or"-joined double question) as a HARD
+    CAP, and the appliance/heating guidance's own illustrative example no
+    longer uses that "or"-question shape."""
+    content = node_mod._build_user_content(
+        body="fridge just completely died",
+        tenant_name="Sam",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.URGENT, rules_fired=["Refrigerator dead (food spoilage clock is running)"]
+        ),
+        refusal_flags=[],
+    )
+    assert "HARD CAP" in content
+    assert "plugged in and the breaker" in content
+    assert "plugged in properly, or" not in content
+
+
+@pytest.mark.unit
+def test_build_user_content_urgent_security_topic_gets_bounded_window_not_self_help() -> None:
+    content = node_mod._build_user_content(
+        body="the deadbolt on my unit door stopped catching",
+        tenant_name="Dev",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.URGENT,
+            rules_fired=[
+                "Door or window lock broken -- unit is currently securable but compromised"
+            ],
+        ),
+        refusal_flags=[],
+    )
+    assert "security issue" in content
+    assert "within 24 hours" in content
+    # The POSITIVE self-help instruction is absent -- the guidance text
+    # itself mentions "self-help" only to say a lock has none, which is the
+    # point of this test (a security issue gets no self-help instruction).
+    assert "Include ONE quick self-help check" not in content
+
+
+@pytest.mark.unit
+def test_build_user_content_urgent_generic_topic_gets_concrete_time_only() -> None:
+    content = node_mod._build_user_content(
+        body="the toilet keeps running",
+        tenant_name="Dev",
+        house_rules=None,
+        severity_result=_severity_result(Severity.URGENT, rules_fired=["Some other URGENT rule"]),
+        refusal_flags=[],
+    )
+    assert "bounded next step" in content
+    assert "self-help" not in content
+
+
+@pytest.mark.unit
+def test_build_user_content_emergency_gets_structure_guidance() -> None:
+    content = node_mod._build_user_content(
+        body="water is coming through the ceiling light",
+        tenant_name="Dev",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.EMERGENCY, rules_fired=["Active, uncontained water"]
+        ),
+        refusal_flags=[],
+    )
+    assert "safety instruction(s) first" in content
+    assert "what you (the landlord) are doing right now" in content
+
+
+@pytest.mark.unit
+def test_build_user_content_emergency_requires_numbered_list_max_three_steps() -> None:
+    """Gate run 5 finding: e1's draft crammed 5-6 instructions into one
+    dense paragraph even though it was well under the length budget --
+    plain-language-rules.md rule 2 ("instructions come as a numbered
+    list, most important first, max three steps") was never actually
+    encoded in the EMERGENCY guidance until now."""
+    content = node_mod._build_user_content(
+        body="water is coming through the ceiling light",
+        tenant_name="Dev",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.EMERGENCY, rules_fired=["Active, uncontained water"]
+        ),
+        refusal_flags=[],
+    )
+    assert "NUMBERED LIST" in content
+    assert "AT MOST" in content
+    assert "3 steps" in content
+    assert "most important" in content.lower()
+    assert "plain-language-rules.md rule 2" in content
+
+
+@pytest.mark.unit
+def test_build_user_content_routine_gets_no_severity_specific_structure_guidance() -> None:
+    content = node_mod._build_user_content(
+        body="dripping faucet",
+        tenant_name="Sam",
+        house_rules=None,
+        severity_result=_routine_severity(),
+        refusal_flags=[],
+    )
+    assert "safety instruction(s) first" not in content
+    assert "self-help check" not in content
+
+
+@pytest.mark.unit
+def test_build_user_content_routine_gets_concrete_time_commitment_guidance() -> None:
+    """Gate run 5 triage: r1's draft said "this week"/"soon" -- ROUTINE now
+    gets the same concrete-over-relative next-step reminder EMERGENCY/
+    URGENT already had (plain-language-rules.md rule 4 is unconditional)."""
+    content = node_mod._build_user_content(
+        body="kitchen faucet has a slow drip",
+        tenant_name="Sam",
+        house_rules=None,
+        severity_result=_routine_severity(),
+        refusal_flags=[],
+    )
+    assert "bounded next step" in content
+    assert "bare" in content.lower()
+
+
+@pytest.mark.unit
+def test_build_user_content_emergency_heating_topic_gets_unsafe_heat_source_warning() -> None:
+    """Gate run 5 triage: e3's draft suggested the oven for warmth -- the
+    EMERGENCY path now gets the same oven/stovetop/open-flame warning the
+    URGENT heating branch gets, whenever the topic is heating-related."""
+    content = node_mod._build_user_content(
+        body="the heat hasn't worked since 10pm and it's freezing, we have the baby this week",
+        tenant_name="Maria",
+        house_rules=None,
+        severity_result=_severity_result(Severity.EMERGENCY, rules_fired=["No heat at/below -10C"]),
+        refusal_flags=[],
+    )
+    assert "oven" in content.lower()
+    assert "open flame" in content.lower()
+    assert "space heater" in content.lower()
+
+
+@pytest.mark.unit
+def test_build_user_content_refusal_ack_forbids_handoff_duplication_and_signoff() -> None:
+    """Gate run 6 triage: f1's combined draft read as two texts glued
+    together -- the model's ack said "passed this to the landlord, he'll
+    follow up ... talk soon" and then the appended deferral template said
+    the hand-off AGAIN. The instruction itself mandated that duplication
+    ("ONE brief, neutral sentence noting you've passed it along"). The
+    refusal guidance now forbids the ack from stating the hand-off,
+    promising follow-up, or signing off, because the appended note owns
+    all of that."""
+    content = node_mod._build_user_content(
+        body="last winter the heat was broken for weeks, I want a rent reduction or LTB",
+        tenant_name="Maria",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.ROUTINE, rules_fired=["Refusal topic: rent reduction / LTB"]
+        ),
+        refusal_flags=[RefusalFlag.legal_rent_ltb],
+    )
+    assert "must NOT say you've passed" in content
+    assert "must NOT promise follow-up" in content
+    assert "must NOT sign off" in content
+    assert "more text follows yours" in content
+    # The old duplication-mandating instruction is gone.
+    assert "sentence noting you've passed it along" not in content
+    # The core prohibitions survive the rewrite.
+    assert "pre-approved note" in content
+    assert "paraphrase" in content
+
+
+@pytest.mark.unit
+def test_build_user_content_emergency_non_heating_topic_gets_no_heat_source_warning() -> None:
+    content = node_mod._build_user_content(
+        body="water is coming through the ceiling light",
+        tenant_name="Dev",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.EMERGENCY, rules_fired=["Active, uncontained water"]
+        ),
+        refusal_flags=[],
+    )
+    assert "oven" not in content.lower()
+
+
+@pytest.mark.unit
+def test_build_user_content_access_codes_gets_alternative_guidance() -> None:
+    content = node_mod._build_user_content(
+        body="can you give my buddy the code",
+        tenant_name="Sam",
+        house_rules=None,
+        severity_result=_routine_severity([RefusalFlag.access_codes]),
+        refusal_flags=[RefusalFlag.access_codes],
+    )
+    assert "arrange this themselves directly" in content
+
+
+@pytest.mark.unit
+def test_build_user_content_non_access_refusal_flag_does_not_get_alternative_guidance() -> None:
+    content = node_mod._build_user_content(
+        body="I think I'm owed a rent reduction",
+        tenant_name="Maria",
+        house_rules=None,
+        severity_result=_routine_severity([RefusalFlag.legal_rent_ltb]),
+        refusal_flags=[RefusalFlag.legal_rent_ltb],
+    )
+    assert "arrange this themselves directly" not in content
+
+
+# ---------------------------------------------------------------------------
+# Length-budget character hint (senior review, 2026-07-05) -- pure
+# _build_user_content / helper tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_build_user_content_includes_available_character_budget_hint() -> None:
+    content = node_mod._build_user_content(
+        body="dripping faucet",
+        tenant_name="Sam",
+        house_rules=None,
+        severity_result=_routine_severity(),
+        refusal_flags=[],
+    )
+    assert f"at most {node_mod._LENGTH_BUDGET_CHARS} characters" in content
+
+
+@pytest.mark.unit
+def test_build_user_content_available_chars_shrinks_when_deferral_will_be_appended() -> None:
+    available = node_mod._available_ack_chars([RefusalFlag.access_codes])
+    assert available < node_mod._LENGTH_BUDGET_CHARS
+    content = node_mod._build_user_content(
+        body="can you give my buddy the code",
+        tenant_name="Sam",
+        house_rules=None,
+        severity_result=_routine_severity([RefusalFlag.access_codes]),
+        refusal_flags=[RefusalFlag.access_codes],
+    )
+    assert f"at most {available} characters" in content
+
+
+@pytest.mark.unit
+def test_available_ack_chars_never_below_floor_for_a_very_long_deferral_combo() -> None:
+    available = node_mod._available_ack_chars(list(RefusalFlag))
+    assert available == node_mod._MIN_ACK_CHARS_FLOOR
+
+
+@pytest.mark.unit
+def test_available_ack_chars_full_budget_when_no_refusal_flags() -> None:
+    assert node_mod._available_ack_chars([]) == node_mod._LENGTH_BUDGET_CHARS
+
+
+# ---------------------------------------------------------------------------
+# Length discipline: regenerate once, then flag -- TRUNCATION IS FORBIDDEN
+# (senior review, 2026-07-05).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_draft_response_length_violation_regenerates_once_then_succeeds(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="dripping faucet",
+    )
+
+    long_body = "This is a very long reply. " * 20  # well over 300 chars, guard-clean
+    short_body = "Thanks, I'll send someone by Thursday morning."
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(body=long_body, refusal_templates_used=[]),
+            _fake_message(body=short_body, refusal_templates_used=[]),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update.get("length_over_budget", False) is False
+        assert update["draft_guard_failed"] is False
+        assert update["draft"].body == short_body
+        assert len(fake_messages.calls) == 2
+        # The SECOND call's user content carries the shorten note, not the
+        # hard-guard violation note.
+        second_call_content = fake_messages.calls[1]["messages"][0]["content"]
+        assert "too long" in second_call_content
+        assert "IMPORTANT" in second_call_content
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_length_violation_persists_kept_not_truncated(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TRUNCATION IS FORBIDDEN: a guard-clean draft that is STILL too long
+    after the one regeneration attempt is kept exactly as generated (never
+    cut), and state["length_over_budget"] is set."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="dripping faucet",
+    )
+
+    long_body_1 = "This is a very long reply, attempt one. " * 15
+    long_body_2 = "This is a very long reply, attempt two, still long. " * 15
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(body=long_body_1, refusal_templates_used=[]),
+            _fake_message(body=long_body_2, refusal_templates_used=[]),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["length_over_budget"] is True
+        assert update["draft_guard_failed"] is False  # independent dimensions
+        # Kept EXACTLY as generated -- never truncated, never replaced with
+        # the generic fallback.
+        assert update["draft"].body == long_body_2
+        assert len(fake_messages.calls) == 2
+        assert any("longer than usual" in line for line in update["reasoning_log"])
+
+        draft_row = (
+            (
+                await db_session.execute(
+                    text("SELECT body FROM drafts WHERE case_id = :cid"), {"cid": case_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert draft_row["body"] == long_body_2
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_length_check_exempt_when_refusal_flags_present(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Documented exception: a refusal-flagged message never triggers the
+    length-driven retry, no matter how long the guard-clean ack is."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="can you give my buddy the code",
+    )
+
+    long_ack = "Thanks for letting me know about this. " * 10  # well over 300 chars
+    fake_messages = _FakeMessages(
+        responses=[_fake_message(body=long_ack, refusal_templates_used=[])]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity([RefusalFlag.access_codes]),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["length_over_budget"] is False
+        assert len(fake_messages.calls) == 1  # no length-driven retry at all
+        assert long_ack.rstrip() in update["draft"].body
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_guard_violation_takes_priority_over_length_violation(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a candidate is BOTH a hard-guard violation AND too long, the
+    retry note names the guard violation, not the length issue -- safety
+    takes priority."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="fridge died, lost groceries",
+    )
+
+    long_and_violating = ("I'll send you $50 for the trouble. " * 10) + "extra padding text"
+    short_and_clean = "Thanks, I'll check the breaker and follow up by 9am tomorrow."
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(body=long_and_violating, refusal_templates_used=[]),
+            _fake_message(body=short_and_clean, refusal_templates_used=[]),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        assert update["length_over_budget"] is False
+        assert update["draft"].body == short_and_clean
+        second_call_content = fake_messages.calls[1]["messages"][0]["content"]
+        assert "dollar_compensation" in second_call_content
+        assert "too long" not in second_call_content
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_length_over_budget_cost_accumulates_across_both_calls(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="dripping faucet",
+    )
+
+    long_body = "This is a very long reply. " * 20
+    short_body = "Thanks, I'll send someone Thursday between 10 and 12."
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(body=long_body, refusal_templates_used=[]),
+            _fake_message(body=short_body, refusal_templates_used=[]),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        await draft_response(state)
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload FROM audit_log WHERE case_id = :cid AND action = 'drafted'"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        # 150 tokens_in / 40 tokens_out PER call (see _fake_message) -- summed
+        # across both attempts, never just the last one.
+        assert audit_row["payload"]["tokens_in"] == 300
+        assert audit_row["payload"]["tokens_out"] == 80
     finally:
         await _cleanup(db_session, landlord_id)

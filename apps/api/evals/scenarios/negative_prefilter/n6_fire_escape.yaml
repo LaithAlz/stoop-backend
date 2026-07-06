@@ -1,0 +1,22 @@
+# See n1_smoke_detector_battery.yaml's header comment. Message text reused
+# verbatim from
+# tests/test_prefilter.py::TestRegressionIssue143FireCompoundNounGuards::
+# test_fire_escape_door_broken_guarded.
+id: n6-fire-escape
+category: routine
+tier0_only: true
+prefilter_must_fire: false
+context:
+  property: "88 Dovercourt"
+  tenant: { name: Dev, unit: "3" }
+  time_local: "10:00"
+message: >
+  the fire escape door is broken
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+rationale: >
+  "Fire escape" is a fixture name, not a hazard -- a broken fixture is
+  routine maintenance. Must NOT trip Tier-0's fire trigger. Guards on the
+  fire_escape pattern (with no independent hazard word present to veto the
+  guard).

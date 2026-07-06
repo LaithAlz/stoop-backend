@@ -1,0 +1,20 @@
+# See n1_smoke_detector_battery.yaml's header comment. Message text reused
+# verbatim from
+# tests/test_prefilter.py::TestRegressionIssue143FireCompoundNounGuards::
+# test_fire_pit_allowed_guarded.
+id: n8-fire-pit
+category: routine
+tier0_only: true
+prefilter_must_fire: false
+context:
+  property: "41 Palmerston"
+  tenant: { name: Maria, unit: "2" }
+  time_local: "18:00"
+message: >
+  is the fire pit allowed on the patio
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+rationale: >
+  An amenity-rules question, not a hazard. Must NOT trip Tier-0's fire
+  trigger. Guards on the fire_pit pattern.

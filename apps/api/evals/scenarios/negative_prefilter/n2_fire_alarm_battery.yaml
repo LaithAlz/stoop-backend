@@ -1,0 +1,23 @@
+# See n1_smoke_detector_battery.yaml's header comment for the negative
+# -prefilter suite's rationale. Message text reused verbatim from
+# tests/test_prefilter.py::TestRegressionIssue143AlarmBatteryChirpGuard::
+# test_fire_alarm_chirping_needs_battery_guarded -- "the exact false
+# positive reported in issue #143".
+id: n2-fire-alarm-battery
+category: routine
+tier0_only: true
+prefilter_must_fire: false
+context:
+  property: "41 Palmerston"
+  tenant: { name: Maria, unit: "2" }
+  time_local: "10:30"
+message: >
+  the fire alarm is chirping, needs a new battery
+expect:
+  severity: routine
+  actions: [draft_and_hold]
+rationale: >
+  R-class "detector chirping": tenants overwhelmingly say "fire alarm" for
+  what is functionally a smoke alarm. A battery chirp on it is rubric
+  ROUTINE and must NOT trip Tier-0's fire trigger. Guards on the
+  fire_alarm_battery pattern.
