@@ -38,5 +38,3 @@ export function SeverityPlaque({ severity, size = "default", className }: Severi
     </span>
   );
 }
-
-export { plaqueConfig };

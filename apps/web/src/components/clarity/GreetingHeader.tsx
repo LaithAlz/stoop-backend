@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 /** "Good morning / afternoon / evening" — same three-way split the mockup's
@@ -33,7 +33,16 @@ export function GreetingHeader({
   children,
   className,
 }: GreetingHeaderProps) {
-  const word = greeting ?? timeOfDayGreeting(new Date());
+  // SSR renders on Cloudflare Workers in UTC while the browser re-evaluates
+  // in the user's local timezone, so computing the greeting during render is
+  // a guaranteed hydration mismatch for most of the day (senior review, PR
+  // #181). Render a stable word on the server and settle the real one after
+  // mount -- the initial client render matches the server, then updates.
+  const [timeWord, setTimeWord] = useState("morning");
+  useEffect(() => {
+    setTimeWord(timeOfDayGreeting(new Date()));
+  }, []);
+  const word = greeting ?? timeWord;
   return (
     <header className={cn("border-b border-clarity-line px-5 pb-3.5 pt-4", className)}>
       <div className="flex items-center justify-between gap-3">

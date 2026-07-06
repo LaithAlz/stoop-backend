@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
 import { AppTabBar } from "@/components/stoop/AppTabBar";
@@ -27,6 +27,7 @@ type EntryStatus = "pending" | "sending" | "sent" | "skipped";
 type EntryState = Record<string, { status: EntryStatus; secondsLeft: number }>;
 
 function AppQueuePage() {
+  const navigate = useNavigate();
   const [entries, setEntries] = useState<EntryState>({});
 
   const hasSending = Object.values(entries).some((e) => e.status === "sending");
@@ -141,6 +142,12 @@ function AppQueuePage() {
                       secondsLeft={entry?.secondsLeft}
                       totalSeconds={SEND_WINDOW_SECONDS}
                       onApprove={() => handleApprove(item.id)}
+                      onEdit={() =>
+                        navigate({
+                          to: "/app/conversations/$id",
+                          params: { id: item.id },
+                        })
+                      }
                       onSkip={() => handleSkip(item.id)}
                       onUndo={() => handleUndo(item.id)}
                     />
