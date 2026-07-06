@@ -18,6 +18,7 @@ dist/
 # orchestrator deliberately commits a real (paid) gate run's output.
 apps/api/evals/results/*.json
 !apps/api/evals/results/.gitkeep
+!apps/api/evals/results/v1-baseline.json
 
 # Node / Bun (apps/web)
 node_modules/
