@@ -66,6 +66,24 @@ message ends up attached to (one row for the common single-issue path,
 multiple rows for a future multi-issue split). ``message_cases`` is an
 ordinary table (full CRUD for ``app_role``), not append-only.
 
+Open cases: reused from state, never re-queried (#34 senior review, PR
+#173/#175 item 2: "identify_case should consume state['open_cases'] from
+load_context instead of re-querying — two round-trips per message once
+chained")
+------------------------------------------------------------------------
+``load_context`` (the node immediately before this one) already loads the
+tenant's open cases into ``state["open_cases"]`` (a list of
+``OpenCaseSummary.model_dump(mode="json")`` dicts) with the EXACT same
+predicate/ordering this node used to run itself (``status IN
+OPEN_STATUSES``, scoped to the tenant, most-recently-active first). Once
+the graph chains these two nodes (#34), re-running that query here is a
+redundant round-trip for every message — this node now builds its
+``OpenCase`` routing inputs from ``state["open_cases"]`` instead
+(:func:`_open_cases_from_state`), a pure re-shape, not a semantic change.
+Direct unit/integration tests of this node that don't go through
+``load_context`` first must populate ``state["open_cases"]`` themselves to
+exercise the "attach to an existing case" paths.
+
 Tenant-confirmed resolution (schema-v1.md v1.5, migration 0008)
 ------------------------------------------------------------------
 When a future intent signal marks ``tenant_confirms_resolved=True`` on the
@@ -107,7 +125,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.case_lifecycle import (
     AUDIT_ACTION_CASE_OPENED,
     AUDIT_ACTION_CASE_REOPENED,
-    OPEN_STATUSES,
     STATUS_RESOLVED,
     CaseSnapshot,
     OpenCase,
@@ -123,21 +140,11 @@ from app.db.session import get_admin_session
 
 log = structlog.get_logger(__name__)
 
-_OPEN_STATUS_LITERAL_LIST = ", ".join(f"'{status}'" for status in sorted(OPEN_STATUSES))
-
 _SELECT_MESSAGE_SQL = text(
     "SELECT m.id, m.tenant_id, m.landlord_id, m.property_id, m.prefilter, t.name AS tenant_name "
     "FROM messages m "
     "LEFT JOIN tenants t ON t.id = m.tenant_id "
     "WHERE m.id = :message_id"
-)
-
-_SELECT_OPEN_CASES_SQL = text(
-    "SELECT id, last_activity_at FROM cases "  # noqa: S608
-    f"WHERE tenant_id = :tenant_id AND status IN ({_OPEN_STATUS_LITERAL_LIST}) "
-    "ORDER BY last_activity_at DESC"
-    # ^ IN-list built from the internal OPEN_STATUSES constant only, never
-    #   external/request-supplied data — not a real injection vector.
 )
 
 _SELECT_CASE_SQL = text(
@@ -201,6 +208,21 @@ def _extract_signals(state: AgentState) -> list[RoutingSignal] | None:
     a future node adds e.g. ``state["intents"]``.
     """
     return None
+
+
+def _open_cases_from_state(open_cases_state: list[dict[str, Any]]) -> list[OpenCase]:
+    """Build ``route_inbound_message``'s ``OpenCase`` inputs from
+    ``state["open_cases"]`` (``load_context``'s own
+    ``OpenCaseSummary.model_dump(mode="json")`` dicts) instead of
+    re-querying ``cases`` a second time — see module docstring "Open
+    cases: reused from state, never re-queried"."""
+    return [
+        OpenCase(
+            case_id=UUID(str(entry["case_id"])),
+            last_activity_at=datetime.fromisoformat(str(entry["last_activity_at"])),
+        )
+        for entry in open_cases_state
+    ]
 
 
 def _parse_prefilter(raw: Any) -> PrefilterResult:
@@ -332,15 +354,9 @@ async def identify_case(state: AgentState) -> dict[str, Any]:
             )
             return {"case_context": case_context, "reasoning_log": reasoning_log}
 
-        open_case_rows = (
-            (await session.execute(_SELECT_OPEN_CASES_SQL, {"tenant_id": str(tenant_id)}))
-            .mappings()
-            .all()
-        )
-        open_cases = [
-            OpenCase(case_id=row["id"], last_activity_at=row["last_activity_at"])
-            for row in open_case_rows
-        ]
+        # Reused from load_context, never re-queried here — see module
+        # docstring "Open cases: reused from state, never re-queried".
+        open_cases = _open_cases_from_state(list(state.get("open_cases") or []))
 
         signals = _extract_signals(state)
         results = route_inbound_message(

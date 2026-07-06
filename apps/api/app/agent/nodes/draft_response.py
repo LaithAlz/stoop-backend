@@ -312,6 +312,40 @@ documented rule ("new inbound → old draft stale → re-run"), implemented
 minimally here (no notification, no diffing of what changed — that is
 #44/#50 territory per the same doc).
 
+Race-safety against a genuinely CONCURRENT insert (#34 senior review,
+PR #173/#175: "wrap draft INSERT in ON CONFLICT/retry when this issue
+introduces concurrent/retried invocations — the partial-unique-index
+loser currently raises unhandled")
+------------------------------------------------------------------------
+The SELECT-then-UPDATE-then-INSERT sequence above is only safe against a
+SINGLE writer. Once #34 wires the graph to actually run (background
+tasks, possible webhook redeliveries), two genuinely concurrent graph
+runs for the SAME case can both see "no pending draft" before either
+writes anything, and the SECOND transaction's plain INSERT would then hit
+``uq_drafts_one_pending`` and raise an unhandled ``IntegrityError`` —
+which would abort that transaction (losing ITS OWN stale-marking and
+audit writes too) and propagate out of the node. Fixed by
+:func:`_stale_then_insert_draft`:
+
+1. The INSERT targets ``uq_drafts_one_pending`` directly via
+   ``ON CONFLICT (case_id) WHERE status = 'pending' DO NOTHING`` (same
+   "target the partial index by its predicate" pattern already used for
+   ``uq_notifications_message_dedupe`` elsewhere in this codebase) — a
+   losing transaction's INSERT is silently skipped, never raised, and
+   never poisons the transaction.
+2. If the insert is skipped (``RETURNING`` produced no row — a concurrent
+   transaction's draft won the race after our own SELECT ran), we
+   RE-CHECK: read back the now-current pending draft (the winner's row),
+   mark IT stale too, and retry the insert. Bounded to
+   :data:`_MAX_DRAFT_INSERT_ATTEMPTS` attempts so a pathological repeated
+   collision cannot spin forever.
+3. If every attempt is exhausted (extremely unlikely — would require
+   another writer to win the race on every single retry), the node logs
+   an error, appends a plain reasoning_log line, and returns WITHOUT
+   inserting a draft this run, rather than raising and crashing the whole
+   graph invocation — "a concurrent duplicate must not error the whole
+   graph run."
+
 20 s END-TO-END budget / retry
 ----------------------------------
 Same shared-deadline arithmetic as ``classify_intent.py`` /
@@ -347,12 +381,13 @@ from __future__ import annotations
 import json
 import re
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import structlog
 from pydantic import ValidationError
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.prompts.v2 import (
     PROMPT_VERSION,
@@ -648,9 +683,18 @@ _SELECT_PENDING_DRAFT_SQL = text(
 _UPDATE_DRAFT_STALE_SQL = text(
     "UPDATE drafts SET status = 'stale', updated_at = now() WHERE id = :draft_id"
 )
+# ON CONFLICT targets uq_drafts_one_pending (a partial unique index on
+# case_id WHERE status = 'pending') directly, by reproducing its predicate
+# verbatim — Postgres's unique-index inference for a partial index requires
+# a textually-equivalent WHERE clause to identify the right index (same
+# pattern as the notifications dedupe elsewhere in this codebase). A
+# concurrent transaction winning the race makes this a silent no-op
+# (RETURNING produces no row), never a raised IntegrityError — see module
+# docstring "Race-safety against a genuinely CONCURRENT insert".
 _INSERT_DRAFT_SQL = text(
     "INSERT INTO drafts (landlord_id, case_id, recipient, body, prompt_version, status) "
     "VALUES (:landlord_id, :case_id, 'tenant', :body, :prompt_version, 'pending') "
+    "ON CONFLICT (case_id) WHERE status = 'pending' DO NOTHING "
     "RETURNING id"
 )
 _INSERT_DRAFT_STALE_AUDIT_SQL = text(
@@ -661,6 +705,97 @@ _INSERT_DRAFTED_AUDIT_SQL = text(
     "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
     "VALUES (:landlord_id, :case_id, 'agent', 'drafted', CAST(:payload AS jsonb))"
 )
+
+_MAX_DRAFT_INSERT_ATTEMPTS: int = 3
+"""Bound on the stale-then-insert retry loop (see module docstring
+"Race-safety against a genuinely CONCURRENT insert") — high enough that a
+single genuine collision always resolves on the next attempt, low enough
+that a pathological repeated collision fails loudly instead of spinning
+forever."""
+
+
+class DraftInsertRaceExhaustedError(RuntimeError):
+    """Raised by :func:`_stale_then_insert_draft` when
+    :data:`_MAX_DRAFT_INSERT_ATTEMPTS` stale-then-insert attempts all lost
+    the ``uq_drafts_one_pending`` race. Caught by :func:`draft_response`
+    itself (never propagates out of the node) — see module docstring point
+    3."""
+
+
+async def _stale_then_insert_draft(
+    session: AsyncSession,
+    *,
+    landlord_id: UUID,
+    case_id: UUID,
+    body: str,
+    prompt_version: str,
+    reasoning_log: list[str],
+) -> UUID:
+    """Mark whatever pending draft currently exists for *case_id* stale,
+    then insert the new pending draft — safe against a genuinely
+    CONCURRENT writer racing on the SAME case (see module docstring "Race
+    -safety against a genuinely CONCURRENT insert"). Appends a
+    landlord-facing ``reasoning_log`` line for every stale draft actually
+    encountered (once per attempt that finds one — a landlord seeing this
+    twice under a genuine race is still an accurate account of what
+    happened, not a bug). Raises :class:`DraftInsertRaceExhaustedError`
+    if every attempt loses the race — the caller decides what to do next,
+    this function never leaves two 'pending' rows coexisting and never
+    lets a unique-violation escape as an unhandled ``IntegrityError``.
+    """
+    for attempt in range(_MAX_DRAFT_INSERT_ATTEMPTS):
+        pending_row = (
+            (await session.execute(_SELECT_PENDING_DRAFT_SQL, {"case_id": str(case_id)}))
+            .mappings()
+            .one_or_none()
+        )
+        if pending_row is not None:
+            stale_draft_id: UUID = pending_row["id"]
+            await session.execute(_UPDATE_DRAFT_STALE_SQL, {"draft_id": str(stale_draft_id)})
+            await session.execute(
+                _INSERT_DRAFT_STALE_AUDIT_SQL,
+                {
+                    "landlord_id": str(landlord_id),
+                    "case_id": str(case_id),
+                    "payload": json.dumps({"draft_id": str(stale_draft_id)}),
+                },
+            )
+            reasoning_log.append(
+                "A new message came in, so I marked the earlier draft as out of date and "
+                "wrote a fresh one."
+            )
+
+        new_draft_row = (
+            (
+                await session.execute(
+                    _INSERT_DRAFT_SQL,
+                    {
+                        "landlord_id": str(landlord_id),
+                        "case_id": str(case_id),
+                        "body": body,
+                        "prompt_version": prompt_version,
+                    },
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if new_draft_row is not None:
+            return cast("UUID", new_draft_row["id"])
+
+        # Lost the race: a concurrent transaction's own pending draft won
+        # between our SELECT above and this INSERT. Loop again -- the next
+        # iteration's SELECT will see the winner's row and stale it too.
+        log.warning(
+            "draft_response_insert_conflict_retry",
+            case_id=str(case_id),
+            attempt=attempt,
+        )
+
+    raise DraftInsertRaceExhaustedError(
+        f"stale-then-insert lost the uq_drafts_one_pending race "
+        f"{_MAX_DRAFT_INSERT_ATTEMPTS} times in a row for this case"
+    )
 
 
 def _strip_mandated_templates(body: str) -> str:
@@ -953,70 +1088,57 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
         tokens_in=total_tokens_in, tokens_out=total_tokens_out
     )
 
-    async with asynccontextmanager(get_admin_session)() as session:
-        pending_row = (
-            (
-                await session.execute(
-                    _SELECT_PENDING_DRAFT_SQL, {"case_id": str(case_context.case_id)}
-                )
+    try:
+        async with asynccontextmanager(get_admin_session)() as session:
+            new_draft_id = await _stale_then_insert_draft(
+                session,
+                landlord_id=cast("UUID", case_context.landlord_id),
+                case_id=case_context.case_id,
+                body=draft_result.body,
+                prompt_version=PROMPT_VERSION,
+                reasoning_log=reasoning_log,
             )
-            .mappings()
-            .one_or_none()
-        )
 
-        if pending_row is not None:
-            stale_draft_id: UUID = pending_row["id"]
-            await session.execute(_UPDATE_DRAFT_STALE_SQL, {"draft_id": str(stale_draft_id)})
             await session.execute(
-                _INSERT_DRAFT_STALE_AUDIT_SQL,
+                _INSERT_DRAFTED_AUDIT_SQL,
                 {
                     "landlord_id": str(case_context.landlord_id),
                     "case_id": str(case_context.case_id),
-                    "payload": json.dumps({"draft_id": str(stale_draft_id)}),
+                    "payload": json.dumps(
+                        {
+                            "draft_id": str(new_draft_id),
+                            "refusal_templates_used": [
+                                flag.value for flag in draft_result.refusal_templates_used
+                            ],
+                            "guard_failed": guard_failed,
+                            "model": last_model,
+                            "tokens_in": total_tokens_in,
+                            "tokens_out": total_tokens_out,
+                            "cost_cents": cost_cents,
+                        }
+                    ),
                 },
             )
-            reasoning_log.append(
-                "A new message came in, so I marked the earlier draft as out of date and "
-                "wrote a fresh one."
-            )
-
-        new_draft_row = (
-            (
-                await session.execute(
-                    _INSERT_DRAFT_SQL,
-                    {
-                        "landlord_id": str(case_context.landlord_id),
-                        "case_id": str(case_context.case_id),
-                        "body": draft_result.body,
-                        "prompt_version": PROMPT_VERSION,
-                    },
-                )
-            )
-            .mappings()
-            .one()
+    except DraftInsertRaceExhaustedError:
+        # See module docstring point 3 -- "a concurrent duplicate must not
+        # error the whole graph run". The draft that WAS composed above is
+        # simply not persisted this run; the next inbound message (or a
+        # retry) gets another chance via the normal stale-then-insert path.
+        log.error(
+            "draft_response_insert_race_exhausted",
+            message_id=str(message_id),
+            case_id=str(case_context.case_id),
         )
-        new_draft_id = new_draft_row["id"]
-
-        await session.execute(
-            _INSERT_DRAFTED_AUDIT_SQL,
-            {
-                "landlord_id": str(case_context.landlord_id),
-                "case_id": str(case_context.case_id),
-                "payload": json.dumps(
-                    {
-                        "draft_id": str(new_draft_id),
-                        "refusal_templates_used": [
-                            flag.value for flag in draft_result.refusal_templates_used
-                        ],
-                        "guard_failed": guard_failed,
-                        "model": last_model,
-                        "tokens_in": total_tokens_in,
-                        "tokens_out": total_tokens_out,
-                        "cost_cents": cost_cents,
-                    }
-                ),
-            },
+        reasoning_log.append(
+            "I drafted a reply, but couldn't save it just now because of a conflicting "
+            "update — it'll be retried."
         )
+        return {
+            "draft": draft_result,
+            "draft_guard_failed": guard_failed,
+            "length_over_budget": length_over_budget,
+            "reasoning_log": reasoning_log,
+        }
 
     return {
         "draft": draft_result,
@@ -1026,4 +1148,4 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
     }
 
 
-__all__: list[str] = ["draft_response"]
+__all__: list[str] = ["DraftInsertRaceExhaustedError", "draft_response"]

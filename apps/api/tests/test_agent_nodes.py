@@ -254,6 +254,23 @@ async def _insert_case(
     return case_id
 
 
+def _open_case_entry(
+    *, case_id: str, last_activity_at: datetime, status: str = STATUS_OPEN
+) -> dict[str, object]:
+    """Build one ``state["open_cases"]`` entry — the same shape
+    ``load_context``'s ``OpenCaseSummary.model_dump(mode="json")`` produces
+    (#34 senior review: ``identify_case`` now consumes this from state
+    instead of re-querying the ``cases`` table itself)."""
+    return {
+        "case_id": case_id,
+        "status": status,
+        "severity": None,
+        "intent": None,
+        "title": None,
+        "last_activity_at": last_activity_at.isoformat(),
+    }
+
+
 async def _insert_needs_eyes_or_emergency_notification(
     session: AsyncSession, *, landlord_id: str, message_id: str, notif_type: str = "emergency_call"
 ) -> None:
@@ -711,7 +728,11 @@ async def test_identify_case_one_open_case_attaches_and_bumps_activity(
     )
 
     try:
-        state: AgentState = {"message_id": uuid.UUID(message_id), "reasoning_log": []}
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "open_cases": [_open_case_entry(case_id=case_id, last_activity_at=old_activity)],
+            "reasoning_log": [],
+        }
         update = await identify_case(state)
 
         assert str(update["case_context"].case_id) == case_id
@@ -746,7 +767,7 @@ async def test_identify_case_multiple_open_cases_attaches_most_recent(
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
     now = datetime.now(UTC)
-    await _insert_case(
+    older_case_id = await _insert_case(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
@@ -765,7 +786,14 @@ async def test_identify_case_multiple_open_cases_attaches_most_recent(
     )
 
     try:
-        state: AgentState = {"message_id": uuid.UUID(message_id), "reasoning_log": []}
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "open_cases": [
+                _open_case_entry(case_id=older_case_id, last_activity_at=now - timedelta(days=3)),
+                _open_case_entry(case_id=newer_case_id, last_activity_at=now - timedelta(hours=1)),
+            ],
+            "reasoning_log": [],
+        }
         update = await identify_case(state)
 
         assert str(update["case_context"].case_id) == newer_case_id
@@ -1157,11 +1185,13 @@ async def test_new_message_before_deadline_contradicts_and_clears_pending(
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_activity = datetime.now(UTC)
     case_id = await _insert_case(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
         tenant_id=tenant_id,
+        last_activity_at=case_activity,
         pending_resolved_at=datetime.now(UTC) + timedelta(hours=1),
     )
     message_id = await _insert_message(
@@ -1169,7 +1199,11 @@ async def test_new_message_before_deadline_contradicts_and_clears_pending(
     )
 
     try:
-        state: AgentState = {"message_id": uuid.UUID(message_id), "reasoning_log": []}
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "open_cases": [_open_case_entry(case_id=case_id, last_activity_at=case_activity)],
+            "reasoning_log": [],
+        }
         update = await identify_case(state)
 
         assert str(update["case_context"].case_id) == case_id

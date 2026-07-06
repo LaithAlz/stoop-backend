@@ -499,6 +499,14 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # future scheduled-job entrypoint with the same pre-identity
         # rationale — see its own docstring "The scheduler seam".
         "app/agent/case_lifecycle.py",
+        # #34: the degraded-mode notification seam (G1) — same background
+        # /graph context, no HTTP request/JWT, same pre-identity rationale
+        # as every other node above.
+        "app/agent/nodes/degraded_mode.py",
+        # #34: app/agent/graph.py resolves a case's langgraph_thread_id via
+        # its own small SELECT (the pre-routing/case-scoped graph split) —
+        # same background/graph context as every node above.
+        "app/agent/graph.py",
     }
 )
 

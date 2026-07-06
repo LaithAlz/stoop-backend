@@ -162,6 +162,20 @@ async def _insert_tenant(
 
 
 async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
+    # #34: the background task (enqueue_classification) now invokes the
+    # real graph, which — even when it fails partway through (e.g. the
+    # checkpointer pool isn't set up in this test module) — may have
+    # already run identify_case far enough to open a real `cases` row and
+    # a `message_cases` link before failing. Both must be cleared before
+    # `messages` (FK: message_cases -> messages / cases) can be deleted.
+    await session.execute(
+        text(
+            "DELETE FROM message_cases WHERE case_id IN "
+            "(SELECT id FROM cases WHERE landlord_id = :lid)"
+        ),
+        {"lid": landlord_id},
+    )
+    await session.execute(text("DELETE FROM drafts WHERE landlord_id = :lid"), {"lid": landlord_id})
     await session.execute(
         text(
             "DELETE FROM message_status_events WHERE message_id IN "
@@ -175,6 +189,7 @@ async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
     await session.execute(
         text("DELETE FROM notifications WHERE landlord_id = :lid"), {"lid": landlord_id}
     )
+    await session.execute(text("DELETE FROM cases WHERE landlord_id = :lid"), {"lid": landlord_id})
     await session.execute(
         text("DELETE FROM messages WHERE landlord_id = :lid"), {"lid": landlord_id}
     )
