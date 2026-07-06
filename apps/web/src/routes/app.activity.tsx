@@ -157,7 +157,10 @@ function ActivityPage() {
         )}
       </div>
 
-      <AppTabBar active="activity" queueCount={queue.length} />
+      {/* Activity is no longer one of the four tabs (Tab IA decision,
+          2026-07-06) — this route is still reachable by URL, it just has
+          no corresponding tab to highlight. */}
+      <AppTabBar queueCount={queue.length} />
     </PhoneFrame>
   );
 }

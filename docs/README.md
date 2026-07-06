@@ -73,11 +73,13 @@ across Train 1/2/3 milestones, each with acceptance criteria).
 ## mockups/ — design references
 
 Open any file in a browser. `index.html` is the gallery.
-**06 = THE app design: Heritage light, radically simple — every screen
-navigable (home, conversation, properties + detail, onboarding, settings,
-dark emergency takeover).** 01–04 = explored directions (Brownstone dark
-et al., kept for reference) · 05 = Brownstone landing (superseded — the
-live site and the app both use Heritage light).
+**07 = THE app design (founder-approved 2026-07-05): "Clarity" — enamel
+severity plaques, margin-note reasoning, perforated undo ticket, three
+system type voices, no paper texture. The dashboard rebuild implements it
+screen by screen.** 06 = Heritage light (the previous app authority;
+remains the contract for the marketing site and any app screen not yet
+rebuilt on Clarity) · 01–04 = explored directions (Brownstone dark et al.,
+kept for reference) · 05 = Brownstone landing (superseded).
 
 ---
 

@@ -1,0 +1,1058 @@
+<title>Stoop — Clarity (redesign exploration)</title>
+<style>
+  /* ============================================================
+     TOKENS — no external fonts, no CDNs, no images. System stacks
+     only (CSP-safe). Palette stays Heritage (warm off-white, deep
+     forest green, brick red) — the material treatment is new.
+     ============================================================ */
+  :root{
+    --page-bg:#EAE6D9;        /* brownstone plaster/brick backdrop behind the exhibit */
+    --bg:#FDFBF6;             /* app canvas — warm off-white */
+    --surface:#FCFAF3;        /* clean near-white warm surface for cards — flat, no texture */
+    --panel:#FFFFFF;
+    --line:#E2DFD1;
+    --line-strong:#C7C0AC;
+    --ink:#1E1B16;
+    --ink-dim:#5B564C;
+
+    --brand:#2D4A3E;          /* Stoop's own voice & actions — deep forest green */
+    --brand-deep:#1E332A;
+    --brand-soft:#E7ECE6;
+    --brand-border:#B7CBBE;
+    --brand-on:#FBFBF6;
+
+    --whenever:#1F7A4C;       /* "Whenever" — enamel green */
+    --whenever-deep:#155C38;
+    --whenever-ink:#EAF6EE;
+
+    --wait:#8B5A1E;           /* "Can't wait" — enamel amber-brass */
+    --wait-deep:#6B4113;
+    --wait-ink:#FCEFDD;
+
+    --emergency:#963226;      /* "Emergency" — enamel brick red */
+    --emergency-deep:#711B12;
+    --emergency-ink:#FBEAE6;
+
+    --serif: ui-serif, "Iowan Old Style", "Palatino Linotype", Charter, Georgia, "Times New Roman", serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --ease: cubic-bezier(.16,1,.3,1);
+
+    /* Radius scale — three steps, applied consistently. Never full-pill (999px)
+       on cards/buttons/badges; that's reserved for genuine hardware conventions
+       (toggle switches, progress bars, the phone's own home-indicator). */
+    --r-sm: 8px;      /* chips, thumbnails, bubble tail-corners */
+    --r-md: 14px;     /* buttons, the undo ticket's outer shell, notification banners */
+    --r-lg: 16px;     /* queue cards, trust cards, safety box, desktop frame */
+    --r-plaque: 6px;  /* enamel severity plaques — softened, but a plaque, never a pill */
+  }
+
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--page-bg);
+    color:var(--ink);
+    font-family:var(--sans);
+    font-size:16px;
+    line-height:1.5;
+    min-height:100vh;
+  }
+  img,svg{display:block}
+  a{color:inherit}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0,0,0,0);white-space:nowrap;border:0}
+  :focus-visible{outline:3px solid var(--brand);outline-offset:3px;border-radius:6px}
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    *{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+  }
+
+  /* ============================================================
+     PAGE INTRO — rationale + do/don't
+     ============================================================ */
+  .page{max-width:1360px;margin:0 auto;padding:64px 28px 140px}
+  .intro{max-width:760px;margin:0 auto 40px}
+  .eyebrow{font:800 12.5px/1 var(--sans);letter-spacing:.14em;text-transform:uppercase;color:var(--brand)}
+  .intro h1{font:600 clamp(32px,4.4vw,46px)/1.15 var(--serif);letter-spacing:-.01em;margin:.5em 0 .4em}
+  .intro .tradition{font:italic 17px/1.6 var(--serif);color:var(--ink);margin-bottom:18px;
+    padding:14px 18px;border-left:3px solid var(--brand);background:var(--brand-soft)/* fallback below */;
+    background:rgba(45,74,62,.06);border-radius:0 var(--r-lg) var(--r-lg) 0}
+  .rationale{list-style:none;margin:22px 0 26px;padding:0;display:grid;gap:13px}
+  .rationale li{display:flex;gap:14px;font-size:15.5px;line-height:1.55;color:var(--ink)}
+  .rationale li .n{flex:none;width:24px;height:24px;border:1.5px solid var(--brand-border);border-radius:50%;
+    color:var(--brand);font:800 12px/1 var(--mono);display:flex;align-items:center;justify-content:center;margin-top:2px}
+
+  .donts{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+  @media (max-width:640px){.donts{grid-template-columns:1fr}}
+  .donts .box{border:1px solid var(--line-strong);border-radius:var(--r-lg);padding:16px 20px;background:var(--surface)}
+  .donts .box h2{font:800 11.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px}
+  .donts .do h2{color:var(--whenever-deep)}
+  .donts .dont h2{color:var(--emergency-deep)}
+  .donts ul{list-style:none;margin:0;display:grid;gap:7px;font-size:14px;color:var(--ink-dim)}
+  .donts li{padding-left:20px;position:relative}
+  .donts li::before{position:absolute;left:0;top:0}
+  .do li::before{content:"✓";color:var(--whenever);font-weight:900}
+  .dont li::before{content:"✕";color:var(--emergency);font-weight:900}
+
+  /* severity key strip */
+  .key-strip{max-width:760px;margin:34px auto 0;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .key-strip .label{font:800 11.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.1em;color:var(--ink-dim)}
+
+  /* ============================================================
+     SIGNATURE — enamel plaque (severity, everywhere)
+     ============================================================ */
+  .plaque{
+    display:inline-flex;align-items:center;gap:8px;position:relative;
+    padding:7px 16px;border-radius:var(--r-plaque);
+    font:800 12px/1 var(--sans);letter-spacing:.08em;text-transform:uppercase;
+    border:1px solid rgba(0,0,0,.25);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.35),inset 0 -2px 3px rgba(0,0,0,.16),0 1px 2px rgba(0,0,0,.14);
+  }
+  .plaque::before,.plaque::after{content:"";position:absolute;top:50%;transform:translateY(-50%);
+    width:4px;height:4px;border-radius:50%;background:rgba(0,0,0,.32);
+    box-shadow:inset 0 1px 1px rgba(0,0,0,.5),0 .5px 0 rgba(255,255,255,.35)}
+  .plaque::before{left:5px}
+  .plaque::after{right:5px}
+  .plaque.emergency{background:linear-gradient(180deg,var(--emergency),var(--emergency-deep));color:var(--emergency-ink)}
+  .plaque.wait{background:linear-gradient(180deg,var(--wait),var(--wait-deep));color:var(--wait-ink)}
+  .plaque.whenever{background:linear-gradient(180deg,var(--whenever),var(--whenever-deep));color:var(--whenever-ink)}
+  .plaque.sm{padding:5px 12px 5px 14px;font-size:10.5px}
+
+  /* ============================================================
+     GALLERY LAYOUT
+     ============================================================ */
+  .gallery{display:flex;flex-wrap:wrap;gap:44px;align-items:flex-start;justify-content:center;margin-top:44px}
+  .frame-block{display:flex;flex-direction:column;align-items:flex-start;gap:14px;scroll-margin-top:36px}
+  .frame-pair{display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start}
+
+  /* museum placard — labels the exhibit above each phone */
+  .placard{max-width:372px}
+  .placard .no{font:800 11px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--brand)}
+  .placard h2{font:600 18px/1.3 var(--serif);margin:.35em 0 .3em;letter-spacing:-.005em}
+  .placard p{font-size:13px;line-height:1.55;color:var(--ink-dim)}
+  .placard-rule{height:1px;background:var(--line-strong);margin-top:8px;max-width:372px}
+
+  /* ============================================================
+     DEVICE FRAME (presentation chrome only — not "the design")
+     ============================================================ */
+  .device{width:372px;background:#242219;border-radius:46px;padding:13px;
+    box-shadow:0 34px 60px -24px rgba(20,18,14,.4),0 6px 16px rgba(20,18,14,.18)}
+  .device-screen{position:relative;background:var(--bg);border-radius:33px;overflow:hidden;
+    height:768px;display:flex;flex-direction:column}
+  .island{position:absolute;top:9px;left:50%;transform:translateX(-50%);width:92px;height:23px;
+    background:#000;border-radius:13px;z-index:5}
+  .status-bar{flex:none;height:38px;display:flex;align-items:center;justify-content:space-between;
+    padding:14px 26px 0;font:700 13px/1 var(--sans);color:var(--ink)}
+  .status-bar .icons{display:flex;align-items:center;gap:5px;color:var(--ink)}
+  .device-screen.dark .status-bar{color:#F3EEE4}
+  .device-screen.dark .status-bar .icons{color:#F3EEE4}
+
+  /* ============================================================
+     APP CHROME
+     ============================================================ */
+  .app-header{flex:none;padding:6px 20px 14px;border-bottom:1px solid var(--line)}
+  .wordmark{font:700 21px/1 var(--serif);letter-spacing:.01em;
+    text-shadow:0 1px 0 rgba(255,255,255,.55),0 1.5px 1.5px rgba(30,27,22,.16)}
+  .wordmark .dot{color:var(--emergency);font-weight:900}
+  .header-row{display:flex;align-items:center;justify-content:space-between}
+  .live-dot{display:inline-flex;align-items:center;gap:6px;font:700 11.5px/1 var(--sans);color:var(--brand)}
+  .live-dot i{width:6px;height:6px;border-radius:50%;background:var(--brand);display:inline-block}
+
+  .greeting{font:600 27px/1.2 var(--serif);letter-spacing:-.01em;margin:14px 0 4px;
+    text-shadow:0 1px 0 rgba(255,255,255,.5),0 1px 1.5px rgba(30,27,22,.1)}
+
+  .counts{display:flex;align-items:center;gap:8px;font:700 13.5px/1 var(--sans);color:var(--ink-dim);
+    margin-top:6px;flex-wrap:wrap}
+  .counts b{color:var(--ink)}
+  .counts .sep{opacity:.45}
+
+  .app-main{flex:1 1 auto;overflow-y:auto;padding:16px 18px 20px;scrollbar-width:none}
+  .app-main::-webkit-scrollbar{display:none}
+
+  .back-link{display:inline-flex;align-items:center;gap:5px;font:700 13px/1 var(--sans);color:var(--ink-dim);
+    text-decoration:none;min-height:32px}
+  .back-link svg{width:15px;height:15px}
+  .back-link:hover{color:var(--ink)}
+
+  /* tab bar */
+  .tabbar{flex:none;display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--line);
+    background:rgba(253,251,246,.97)}
+  .tab{background:none;border:none;color:var(--ink-dim);font:800 10.5px/1 var(--sans);
+    letter-spacing:.02em;padding:11px 0 8px;min-height:48px;cursor:default;
+    display:flex;flex-direction:column;align-items:center;gap:4px;position:relative}
+  .tab svg{width:21px;height:21px}
+  .tab.on{color:var(--brand)}
+  .tab .badge{position:absolute;top:2px;right:calc(50% - 20px);background:var(--brand);color:var(--brand-on);
+    font:800 9px/1 var(--mono);border-radius:999px;padding:2px 5px;min-width:15px;text-align:center}
+  .home-indicator{width:120px;height:5px;border-radius:99px;background:var(--ink);opacity:.22;
+    margin:4px auto 8px}
+
+  /* ============================================================
+     EMERGENCY BANNER (on Home) — link into the takeover frame
+     ============================================================ */
+  .em-banner{display:flex;align-items:center;gap:12px;text-decoration:none;
+    background:linear-gradient(180deg,var(--emergency),var(--emergency-deep));color:var(--emergency-ink);
+    border-radius:var(--r-md);padding:14px 16px;margin-bottom:16px;border:1px solid rgba(0,0,0,.25)}
+  .em-banner svg.alert{width:22px;height:22px;flex:none}
+  .em-banner .pulse{width:8px;height:8px;border-radius:50%;background:#fff;flex:none;
+    animation:pulse 1.4s infinite;margin-left:auto}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,255,255,.55)}60%{box-shadow:0 0 0 9px rgba(255,255,255,0)}}
+  .em-banner strong{display:block;font:700 15px/1.3 var(--serif)}
+  .em-banner span.sub{display:block;font:600 12px/1.4 var(--sans);opacity:.85;margin-top:2px}
+
+  /* ============================================================
+     QUEUE ENTRY (the card) — a clean flat surface, hairline border,
+     at most a whisper of shadow. No texture, no soft-glow slop.
+     ============================================================ */
+  .entry{
+    background:var(--surface);
+    border:1px solid var(--line-strong);border-radius:var(--r-lg);padding:18px;
+    box-shadow:0 2px 6px -4px rgba(30,27,22,.22);
+  }
+  .entry+.entry{margin-top:14px}
+  .entry-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+  .open-link{display:inline-flex;align-items:center;gap:3px;font:700 12px/1 var(--sans);color:var(--ink-dim);
+    text-decoration:none;min-height:32px;padding:4px 2px}
+  .open-link svg{width:13px;height:13px}
+  .open-link:hover{color:var(--brand)}
+
+  .entry-meta{font:600 12.5px/1.5 var(--sans);color:var(--ink-dim);margin-bottom:12px}
+  .entry-meta b{color:var(--ink)}
+
+  .stamp{display:inline-block;font:700 10.5px/1 var(--mono);letter-spacing:.05em;text-transform:uppercase;
+    color:var(--brand);border:1.5px solid var(--brand);border-radius:var(--r-sm);padding:3px 8px;
+    background:rgba(45,74,62,.05)}
+
+  .bubble{border-radius:var(--r-lg);padding:13px 15px;font-size:15.5px;line-height:1.55}
+  .bubble .who{display:block;font:700 11px/1 var(--sans);letter-spacing:.02em;text-transform:uppercase;
+    color:var(--ink-dim);margin-bottom:6px}
+  .bubble-in{background:var(--panel);border:1px solid var(--line-strong);border-top-left-radius:var(--r-sm);
+    font-family:var(--sans);color:var(--ink)}
+  .bubble-out{background:var(--brand-soft);border:1.5px dashed var(--brand-border);border-top-right-radius:var(--r-sm);
+    font-family:var(--serif);font-style:italic;color:var(--ink);margin-top:8px}
+  .bubble-out .who{color:var(--brand)}
+
+  .photo-chip{display:inline-flex;align-items:center;gap:8px;margin-top:9px;
+    background:var(--panel);border:1px solid var(--line-strong);border-radius:var(--r-sm);padding:5px 10px 5px 5px;
+    font:600 12px/1 var(--sans);color:var(--ink-dim)}
+  .photo-chip .thumb{width:30px;height:30px;border-radius:6px;background:var(--line);
+    display:flex;align-items:center;justify-content:center;color:var(--ink-dim);flex:none}
+  .photo-chip .thumb svg{width:16px;height:16px}
+
+  /* margin note — the reasoning line, styled as marginalia, not a hidden log */
+  .margin-note{position:relative;margin:14px 2px 16px 12px;padding:2px 0 2px 16px;
+    border-left:2px solid var(--brand);
+    transform:rotate(-.35deg)}
+  .margin-note::before{content:"";position:absolute;left:5px;top:0;bottom:0;width:1px;
+    background:rgba(45,74,62,.35)}
+  .margin-note .kicker{display:block;font:800 10px/1 var(--sans);letter-spacing:.1em;text-transform:uppercase;
+    color:var(--brand);margin-bottom:5px}
+  .margin-note p{font:italic 14.5px/1.6 var(--serif);color:var(--ink-dim)}
+  .margin-note p b{color:var(--ink);font-weight:600;font-style:normal}
+  .margin-note a{font:700 13px/1 var(--sans);color:var(--brand);text-decoration:none;display:inline-block;
+    margin-top:8px}
+  .margin-note a:hover{text-decoration:underline}
+
+  /* actions */
+  .actions{display:flex;gap:9px;margin-top:15px}
+  .btn{font-family:var(--sans);font-weight:800;font-size:15px;min-height:48px;padding:12px 16px;
+    border-radius:var(--r-md);border:1.5px solid var(--line-strong);background:var(--panel);color:var(--ink-dim);
+    cursor:pointer;transition:transform .15s var(--ease),box-shadow .15s var(--ease)}
+  .btn svg{width:16px;height:16px}
+  .btn.primary{flex:1;background:var(--brand);border-color:var(--brand-deep);color:var(--brand-on);
+    font-size:16px;min-height:52px;display:inline-flex;align-items:center;justify-content:center;gap:8px;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.15),0 3px 8px -3px rgba(30,27,22,.4)}
+  .btn.ghost{display:inline-flex;align-items:center;justify-content:center;gap:7px}
+  .btn:hover{transform:translateY(-1px)}
+  a.btn{text-decoration:none}
+
+  /* handled-automatically note */
+  .handled{border:1px dashed var(--line-strong);border-radius:var(--r-lg);padding:14px 16px;margin-top:14px;
+    display:flex;gap:12px;align-items:flex-start;background:transparent}
+  .handled svg{width:18px;height:18px;color:var(--whenever);flex:none;margin-top:1px}
+  .handled p{font-size:13.5px;line-height:1.55;color:var(--ink-dim)}
+  .handled p b{color:var(--ink)}
+
+  .footnote{font-size:12.5px;line-height:1.6;color:var(--ink-dim);margin-top:16px}
+
+  /* all-clear state */
+  .all-clear{text-align:center;padding:52px 14px 24px}
+  .all-clear .badge-circle{width:56px;height:56px;border-radius:50%;background:var(--brand-soft);
+    color:var(--brand);display:flex;align-items:center;justify-content:center;margin:0 auto 18px}
+  .all-clear .badge-circle svg{width:26px;height:26px}
+  .all-clear h3{font:600 22px/1.3 var(--serif);margin-bottom:8px}
+  .all-clear p{font-size:14.5px;color:var(--ink-dim);line-height:1.6;max-width:26ch;margin:0 auto}
+  .all-clear .small{font-size:12.5px;margin-top:10px;opacity:.8}
+
+  /* ============================================================
+     SIGNATURE — the undo control as a physical ticket strip
+     ============================================================ */
+  .ticket{position:relative;background:var(--surface);border:1px solid var(--line-strong);border-radius:var(--r-md);
+    padding:16px 16px 14px;margin-top:15px}
+  .ticket::before,.ticket::after{content:"";position:absolute;left:16px;right:16px;height:9px;
+    background-image:radial-gradient(circle, var(--bg) 3px, transparent 3.2px);
+    background-size:14px 9px;background-repeat:repeat-x;background-position:0 0}
+  .ticket::before{top:-5px}
+  .ticket::after{bottom:-5px}
+  .ticket-row{display:flex;align-items:center;gap:12px}
+  .ticket-main{flex:1;min-width:0}
+  .ticket-main .lbl{font:700 10px/1 var(--sans);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-dim);
+    margin-bottom:5px}
+  .ticket-main .val{font:700 17px/1 var(--mono);color:var(--ink)}
+  .ticket-tear{border-left:1px dashed var(--line-strong);padding-left:14px;flex:none}
+  .undo-btn{background:none;border:none;font:800 13.5px/1 var(--sans);letter-spacing:.03em;
+    text-transform:uppercase;color:var(--emergency);cursor:pointer;min-height:44px;padding:0 6px;
+    text-decoration:underline;text-underline-offset:3px}
+  .ticket-track{height:4px;background:var(--line);border-radius:99px;margin-top:12px;overflow:hidden}
+  .ticket-fill{height:100%;width:22%;background:var(--brand);border-radius:99px}
+
+  /* ============================================================
+     EMERGENCY TAKEOVER — dark styling permitted here only
+     ============================================================ */
+  .device-screen.dark{background:#181310}
+  .emergency-content{flex:1;overflow-y:auto;padding:20px 24px 28px;
+    background-image:radial-gradient(560px 380px at 50% 8%, rgba(150,50,38,.4), transparent 65%);
+    color:#F3EEE4;scrollbar-width:none}
+  .emergency-content::-webkit-scrollbar{display:none}
+  .em-h{font:600 clamp(24px,6vw,30px)/1.2 var(--serif);letter-spacing:-.01em;margin:16px 0 8px;
+    text-shadow:0 1px 0 rgba(0,0,0,.6),0 -1px 0 rgba(255,255,255,.1)}
+  .em-sub{font-size:14.5px;line-height:1.6;color:#D8CFC2;margin-bottom:14px}
+  .em-sub b{color:#F3EEE4}
+  .em-call-hint{font-size:13.5px;color:#D8CFC2;margin-bottom:16px;line-height:1.6}
+  .safety-box{border:1px dashed rgba(159,220,186,.45);border-radius:var(--r-lg);padding:14px 16px;margin-bottom:20px}
+  .safety-box .lbl{font:800 10.5px/1 var(--sans);letter-spacing:.1em;text-transform:uppercase;
+    color:#9FDCBA;margin-bottom:8px}
+  .safety-box p{font:italic 14px/1.65 var(--serif);color:#CDEAD8}
+
+  .timeline{list-style:none;margin:0 0 22px;padding:0;display:grid;gap:12px}
+  .timeline li{display:flex;gap:12px;font-size:13.5px;line-height:1.55;color:#D8CFC2}
+  .timeline li .dot{flex:none;width:9px;height:9px;border-radius:50%;background:#9FDCBA;margin-top:5px}
+  .timeline li.pending .dot{background:#E8A24A;animation:pulse 1.4s infinite}
+  .timeline li time{display:block;font:700 11px/1 var(--mono);color:#F3EEE4;margin-bottom:2px;letter-spacing:.03em}
+
+  .btn.call{width:100%;background:linear-gradient(180deg,var(--emergency),var(--emergency-deep));
+    border-color:var(--emergency-deep);color:#FBEAE6;min-height:56px;font-size:16.5px;
+    display:flex;align-items:center;justify-content:center;gap:9px;margin-bottom:10px;text-decoration:none;
+    box-shadow:0 6px 16px -6px rgba(0,0,0,.5)}
+  .btn.ack{width:100%;background:transparent;border:1.5px solid rgba(243,238,228,.35);color:#F3EEE4;
+    min-height:48px}
+
+  /* ============================================================
+     CONVERSATION THREAD
+     ============================================================ */
+  .day-stamp{display:flex;align-items:center;gap:10px;margin:18px 0 14px}
+  .day-stamp .rule{flex:1;height:1px;background:var(--line-strong)}
+
+  .thread-msg{max-width:83%;margin-bottom:14px}
+  .thread-msg.out{margin-left:auto}
+  .thread-bubble-in{background:var(--panel);border:1px solid var(--line-strong);border-top-left-radius:var(--r-sm);
+    font-family:var(--sans);padding:13px 15px;border-radius:var(--r-lg);font-size:15px;line-height:1.55}
+  .thread-bubble-sent{background:var(--brand);color:var(--brand-on);border-top-right-radius:var(--r-sm);
+    font-family:var(--serif);font-style:italic;padding:13px 15px;border-radius:var(--r-lg);font-size:15px;line-height:1.55}
+  .thread-bubble-pending{background:var(--brand-soft);border:1.5px dashed var(--brand-border);
+    border-top-right-radius:var(--r-sm);font-family:var(--serif);font-style:italic;padding:13px 15px;
+    border-radius:var(--r-lg);font-size:15px;line-height:1.55}
+  .thread-meta{font:600 11px/1 var(--sans);color:var(--ink-dim);margin-top:6px}
+  .thread-meta.out{text-align:right}
+  .thread-meta .sent-by{color:var(--brand);font-weight:700}
+
+  /* ============================================================
+     PROPERTY TRUST SCREEN
+     ============================================================ */
+  .trust-intro{font-size:14.5px;line-height:1.6;color:var(--ink-dim);margin:10px 0 18px}
+  .trust-card{background:var(--surface);border:1px solid var(--line-strong);border-radius:var(--r-lg);padding:16px 18px}
+  .trust-card+.trust-card{margin-top:14px}
+  .trust-card h3{font:600 16px/1.35 var(--serif);margin-bottom:8px}
+  .trust-stat{font:700 12.5px/1 var(--sans);color:var(--ink-dim);margin-bottom:10px}
+  .trust-stat b{color:var(--brand)}
+  .progress-track{height:9px;border-radius:99px;background:var(--line);border:1px solid var(--line-strong);
+    overflow:hidden;margin-bottom:10px}
+  .progress-fill{height:100%;background:var(--brand);border-radius:99px}
+  .trust-card p{font-size:14px;line-height:1.6;color:var(--ink-dim)}
+  .trust-card p b{color:var(--ink)}
+  .trust-row{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px}
+  .chip{font:700 11px/1 var(--sans);letter-spacing:.03em;text-transform:uppercase;color:var(--ink-dim);
+    border:1px solid var(--line-strong);border-radius:var(--r-sm);padding:6px 12px;white-space:nowrap}
+
+  .switch{position:relative;width:50px;height:29px;border-radius:999px;background:var(--line);
+    border:1.5px solid var(--line-strong);cursor:pointer;flex:none}
+  .switch::after{content:"";position:absolute;top:3px;left:3px;width:21px;height:21px;border-radius:50%;
+    background:var(--ink-dim);transition:all .2s var(--ease)}
+  .switch.on{background:var(--whenever-ink);border-color:var(--whenever)}
+  .switch.on::after{left:23px;background:var(--whenever)}
+
+  /* ============================================================
+     DESKTOP ADAPTATION
+     ============================================================ */
+  .desktop-frame{width:100%;max-width:820px;margin:0 auto;border:1px solid var(--line-strong);
+    border-radius:var(--r-lg);overflow:hidden;box-shadow:0 26px 54px -26px rgba(30,27,22,.32);background:var(--bg)}
+  .browser-bar{height:38px;background:var(--surface);border-bottom:1px solid var(--line-strong);
+    display:flex;align-items:center;gap:6px;padding:0 16px}
+  .browser-bar .dot{width:9px;height:9px;border-radius:50%;background:var(--line-strong)}
+  .desktop-body{padding:44px 60px 56px}
+  .desktop-col{max-width:600px;margin:0 auto}
+
+  /* footer */
+  .page-footer{max-width:760px;margin:70px auto 0;font-size:12.5px;color:var(--ink-dim);
+    border-top:1px solid var(--line-strong);padding-top:18px;line-height:1.6}
+</style>
+
+
+<!-- ============================================================
+     ICON SPRITE — inline SVG only, no external assets
+     ============================================================ -->
+<svg aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden">
+<defs>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-skip" viewBox="0 0 24 24"><path d="M5 5v14l10-7z" fill="currentColor"/><path d="M17 5v14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3 19.5 19.5 0 0 1-6-6 19.8 19.8 0 0 1-3-8.7A2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .8 2.9a2 2 0 0 1-.4 2.2L8.1 10.2a16 16 0 0 0 5.7 5.7l1.4-1.4a2 2 0 0 1 2.2-.4c.9.4 1.9.7 2.9.8a2 2 0 0 1 1.7 2.1Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9 2.5 17a2 2 0 0 0 1.7 3h15.6a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-photo" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8.5" cy="10" r="1.4" fill="currentColor"/><path d="m21 15-5-5-9 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 11l9-8 9 8v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-1 4 8.5 8.5 0 0 1-7.5 4.5A8.4 8.4 0 0 1 8 19l-5 1 1-5a8.4 8.4 0 0 1-1-4 8.5 8.5 0 0 1 4.5-7.5 8.4 8.4 0 0 1 4-1h.5a8.5 8.5 0 0 1 8 8Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 8h6M9 12h6M9 16h3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M4 20c1.5-4 5-6 8-6s6.5 2 8 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-signal" viewBox="0 0 24 24"><path d="M2 17h2v3H2zM7 13h2v7H7zM12 9h2v11h-2zM17 5h2v15h-2z" fill="currentColor"/></symbol>
+  <symbol id="i-battery" viewBox="0 0 24 24"><rect x="1" y="7" width="19" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="3" y="9" width="13" height="6" rx="1" fill="currentColor"/><rect x="21.5" y="9.5" width="1.8" height="5" rx="1" fill="currentColor"/></symbol>
+</defs>
+</svg>
+
+<div class="page">
+
+  <!-- ============================================================
+       INTRO — rationale + do/don't strip
+       ============================================================ -->
+  <header class="intro">
+    <p class="eyebrow">Design exploration · docs/mockups/07</p>
+    <h1>Clarity — the brass plaque, redrawn for a phone.</h1>
+    <p class="tradition">The tradition this draws from: the brass plaque by the door and the
+      superintendent's log — the clarity of well-set print, not a SaaS dashboard.</p>
+
+    <ol class="rationale">
+      <li><span class="n">1</span><span>Competitors are dashboards; Stoop is a feed — one decision, one screen,
+        one button, not a control panel to scan.</span></li>
+      <li><span class="n">2</span><span>Reasoning is trust, so it reads like an editor's margin note next to
+        the reply — a plain sentence, visible by default, never tucked behind a disclosure toggle.</span></li>
+      <li><span class="n">3</span><span>Severity is a plain word set like the enamel plaque by the door —
+        Emergency, Can't wait, Whenever — read in a glance, never a coded tag.</span></li>
+      <li><span class="n">4</span><span>Type and touch sized for a landlord on a job site, not a designer's
+        laptop: 16px+ body, 48px+ targets, one composed serif voice for Stoop, one plain voice for the
+        tenant's actual texts.</span></li>
+      <li><span class="n">5</span><span>No separate desktop product — the same feed just gets more margin
+        to breathe.</span></li>
+    </ol>
+
+    <div class="donts">
+      <div class="box do">
+        <h2>Do</h2>
+        <ul>
+          <li>16px+ type, 48px+ targets</li>
+          <li>One action per screen</li>
+          <li>Reasoning written in plain view</li>
+          <li>Severity in plain words</li>
+          <li>Four tabs, no more</li>
+        </ul>
+      </div>
+      <div class="box dont">
+        <h2>Don't</h2>
+        <ul>
+          <li>Rounded-card dashboards</li>
+          <li>Icon-only buttons</li>
+          <li>Purple gradients, glassmorphism</li>
+          <li>"Triage," "AI agent," jargon</li>
+          <li>Sidebars or breadcrumbs</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="key-strip">
+      <span class="label">Severity, in plain words</span>
+      <span class="plaque emergency sm">Emergency</span>
+      <span class="plaque wait sm">Can't wait</span>
+      <span class="plaque whenever sm">Whenever</span>
+    </div>
+  </header>
+
+  <!-- ============================================================
+       GALLERY
+       ============================================================ -->
+  <div class="gallery">
+
+    <!-- ════ FRAME 1a — HOME / QUEUE (needs-you) ════ -->
+    <section class="frame-block" id="frame-1a">
+      <div class="placard">
+        <span class="no">Exhibit 01 · A</span>
+        <h2>Home — the queue, needing you</h2>
+        <p>Counts strip up top, an emergency banner if one exists (never buried below the fold), then
+          full decision cards — no table, no list of rows to parse.</p>
+      </div>
+      <div class="device">
+        <div class="device-screen">
+          <div class="island" aria-hidden="true"></div>
+          <div class="status-bar">
+            <span>9:41</span>
+            <span class="icons"><svg class="sr-only" aria-hidden="true"></svg>
+              <svg style="width:16px;height:16px" aria-hidden="true"><use href="#i-signal"/></svg>
+              <svg style="width:20px;height:13px" aria-hidden="true"><use href="#i-battery"/></svg>
+            </span>
+          </div>
+          <header class="app-header">
+            <div class="header-row">
+              <span class="wordmark">Stoop<span class="dot">.</span></span>
+              <span class="live-dot"><i aria-hidden="true"></i>Watching your messages</span>
+            </div>
+            <h3 class="greeting">Good morning, Laith.</h3>
+            <p class="counts">
+              <b>3</b> need you <span class="sep">·</span> <b>2</b> waiting on tenants
+            </p>
+          </header>
+          <main class="app-main">
+            <a class="em-banner" href="#frame-3">
+              <svg class="alert" aria-hidden="true"><use href="#i-alert"/></svg>
+              <span>
+                <strong>Maria reported a flood.</strong>
+                <span class="sub">88 Dovercourt · tap to call her now</span>
+              </span>
+              <span class="pulse" aria-hidden="true"></span>
+            </a>
+
+            <article class="entry">
+              <div class="entry-head">
+                <span class="plaque wait">Can't wait</span>
+                <a class="open-link" href="#frame-2a">Full view<svg aria-hidden="true"><use href="#i-chevron"/></svg></a>
+              </div>
+              <p class="entry-meta"><b>Elena</b> — Unit 2, 41 Palmerston Ave <span class="stamp">7:14 AM</span></p>
+              <div class="bubble bubble-in">
+                <span class="who">Elena said</span>
+                hi! no hot water since last night, tried the reset on the tank but nothing's happening.
+                any chance someone can look today?
+              </div>
+              <div class="bubble bubble-out">
+                <span class="who">I'd like to reply</span>
+                Hi Elena — sorry about that, I'll get someone out today. Tony has a 1 PM slot; he'll
+                call you 30 minutes before he heads over.
+              </div>
+              <div class="margin-note">
+                <span class="kicker">Why</span>
+                <p>No hot water for a full day is enough to need you today — but nobody's in danger, so
+                  it went in your queue instead of ringing your phone.</p>
+              </div>
+              <div class="actions">
+                <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-edit"/></svg>Edit</button>
+                <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-skip"/></svg>Skip</button>
+                <button class="btn primary" type="button"><svg aria-hidden="true"><use href="#i-check"/></svg>Approve &amp; send</button>
+              </div>
+            </article>
+
+            <article class="entry">
+              <div class="entry-head">
+                <span class="plaque whenever">Whenever</span>
+              </div>
+              <p class="entry-meta"><b>Sam</b> — 12 Ossington Ave <span class="stamp">Yesterday, 6:40 PM</span></p>
+              <div class="bubble bubble-in">
+                <span class="who">Sam said</span>
+                hey no rush at all but the kitchen faucet has a slow drip, driving me a little nuts lol
+              </div>
+              <div class="bubble bubble-out">
+                <span class="who">I'd like to reply</span>
+                Morning Sam — thanks for flagging it. I've booked Tony for Thursday morning. Send me a
+                video if it gets worse before then and I'll move him up.
+              </div>
+              <div class="margin-note">
+                <span class="kicker">Why</span>
+                <p>A slow drip can wait a couple of days, and Sam said there's no rush — so I booked your
+                  usual plumber's next opening instead of bothering you sooner.</p>
+              </div>
+              <div class="actions">
+                <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-edit"/></svg>Edit</button>
+                <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-skip"/></svg>Skip</button>
+                <button class="btn primary" type="button"><svg aria-hidden="true"><use href="#i-check"/></svg>Approve &amp; send</button>
+              </div>
+            </article>
+
+            <div class="handled">
+              <svg aria-hidden="true"><use href="#i-check"/></svg>
+              <p><b>Sam also asked about weekend parking.</b> I answered that one myself from your house
+                rules — you've approved enough of these that I don't need to ask about the simple ones.</p>
+            </div>
+
+            <p class="footnote">Also waiting on tenants: a reply about a roof leak, and one about the gate
+              code — nothing to do until they answer back.</p>
+          </main>
+          <nav class="tabbar" aria-label="Primary">
+            <button class="tab on" type="button"><svg aria-hidden="true"><use href="#i-home"/></svg>Home<span class="badge">3</span></button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-chat"/></svg>Conversations</button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-building"/></svg>Properties</button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-user"/></svg>Me</button>
+          </nav>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════ FRAME 1b — HOME / QUEUE (all clear) ════ -->
+    <section class="frame-block" id="frame-1b">
+      <div class="placard">
+        <span class="no">Exhibit 01 · B</span>
+        <h2>Home — all clear variant</h2>
+        <p>Same shell, nothing pending. Quiet and specific, not a cheerful empty-state illustration.</p>
+      </div>
+      <div class="device">
+        <div class="device-screen">
+          <div class="island" aria-hidden="true"></div>
+          <div class="status-bar">
+            <span>9:41</span>
+            <span class="icons">
+              <svg style="width:16px;height:16px" aria-hidden="true"><use href="#i-signal"/></svg>
+              <svg style="width:20px;height:13px" aria-hidden="true"><use href="#i-battery"/></svg>
+            </span>
+          </div>
+          <header class="app-header">
+            <div class="header-row">
+              <span class="wordmark">Stoop<span class="dot">.</span></span>
+              <span class="live-dot"><i aria-hidden="true"></i>Watching your messages</span>
+            </div>
+            <h3 class="greeting">Good morning, Laith.</h3>
+            <p class="counts"><b>0</b> need you <span class="sep">·</span> <b>1</b> waiting on tenants</p>
+          </header>
+          <main class="app-main">
+            <div class="all-clear">
+              <div class="badge-circle"><svg aria-hidden="true"><use href="#i-check"/></svg></div>
+              <h3>That's everything.</h3>
+              <p>I'm watching your messages — go enjoy your day. I'll text you if anything needs you.</p>
+              <p class="small">Last checked 2 minutes ago.</p>
+            </div>
+            <div class="handled">
+              <svg aria-hidden="true"><use href="#i-check"/></svg>
+              <p><b>Sam asked about weekend parking.</b> I answered that myself from your house rules —
+                you've approved enough of these that I don't need to ask about the simple ones.</p>
+            </div>
+          </main>
+          <nav class="tabbar" aria-label="Primary">
+            <button class="tab on" type="button"><svg aria-hidden="true"><use href="#i-home"/></svg>Home</button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-chat"/></svg>Conversations</button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-building"/></svg>Properties</button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-user"/></svg>Me</button>
+          </nav>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════ FRAME 2a / 2b — APPROVAL CARD FOCUSED + UNDO ════ -->
+    <section class="frame-pair">
+      <div class="frame-block" id="frame-2a">
+        <div class="placard">
+          <span class="no">Exhibit 02 · A</span>
+          <h2>One decision, full screen</h2>
+          <p>Tapping "Full view" opens the same case as the only thing on the screen — the photo
+            attached, the reasoning right there, one primary button.</p>
+        </div>
+        <div class="device">
+          <div class="device-screen">
+            <div class="island" aria-hidden="true"></div>
+            <div class="status-bar">
+              <span>9:41</span>
+              <span class="icons">
+                <svg style="width:16px;height:16px" aria-hidden="true"><use href="#i-signal"/></svg>
+                <svg style="width:20px;height:13px" aria-hidden="true"><use href="#i-battery"/></svg>
+              </span>
+            </div>
+            <header class="app-header">
+              <div class="header-row">
+                <a class="back-link" href="#frame-1a"><svg aria-hidden="true"><use href="#i-back"/></svg>Home</a>
+                <span class="plaque wait">Can't wait</span>
+              </div>
+            </header>
+            <main class="app-main">
+              <p class="entry-meta" style="margin-top:6px"><b>Elena</b> — Unit 2, 41 Palmerston Ave</p>
+              <div class="bubble bubble-in">
+                <span class="who">Elena said · 7:14 AM</span>
+                hi! no hot water since last night, tried the reset on the tank but nothing's happening.
+                any chance someone can look today?
+                <div class="photo-chip">
+                  <span class="thumb"><svg aria-hidden="true"><use href="#i-photo"/></svg></span>
+                  Photo — the tank's reset switch, no light on
+                  <span class="sr-only">Photo Elena sent showing the water heater's reset switch with no indicator light on.</span>
+                </div>
+              </div>
+              <div class="bubble bubble-out">
+                <span class="who">I'd like to reply · not sent yet</span>
+                Hi Elena — sorry about that, I'll get someone out today. Tony has a 1 PM slot; he'll
+                call you 30 minutes before he heads over. If nobody's shown up by 3, text me and I'll
+                chase it.
+              </div>
+              <div class="margin-note">
+                <span class="kicker">Why</span>
+                <p>No hot water for a full day is enough to need you today — but nobody's in danger, so
+                  I didn't call, I just added it to your list.</p>
+                <a href="#frame-4">See the whole conversation →</a>
+              </div>
+              <div class="actions">
+                <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-edit"/></svg>Edit</button>
+                <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-skip"/></svg>Skip</button>
+                <button class="btn primary" type="button"><svg aria-hidden="true"><use href="#i-check"/></svg>Approve &amp; send</button>
+              </div>
+            </main>
+            <nav class="tabbar" aria-label="Primary">
+              <button class="tab on" type="button"><svg aria-hidden="true"><use href="#i-home"/></svg>Home<span class="badge">3</span></button>
+              <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-chat"/></svg>Conversations</button>
+              <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-building"/></svg>Properties</button>
+              <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-user"/></svg>Me</button>
+            </nav>
+          </div>
+        </div>
+      </div>
+
+      <div class="frame-block" id="frame-2b">
+        <div class="placard">
+          <span class="no">Exhibit 02 · B — five seconds later</span>
+          <h2>Sending, with an easy way out</h2>
+          <p>The undo is a physical ticket — a perforated strip with a tear line, not a toast that
+            vanishes. Nothing else on screen competes with it.</p>
+        </div>
+        <div class="device">
+          <div class="device-screen">
+            <div class="island" aria-hidden="true"></div>
+            <div class="status-bar">
+              <span>9:41</span>
+              <span class="icons">
+                <svg style="width:16px;height:16px" aria-hidden="true"><use href="#i-signal"/></svg>
+                <svg style="width:20px;height:13px" aria-hidden="true"><use href="#i-battery"/></svg>
+              </span>
+            </div>
+            <header class="app-header">
+              <div class="header-row">
+                <a class="back-link" href="#frame-1a"><svg aria-hidden="true"><use href="#i-back"/></svg>Home</a>
+                <span class="plaque wait">Can't wait</span>
+              </div>
+            </header>
+            <main class="app-main">
+              <p class="entry-meta" style="margin-top:6px"><b>Elena</b> — Unit 2, 41 Palmerston Ave</p>
+              <div class="bubble bubble-in">
+                <span class="who">Elena said · 7:14 AM</span>
+                hi! no hot water since last night, tried the reset on the tank but nothing's happening.
+                any chance someone can look today?
+                <div class="photo-chip">
+                  <span class="thumb"><svg aria-hidden="true"><use href="#i-photo"/></svg></span>
+                  Photo — the tank's reset switch, no light on
+                </div>
+              </div>
+              <div class="bubble bubble-out">
+                <span class="who">On its way to Elena</span>
+                Hi Elena — sorry about that, I'll get someone out today. Tony has a 1 PM slot; he'll
+                call you 30 minutes before he heads over. If nobody's shown up by 3, text me and I'll
+                chase it.
+              </div>
+              <div class="ticket" role="status">
+                <div class="ticket-row">
+                  <div class="ticket-main">
+                    <span class="lbl">Sending</span>
+                    <span class="val">00:04</span>
+                  </div>
+                  <div class="ticket-tear">
+                    <button class="undo-btn" type="button">Undo</button>
+                  </div>
+                </div>
+                <div class="ticket-track"><div class="ticket-fill" aria-hidden="true"></div></div>
+              </div>
+            </main>
+            <nav class="tabbar" aria-label="Primary">
+              <button class="tab on" type="button"><svg aria-hidden="true"><use href="#i-home"/></svg>Home<span class="badge">3</span></button>
+              <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-chat"/></svg>Conversations</button>
+              <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-building"/></svg>Properties</button>
+              <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-user"/></svg>Me</button>
+            </nav>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════ FRAME 3 — EMERGENCY TAKEOVER ════ -->
+    <section class="frame-block" id="frame-3">
+      <div class="placard">
+        <span class="no">Exhibit 03</span>
+        <h2>Emergency takeover</h2>
+        <p>The one place dark styling is allowed. Phone-call framing first, the record of what Stoop
+          already did second, one button to reach the tenant and one to acknowledge.</p>
+      </div>
+      <div class="device">
+        <div class="device-screen dark">
+          <div class="island" aria-hidden="true"></div>
+          <div class="status-bar">
+            <span>12:52</span>
+            <span class="icons">
+              <svg style="width:16px;height:16px" aria-hidden="true"><use href="#i-signal"/></svg>
+              <svg style="width:20px;height:13px" aria-hidden="true"><use href="#i-battery"/></svg>
+            </span>
+          </div>
+          <div class="emergency-content" role="alertdialog" aria-label="Emergency">
+            <span class="plaque emergency">Emergency</span>
+            <h2 class="em-h">Maria reported a flood.</h2>
+            <p class="em-sub">88 Dovercourt · Unit 4 · water is coming through the ceiling</p>
+            <p class="em-call-hint"><b>I've called your phone twice.</b> Tap below to reach Maria
+              directly — you don't have to wait for me.</p>
+
+            <div class="safety-box">
+              <span class="lbl">I already told Maria what to do</span>
+              <p>"Turn off the breaker for that room if you can reach it safely. Move anything valuable
+                out from under the leak. Don't touch the ceiling or any light fixture near it. I'm
+                reaching your landlord right now."</p>
+            </div>
+
+            <ul class="timeline">
+              <li><span class="dot" aria-hidden="true"></span><span><time>12:47 AM</time>Maria texted: "water's coming through my ceiling, it's a lot"</span></li>
+              <li><span class="dot" aria-hidden="true"></span><span><time>12:47 AM</time>I sent Maria the safety steps above</span></li>
+              <li><span class="dot" aria-hidden="true"></span><span><time>12:47 AM</time>I called your phone — no answer</span></li>
+              <li><span class="dot" aria-hidden="true"></span><span><time>12:52 AM</time>I called again — no answer</span></li>
+              <li class="pending"><span class="dot" aria-hidden="true"></span><span><time>Now</time>Waiting for you</span></li>
+            </ul>
+
+            <a class="btn call" href="tel:+15555550142"><svg aria-hidden="true"><use href="#i-phone"/></svg>Call Maria now</a>
+            <button class="btn ack" type="button">I'm on it</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════ FRAME 4 — CONVERSATION THREAD ════ -->
+    <section class="frame-block" id="frame-4">
+      <div class="placard">
+        <span class="no">Exhibit 04</span>
+        <h2>Conversation thread</h2>
+        <p>Plain SMS history. Stoop's own sent replies are marked, quietly, as its own — not disguised
+          as the landlord and not hidden as "the system."</p>
+      </div>
+      <div class="device">
+        <div class="device-screen">
+          <div class="island" aria-hidden="true"></div>
+          <div class="status-bar">
+            <span>9:41</span>
+            <span class="icons">
+              <svg style="width:16px;height:16px" aria-hidden="true"><use href="#i-signal"/></svg>
+              <svg style="width:20px;height:13px" aria-hidden="true"><use href="#i-battery"/></svg>
+            </span>
+          </div>
+          <header class="app-header">
+            <a class="back-link" href="#frame-1a"><svg aria-hidden="true"><use href="#i-back"/></svg>Home</a>
+            <h3 style="font:600 19px/1.3 var(--serif);margin-top:8px">Elena — Unit 2</h3>
+            <p style="font-size:12.5px;color:var(--ink-dim);margin-top:2px">41 Palmerston Ave · every
+              message, saved with dates and times</p>
+          </header>
+          <main class="app-main">
+            <div class="day-stamp"><span class="rule"></span><span class="stamp">Monday</span><span class="rule"></span></div>
+            <div class="thread-msg">
+              <div class="thread-bubble-in">got the rent receipt, thank you!!</div>
+              <div class="thread-meta">Elena · 6:58 PM</div>
+            </div>
+            <div class="thread-msg out">
+              <div class="thread-bubble-sent">Anytime, Elena!</div>
+              <div class="thread-meta out"><span class="sent-by">Sent by Stoop for you</span> · 7:10 PM</div>
+            </div>
+
+            <div class="day-stamp"><span class="rule"></span><span class="stamp">Today</span><span class="rule"></span></div>
+            <div class="thread-msg">
+              <div class="thread-bubble-in">hi! no hot water since last night, tried the reset on the
+                tank but nothing's happening. any chance someone can look today?
+                <div class="photo-chip">
+                  <span class="thumb"><svg aria-hidden="true"><use href="#i-photo"/></svg></span>
+                  Photo attached
+                </div>
+              </div>
+              <div class="thread-meta">Elena · 7:14 AM</div>
+            </div>
+            <div class="thread-msg out">
+              <div class="thread-bubble-pending">Hi Elena — sorry about that, I'll get someone out
+                today. Tony has a 1 PM slot…
+                <a href="#frame-2a" style="display:block;margin-top:8px;font:700 13px var(--sans);color:var(--brand);text-decoration:none">Review and send →</a>
+              </div>
+              <div class="thread-meta out">Waiting for your OK</div>
+            </div>
+
+            <p class="footnote">Nothing here can be edited or removed once it's sent — that's what makes
+              it useful if you ever need the record.</p>
+          </main>
+          <nav class="tabbar" aria-label="Primary">
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-home"/></svg>Home</button>
+            <button class="tab on" type="button"><svg aria-hidden="true"><use href="#i-chat"/></svg>Conversations</button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-building"/></svg>Properties</button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-user"/></svg>Me</button>
+          </nav>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════ FRAME 5 — PROPERTY TRUST SCREEN ════ -->
+    <section class="frame-block" id="frame-5">
+      <div class="placard">
+        <span class="no">Exhibit 05</span>
+        <h2>Property trust, told as a story</h2>
+        <p>The trust ladder as a plain sentence and a progress bar, not a settings table. New
+          permissions default off, always the landlord's call.</p>
+      </div>
+      <div class="device">
+        <div class="device-screen">
+          <div class="island" aria-hidden="true"></div>
+          <div class="status-bar">
+            <span>9:41</span>
+            <span class="icons">
+              <svg style="width:16px;height:16px" aria-hidden="true"><use href="#i-signal"/></svg>
+              <svg style="width:20px;height:13px" aria-hidden="true"><use href="#i-battery"/></svg>
+            </span>
+          </div>
+          <header class="app-header">
+            <h3 style="font:600 22px/1.3 var(--serif)">12 Ossington Ave</h3>
+            <p style="font-size:12.5px;color:var(--ink-dim);margin-top:2px">Sam · 1 unit</p>
+          </header>
+          <main class="app-main">
+            <p class="trust-intro">The more replies you approve without changing them, the more I can
+              send on my own here. You're always the one who decides — I just tell you when I've earned
+              the next step.</p>
+
+            <div class="trust-card">
+              <h3>Parking, garbage day, and simple questions</h3>
+              <p class="trust-stat"><b>30 of your last 30</b> approvals here, unchanged</p>
+              <div class="progress-track"><div class="progress-fill" style="width:100%"></div></div>
+              <p>I could send these myself from now on. You'd still see every message — I'd just stop
+                waiting for your tap.</p>
+              <div class="trust-row">
+                <span id="switchLabel1" style="font-size:13px;color:var(--ink-dim)">Off by default</span>
+                <span class="switch" role="switch" aria-checked="false" aria-labelledby="switchLabel1"
+                  tabindex="0" id="trustSwitch1"></span>
+              </div>
+            </div>
+
+            <div class="trust-card">
+              <h3>Repair requests, like Elena's no-hot-water text</h3>
+              <p class="trust-stat">You're at <b>8</b> of 12 approved replies, unedited</p>
+              <div class="progress-track"><div class="progress-fill" style="width:67%"></div></div>
+              <p>After 12 approved replies with no edits, I can start sending these myself too — four
+                more and I'll offer you this switch.</p>
+              <div class="trust-row">
+                <span class="chip">Not yet — nothing to do</span>
+              </div>
+            </div>
+
+            <div class="trust-card">
+              <h3>Rent, legal notices, anything about money</h3>
+              <p>This always comes to you first, no matter how many replies you approve.</p>
+              <div class="trust-row">
+                <span class="chip">No switch — on purpose</span>
+              </div>
+            </div>
+          </main>
+          <nav class="tabbar" aria-label="Primary">
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-home"/></svg>Home</button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-chat"/></svg>Conversations</button>
+            <button class="tab on" type="button"><svg aria-hidden="true"><use href="#i-building"/></svg>Properties</button>
+            <button class="tab" type="button"><svg aria-hidden="true"><use href="#i-user"/></svg>Me</button>
+          </nav>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ════ FRAME 6 — DESKTOP ADAPTATION ════ -->
+  <section class="frame-block" id="frame-6" style="width:100%;align-items:center;margin-top:52px">
+    <div class="placard" style="max-width:820px;text-align:center">
+      <span class="no">Exhibit 06</span>
+      <h2>Desktop — same feed, wider margin</h2>
+      <p>No sidebar, no separate information architecture. The centered column just gets room to
+        breathe; nothing about the model changes.</p>
+    </div>
+    <div class="desktop-frame">
+      <div class="browser-bar">
+        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      </div>
+      <div class="desktop-body">
+        <div class="desktop-col">
+          <div class="header-row" style="margin-bottom:6px">
+            <span class="wordmark">Stoop<span class="dot">.</span></span>
+            <span class="live-dot"><i aria-hidden="true"></i>Watching your messages</span>
+          </div>
+          <h3 class="greeting">Good morning, Laith.</h3>
+          <p class="counts" style="margin-bottom:22px"><b>3</b> need you <span class="sep">·</span> <b>2</b> waiting on tenants</p>
+
+          <a class="em-banner" href="#frame-3">
+            <svg class="alert" aria-hidden="true"><use href="#i-alert"/></svg>
+            <span>
+              <strong>Maria reported a flood.</strong>
+              <span class="sub">88 Dovercourt · tap to call her now</span>
+            </span>
+            <span class="pulse" aria-hidden="true"></span>
+          </a>
+
+          <article class="entry">
+            <div class="entry-head">
+              <span class="plaque wait">Can't wait</span>
+              <a class="open-link" href="#frame-2a">Full view<svg aria-hidden="true"><use href="#i-chevron"/></svg></a>
+            </div>
+            <p class="entry-meta"><b>Elena</b> — Unit 2, 41 Palmerston Ave <span class="stamp">7:14 AM</span></p>
+            <div class="bubble bubble-in">
+              <span class="who">Elena said</span>
+              hi! no hot water since last night, tried the reset on the tank but nothing's happening.
+              any chance someone can look today?
+            </div>
+            <div class="bubble bubble-out">
+              <span class="who">I'd like to reply</span>
+              Hi Elena — sorry about that, I'll get someone out today. Tony has a 1 PM slot; he'll call
+              you 30 minutes before he heads over.
+            </div>
+            <div class="margin-note">
+              <span class="kicker">Why</span>
+              <p>No hot water for a full day is enough to need you today — but nobody's in danger, so it
+                went in your queue instead of ringing your phone.</p>
+            </div>
+            <div class="actions">
+              <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-edit"/></svg>Edit</button>
+              <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-skip"/></svg>Skip</button>
+              <button class="btn primary" type="button"><svg aria-hidden="true"><use href="#i-check"/></svg>Approve &amp; send</button>
+            </div>
+          </article>
+
+          <article class="entry">
+            <div class="entry-head">
+              <span class="plaque whenever">Whenever</span>
+            </div>
+            <p class="entry-meta"><b>Sam</b> — 12 Ossington Ave <span class="stamp">Yesterday, 6:40 PM</span></p>
+            <div class="bubble bubble-in">
+              <span class="who">Sam said</span>
+              hey no rush at all but the kitchen faucet has a slow drip, driving me a little nuts lol
+            </div>
+            <div class="bubble bubble-out">
+              <span class="who">I'd like to reply</span>
+              Morning Sam — thanks for flagging it. I've booked Tony for Thursday morning.
+            </div>
+            <div class="actions">
+              <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-edit"/></svg>Edit</button>
+              <button class="btn ghost" type="button"><svg aria-hidden="true"><use href="#i-skip"/></svg>Skip</button>
+              <button class="btn primary" type="button"><svg aria-hidden="true"><use href="#i-check"/></svg>Approve &amp; send</button>
+            </div>
+          </article>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <p class="page-footer">docs/mockups/07-clarity-redesign.html — self-contained, no build step, no
+    external requests (system fonts + inline SVG only). Open directly in a browser. Mock data only:
+    every name, address, and phone number here is fictional.</p>
+</div>
+
+<script>
+  // Small, honest interactivity: trust toggles only. Everything else is a static
+  // frame by design — these are screenshots of one decision at a time, not a
+  // simulated app shell.
+  document.querySelectorAll('.switch[role="switch"]').forEach(function (sw) {
+    function toggle() {
+      var on = sw.classList.toggle('on');
+      sw.setAttribute('aria-checked', on ? 'true' : 'false');
+    }
+    sw.addEventListener('click', toggle);
+    sw.addEventListener('keydown', function (e) {
+      if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggle(); }
+    });
+  });
+</script>
