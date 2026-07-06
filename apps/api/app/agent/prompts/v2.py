@@ -50,10 +50,13 @@ REFUSAL_TEMPLATES: dict[str, str] = {
         "For safety, I can't share or reset codes, or let anyone in from "
         "here. Please ask your landlord directly about keys or access."
     ),
+    # No time word on the follow-up: plain-language rule 4 bans relative
+    # times ("soon"), and a concrete time would be a false commitment made
+    # on the landlord's behalf about a topic Stoop refuses to handle.
     "legal_rent_ltb": (
         "I can't discuss rent or legal questions here. That's for your "
         "landlord to work out with you directly. I've passed your message "
-        "along, and they'll follow up soon."
+        "along so they can follow up with you."
     ),
     "cost_compensation": (
         "I can't make promises about costs, refunds, or rent changes. "

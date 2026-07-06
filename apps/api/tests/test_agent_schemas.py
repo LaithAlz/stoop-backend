@@ -317,6 +317,108 @@ def test_severity_result_single_key_dict_with_non_dict_value_not_unwrapped() -> 
 
 
 @pytest.mark.unit
+def test_severity_result_gate8_e4_payload_flag_dict_plus_boolean_modifier() -> None:
+    """Reproduces the EXACT gate-8 e4 infra failure (2026-07-06):
+    refusal_flags as a per-flag boolean dict + the invented
+    vulnerable_occupant_modifier_applied bool. Both coercions must absorb
+    it into a valid, semantically-identical result."""
+    result = SeverityResult.model_validate(
+        {
+            "severity": "EMERGENCY",
+            "rules_fired": ["Active fire (Q1: YES)"],
+            "refusal_flags": {
+                "access_codes": False,
+                "legal_rent_ltb": False,
+                "cost_compensation": False,
+                "other_tenants": False,
+                "impersonation": False,
+            },
+            "vulnerable_occupant_modifier_applied": False,
+            "reasoning": ["Tenant reports active fire."],
+        }
+    )
+    assert result.severity == Severity.EMERGENCY
+    assert result.refusal_flags == []
+    assert result.modifier is None
+
+
+@pytest.mark.unit
+def test_severity_result_flag_dict_with_true_values_coerces_to_fired_flags() -> None:
+    result = SeverityResult.model_validate(
+        {
+            "severity": "ROUTINE",
+            "refusal_flags": {
+                "legal_rent_ltb": True,
+                "cost_compensation": True,
+                "other_tenants": False,
+            },
+        }
+    )
+    assert result.refusal_flags == [RefusalFlag.legal_rent_ltb, RefusalFlag.cost_compensation]
+
+
+@pytest.mark.unit
+def test_severity_result_flag_dict_with_non_bool_values_still_fails() -> None:
+    """Narrowness: a dict whose values are not all bools is NOT coerced --
+    it must fail list validation loudly."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate(
+            {"severity": "ROUTINE", "refusal_flags": {"legal_rent_ltb": "yes"}}
+        )
+
+
+@pytest.mark.unit
+def test_severity_result_boolean_modifier_true_preserves_escalation_signal() -> None:
+    """True must NOT be silently dropped -- losing a vulnerable-occupant
+    signal would be a de-escalation. It becomes a modifier string."""
+    result = SeverityResult.model_validate(
+        {"severity": "URGENT", "vulnerable_occupant_modifier_applied": True}
+    )
+    assert result.modifier is not None
+    assert "vulnerable occupant" in result.modifier
+
+
+@pytest.mark.unit
+def test_severity_result_boolean_modifier_true_never_overwrites_real_modifier() -> None:
+    result = SeverityResult.model_validate(
+        {
+            "severity": "EMERGENCY",
+            "modifier": "vulnerable-occupant bump: infant",
+            "vulnerable_occupant_modifier_applied": True,
+        }
+    )
+    assert result.modifier == "vulnerable-occupant bump: infant"
+
+
+@pytest.mark.unit
+def test_severity_result_boolean_modifier_non_bool_value_still_fails() -> None:
+    """Narrowness: only an exact bool is absorbed; anything else keeps the
+    unknown key and fails extra="forbid" loudly."""
+    with pytest.raises(ValidationError):
+        SeverityResult.model_validate(
+            {"severity": "ROUTINE", "vulnerable_occupant_modifier_applied": "true"}
+        )
+
+
+@pytest.mark.unit
+def test_severity_result_wrapper_plus_gate8_variances_compose() -> None:
+    """All three variance classes at once: wrapper key OUTSIDE, flag dict
+    + boolean modifier INSIDE. Unwrap runs first, then the coercions."""
+    result = SeverityResult.model_validate(
+        {
+            "severity_result": {
+                "severity": "EMERGENCY",
+                "refusal_flags": {"access_codes": False},
+                "vulnerable_occupant_modifier_applied": True,
+            }
+        }
+    )
+    assert result.severity == Severity.EMERGENCY
+    assert result.refusal_flags == []
+    assert result.modifier is not None and "vulnerable occupant" in result.modifier
+
+
+@pytest.mark.unit
 def test_severity_result_wrapper_plus_bare_string_reasoning_compose() -> None:
     """Both robustness layers fire together: the payload is wrapped AND
     its inner ``reasoning`` is a bare string -- both must be corrected."""

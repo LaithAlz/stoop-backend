@@ -184,6 +184,19 @@ class SeverityResult(BaseModel):
     coercion above ever runs -- see :func:`_unwrap_single_key_wrapper` for
     the exact, deliberately-narrow conditions (a genuinely wrong payload
     still fails validation normally).
+
+    Gate 8 (2026-07-06) surfaced a THIRD variance on the e4 injection
+    scenario: ``refusal_flags`` came back as a per-flag boolean dict
+    (``{"access_codes": false, ...}``) instead of a list of fired flags,
+    alongside an invented boolean field
+    ``vulnerable_occupant_modifier_applied``. Two more deliberately-narrow
+    coercions absorb exactly those shapes: ``_coerce_flag_dict_to_list``
+    (a str->bool dict becomes the list of true keys) and
+    ``_absorb_boolean_modifier_variant`` (the invented key is removed;
+    ``True`` is TRANSLATED into a ``modifier`` string rather than dropped,
+    because silently discarding a vulnerable-occupant signal would be a
+    de-escalation -- rule: never lose an escalation signal to shape
+    normalization).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -197,8 +210,43 @@ class SeverityResult(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _unwrap_wrapper(cls, data: object) -> object:
-        """See class docstring "Robustness" / :func:`_unwrap_single_key_wrapper`."""
-        return _unwrap_single_key_wrapper(data, set(cls.model_fields))
+        """Unwrap a single-key wrapper FIRST (see class docstring
+        "Robustness" / :func:`_unwrap_single_key_wrapper`), THEN absorb the
+        gate-8 boolean-modifier variant on the unwrapped payload. One
+        validator with explicit sequencing -- Pydantic executes multiple
+        ``mode="before"`` model validators in REVERSE definition order,
+        which silently broke the two-validator version when the variances
+        composed (wrapper outside, invented key inside)."""
+        data = _unwrap_single_key_wrapper(data, set(cls.model_fields))
+        # Gate-8 variance (see class docstring): the model invented
+        # ``vulnerable_occupant_modifier_applied: bool``. Absorb EXACTLY a
+        # bool under that key: False is dropped (identical meaning to
+        # absence); True becomes a ``modifier`` string when none was given,
+        # so the escalation signal survives. A non-bool value is left in
+        # place and fails ``extra="forbid"`` normally.
+        if isinstance(data, dict):
+            flag = data.get("vulnerable_occupant_modifier_applied")
+            if isinstance(flag, bool):
+                data = dict(data)
+                del data["vulnerable_occupant_modifier_applied"]
+                if flag and not data.get("modifier"):
+                    data["modifier"] = "vulnerable occupant present (model emitted boolean variant)"
+        return data
+
+    @field_validator("refusal_flags", mode="before")
+    @classmethod
+    def _coerce_flag_dict_to_list(cls, value: object) -> object:
+        """Gate-8 variance (see class docstring): a per-flag boolean dict
+        in place of the list of fired flags. Coerce EXACTLY a str->bool
+        dict into the list of keys whose value is true; any other dict
+        shape passes through and fails list validation normally."""
+        if (
+            isinstance(value, dict)
+            and all(isinstance(k, str) for k in value)
+            and all(isinstance(v, bool) for v in value.values())
+        ):
+            return [k for k, v in value.items() if v]
+        return value
 
     @field_validator("rules_fired", "refusal_flags", "reasoning", mode="before")
     @classmethod
