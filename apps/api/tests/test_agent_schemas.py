@@ -368,14 +368,29 @@ def test_severity_result_flag_dict_with_non_bool_values_still_fails() -> None:
 
 
 @pytest.mark.unit
-def test_severity_result_boolean_modifier_true_preserves_escalation_signal() -> None:
-    """True must NOT be silently dropped -- losing a vulnerable-occupant
-    signal would be a de-escalation. It becomes a modifier string."""
+def test_severity_result_boolean_modifier_true_at_emergency_becomes_modifier() -> None:
+    """True at EMERGENCY is safe to absorb: the severity already honors the
+    signal, so it is recorded as a modifier string."""
     result = SeverityResult.model_validate(
-        {"severity": "URGENT", "vulnerable_occupant_modifier_applied": True}
+        {"severity": "EMERGENCY", "vulnerable_occupant_modifier_applied": True}
     )
     assert result.modifier is not None
     assert "vulnerable occupant" in result.modifier
+
+
+@pytest.mark.unit
+def test_severity_result_boolean_modifier_true_below_emergency_fails_closed() -> None:
+    """Safety review 2026-07-06: a True vulnerable-occupant assertion on a
+    below-EMERGENCY severity must NOT validate -- modifier never re-derives
+    severity, so absorbing it would turn the fail-closed path (validation
+    error -> retry -> classification_failed -> landlord notification) into
+    a silent under-classification. The exact e4-injection-shaped payload
+    the safety reviewer reproduced must raise."""
+    for severity in ("ROUTINE", "URGENT"):
+        with pytest.raises(ValidationError):
+            SeverityResult.model_validate(
+                {"severity": severity, "vulnerable_occupant_modifier_applied": True}
+            )
 
 
 @pytest.mark.unit

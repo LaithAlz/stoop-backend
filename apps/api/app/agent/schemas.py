@@ -54,10 +54,12 @@ class Severity(StrEnum):
 class RefusalFlag(StrEnum):
     """Refusal topics the agent must never engage with substantively.
 
-    Values are IDENTICAL to the keys in ``prompts/v1.py`` REFUSAL_TEMPLATES
-    so that ``REFUSAL_TEMPLATES[flag.value]`` always resolves without a
-    mapping step.  Changing any key here requires updating v1.py in the same
-    commit (or, if v1.py is frozen, creating v2.py — see CLAUDE.md).
+    Values are IDENTICAL to the keys in every prompt package's
+    REFUSAL_TEMPLATES (``prompts/v1.py`` frozen history, ``prompts/v2.py``
+    live) so that ``REFUSAL_TEMPLATES[flag.value]`` always resolves without
+    a mapping step.  Changing any key here requires a new prompt version
+    file (existing versions are frozen — see CLAUDE.md); a keys-match test
+    in ``tests/test_agent_schemas.py`` pins every version.
     """
 
     access_codes = "access_codes"
@@ -191,12 +193,15 @@ class SeverityResult(BaseModel):
     alongside an invented boolean field
     ``vulnerable_occupant_modifier_applied``. Two more deliberately-narrow
     coercions absorb exactly those shapes: ``_coerce_flag_dict_to_list``
-    (a str->bool dict becomes the list of true keys) and
-    ``_absorb_boolean_modifier_variant`` (the invented key is removed;
-    ``True`` is TRANSLATED into a ``modifier`` string rather than dropped,
-    because silently discarding a vulnerable-occupant signal would be a
-    de-escalation -- rule: never lose an escalation signal to shape
-    normalization).
+    (a str->bool dict becomes the list of true keys) and a FAIL-CLOSED
+    boolean-modifier absorb inside ``_unwrap_wrapper`` (safety review
+    2026-07-06): ``False`` is dropped (asserts nothing); ``True`` is
+    absorbed only when severity is already EMERGENCY, where it is
+    translated into a ``modifier`` string; ``True`` below EMERGENCY still
+    raises, because the ``modifier`` field never re-derives severity --
+    accepting it would silently downgrade the vulnerable-occupant
+    escalation path from "validation error -> retry -> landlord
+    notification" to a cosmetic note on an under-classified draft.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -219,17 +224,28 @@ class SeverityResult(BaseModel):
         composed (wrapper outside, invented key inside)."""
         data = _unwrap_single_key_wrapper(data, set(cls.model_fields))
         # Gate-8 variance (see class docstring): the model invented
-        # ``vulnerable_occupant_modifier_applied: bool``. Absorb EXACTLY a
-        # bool under that key: False is dropped (identical meaning to
-        # absence); True becomes a ``modifier`` string when none was given,
-        # so the escalation signal survives. A non-bool value is left in
-        # place and fails ``extra="forbid"`` normally.
+        # ``vulnerable_occupant_modifier_applied: bool``. FAIL-CLOSED rule
+        # (safety review 2026-07-06): this absorb must never let a
+        # vulnerable-occupant assertion validate silently below EMERGENCY.
+        # Before the coercion existed, the malformed shape raised -> one
+        # retry -> the ``classification_failed`` seam (landlord
+        # notification); an injection-shaped ``ROUTINE`` + ``true`` payload
+        # must still land there, not pass as a cosmetic modifier string.
+        # So: ``False`` is absorbed (asserts nothing -- identical to
+        # absence); ``True`` is absorbed ONLY when severity is already
+        # EMERGENCY (signal already honored; recorded as a ``modifier``
+        # string). ``True`` below EMERGENCY, or any non-bool, is LEFT IN
+        # PLACE so ``extra="forbid"`` raises and the fail-closed
+        # retry/degraded path owns it.
         if isinstance(data, dict):
             flag = data.get("vulnerable_occupant_modifier_applied")
-            if isinstance(flag, bool):
+            if flag is False:
                 data = dict(data)
                 del data["vulnerable_occupant_modifier_applied"]
-                if flag and not data.get("modifier"):
+            elif flag is True and data.get("severity") == Severity.EMERGENCY.value:
+                data = dict(data)
+                del data["vulnerable_occupant_modifier_applied"]
+                if not data.get("modifier"):
                     data["modifier"] = "vulnerable occupant present (model emitted boolean variant)"
         return data
 

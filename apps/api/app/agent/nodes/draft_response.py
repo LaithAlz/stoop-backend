@@ -604,9 +604,10 @@ instruction"). Refusal-topic drafts are exempt entirely, see
 exception"."""
 
 _MIN_ACK_CHARS_FLOOR: int = 60
-"""Even the longest REFUSAL_TEMPLATES entry (~223 chars) must never drive
-the model's suggested acknowledgment budget down to something that can't
-fit a single short sentence."""
+"""Even the longest REFUSAL_TEMPLATES entry (or several stacked -- the
+budget math in :func:`_available_ack_chars` measures the actual appended
+text) must never drive the model's suggested acknowledgment budget down to
+something that can't fit a single short sentence."""
 
 
 def _combined_deferral_text(refusal_flags: list[RefusalFlag]) -> str:
