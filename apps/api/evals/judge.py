@@ -33,14 +33,42 @@ function ``classify_severity``/``draft_response`` use in production, see
 verdict -- never free-text grading, for the same reason the product itself
 never trusts free-text tool-less output: a forced tool call is
 machine-checkable.
+
+BLOCKING bug found in gate 5 triage, 2026-07-05: judge verdict inversion
+--------------------------------------------------------------------------
+``e1``/``e2``'s recorded ``judge_reasoning`` explicitly described every
+must-include item as present and every must-not-include item as absent
+("Fully conformant.") -- yet ALL FOUR corresponding booleans scored as
+failures. Root cause, confirmed by comparing every OTHER scenario's
+reasoning against its recorded booleans (they were consistent everywhere
+except e1/e2): ``must_include_present``/``must_not_include_absent`` are
+``dict[str, bool]`` -- the JSON schema for a generic string-keyed map has
+NO enumerable ``properties``, so the model has to infer the correct key
+strings purely from the natural-language checklist in the user content.
+On at least these two calls, the model most likely returned semantically
+-correct verdicts under KEYS THAT DIDN'T MATCH ``scenario.expect.
+draft_must_include``/``draft_must_not_include``'s exact strings (a
+paraphrase, a summary, or incidental quote/whitespace variance) -- this
+validates FINE as a well-formed ``dict[str, bool]`` (nothing raises), so
+:func:`evals.scoring.check_draft`'s ORIGINAL exact-string ``.get(item,
+False)`` lookup silently fell back to its fail-closed default for EVERY
+item, producing a scenario-wide "everything failed" result that
+contradicts the judge's own genuine reasoning. This is the SAME class of
+"model doesn't hit the exact requested shape" finding
+``app/agent/schemas.py``'s ``_unwrap_single_key_wrapper`` already fixed for
+``SeverityResult``/``IntentResult``/``DraftResult`` -- mirrored here at
+TWO layers (see :func:`evals.scoring.check_draft`'s tolerant key matching,
+and this module's own wrapper-unwrap validator below) rather than assumed
+fixed by only one.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.agent.schemas import _unwrap_single_key_wrapper
 from app.integrations import anthropic as anthropic_mod
 from evals.types import ToolCaller
 
@@ -55,14 +83,20 @@ class JudgeVerdict(BaseModel):
     ``must_include_present`` / ``must_not_include_absent`` are keyed by the
     EXACT scenario ``draft_must_include`` / ``draft_must_not_include``
     strings (the judge is instructed, in the user content, to use those
-    exact strings as keys) -- so a missing key after validation means the
-    judge simply didn't grade that item, which the caller treats
-    conservatively as a failure (see ``evals/scoring.py``).
+    exact strings as keys) -- but see module docstring "BLOCKING bug found
+    in gate 5 triage": the model does not always hit this exactly, so
+    ``evals/scoring.py``'s ``check_draft`` does NOT do a bare exact-string
+    ``dict.get`` lookup -- it normalizes both sides (whitespace/quote/case
+    -tolerant) before falling back to "no matching key" (a distinct,
+    loudly-flagged outcome from "matched and False"). This model only
+    guarantees the SHAPE; the key-matching tolerance lives in scoring.py.
 
     Deliberately a NEW model, not reused from ``app.agent.schemas`` --
     this is eval-infrastructure data (a grading verdict), not a product
     boundary type; keeping it separate keeps the governance line in
-    the module docstring true in the type system too.
+    the module docstring true in the type system too. The ONE thing
+    reused from there is ``_unwrap_single_key_wrapper`` (see below) --
+    the wrapper-key defense itself, not the product schema types.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -71,6 +105,18 @@ class JudgeVerdict(BaseModel):
     must_not_include_absent: dict[str, bool] = Field(default_factory=dict)
     plain_language_conformant: bool
     reasoning: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_wrapper(cls, data: object) -> object:
+        """Defense-in-depth mirror of ``app.agent.schemas``'
+        ``SeverityResult``/``IntentResult``/``DraftResult`` fix -- unwraps
+        a single-key wrapper dict (e.g. ``{"judge_verdict": {...}}``)
+        before field validation runs. NOT the primary fix for the gate-5
+        inversion (that was a key-STRING mismatch inside an otherwise
+        well-shaped payload, not a wrapper) -- kept because it is the same
+        risk class and costs nothing to guard against too."""
+        return _unwrap_single_key_wrapper(data, set(cls.model_fields))
 
 
 JUDGE_TOOL: dict[str, Any] = {
@@ -116,23 +162,41 @@ own prompt):
   legalistic.
 - At most one question.
 
-Call the judge_draft tool with your verdict. Use the EXACT checklist item
-text (given to you) as the dict keys in must_include_present /
-must_not_include_absent -- do not paraphrase the keys themselves, only judge
-their content against the draft.
+Call the judge_draft tool with your verdict. CRITICAL: the dict keys in
+must_include_present / must_not_include_absent must be COPIED EXACTLY,
+character-for-character, from the numbered checklist items you are given
+below -- no added or removed quote marks, no paraphrasing, no summarizing,
+no renumbering. Every single checklist item must appear as its own key --
+never omit one, never combine two into one key, never add an extra key
+that wasn't in the checklist. Judge the MEANING of the draft against each
+item; copy the KEY STRING itself verbatim regardless.
 """
 
 
 def build_judge_user_content(
     *, draft_body: str, must_include: list[str], must_not_include: list[str]
 ) -> str:
-    include_lines = "\n".join(f'- "{item}"' for item in must_include) or "(none)"
-    exclude_lines = "\n".join(f'- "{item}"' for item in must_not_include) or "(none)"
+    # Numbered, unquoted list -- deliberately NOT wrapped in extra quote
+    # marks (gate-5 judge-inversion triage: a prior "- \"{item}\"" bullet
+    # format risked the model treating the added quote characters as part
+    # of the key it should copy back). See module docstring "BLOCKING bug
+    # found in gate 5 triage".
+    include_lines = (
+        "\n".join(f"{i}. {item}" for i, item in enumerate(must_include, start=1)) or "(none)"
+    )
+    exclude_lines = (
+        "\n".join(f"{i}. {item}" for i, item in enumerate(must_not_include, start=1)) or "(none)"
+    )
     return (
         f"Drafted SMS reply to grade:\n{draft_body}\n\n"
-        f"Must include (meaning must be present):\n{include_lines}\n\n"
-        f"Must NOT include (meaning must be absent):\n{exclude_lines}\n\n"
-        "Grade plain-language conformance as described in your instructions."
+        f"Must include (meaning must be present) -- {len(must_include)} item(s):\n"
+        f"{include_lines}\n\n"
+        f"Must NOT include (meaning must be absent) -- {len(must_not_include)} item(s):\n"
+        f"{exclude_lines}\n\n"
+        "Grade plain-language conformance as described in your instructions.\n\n"
+        "Reminder: must_include_present / must_not_include_absent dict keys must be the "
+        "EXACT item text above (no added quotes, no paraphrasing) -- one key per item, "
+        "every item present, no extra keys."
     )
 
 

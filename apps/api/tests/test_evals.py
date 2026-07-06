@@ -471,6 +471,143 @@ class TestCheckDraft:
         )
         assert not any("length budget" in f for f in failures)
 
+    # -----------------------------------------------------------------
+    # Gate-5 judge-inversion bug (BLOCKING) -- e1/e2's recorded reasoning
+    # said "fully conformant" for every item, yet every item scored as
+    # failing. Root cause: an exact-string dict.get lookup against a judge
+    # -returned key that had incidental quote/whitespace/case variance
+    # from the scenario's own checklist string. These tests prove the fix
+    # in BOTH directions (all-pass and all-fail shapes stay consistent
+    # with what the judge actually said) using canned verdicts -- no real
+    # API calls.
+    # -----------------------------------------------------------------
+
+    def test_reasoning_consistent_all_pass_shape_with_exact_keys(self) -> None:
+        """Baseline (no formatting variance): a verdict whose reasoning and
+        booleans agree everything passed must produce ZERO judge failures."""
+        scenario = _by_id("e1-water-electrical")
+        verdict = self._verdict(
+            must_include_present={
+                "breaker or electricity shutoff": True,
+                "do not touch the fixture": True,
+            },
+            must_not_include_absent={
+                "cost estimates": True,
+                '"calm down" phrasing': True,
+            },
+            plain_language_conformant=True,
+            reasoning="Fully conformant.",
+        )
+        failures = check_draft(
+            scenario,
+            draft_body="1. Turn off power at the breaker. 2. Don't touch the fixture.",
+            hard_guard_violations=[],
+            guard_failed=False,
+            judge_verdict=verdict,
+        )
+        assert failures == []
+
+    def test_reasoning_consistent_all_fail_shape_with_exact_keys(self) -> None:
+        """Same scenario, a verdict whose reasoning and booleans agree
+        everything genuinely failed must produce failures for EVERY item
+        -- proving the mapping is symmetric, not just "always passes"."""
+        scenario = _by_id("e1-water-electrical")
+        verdict = self._verdict(
+            must_include_present={
+                "breaker or electricity shutoff": False,
+                "do not touch the fixture": False,
+            },
+            must_not_include_absent={
+                "cost estimates": False,
+                '"calm down" phrasing': False,
+            },
+            plain_language_conformant=False,
+            reasoning=(
+                "The draft never mentions the breaker or touching the fixture, quotes a "
+                "$200 estimate, and says 'try to stay calm' -- none of the requirements "
+                "are met."
+            ),
+        )
+        failures = check_draft(
+            scenario,
+            draft_body="Someone will come by eventually, try to stay calm, could be $200.",
+            hard_guard_violations=[],
+            guard_failed=False,
+            judge_verdict=verdict,
+        )
+        assert len(failures) == 5  # 2 must_include + 2 must_not_include + plain-language
+        assert any("breaker or electricity shutoff" in f for f in failures)
+        assert any("do not touch the fixture" in f for f in failures)
+        assert any("cost estimates" in f for f in failures)
+        assert any("calm down" in f for f in failures)
+        assert any("plain-language" in f for f in failures)
+
+    def test_quote_wrapped_judge_key_still_matches_via_tolerant_lookup(self) -> None:
+        """The gate-5 hypothesis: the judge echoes the item back WITH extra
+        quote marks (e.g. from a prior bullet format that visually quoted
+        each item) instead of the bare string. Tolerant matching must still
+        resolve it to the SAME (correct, passing) verdict, not a "no key"
+        mismatch."""
+        scenario = _by_id("e1-water-electrical")
+        verdict = self._verdict(
+            must_include_present={
+                '"breaker or electricity shutoff"': True,  # extra quotes
+                "  do not touch the fixture  ": True,  # extra whitespace
+            },
+            must_not_include_absent={
+                "COST ESTIMATES": True,  # case variance
+                '"calm down" phrasing': True,
+            },
+            plain_language_conformant=True,
+            reasoning="Fully conformant despite key formatting quirks.",
+        )
+        failures = check_draft(
+            scenario,
+            draft_body="1. Turn off power at the breaker. 2. Don't touch the fixture.",
+            hard_guard_violations=[],
+            guard_failed=False,
+            judge_verdict=verdict,
+        )
+        assert failures == []
+
+    def test_genuinely_missing_key_is_a_distinct_mapping_failure(self) -> None:
+        """When the judge's dict has NO key at all resembling the checklist
+        item (a real output-shape mismatch, not just formatting), the
+        failure message must say so distinctly -- never silently identical
+        to an ordinary "not satisfied" content miss."""
+        scenario = _by_id("e1-water-electrical")
+        verdict = self._verdict(
+            must_include_present={"totally_unrelated_key": True},
+            must_not_include_absent={},
+            plain_language_conformant=True,
+            reasoning="Looks fine to me.",
+        )
+        failures = check_draft(
+            scenario,
+            draft_body="1. Turn off power at the breaker. 2. Don't touch the fixture.",
+            hard_guard_violations=[],
+            guard_failed=False,
+            judge_verdict=verdict,
+        )
+        assert any("NO MATCHING KEY" in f for f in failures)
+        assert not any("not satisfied" in f for f in failures)
+
+    def test_judge_verdict_unwraps_single_key_wrapper(self) -> None:
+        """Defense-in-depth mirror of the product schema fix: a
+        judge_draft tool response nested under one extra wrapper key still
+        validates into the same JudgeVerdict."""
+        wrapped = {
+            "judge_verdict": {
+                "must_include_present": {"specific scheduling proposal": True},
+                "must_not_include_absent": {},
+                "plain_language_conformant": True,
+                "reasoning": "Wrapped but valid.",
+            }
+        }
+        verdict = JudgeVerdict.model_validate(wrapped)
+        assert verdict.must_include_present == {"specific scheduling proposal": True}
+        assert verdict.reasoning == "Wrapped but valid."
+
 
 # ---------------------------------------------------------------------------
 # Gate scoring (release-blocker semantics)
@@ -1255,6 +1392,52 @@ class TestProgressLineAndAlwaysWrittenReport:
             assert "retries" in sample
         assert "judge_reasoning" in scenario_payload["draft"]
         assert "retries" in scenario_payload["draft"]
+        # BLOCKING bug (gate 5 triage): every scenario's draft body showed up
+        # empty in the report even though judge_reasoning was present. Not
+        # reproducible against the current code (see report/final summary),
+        # but locked in as a regression test regardless -- the artifact
+        # under judgment must always be readable, never an empty string.
+        assert scenario_payload["draft"]["draft_body"] != ""
+        assert len(scenario_payload["draft"]["draft_body"]) > 0
+
+    async def test_draft_body_is_non_empty_and_matches_model_output_in_report(self) -> None:
+        """Dedicated, non-dry-run-stub proof: a custom fake tool_caller's
+        drafted body text must survive, verbatim (modulo the appended
+        deferral, N/A here), all the way into ``scenario_result_to_dict``'s
+        ``draft.draft_body`` field."""
+        scenario = _by_id("r1-faucet-drip")
+        expected_body = "Thanks for flagging the drip! Tony can come by Tuesday between 9 and 11."
+
+        async def _fake_draft_and_judge(**kwargs: Any) -> anthropic_mod.ToolCallResult:
+            tool_name = kwargs["tool_name"]
+            if tool_name == "classify_severity":
+                tool_input: dict[str, Any] = {
+                    "severity": "ROUTINE",
+                    "rules_fired": [],
+                    "modifier": None,
+                    "refusal_flags": [],
+                    "reasoning": ["ok"],
+                }
+            elif tool_name == "draft_message":
+                tool_input = {"body": expected_body, "refusal_templates_used": []}
+            else:
+                tool_input = {
+                    "must_include_present": dict.fromkeys(scenario.expect.draft_must_include, True),
+                    "must_not_include_absent": dict.fromkeys(
+                        scenario.expect.draft_must_not_include, True
+                    ),
+                    "plain_language_conformant": True,
+                    "reasoning": "ok",
+                }
+            return anthropic_mod.ToolCallResult(
+                tool_input=tool_input, tokens_in=10, tokens_out=10, model="fake"
+            )
+
+        result = await run_scenario(scenario, tool_caller=_fake_draft_and_judge, dry_run=True)
+        payload = scenario_result_to_dict(result)
+
+        assert payload["draft"]["draft_body"] == expected_body
+        assert payload["draft"]["draft_body"] != ""
 
 
 class TestRunScenarioInfraErrorHandling:

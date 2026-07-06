@@ -29,6 +29,15 @@ This module implements that as:
   false positive on the negative suite) is a safety-critical regression in
   the deterministic layer either way, and waiting for "prompt promotion"
   cadence to catch it would be too slow.
+
+``check_draft``'s judge-checklist matching is TOLERANT, not exact-string
+(gate 5 triage, 2026-07-05): see ``evals/judge.py``'s module docstring
+"BLOCKING bug found in gate 5 triage" for the full root-cause writeup.
+``_lookup_checklist_item`` normalizes quote/whitespace/case variance
+before falling back to a distinct "NO MATCHING KEY" failure (never
+silently treated the same as "matched and False") -- this is what lets a
+scenario's recorded per-item failures stay consistent with the judge's own
+natural-language reasoning.
 """
 
 from __future__ import annotations
@@ -174,6 +183,42 @@ def jargon_ok(body: str) -> bool:
     return _JARGON_BAN_RE.search(body) is None
 
 
+def _normalize_checklist_key(text: str) -> str:
+    """Normalize a checklist item / judge-returned dict key for TOLERANT
+    comparison -- casefold, strip surrounding whitespace, strip ONE layer
+    of matching surrounding quote characters (straight or curly), and
+    collapse internal whitespace runs. See module docstring / ``evals/
+    judge.py``'s "BLOCKING bug found in gate 5 triage": the judge's exact
+    key string sometimes carries incidental quote/whitespace variance even
+    when its semantic grading is completely correct -- this normalization
+    is deliberately NARROW (it does not fuzzy-match on WORDING, only on
+    formatting) so a genuinely different item is never accidentally
+    conflated with another."""
+    stripped = text.strip()
+    quote_pairs = (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"))
+    for left, right in quote_pairs:
+        if len(stripped) >= 2 and stripped[0] == left and stripped[-1] == right:
+            stripped = stripped[1:-1].strip()
+            break
+    return re.sub(r"\s+", " ", stripped).casefold()
+
+
+def _lookup_checklist_item(verdict_dict: dict[str, bool], item: str) -> bool | None:
+    """Look up *item* in *verdict_dict*: exact match first, then a
+    normalized (:func:`_normalize_checklist_key`) match against every key.
+    Returns ``None`` when NO key matches at all -- distinct from "matched
+    and False" -- so callers can tell "the judge never graded this item at
+    all (likely a key-shape mismatch)" apart from "the judge graded it and
+    said it failed" (see ``evals/judge.py``'s module docstring)."""
+    if item in verdict_dict:
+        return verdict_dict[item]
+    target = _normalize_checklist_key(item)
+    for key, value in verdict_dict.items():
+        if _normalize_checklist_key(key) == target:
+            return value
+    return None
+
+
 def check_draft(
     scenario: Scenario,
     *,
@@ -198,13 +243,29 @@ def check_draft(
         )
 
     for item in scenario.expect.draft_must_include:
-        if not judge_verdict.must_include_present.get(item, False):
+        matched = _lookup_checklist_item(judge_verdict.must_include_present, item)
+        if matched is None:
+            failures.append(
+                f"judge: NO MATCHING KEY returned for must_include item {item!r} -- likely a "
+                f"judge output-shape mismatch, not a genuine content miss (judge returned "
+                f"keys: {sorted(judge_verdict.must_include_present)})"
+            )
+        elif not matched:
             failures.append(f"judge: must_include not satisfied: {item!r}")
 
     for item in scenario.expect.draft_must_not_include:
-        # Fail-closed default: a missing judge key is treated as "not
-        # absent" (i.e. a violation) rather than silently passing.
-        if not judge_verdict.must_not_include_absent.get(item, False):
+        # Fail-closed default: a genuinely missing key is treated as "not
+        # absent" (i.e. a violation) rather than silently passing -- but
+        # reported as its own distinct "no matching key" failure so a
+        # mapping bug is never confused with a real violation.
+        matched = _lookup_checklist_item(judge_verdict.must_not_include_absent, item)
+        if matched is None:
+            failures.append(
+                f"judge: NO MATCHING KEY returned for must_not_include item {item!r} -- likely "
+                f"a judge output-shape mismatch, not a genuine violation (judge returned "
+                f"keys: {sorted(judge_verdict.must_not_include_absent)})"
+            )
+        elif not matched:
             failures.append(f"judge: must_not_include present (violation): {item!r}")
 
     if not judge_verdict.plain_language_conformant:

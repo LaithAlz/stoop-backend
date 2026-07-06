@@ -50,6 +50,61 @@ product behavior (every URGENT/EMERGENCY draft gets it, not just the
 scenarios that happened to fail), per this task's explicit instruction not
 to key guidance to eval text.
 
+Never suggest an oven/stovetop/open flame as a heat source (gate run 5
+triage, 2026-07-05) — LIFE-SAFETY class, not a style guideline
+--------------------------------------------------------------------------
+``e3-noheat-extreme-cold-infant``'s draft suggested "space heaters or the
+oven (off) for warmth" — a fire/carbon-monoxide hazard, not a wording
+nitpick, regardless of the hedging "(off)" parenthetical (a tenant reading
+quickly could still misread it as an instruction to use the oven). Fixed
+at THREE layers, matching this module's existing severity-aware-guidance +
+hard-guard pattern:
+
+1. **Topic-derived guidance** (:data:`_UNSAFE_HEAT_SOURCE_GUIDANCE`),
+   appended to BOTH the EMERGENCY and URGENT paths whenever the topic is
+   heating-related (``_HEATING_TOPIC_RE``) — general product behavior, not
+   an eval-scenario-keyed patch, per this module's own established
+   convention above. Explicitly: never oven/stovetop/open flame; safe
+   alternatives only (a space heater if the tenant has one, blankets, warm
+   clothing/layers, and offering to help arrange somewhere warmer to stay
+   if the cold is severe).
+2. **Hard guard** (:data:`_UNSAFE_HEAT_SOURCE_RE` in :func:`_check_hard_
+   guards`): the model's OWN acknowledgment is REJECTED and regenerated if
+   it mentions oven/stovetop/gas range/open flame/candles anywhere near a
+   warmth/heat word, hedged or not -- this is deterministic and
+   code-enforced, not left to the model's own compliance, exactly because
+   it is a safety class (see this module's own "Hard guards" section
+   below for why guards exist at all: "false positives here cost one extra
+   regeneration; false negatives are the failure mode that matters").
+3. The appliance/electrical branch of :func:`_urgent_next_step_guidance`
+   was ALSO reworded while touching this code (see "One-question hard cap"
+   below) to stop suggesting "or"-joined alternatives that read as two
+   separate questions.
+
+Concrete-time commitment extended to ROUTINE (gate run 5 triage,
+2026-07-05)
+--------------------------------------------------------------------------
+``r1-faucet-drip``'s draft said "this week" / "soon" — the generic
+``_PLAIN_LANGUAGE_REMINDER`` already states "concrete over relative...
+never 'soon'" but, unlike EMERGENCY/URGENT, ROUTINE received no
+topic-specific reinforcement of it at the point the model commits to a
+next step. ``_build_user_content`` now emits the same concrete-next-step
+reminder for ROUTINE too (plain-language-rules.md rule 4 is unconditional
+-- "concrete over relative" is not an EMERGENCY/URGENT-only rule).
+
+One-question hard cap (gate run 5 triage, 2026-07-05)
+--------------------------------------------------------------------------
+``u2-fridge-dead``'s draft asked two questions ("Can you check the plug...
+or if a breaker tripped?") despite ``_PLAIN_LANGUAGE_REMINDER`` already
+saying "at most ONE question" -- traced to the appliance/electrical
+next-step guidance ITSELF modeling the failure: it offered its self-help
+example as two "or"-joined alternatives ("whether it's plugged in
+properly, or whether a breaker has tripped"), which reads as license to
+ask about both separately. Fixed by (a) rewording that example as ONE
+non-question checklist instruction instead of an "or" question, and (b)
+restating the reminder itself as an explicit HARD CAP with the same
+concrete failure pattern spelled out, so the model can't miss it.
+
 EMERGENCY: numbered-list safety instructions (gate run 5 finding,
 2026-07-05)
 --------------------------------------------------------------------------
@@ -330,7 +385,11 @@ _PLAIN_LANGUAGE_REMINDER: str = (
     '- No jargon or idioms (no "touch base", no "ASAP").\n'
     '- Concrete over relative: a specific day and time window, never "soon" or "later '
     'this week".\n'
-    "- Ask at most ONE question, if any.\n"
+    "- HARD CAP: at most ONE question mark in the whole reply, covering at most ONE "
+    'question. Never join two checks with "or" and a question mark (e.g. "is it '
+    'plugged in, or did a breaker trip?" is TWO questions) -- ask ONE, or turn '
+    'multiple checks into a single non-question instruction instead (e.g. "check '
+    "that it's plugged in and the breaker hasn't tripped\").\n"
     "- Routine replies: 2 SMS segments or fewer (about 300 characters).\n"
     "- Calm, warm, certain tone — never scolding, never panicked."
 )
@@ -356,26 +415,52 @@ _CONCRETE_NEXT_STEP_GUIDANCE: str = (
 )
 
 
+_UNSAFE_HEAT_SOURCE_GUIDANCE: str = (
+    "Never suggest using an oven, stovetop, gas range, or any open flame/candle as a "
+    "heat source -- this is a fire/carbon-monoxide safety hazard, not a style choice, "
+    'even hedged (e.g. do not write anything like "the oven (off) for warmth"). If '
+    "warming guidance is needed, offer ONLY safe alternatives: a space heater if the "
+    "tenant has one, extra blankets, warm clothing/layers, and -- if the cold is "
+    "severe -- offer to help arrange somewhere warmer to stay."
+)
+
+
 def _urgent_next_step_guidance(topic_text: str) -> str:
     """Topic-derived next-step guidance for URGENT severity — see module
-    docstring "Severity-aware next-step guidance". *topic_text* is the
-    tenant message plus the classifier's own ``rules_fired`` text (both
-    already available to this node; no new inputs)."""
+    docstring "Severity-aware next-step guidance" / "Never suggest an
+    oven/stovetop/open flame..." / "One-question hard cap". *topic_text*
+    is the tenant message plus the classifier's own ``rules_fired`` text
+    (both already available to this node; no new inputs)."""
     if _SECURITY_TOPIC_RE.search(topic_text):
         return (
             "This is a security issue (lock/door/window). Commit to "
             f"{_CONCRETE_NEXT_STEP_GUIDANCE} for the repair -- a compromised lock "
             "needs a fast, bounded window, not a self-help check."
         )
-    if _HEATING_TOPIC_RE.search(topic_text) or _APPLIANCE_ELECTRICAL_TOPIC_RE.search(topic_text):
+    if _HEATING_TOPIC_RE.search(topic_text):
         return (
-            "Include ONE quick self-help check the tenant can try right now, "
-            "relevant to this issue (e.g. whether it's plugged in properly, or "
-            "whether a breaker has tripped) -- just one, not a list -- AND commit to "
+            "Include ONE quick self-help check the tenant can try right now (e.g. "
+            "checking the thermostat setting and the breaker) -- state it as a "
+            'SINGLE non-question instruction, not two "or"-joined questions. This is '
+            f"a safety requirement, not a style choice: {_UNSAFE_HEAT_SOURCE_GUIDANCE} "
+            f"AND commit to {_CONCRETE_NEXT_STEP_GUIDANCE}."
+        )
+    if _APPLIANCE_ELECTRICAL_TOPIC_RE.search(topic_text):
+        return (
+            "Include ONE self-help step the tenant can try right now, relevant to "
+            "this issue, stated as a SINGLE non-question instruction, not two "
+            '"or"-joined questions (e.g. "check that it\'s plugged in and the '
+            'breaker hasn\'t tripped" -- one sentence, one instruction, not "is it '
+            'plugged in, or did a breaker trip?") -- AND commit to '
             f"{_CONCRETE_NEXT_STEP_GUIDANCE}."
         )
     return f"Commit to {_CONCRETE_NEXT_STEP_GUIDANCE}."
 
+
+_ROUTINE_NEXT_STEP_GUIDANCE: str = f"Commit to {_CONCRETE_NEXT_STEP_GUIDANCE}."
+"""Plain-language-rules.md rule 4 ("concrete over relative") is
+unconditional, not an EMERGENCY/URGENT-only rule -- see module docstring
+"Concrete-time commitment extended to ROUTINE"."""
 
 _EMERGENCY_STRUCTURE_GUIDANCE: str = (
     "Structure this EMERGENCY reply in order: (1) the safety instruction(s) first -- "
@@ -478,6 +563,21 @@ _LEGAL_POSITION_RE = re.compile(
     r"|\bour\s+lawyer\s+says\b"
     r"|\byou\s+have\s+no\s+right\s+to\b"
     r"|\byou\s+don'?t\s+have\s+a\s+case\b",
+    re.IGNORECASE,
+)
+
+# Oven/stovetop/open-flame-as-heat-source — LIFE-SAFETY class, not style
+# (see module docstring "Never suggest an oven/stovetop/open flame...").
+# Deliberately fires regardless of hedging ("the oven (off) for warmth" still
+# matches) -- a suggestion this hazardous is rejected outright, never
+# "mostly safe because it says off". Window-based like every other guard in
+# this file (see "Hard guards" docstring above for why false positives here
+# are an accepted, low-cost tradeoff).
+_UNSAFE_HEAT_SOURCE_RE = re.compile(
+    r"\b(?:oven|stove\s*-?\s*top|stovetop|gas\s+range|open\s+flame|candles?)\b.{0,50}"
+    r"\b(?:warm(?:th|ing|er|ed)?|heat(?:ing|ed)?)\b"
+    r"|\b(?:warm(?:th|ing|er|ed)?|heat(?:ing|ed)?)\b.{0,50}"
+    r"\b(?:oven|stove\s*-?\s*top|stovetop|gas\s+range|open\s+flame|candles?)\b",
     re.IGNORECASE,
 )
 
@@ -585,6 +685,8 @@ def _check_hard_guards(*, body: str) -> list[str]:
         violations.append("access_code")
     if _LEGAL_POSITION_RE.search(scrubbed_body):
         violations.append("legal_position")
+    if _UNSAFE_HEAT_SOURCE_RE.search(scrubbed_body):
+        violations.append("unsafe_heat_source")
     return violations
 
 
@@ -592,7 +694,10 @@ def _violation_retry_note(violations: list[str]) -> str:
     return (
         "\n\nIMPORTANT: your previous reply violated the following hard rule(s): "
         f"{', '.join(violations)}. Do not include dollar amounts, compensation promises, "
-        "reimbursement/refund/discount language, access codes or PINs, or any legal "
+        "reimbursement/refund/discount language, access codes or PINs, any suggestion to "
+        "use an oven, stovetop, or open flame for warmth/heat (safe alternatives only: a "
+        "space heater if available, blankets, warm clothing, or offering to help arrange "
+        "somewhere warmer to stay), or any legal "
         "position (LTB, eviction, entitlement claims). Revise and resend the FULL reply."
     )
 
@@ -632,9 +737,14 @@ def _build_user_content(
     # rules_fired, never from eval-scenario wording.
     if severity_result.severity is Severity.EMERGENCY:
         lines.append(f"\n{_EMERGENCY_STRUCTURE_GUIDANCE}")
+        topic_text = f"{body} {' '.join(severity_result.rules_fired)}"
+        if _HEATING_TOPIC_RE.search(topic_text):
+            lines.append(f"\n{_UNSAFE_HEAT_SOURCE_GUIDANCE}")
     elif severity_result.severity is Severity.URGENT:
         topic_text = f"{body} {' '.join(severity_result.rules_fired)}"
         lines.append(f"\n{_urgent_next_step_guidance(topic_text)}")
+    elif severity_result.severity is Severity.ROUTINE:
+        lines.append(f"\n{_ROUTINE_NEXT_STEP_GUIDANCE}")
 
     if refusal_flags:
         topics = ", ".join(flag.value.replace("_", " ") for flag in refusal_flags)

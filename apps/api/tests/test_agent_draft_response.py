@@ -727,6 +727,12 @@ async def test_draft_response_dollar_guard_rejects_and_regenerates(
         ("Our lawyer says you have to pay for it.", "legal_position"),
         ("You have no right to withhold rent.", "legal_position"),
         ("You don't have a case here.", "legal_position"),
+        # Life-safety class (gate run 5 triage, 2026-07-05): oven/stovetop/
+        # open-flame-as-heat-source, hedged or not.
+        ("Use space heaters or the oven (off) for warmth", "unsafe_heat_source"),
+        ("You could turn on the oven for heat tonight.", "unsafe_heat_source"),
+        ("Try the stovetop to warm up the kitchen.", "unsafe_heat_source"),
+        ("Light some candles to stay warm until then.", "unsafe_heat_source"),
     ],
 )
 @pytest.mark.integration
@@ -786,6 +792,11 @@ async def test_draft_response_hard_guard_positive_cases(
         "Thanks for letting me know, I'll take a look this week.",
         "Tony can come by Thursday morning between 8 and 11.",
         "No worries at all, I'll follow up soon.",
+        # A broken oven/stove (repair topic, not a heat-source suggestion)
+        # must never trip the new unsafe_heat_source guard.
+        "Sorry to hear the oven is broken, someone will look at it tomorrow.",
+        "The stove is dead -- I'll get a repair person out by 9am.",
+        "Use a space heater and extra blankets to stay warm tonight.",
     ],
 )
 @pytest.mark.unit
@@ -1334,6 +1345,27 @@ def test_build_user_content_urgent_appliance_topic_gets_self_help_and_time_guida
 
 
 @pytest.mark.unit
+def test_build_user_content_one_question_hard_cap_is_explicit() -> None:
+    """Gate run 5 triage: u2's draft asked two questions despite the
+    original "at most ONE question" line -- the reminder now spells out
+    the exact failure pattern (an "or"-joined double question) as a HARD
+    CAP, and the appliance/heating guidance's own illustrative example no
+    longer uses that "or"-question shape."""
+    content = node_mod._build_user_content(
+        body="fridge just completely died",
+        tenant_name="Sam",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.URGENT, rules_fired=["Refrigerator dead (food spoilage clock is running)"]
+        ),
+        refusal_flags=[],
+    )
+    assert "HARD CAP" in content
+    assert "plugged in and the breaker" in content
+    assert "plugged in properly, or" not in content
+
+
+@pytest.mark.unit
 def test_build_user_content_urgent_security_topic_gets_bounded_window_not_self_help() -> None:
     content = node_mod._build_user_content(
         body="the deadbolt on my unit door stopped catching",
@@ -1417,6 +1449,53 @@ def test_build_user_content_routine_gets_no_severity_specific_structure_guidance
     )
     assert "safety instruction(s) first" not in content
     assert "self-help check" not in content
+
+
+@pytest.mark.unit
+def test_build_user_content_routine_gets_concrete_time_commitment_guidance() -> None:
+    """Gate run 5 triage: r1's draft said "this week"/"soon" -- ROUTINE now
+    gets the same concrete-over-relative next-step reminder EMERGENCY/
+    URGENT already had (plain-language-rules.md rule 4 is unconditional)."""
+    content = node_mod._build_user_content(
+        body="kitchen faucet has a slow drip",
+        tenant_name="Sam",
+        house_rules=None,
+        severity_result=_routine_severity(),
+        refusal_flags=[],
+    )
+    assert "bounded next step" in content
+    assert "bare" in content.lower()
+
+
+@pytest.mark.unit
+def test_build_user_content_emergency_heating_topic_gets_unsafe_heat_source_warning() -> None:
+    """Gate run 5 triage: e3's draft suggested the oven for warmth -- the
+    EMERGENCY path now gets the same oven/stovetop/open-flame warning the
+    URGENT heating branch gets, whenever the topic is heating-related."""
+    content = node_mod._build_user_content(
+        body="the heat hasn't worked since 10pm and it's freezing, we have the baby this week",
+        tenant_name="Maria",
+        house_rules=None,
+        severity_result=_severity_result(Severity.EMERGENCY, rules_fired=["No heat at/below -10C"]),
+        refusal_flags=[],
+    )
+    assert "oven" in content.lower()
+    assert "open flame" in content.lower()
+    assert "space heater" in content.lower()
+
+
+@pytest.mark.unit
+def test_build_user_content_emergency_non_heating_topic_gets_no_heat_source_warning() -> None:
+    content = node_mod._build_user_content(
+        body="water is coming through the ceiling light",
+        tenant_name="Dev",
+        house_rules=None,
+        severity_result=_severity_result(
+            Severity.EMERGENCY, rules_fired=["Active, uncontained water"]
+        ),
+        refusal_flags=[],
+    )
+    assert "oven" not in content.lower()
 
 
 @pytest.mark.unit
