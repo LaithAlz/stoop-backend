@@ -270,7 +270,11 @@ reported model id (``None`` if every attempt failed at the transport level
 with no response at all). All four (``model``, ``tokens_in``,
 ``tokens_out``, ``cost_cents``) are added to the existing ``'drafted'``
 ``audit_log`` payload alongside ``draft_id``, ``refusal_templates_used``,
-and ``guard_failed`` — never a message body.
+and ``guard_failed`` — never a message body. ``message_id`` is ALSO
+included (#34 safety review): ``app/agent/graph_entry.py`` uses a
+``'drafted'``-or-``'degraded_mode'`` audit row carrying THIS message's id
+as the completion marker that decides whether a redelivered/retried graph
+invocation should re-run the pipeline — see that module's own docstring.
 
 Reported gap: the EMERGENCY safety instruction
 --------------------------------------------------
@@ -1106,6 +1110,7 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
                     "case_id": str(case_context.case_id),
                     "payload": json.dumps(
                         {
+                            "message_id": str(message_id),
                             "draft_id": str(new_draft_id),
                             "refusal_templates_used": [
                                 flag.value for flag in draft_result.refusal_templates_used

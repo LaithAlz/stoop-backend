@@ -119,6 +119,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import structlog
+from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -226,10 +227,23 @@ def _open_cases_from_state(open_cases_state: list[dict[str, Any]]) -> list[OpenC
 
 
 def _parse_prefilter(raw: Any) -> PrefilterResult:
+    """Never raises — a missing OR malformed snapshot both fall back to
+    ``hard_hit=False`` (safety review LOW: an unhandled ``ValidationError``
+    here used to crash the whole graph run for a non-null-but-malformed
+    snapshot, since it lived outside any try/except). This can NEVER
+    de-escalate a real Tier-0 fire: the snapshot the webhook actually
+    persisted is untouched either way — this fallback only affects THIS
+    node's own backfill/reasoning decision when the persisted snapshot
+    itself can't be read, exactly like the "missing" case already
+    documented below."""
     if raw is None:
         log.error("identify_case_prefilter_snapshot_missing")
         return PrefilterResult(hard_hit=False)
-    return PrefilterResult.model_validate(raw)
+    try:
+        return PrefilterResult.model_validate(raw)
+    except (ValidationError, TypeError) as exc:
+        log.warning("identify_case_prefilter_snapshot_malformed", exc_type=type(exc).__name__)
+        return PrefilterResult(hard_hit=False)
 
 
 async def _open_new_case(

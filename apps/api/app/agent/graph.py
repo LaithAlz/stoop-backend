@@ -8,15 +8,34 @@ layout)::
 
     identify_property -> load_context -> identify_case -> classify_intent
       -> classify_severity -> [classification_failed?] -> degraded_mode
-                            -> draft_response -> [draft_guard_failed?] -> degraded_mode
+                            -> draft_response
+                                 -> [draft_guard_failed? OR severity==EMERGENCY?]
+                                      -> degraded_mode
 
 LINEAR pipeline, no fan-out (founder directive, 2026-07-06): every edge
 above is a plain or conditional edge between exactly one predecessor and
 one successor per step — nothing here ever schedules two nodes to run
 concurrently from a single source (that is a deliberate v1 scope
-boundary, not a LangGraph limitation). ``interrupt()`` before any send,
-and the ``emergency_protocol``/approval branch the AC also mentions, are
-#43's job — seam noted below, not built here.
+boundary, not a LangGraph limitation). Two DIFFERENT future issues own
+two DIFFERENT things this graph deliberately does not build yet — keep
+them straight (a senior review caught an earlier revision of this
+docstring conflating them):
+
+- **#43** owns ``interrupt()`` (from ``langgraph.types``) pausing the
+  urgent/routine draft for landlord approval before any send — see "Seam
+  for #43" below.
+- **#108** owns the actual EMERGENCY execution (the voice call, the
+  tenant safety SMS, the escalation chain — ``app/agent/emergency.py``'s
+  still-a-no-op seam). This graph does NOT invoke that seam and never
+  will from here (the Tier-0 HARD-hit path already calls it from the
+  WEBHOOK, before the graph even runs — ``app/routers/webhooks/twilio.py``).
+  What THIS graph is responsible for is the case #108 does not cover: an
+  EMERGENCY severity the model itself assigned that Tier-0 DIDN'T catch
+  (escalating past a Tier-0 miss, never de-escalating a Tier-0 fire — see
+  "The degraded-mode routing" below). Until #108 ships the real
+  escalation chain, routing that case to ``degraded_mode`` (a durable
+  ``needs_eyes`` notification) is the honest interim behavior — never
+  silent, never a fabricated call.
 
 Two compiled graphs, not one — the thread-id timing tension
 ------------------------------------------------------------------------
@@ -98,36 +117,69 @@ regression test for this (``tests/test_agent_graph.py``) runs two
 consecutive nodes and asserts no duplicated lines.
 
 The degraded-mode routing (#34 G1 — merge-blocking, PR #173/#175 senior
-review)
+review; EMERGENCY leg added after a second senior-review round on THIS
+issue)
 ------------------------------------------------------------------------
-``classify_severity`` sets ``state["classification_failed"] = True`` on a
-double Anthropic failure and otherwise leaves ``severity`` unset — letting
-the pipeline continue to ``draft_response`` in that state would either
-crash (no severity to draft against) or silently no-op
-(``draft_response`` already guards this and returns early with only a
-reasoning_log note — see its own docstring). :func:`_route_after_classify_
-severity` intercepts exactly that flag and routes to
-``app.agent.nodes.degraded_mode`` INSTEAD of ``draft_response`` — no
-silent dead end. Symmetrically, ``draft_response`` sets
-``state["draft_guard_failed"] = True`` when the model's own text failed
-the hard safety guards twice (a draft IS still inserted, using the safe
-generic fallback) — :func:`_route_after_draft_response` routes that case
-to the SAME ``degraded_mode`` node afterward, so a person is durably
-notified either way. Both flags are checked independently (never
-combined into one condition) per the senior review's own wording:
-"classification_failed AND draft_guard_failed must EACH route to an
-explicit degraded-mode edge."
+Three independent triggers all route to ``app.agent.nodes.degraded_mode``
+— never combined into one condition, each checked on its own, per the
+senior review's own wording ("classification_failed AND draft_guard_failed
+must EACH route to an explicit degraded-mode edge"):
+
+1. ``classify_severity`` sets ``state["classification_failed"] = True`` on
+   a double Anthropic failure and otherwise leaves ``severity`` unset —
+   letting the pipeline continue to ``draft_response`` in that state
+   would either crash (no severity to draft against) or silently no-op
+   (``draft_response`` already guards this and returns early with only a
+   reasoning_log note — see its own docstring). :func:`_route_after_
+   classify_severity` intercepts exactly that flag and routes to
+   ``degraded_mode`` INSTEAD of ``draft_response`` — no silent dead end.
+2. **EMERGENCY severity the model itself assigned** (a genuine Tier-0
+   MISS the LLM caught — architecture.md §5/§8 and
+   ``docs/02-product/emergency-prefilter.md``'s escalate-past-a-miss
+   doctrine: the agent may escalate past a miss, it may never de-escalate
+   a fire). A first revision of this graph let an LLM-classified
+   EMERGENCY fall through to an ORDINARY approval-queued draft with NO
+   notification at all — silent, exactly the failure mode this whole
+   gate exists to prevent (senior review, CRITICAL). Fixed by
+   :func:`_route_after_draft_response` checking ``state["severity"]`` for
+   ``Severity.EMERGENCY`` IN ADDITION TO ``draft_guard_failed`` — checked
+   AFTER ``draft_response`` runs (not instead of it), so the draft is
+   composed first (a draft plus a needs_eyes notification beats a
+   notification alone) and the notification is what actually gates
+   "did a person get told" — see "Interim, not #108" below for why this
+   lives here instead of a real escalation.
+3. ``draft_response`` sets ``state["draft_guard_failed"] = True`` when the
+   model's own text failed the hard safety guards twice (a draft IS
+   still inserted, using the safe generic fallback) —
+   :func:`_route_after_draft_response` routes that case to
+   ``degraded_mode`` too, so a person is durably notified either way.
+
+Triggers 2 and 3 can co-occur (an EMERGENCY draft whose OWN guard also
+failed) — ``degraded_mode`` records every applicable reason, never just
+one (see that module's own docstring).
+
+Interim, not #108 — this is NOT the real escalation chain
+------------------------------------------------------------------------
+Routing an LLM-classified EMERGENCY to ``degraded_mode`` is an INTERIM
+behavior, not #108's actual voice-call/safety-SMS/escalation-chain seam
+(``app/agent/emergency.py``). It exists because "silent" is strictly
+worse than "a needs_eyes notification, no voice call yet" — #108 replaces
+this edge (or adds a second one) once the real execution seam exists;
+until then, a durable, queryable ``needs_eyes`` row is the honest floor.
 
 Seam for #43 (left obvious, not built here)
 ------------------------------------------------------------------------
 This graph's non-degraded exit from ``draft_response`` is a plain edge to
-``END`` — #43 replaces that edge with ``interrupt()`` (from
-``langgraph.types``) before any send, and adds the
+``END`` — #43 replaces THAT edge (urgent/routine, non-emergency) with
+``interrupt()`` (from ``langgraph.types``) before any send, and adds the
 ``cases.status = 'awaiting_approval'`` transition ``draft_response``
-deliberately does not own (see that node's own docstring). Nothing in
-this module needs to change shape for that — only the one edge
-(``NODE_DRAFT_RESPONSE -> END``) needs to become
-``NODE_DRAFT_RESPONSE -> interrupt() -> END``.
+deliberately does not own (see that node's own docstring). #43 is ONLY
+the approval pause — it does not own the EMERGENCY routing added above
+(that is #108's territory, or this graph's own interim floor until #108
+ships; see "Interim, not #108"). Nothing in this module needs to change
+shape for #43 — only the one edge (``NODE_DRAFT_RESPONSE -> END``, the
+non-degraded exit) needs to become ``NODE_DRAFT_RESPONSE -> interrupt()
+-> END``.
 """
 
 from __future__ import annotations
@@ -150,7 +202,7 @@ from app.agent.nodes.draft_response import draft_response
 from app.agent.nodes.identify_case import identify_case
 from app.agent.nodes.identify_property import identify_property
 from app.agent.nodes.load_context import load_context
-from app.agent.schemas import CaseContext
+from app.agent.schemas import CaseContext, Severity
 from app.agent.state import AgentState
 from app.db.session import get_admin_session
 
@@ -189,10 +241,24 @@ def _route_after_classify_severity(state: AgentState) -> str:
 
 
 def _route_after_draft_response(state: AgentState) -> str:
-    """``draft_guard_failed`` ALSO routes to degraded_mode, in addition to
-    (not instead of) the draft that ``draft_response`` already inserted
-    using the safe generic fallback text."""
+    """Two INDEPENDENT triggers route to ``degraded_mode`` here, checked
+    separately (never combined into one condition):
+
+    - ``draft_guard_failed`` — the model's OWN acknowledgment text failed
+      the hard safety guards twice.
+    - ``severity == EMERGENCY`` — an LLM-classified emergency Tier-0
+      missed (see module docstring "The degraded-mode routing", trigger
+      2). Checked AFTER ``draft_response`` runs, not instead of it: the
+      draft is still composed and inserted either way (a draft plus a
+      needs_eyes notification beats a notification alone) — this router
+      only decides whether a person ALSO gets durably notified.
+
+    Either way this is IN ADDITION TO (not instead of) the draft that
+    ``draft_response`` already inserted."""
     if state.get("draft_guard_failed"):
+        return NODE_DEGRADED_MODE
+    severity_result = state.get("severity")
+    if severity_result is not None and severity_result.severity is Severity.EMERGENCY:
         return NODE_DEGRADED_MODE
     return END
 

@@ -95,6 +95,15 @@ number (a tenant's one SMS thread can span many cases over time; see
 (#25 onward) must pass
 ``{"configurable": {"thread_id": case.langgraph_thread_id}}`` as its
 ``RunnableConfig``.
+
+**Documented exception (#34):** a message whose sender never resolves to
+a known tenant (``identify_property``'s "unknown sender" branch) never
+gets a ``cases`` row at all — there is no ``langgraph_thread_id`` to key
+by. ``app/agent/graph.py::_resolve_thread_id`` falls back to a
+per-MESSAGE thread id (``f"message:{message_id}"``) in that one case
+only. This does not violate "never per tenant/phone" — a message id is
+neither — and there is no ongoing case to correlate checkpoints across
+multiple messages for anyway in that scenario.
 """
 
 from __future__ import annotations

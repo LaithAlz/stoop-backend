@@ -4,8 +4,10 @@ StateGraph + Postgres checkpointer.
 Marker: ``integration`` — requires a running Postgres instance (docker
 -compose) + ``alembic upgrade head``. The Anthropic SDK itself is ALWAYS
 mocked (``app.integrations.anthropic.get_client`` monkeypatched) — no real
-API calls anywhere in this suite. Self-contained per the project
-convention (helpers duplicated, not imported, from other test modules).
+API calls anywhere in this suite. Seeding helpers come from
+``tests/factories.py`` (senior review: shared factories, not re-duplicated
+in every new test module); the fake-Anthropic-client machinery and
+``_cleanup``/``_case_thread_id`` stay local (not part of that extraction).
 
 Run with:
     export DATABASE_URL=postgresql+asyncpg://stoop:stoop@localhost:5432/stoop
@@ -24,10 +26,16 @@ Proves the #34 acceptance criteria end to end:
    dead end.
 4. ``draft_guard_failed`` ALSO routes to ``degraded_mode`` — in addition
    to (not instead of) the draft ``draft_response`` already inserted.
-5. ``identify_case`` never re-queries open cases — it consumes
+5. An LLM-classified EMERGENCY severity (a Tier-0 miss the model itself
+   caught) ALSO routes to ``degraded_mode`` — in addition to the draft —
+   never silently queued as an ordinary approval-only draft (spec review
+   CRITICAL).
+6. ``identify_case`` never re-queries open cases — it consumes
    ``state["open_cases"]`` from ``load_context`` (G3).
-6. ``reasoning_log`` accumulates without duplication under the chosen
+7. ``reasoning_log`` accumulates without duplication under the chosen
    no-reducer convention.
+8. The unknown-sender path checkpoints under a per-message thread id
+   (``checkpointer.py``'s documented exception), never a case thread.
 """
 
 from __future__ import annotations
@@ -54,6 +62,7 @@ from app.agent.checkpointer import close_checkpointer, setup_checkpointer
 from app.agent.graph import compile_case_graph, run_graph
 from app.agent.prompts.v2 import PROMPT_VERSION
 from app.integrations import anthropic as anthropic_mod
+from tests import factories
 
 _DB_URL_DEFAULT = "postgresql+asyncpg://stoop:stoop@localhost:5432/stoop"
 
@@ -124,80 +133,9 @@ async def _checkpointer_lifecycle(_migrate_once: None) -> AsyncGenerator[None, N
 
 
 # ---------------------------------------------------------------------------
-# Seeding helpers (duplicated per project convention)
+# Local-only helpers (NOT part of the tests/factories.py extraction: cleanup
+# and thread-id lookup are specific to this module's own assertions).
 # ---------------------------------------------------------------------------
-
-
-def _fresh_phone() -> str:
-    return f"+1416{uuid.uuid4().int % 10_000_000:07d}"
-
-
-async def _insert_landlord(session: AsyncSession) -> str:
-    landlord_id = str(uuid.uuid4())
-    await session.execute(
-        text("INSERT INTO landlords (id, auth_user_id, email) VALUES (:id, :auth_id, :email)"),
-        {"id": landlord_id, "auth_id": str(uuid.uuid4()), "email": f"{landlord_id}@example.com"},
-    )
-    await session.commit()
-    return landlord_id
-
-
-async def _insert_property(session: AsyncSession, landlord_id: str) -> str:
-    property_id = str(uuid.uuid4())
-    await session.execute(
-        text(
-            "INSERT INTO properties (id, landlord_id, label, address_line1, city) "
-            "VALUES (:id, :landlord_id, 'Test Property', '123 Test St', 'Toronto')"
-        ),
-        {"id": property_id, "landlord_id": landlord_id},
-    )
-    await session.commit()
-    return property_id
-
-
-async def _insert_tenant(
-    session: AsyncSession, landlord_id: str, property_id: str, *, name: str | None = "Maria"
-) -> str:
-    tenant_id = str(uuid.uuid4())
-    await session.execute(
-        text(
-            "INSERT INTO tenants (id, landlord_id, property_id, phone, name) "
-            "VALUES (:id, :landlord_id, :property_id, :phone, :name)"
-        ),
-        {
-            "id": tenant_id,
-            "landlord_id": landlord_id,
-            "property_id": property_id,
-            "phone": _fresh_phone(),
-            "name": name,
-        },
-    )
-    await session.commit()
-    return tenant_id
-
-
-async def _insert_message(
-    session: AsyncSession, *, landlord_id: str, property_id: str, tenant_id: str, body: str
-) -> str:
-    message_id = str(uuid.uuid4())
-    await session.execute(
-        text(
-            "INSERT INTO messages "
-            "(id, landlord_id, property_id, tenant_id, direction, party, body, twilio_sid) "
-            "VALUES (:id, :landlord_id, :property_id, :tenant_id, 'inbound', 'tenant', :body, "
-            " :twilio_sid)"
-        ),
-        {
-            "id": message_id,
-            "landlord_id": landlord_id,
-            "property_id": property_id,
-            "tenant_id": tenant_id,
-            "body": body,
-            "twilio_sid": f"SM{uuid.uuid4().hex}",
-        },
-    )
-    await session.commit()
-    return message_id
 
 
 async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
@@ -320,10 +258,10 @@ def _draft_response_message(
 async def test_run_graph_happy_path_produces_draft_audit_and_checkpoints(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    landlord_id = await _insert_landlord(db_session)
-    property_id = await _insert_property(db_session, landlord_id)
-    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
-    message_id = await _insert_message(
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
@@ -398,10 +336,10 @@ async def test_run_graph_happy_path_produces_draft_audit_and_checkpoints(
 async def test_run_graph_resume_from_checkpoint_after_restart(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    landlord_id = await _insert_landlord(db_session)
-    property_id = await _insert_property(db_session, landlord_id)
-    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
-    message_id = await _insert_message(
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
@@ -446,10 +384,10 @@ async def test_run_graph_resume_from_checkpoint_after_restart(
 async def test_run_graph_classification_failed_routes_to_degraded_mode(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    landlord_id = await _insert_landlord(db_session)
-    property_id = await _insert_property(db_session, landlord_id)
-    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
-    message_id = await _insert_message(
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
@@ -487,7 +425,7 @@ async def test_run_graph_classification_failed_routes_to_degraded_mode(
             .one()
         )
         assert notif_row["type"] == "needs_eyes"
-        assert notif_row["payload"]["reason"] == "classification_failed"
+        assert notif_row["payload"]["reasons"] == ["classification_failed"]
 
         audit_actions = (
             (
@@ -524,10 +462,10 @@ async def test_run_graph_classification_failed_routes_to_degraded_mode(
 async def test_run_graph_draft_guard_failed_routes_to_degraded_mode(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    landlord_id = await _insert_landlord(db_session)
-    property_id = await _insert_property(db_session, landlord_id)
-    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
-    message_id = await _insert_message(
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
@@ -575,7 +513,7 @@ async def test_run_graph_draft_guard_failed_routes_to_degraded_mode(
             .one()
         )
         assert notif_row["type"] == "needs_eyes"
-        assert notif_row["payload"]["reason"] == "draft_guard_failed"
+        assert notif_row["payload"]["reasons"] == ["draft_guard_failed"]
 
         audit_actions = (
             (
@@ -595,7 +533,94 @@ async def test_run_graph_draft_guard_failed_routes_to_degraded_mode(
 
 
 # ---------------------------------------------------------------------------
-# 5. identify_case never re-queries open cases -- exercised implicitly by
+# 5. An LLM-classified EMERGENCY (Tier-0 miss the model catches) ALSO
+#    routes to degraded_mode -- spec review CRITICAL: an earlier revision
+#    let this fall through to an ordinary approval-queued draft with NO
+#    notification at all, silently.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_run_graph_llm_emergency_routes_to_degraded_mode_with_a_draft(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    # Deliberately NOT a Tier-0 HARD-hit phrase -- prefilter defaults to
+    # hard_hit=False (factories.insert_message's default) so this is
+    # exactly the "Tier-0 missed it, the model caught it" scenario.
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="my elderly mother lives here alone and hasn't been able to reach anyone for days",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _intent_response(),
+            _severity_response(severity="EMERGENCY"),
+            _draft_response_message(),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        final_state = await run_graph(uuid.UUID(message_id))
+
+        assert final_state["severity"].severity.value == "EMERGENCY"
+        assert final_state.get("draft") is not None  # still drafted -- not skipped
+        assert final_state.get("draft_guard_failed") is not True
+
+        # The notification is the gate: never silent for an EMERGENCY.
+        notif_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT type, status, payload FROM notifications WHERE landlord_id = :lid"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert notif_row["type"] == "needs_eyes"
+        assert notif_row["status"] == "pending"
+        assert notif_row["payload"]["reasons"] == ["severity_emergency"]
+
+        draft_row = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE landlord_id = :lid"), {"lid": landlord_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert draft_row["status"] == "pending"  # a draft plus needs_eyes beats needs_eyes alone
+
+        audit_actions = (
+            (
+                await db_session.execute(
+                    text("SELECT action FROM audit_log WHERE landlord_id = :lid ORDER BY id"),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        actions = [row["action"] for row in audit_actions]
+        assert "drafted" in actions
+        assert "degraded_mode" in actions
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 6. identify_case never re-queries open cases -- exercised implicitly by
 #    the happy-path run above (a second message on the SAME tenant must
 #    attach to the case load_context found, using state alone).
 # ---------------------------------------------------------------------------
@@ -605,10 +630,10 @@ async def test_run_graph_draft_guard_failed_routes_to_degraded_mode(
 async def test_run_graph_second_message_attaches_via_state_open_cases(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    landlord_id = await _insert_landlord(db_session)
-    property_id = await _insert_property(db_session, landlord_id)
-    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
-    first_message_id = await _insert_message(
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    first_message_id = await factories.insert_message(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
@@ -631,7 +656,7 @@ async def test_run_graph_second_message_attaches_via_state_open_cases(
         ).scalar_one()
         assert case_count_after_first == 1
 
-        second_message_id = await _insert_message(
+        second_message_id = await factories.insert_message(
             db_session,
             landlord_id=landlord_id,
             property_id=property_id,
@@ -676,7 +701,61 @@ async def test_run_graph_second_message_attaches_via_state_open_cases(
 
 
 # ---------------------------------------------------------------------------
-# 6. reasoning_log accumulation, no-reducer convention -- direct unit-level
+# 7. Unknown sender -- checkpointer.py's documented per-message thread
+#    fallback (spec MINOR).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_run_graph_unknown_sender_uses_message_scoped_thread(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=None,
+        body="hi, is this the right number for 41 Palmerston?",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[_intent_response(), _severity_response(severity="ROUTINE")]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        final_state = await run_graph(uuid.UUID(message_id))
+
+        # draft_response returns early (no case_id) -- no draft, no crash.
+        assert final_state.get("draft") is None
+
+        # No case was ever created for an unresolved sender.
+        case_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM cases WHERE landlord_id = :lid"), {"lid": landlord_id}
+            )
+        ).scalar_one()
+        assert case_count == 0
+
+        # Checkpoints exist under the documented per-message fallback
+        # thread (app/agent/checkpointer.py's "Documented exception"),
+        # never a case thread (there is none).
+        expected_thread_id = f"message:{message_id}"
+        checkpoint_count = (
+            await db_session.execute(
+                text("SELECT count(*) FROM langgraph.checkpoints WHERE thread_id = :tid"),
+                {"tid": expected_thread_id},
+            )
+        ).scalar_one()
+        assert checkpoint_count > 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 8. reasoning_log accumulation, no-reducer convention -- direct unit-level
 #    regression test (no DB), pinning the design decision itself.
 # ---------------------------------------------------------------------------
 

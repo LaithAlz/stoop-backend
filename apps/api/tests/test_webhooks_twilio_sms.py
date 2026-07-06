@@ -27,7 +27,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncGenerator
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -1247,7 +1247,16 @@ async def test_tenant_hard_fire_alert_only_on_creation_not_on_duplicate(
 ) -> None:
     """Consolidated review item 3: the Sentry alert fires on the delivery
     that actually CREATES the escalation artifacts -- a subsequent
-    duplicate delivery (artifacts already exist) must NOT re-alert."""
+    duplicate delivery (artifacts already exist) must NOT re-alert.
+
+    ``sentry_sdk.capture_message`` is a single shared module-level function
+    -- patching it here also intercepts #34's UNRELATED
+    ``app.agent.graph_entry`` total-failure alert (fired on every delivery
+    in this test, since the checkpointer pool isn't set up in this test
+    module and ``run_graph`` fails deterministically). Filtering by the
+    webhook's own alert message text isolates THIS test's actual subject
+    (the tenant-hard-fire alert) from that unrelated call site.
+    """
     landlord_id = await _insert_landlord(db_session)
     to_number = _fresh_phone()
     from_number = _fresh_phone()
@@ -1261,16 +1270,23 @@ async def test_tenant_hard_fire_alert_only_on_creation_not_on_duplicate(
         body="there is a fire!",
     )
 
+    def _tenant_hard_fire_alert_count(mock_capture: MagicMock) -> int:
+        return sum(
+            1
+            for call in mock_capture.call_args_list
+            if call.args and call.args[0] == "Tier-0 HARD hit on a tenant message"
+        )
+
     try:
         with patch("app.routers.webhooks.twilio.sentry_sdk.capture_message") as mock_capture:
             r1 = await _post_sms(params)  # creates the escalation
-            first_call_count = mock_capture.call_count
+            first_call_count = _tenant_hard_fire_alert_count(mock_capture)
             r2 = await _post_sms(params)  # duplicate -- must not re-alert
-            second_call_count = mock_capture.call_count
+            second_call_count = _tenant_hard_fire_alert_count(mock_capture)
 
         assert r1.status_code == 200
         assert r2.status_code == 200
-        assert first_call_count >= 1
+        assert first_call_count == 1
         assert second_call_count == first_call_count, (
             "duplicate delivery must not fire an additional tenant-hard-fire alert"
         )
