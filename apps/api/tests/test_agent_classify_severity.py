@@ -346,7 +346,7 @@ async def test_classify_severity_success_writes_state_and_audit_log(
         assert payload["model"] == "claude-sonnet-5"
         assert payload["tokens_in"] == 200
         assert payload["tokens_out"] == 60
-        assert payload["prompt_version"] == "v1"
+        assert payload["prompt_version"] == "v2"
         assert isinstance(payload["cost_cents"], (int, float))
         assert "rules_fired" in payload
         assert "modifier" in payload

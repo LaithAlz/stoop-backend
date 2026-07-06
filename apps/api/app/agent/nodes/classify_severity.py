@@ -116,7 +116,7 @@ import structlog
 from pydantic import ValidationError
 from sqlalchemy import text
 
-from app.agent.prompts.v1 import PROMPT_VERSION, get_classify_system_prompt
+from app.agent.prompts.v2 import PROMPT_VERSION, get_classify_system_prompt
 from app.agent.schemas import CaseContext, PrefilterResult, Severity, SeverityResult
 from app.agent.state import AgentState
 from app.agent.tools import CLASSIFY_SEVERITY_TOOL

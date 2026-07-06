@@ -286,7 +286,7 @@ from pydantic import ValidationError
 import app.agent.nodes.classify_severity as classify_severity_mod
 import app.agent.nodes.draft_response as draft_response_mod
 from app.agent import prefilter
-from app.agent.prompts.v1 import (
+from app.agent.prompts.v2 import (
     PROMPT_VERSION,
     build_draft_system_prompt,
     get_classify_system_prompt,

@@ -354,7 +354,7 @@ import structlog
 from pydantic import ValidationError
 from sqlalchemy import text
 
-from app.agent.prompts.v1 import (
+from app.agent.prompts.v2 import (
     PROMPT_VERSION,
     REFUSAL_TEMPLATES,
     build_draft_system_prompt,

@@ -63,17 +63,50 @@ def test_severity_rejects_lowercase_token() -> None:
 
 @pytest.mark.unit
 def test_refusal_flag_values_match_prompt_keys() -> None:
-    """RefusalFlag values must be identical to REFUSAL_TEMPLATES keys in v1.py."""
-    from app.agent.prompts.v1 import REFUSAL_TEMPLATES
+    """RefusalFlag values must be identical to REFUSAL_TEMPLATES keys in
+    EVERY prompt package version (v1 frozen, v2 live)."""
+    from app.agent.prompts.v1 import REFUSAL_TEMPLATES as TEMPLATES_V1
+    from app.agent.prompts.v2 import REFUSAL_TEMPLATES as TEMPLATES_V2
 
     flag_values = {f.value for f in RefusalFlag}
-    template_keys = set(REFUSAL_TEMPLATES.keys())
-    assert flag_values == template_keys, (
-        f"RefusalFlag values and REFUSAL_TEMPLATES keys diverged.\n"
-        f"  RefusalFlag : {sorted(flag_values)}\n"
-        f"  REFUSAL_TEMPLATES: {sorted(template_keys)}\n"
-        "Update schemas.py or prompts/v1.py so they match."
-    )
+    for version, templates in (("v1", TEMPLATES_V1), ("v2", TEMPLATES_V2)):
+        template_keys = set(templates.keys())
+        assert flag_values == template_keys, (
+            f"RefusalFlag values and {version} REFUSAL_TEMPLATES keys diverged.\n"
+            f"  RefusalFlag : {sorted(flag_values)}\n"
+            f"  REFUSAL_TEMPLATES: {sorted(template_keys)}\n"
+            f"Update schemas.py or prompts/{version}.py so they match."
+        )
+
+
+@pytest.mark.unit
+def test_prompts_v2_changes_exactly_the_founder_approved_templates() -> None:
+    """Pin the founder-approved v2 diff (2026-07-06): four templates
+    rewritten for plain-language conformance, other_tenants byte-identical
+    to v1, and the system-prompt builders re-exported unchanged from v1."""
+    from app.agent.prompts import v1, v2
+
+    assert v2.PROMPT_VERSION == "v2"
+    assert v1.PROMPT_VERSION == "v1"
+    changed = {
+        key
+        for key in v1.REFUSAL_TEMPLATES
+        if v1.REFUSAL_TEMPLATES[key] != v2.REFUSAL_TEMPLATES[key]
+    }
+    assert changed == {
+        "access_codes",
+        "legal_rent_ltb",
+        "cost_compensation",
+        "impersonation",
+    }
+    assert v2.REFUSAL_TEMPLATES["other_tenants"] == v1.REFUSAL_TEMPLATES["other_tenants"]
+    # Byte-identical by construction: v2 re-exports the frozen v1 builders.
+    assert v2.get_classify_system_prompt is v1.get_classify_system_prompt
+    assert v2.build_draft_system_prompt is v1.build_draft_system_prompt
+    # The v1 legalistic phrasing that failed eval gates 5-7 is gone from v2.
+    assert "Landlord and Tenant Board" not in v2.REFUSAL_TEMPLATES["legal_rent_ltb"]
+    assert "on their behalf" not in v2.REFUSAL_TEMPLATES["legal_rent_ltb"]
+    assert "on their behalf" not in v2.REFUSAL_TEMPLATES["impersonation"]
 
 
 @pytest.mark.unit

@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 import app.agent.nodes.draft_response as node_mod
 import app.db.session as db_mod
 from app.agent.nodes.draft_response import draft_response
-from app.agent.prompts.v1 import REFUSAL_TEMPLATES
+from app.agent.prompts.v2 import REFUSAL_TEMPLATES
 from app.agent.schemas import CaseContext, RefusalFlag, Severity, SeverityResult
 from app.agent.state import AgentState
 from app.integrations import anthropic as anthropic_mod
@@ -485,7 +485,7 @@ async def test_draft_response_success_inserts_pending_draft_and_audit(
         assert len(draft_rows) == 1
         assert draft_rows[0]["status"] == "pending"
         assert draft_rows[0]["recipient"] == "tenant"
-        assert draft_rows[0]["prompt_version"] == "v1"
+        assert draft_rows[0]["prompt_version"] == "v2"
 
         audit_rows = (
             (
@@ -1107,10 +1107,13 @@ async def test_draft_response_appended_deferral_may_exceed_segment_guidance_by_d
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Plain-language exception, documented (module docstring): appending
-    the legal_rent_ltb deferral can push the final draft past the ~300
-    -char "<=2 SMS segments" routine guidance -- this is an intentional
+    mandated deferral(s) can push the final draft past the ~300-char
+    "<=2 SMS segments" routine guidance -- this is an intentional
     trade-off (never omit the mandated deferral), not a bug, and this node
-    performs NO truncation to force the length budget."""
+    performs NO truncation to force the length budget. (Under prompts v2
+    the single legal_rent_ltb template is short enough that ONE flag no
+    longer exceeds the budget, so this test appends TWO flags -- the
+    multi-flag case is exactly where the exception still bites.)"""
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -1140,20 +1143,27 @@ async def test_draft_response_appended_deferral_may_exceed_segment_guidance_by_d
                 tenant_id=uuid.UUID(tenant_id),
                 case_id=uuid.UUID(case_id),
             ),
-            "severity": _routine_severity([RefusalFlag.legal_rent_ltb]),
+            "severity": _routine_severity(
+                [RefusalFlag.legal_rent_ltb, RefusalFlag.cost_compensation]
+            ),
             "reasoning_log": [],
         }
         update = await draft_response(state)
 
         assert update["draft_guard_failed"] is False
-        final_len = len(update["draft"].body)
+        body = update["draft"].body
+        final_len = len(body)
         # Document the exception explicitly rather than asserting a length
         # cap: this draft is EXPECTED to exceed the ~300-char routine
-        # guidance once the deferral is appended, and that is by design.
+        # guidance once both deferrals are appended, and that is by design.
         assert final_len > 300, (
-            "expected the appended legal_rent_ltb deferral to exceed the routine "
-            f"~300-char guidance (documented exception); got {final_len} chars"
+            "expected the appended legal_rent_ltb + cost_compensation deferrals to "
+            f"exceed the routine ~300-char guidance (documented exception); got "
+            f"{final_len} chars"
         )
+        # And NO truncation happened: both templates are present verbatim.
+        assert REFUSAL_TEMPLATES["legal_rent_ltb"] in body
+        assert REFUSAL_TEMPLATES["cost_compensation"] in body
     finally:
         await _cleanup(db_session, landlord_id)
 
