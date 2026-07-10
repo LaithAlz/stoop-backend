@@ -626,7 +626,16 @@ async def resume_case_thread(*, case_id: UUID, draft_id: UUID, resume_value: Any
         if fresh_draft_id != draft_id:
             raise DraftStaleError(case_id=case_id, draft_id=draft_id, fresh_draft_id=fresh_draft_id)
 
-        thread_id = await _select_case_thread_id(case_id)
+        # Reuse the lock's own session for the thread-id read (senior
+        # review, PR #187): opening a second admin-pool connection while
+        # already holding one under the lock compounds the pool-pressure
+        # profile tracked in #186.
+        thread_row = (
+            (await session.execute(_SELECT_CASE_THREAD_ID_SQL, {"case_id": str(case_id)}))
+            .mappings()
+            .one()
+        )
+        thread_id = str(thread_row["langgraph_thread_id"])
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
         case_graph = compile_case_graph()
 

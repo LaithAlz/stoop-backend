@@ -30,14 +30,17 @@ finished." A crash partway through ``run_graph`` (after
 ``message_received`` was already written) combined with a Twilio
 redelivery of the SAME message would then skip re-running the graph
 FOREVER — the exact silent-loss shape never-break rule #2/#40's own
-contract exist to prevent, just moved one layer down. Fixed:
-:data:`_ALREADY_COMPLETED_SQL` checks for a COMPLETION marker instead — an
-``audit_log`` row whose ``action`` is ``'drafted'`` OR ``'degraded_mode'``
-carrying THIS ``message_id`` in its jsonb payload (``draft_response.py``
-and ``degraded_mode.py`` both now stamp ``message_id`` into that payload
-for exactly this reason — see each module's own docstring). EITHER action
-existing means "the pipeline reached a durable outcome for this message,"
-which is the only thing that should ever justify skipping a re-run.
+contract exist to prevent, just moved one layer down. Fixed in two rounds:
+completion is keyed on markers carrying THIS ``message_id`` in the jsonb
+payload (``draft_response.py`` and ``degraded_mode.py`` both stamp it for
+exactly this reason). A ``'degraded_mode'`` row alone is complete
+(:data:`_DEGRADED_MODE_COMPLETED_SQL`); a ``'drafted'`` row is NECESSARY
+but not sufficient — the thread's own checkpoint must ALSO show the run
+reached a terminal or legitimately-paused state
+(:func:`_thread_reached_terminal_or_paused_state`), because the case's
+ambient status can be non-``'open'`` for reasons unrelated to this
+message's run (see "Round 2 fix" below — a reproduced stuck-draft window
+on multi-message cases).
 Redelivery after a mid-graph crash now correctly RE-RUNS the graph; the
 downstream idempotent writes (``uq_notifications_message_dedupe``,
 migration 0006; ``uq_drafts_one_pending`` + ``draft_response.py``'s own
