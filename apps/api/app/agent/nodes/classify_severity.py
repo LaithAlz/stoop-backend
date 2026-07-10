@@ -143,11 +143,25 @@ def _parse_prefilter(raw: Any) -> PrefilterResult:
     """Same fallback as ``identify_case.py``'s ``_parse_prefilter``: the
     webhook always writes a snapshot, so a missing one is an anomaly to log,
     not a reason to block classification. Duplicated rather than imported —
-    project convention (see ``tests/test_agent_nodes.py``'s own docstring)."""
+    project convention (see ``tests/test_agent_nodes.py``'s own docstring).
+
+    Never raises (safety review LOW): a non-null but MALFORMED snapshot
+    used to raise ``ValidationError`` outside any try/except here and
+    crash the whole graph run. Falls back to ``hard_hit=False``, exactly
+    like the "missing" case — this can never de-escalate a real Tier-0
+    fire, since the snapshot the webhook actually persisted on ``messages
+    .prefilter`` is never touched by this fallback; it only affects
+    whether THIS node's Tier-0 clamp (below) has a signal to act on when
+    its OWN read of that snapshot fails. Keep it that way: this function
+    must never be the thing that decides a fire didn't happen."""
     if raw is None:
         log.error("classify_severity_prefilter_snapshot_missing")
         return PrefilterResult(hard_hit=False)
-    return PrefilterResult.model_validate(raw)
+    try:
+        return PrefilterResult.model_validate(raw)
+    except (ValidationError, TypeError) as exc:
+        log.warning("classify_severity_prefilter_snapshot_malformed", exc_type=type(exc).__name__)
+        return PrefilterResult(hard_hit=False)
 
 
 def _build_user_content(

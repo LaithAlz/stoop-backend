@@ -1895,3 +1895,208 @@ async def test_draft_response_length_over_budget_cost_accumulates_across_both_ca
         assert audit_row["payload"]["tokens_out"] == 80
     finally:
         await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# G2 (#34 spec review, MAJOR): the ON CONFLICT/retry path in
+# _stale_then_insert_draft had no test that would fail if it were reverted
+# to a naive INSERT -- every existing test runs a single writer sequentially,
+# so the conflict branch never engages. These tests force it deterministically
+# by wrapping a REAL session and making its FIRST (or every) _INSERT_DRAFT_SQL
+# call look like it lost the uq_drafts_one_pending race (RETURNING produced
+# no row) -- no genuine concurrent transactions needed.
+# ---------------------------------------------------------------------------
+
+
+class _NoRowResult:
+    """Duck-types the tiny slice of a SQLAlchemy ``CursorResult`` that
+    ``_stale_then_insert_draft`` actually calls: ``.mappings().one_or_none()``
+    returning ``None`` -- exactly what a losing ``ON CONFLICT ... DO
+    NOTHING`` INSERT reports."""
+
+    def mappings(self) -> _NoRowResult:
+        return self
+
+    def one_or_none(self) -> None:
+        return None
+
+
+class _ConflictOnceSession:
+    """Wraps a REAL ``AsyncSession``, forcing the first *conflicts*
+    executions of ``_INSERT_DRAFT_SQL`` to look like they lost the
+    ``uq_drafts_one_pending`` race, then delegating every call --
+    including every OTHER statement, and any ``_INSERT_DRAFT_SQL`` call
+    past *conflicts* -- to the real session unchanged. Proves the retry
+    loop in ``_stale_then_insert_draft`` actually engages (and, when
+    *conflicts* is below ``_MAX_DRAFT_INSERT_ATTEMPTS``, succeeds) without
+    needing genuinely concurrent transactions.
+    """
+
+    def __init__(self, real_session: AsyncSession, *, conflicts: int) -> None:
+        self._real = real_session
+        self._conflicts_remaining = conflicts
+        self.insert_draft_attempts = 0
+
+    async def execute(self, statement: Any, params: Any = None) -> Any:
+        if statement is node_mod._INSERT_DRAFT_SQL:  # noqa: SLF001
+            self.insert_draft_attempts += 1
+            if self._conflicts_remaining > 0:
+                self._conflicts_remaining -= 1
+                return _NoRowResult()
+        return await self._real.execute(statement, params)
+
+
+@pytest.mark.integration
+async def test_stale_then_insert_draft_retries_when_insert_loses_the_race(
+    db_session: AsyncSession,
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+
+    try:
+        wrapped = _ConflictOnceSession(db_session, conflicts=1)
+        reasoning_log: list[str] = []
+
+        new_draft_id = await node_mod._stale_then_insert_draft(  # noqa: SLF001
+            wrapped,
+            landlord_id=uuid.UUID(landlord_id),
+            case_id=uuid.UUID(case_id),
+            body="a real reply, composed before the race",
+            prompt_version="v2",
+            reasoning_log=reasoning_log,
+        )
+
+        # Attempt 1 lost the race (forced); attempt 2 actually inserted.
+        assert wrapped.insert_draft_attempts == 2
+        assert new_draft_id is not None
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE id = :id"), {"id": str(new_draft_id)}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["status"] == "pending"
+
+        # Exactly one pending draft for the case -- the retry never left a
+        # duplicate or a partially-applied stale-mark behind.
+        pending_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM drafts WHERE case_id = :cid AND status = 'pending'"),
+                {"cid": case_id},
+            )
+        ).scalar_one()
+        assert pending_count == 1
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_stale_then_insert_draft_raises_after_exhausting_all_attempts(
+    db_session: AsyncSession,
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+
+    try:
+        wrapped = _ConflictOnceSession(
+            db_session,
+            conflicts=node_mod._MAX_DRAFT_INSERT_ATTEMPTS,  # noqa: SLF001
+        )
+        reasoning_log: list[str] = []
+
+        with pytest.raises(node_mod.DraftInsertRaceExhaustedError):
+            await node_mod._stale_then_insert_draft(  # noqa: SLF001
+                wrapped,
+                landlord_id=uuid.UUID(landlord_id),
+                case_id=uuid.UUID(case_id),
+                body="a real reply, always loses the race",
+                prompt_version="v2",
+                reasoning_log=reasoning_log,
+            )
+
+        assert wrapped.insert_draft_attempts == node_mod._MAX_DRAFT_INSERT_ATTEMPTS  # noqa: SLF001
+
+        # Every attempt was skipped (ON CONFLICT DO NOTHING) -- nothing was
+        # ever actually persisted for this case.
+        count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM drafts WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert count == 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_returns_gracefully_when_insert_race_exhausted(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Node-level counterpart to the two tests above: when
+    ``_stale_then_insert_draft`` raises ``DraftInsertRaceExhaustedError``
+    (forced here directly, rather than re-deriving the race), the NODE
+    must catch it and return a normal partial state update -- never an
+    unhandled raise that would crash the whole graph run."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the hallway light is out",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[_fake_message(body="Thanks, I'll take care of it!", refusal_templates_used=[])]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    async def _always_exhausted(*_args: Any, **_kwargs: Any) -> uuid.UUID:
+        raise node_mod.DraftInsertRaceExhaustedError("forced for test")
+
+    monkeypatch.setattr(node_mod, "_stale_then_insert_draft", _always_exhausted)  # noqa: SLF001
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)  # must NOT raise
+
+        assert update["draft"] is not None  # the reply WAS composed
+        assert any("conflicting update" in line for line in update["reasoning_log"])
+
+        # The helper raised before any INSERT could commit -- nothing
+        # persisted for this case.
+        count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM drafts WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert count == 0
+    finally:
+        await _cleanup(db_session, landlord_id)

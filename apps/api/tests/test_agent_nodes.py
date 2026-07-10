@@ -254,6 +254,23 @@ async def _insert_case(
     return case_id
 
 
+def _open_case_entry(
+    *, case_id: str, last_activity_at: datetime, status: str = STATUS_OPEN
+) -> dict[str, object]:
+    """Build one ``state["open_cases"]`` entry — the same shape
+    ``load_context``'s ``OpenCaseSummary.model_dump(mode="json")`` produces
+    (#34 senior review: ``identify_case`` now consumes this from state
+    instead of re-querying the ``cases`` table itself)."""
+    return {
+        "case_id": case_id,
+        "status": status,
+        "severity": None,
+        "intent": None,
+        "title": None,
+        "last_activity_at": last_activity_at.isoformat(),
+    }
+
+
 async def _insert_needs_eyes_or_emergency_notification(
     session: AsyncSession, *, landlord_id: str, message_id: str, notif_type: str = "emergency_call"
 ) -> None:
@@ -711,7 +728,11 @@ async def test_identify_case_one_open_case_attaches_and_bumps_activity(
     )
 
     try:
-        state: AgentState = {"message_id": uuid.UUID(message_id), "reasoning_log": []}
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "open_cases": [_open_case_entry(case_id=case_id, last_activity_at=old_activity)],
+            "reasoning_log": [],
+        }
         update = await identify_case(state)
 
         assert str(update["case_context"].case_id) == case_id
@@ -746,7 +767,7 @@ async def test_identify_case_multiple_open_cases_attaches_most_recent(
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
     now = datetime.now(UTC)
-    await _insert_case(
+    older_case_id = await _insert_case(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
@@ -765,7 +786,14 @@ async def test_identify_case_multiple_open_cases_attaches_most_recent(
     )
 
     try:
-        state: AgentState = {"message_id": uuid.UUID(message_id), "reasoning_log": []}
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "open_cases": [
+                _open_case_entry(case_id=older_case_id, last_activity_at=now - timedelta(days=3)),
+                _open_case_entry(case_id=newer_case_id, last_activity_at=now - timedelta(hours=1)),
+            ],
+            "reasoning_log": [],
+        }
         update = await identify_case(state)
 
         assert str(update["case_context"].case_id) == newer_case_id
@@ -987,6 +1015,94 @@ async def test_identify_case_reopen_past_30_days_creates_related_case(
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
+async def test_identify_case_trusts_state_open_cases_over_a_resolved_db_row(
+    db_session: AsyncSession,
+) -> None:
+    """G3 discriminating test (#34 spec review, MAJOR): without
+    ``_fake_signals`` (the deterministic, no-signals ambiguity path), seed
+    a case that is ALREADY 'resolved' in the DB, but present in
+    ``state["open_cases"]`` — proving ``identify_case`` treats it as a
+    routing CANDIDATE from state, never by re-querying `cases` for open
+    ones itself.
+
+    If ``identify_case`` instead re-queried the DB for open cases (ignoring
+    state), a REAL query would find ZERO open cases for this tenant (the
+    seeded case's status is 'resolved', excluded from every OPEN_STATUSES
+    query) — it would fall to the "no open cases" branch and open a
+    brand-new, UNRELATED case, leaving the old one untouched. Supplying the
+    resolved case via ``state["open_cases"]`` instead makes
+    ``route_inbound_message``'s ambiguity rule treat it as the (only)
+    candidate, so ``identify_case``'s own re-check of that SPECIFIC case's
+    real DB status (which it still legitimately does, to decide reopen-vs-
+    new — a per-target check, not an open-cases re-query) reopens the SAME
+    case within the 30-day window. That reopening is the discriminating
+    signal: it can only happen if state's open_cases was actually consulted
+    as a routing candidate.
+    """
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    resolved_activity = datetime.now(UTC) - timedelta(days=10)
+    resolved_case_id = await _insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status=STATUS_RESOLVED,
+        resolved_reason="landlord",
+        resolved_at=resolved_activity,
+        last_activity_at=resolved_activity,
+    )
+    message_id = await _insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "open_cases": [
+                _open_case_entry(
+                    case_id=resolved_case_id,
+                    last_activity_at=resolved_activity,
+                    status=STATUS_RESOLVED,
+                )
+            ],
+            "reasoning_log": [],
+        }
+        update = await identify_case(state)
+
+        # Attached to (and reopened) the SAME resolved case from state --
+        # not a fresh, unrelated new case a real "open cases" query would
+        # have produced (that query would have found none).
+        assert str(update["case_context"].case_id) == resolved_case_id
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT status, resolved_reason, resolved_at FROM cases WHERE id = :cid"),
+                    {"cid": resolved_case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["status"] == "reopened"
+        assert row["resolved_reason"] is None
+        assert row["resolved_at"] is None
+
+        # Exactly one case exists for this landlord -- no unrelated new
+        # case was created alongside it.
+        case_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM cases WHERE landlord_id = :lid"), {"lid": landlord_id}
+            )
+        ).scalar_one()
+        assert case_count == 1
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 # ---------------------------------------------------------------------------
 # sweep_cases() — the DB entrypoint for the time-driven sweep
 # ---------------------------------------------------------------------------
@@ -1157,11 +1273,13 @@ async def test_new_message_before_deadline_contradicts_and_clears_pending(
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_activity = datetime.now(UTC)
     case_id = await _insert_case(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
         tenant_id=tenant_id,
+        last_activity_at=case_activity,
         pending_resolved_at=datetime.now(UTC) + timedelta(hours=1),
     )
     message_id = await _insert_message(
@@ -1169,7 +1287,11 @@ async def test_new_message_before_deadline_contradicts_and_clears_pending(
     )
 
     try:
-        state: AgentState = {"message_id": uuid.UUID(message_id), "reasoning_log": []}
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "open_cases": [_open_case_entry(case_id=case_id, last_activity_at=case_activity)],
+            "reasoning_log": [],
+        }
         update = await identify_case(state)
 
         assert str(update["case_context"].case_id) == case_id
