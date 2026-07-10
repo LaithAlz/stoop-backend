@@ -888,6 +888,145 @@ async def test_crash_between_draft_response_and_mark_awaiting_approval_heals_on_
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
+async def test_second_message_crash_on_already_awaiting_approval_case_heals_on_redelivery(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 reproduction (safety review): the round-1 completion-gate
+    fix inferred "this message's run completed" from the case's CURRENT
+    status being non-'open' -- which can be true for a reason completely
+    UNRELATED to the message being checked. Here M1 completes normally
+    FIRST (case already 'awaiting_approval', D1 pending) -- THEN M2
+    arrives and crashes between ITS OWN draft_response (D1 staled, D2
+    pending, 'drafted' marker written for M2) and ITS OWN
+    mark_awaiting_approval. The case's status is 'awaiting_approval' the
+    whole time (leftover from M1), so a status-only check would wrongly
+    call M2 already complete -- every redelivery of M2 would be a silent
+    no-op forever, and D2 would be permanently unapprovable
+    (``resume_case_thread`` for D2 would raise
+    ``CaseNotAwaitingApprovalError``, since the thread genuinely has no
+    live interrupt: it's stuck at ``next=('mark_awaiting_approval',)``).
+    The fix keys completion to the THREAD's own checkpoint state instead
+    -- proves the fix, not just the round-1 scenario it was already known
+    to handle."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    first_message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the heat has been out since this morning",
+    )
+    _patch_client(monkeypatch, _happy_path_fake_messages(body="I'll take a look today."))
+
+    try:
+        # M1 completes fully and normally -- case awaiting_approval, D1 pending.
+        await run_graph(uuid.UUID(first_message_id))
+        case = await _case_row(db_session, landlord_id=landlord_id)
+        assert case["status"] == "awaiting_approval"
+        first_draft_id = await _pending_draft_id(db_session, case_id=case["id"])
+
+        # M2 arrives on the SAME (already awaiting_approval) case.
+        second_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="still no heat, it's getting cold in here",
+        )
+        _patch_client(
+            monkeypatch, _happy_path_fake_messages(body="I hear you, sending someone out.")
+        )
+
+        original_mark_awaiting_approval = graph_mod.mark_awaiting_approval
+
+        async def _boom(state: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError(
+                "simulated crash between M2's draft_response and mark_awaiting_approval"
+            )
+
+        monkeypatch.setattr(graph_mod, "mark_awaiting_approval", _boom)
+
+        # M2's first attempt: its OWN draft_response commits (D1 staled, D2
+        # pending, 'drafted' marker for M2), then the simulated crash.
+        await enqueue_classification(uuid.UUID(second_message_id), uuid.UUID(landlord_id))
+
+        case_mid = await _case_row(db_session, landlord_id=landlord_id)
+        # Status is 'awaiting_approval' -- but LEFTOVER from M1, not proof
+        # M2's own mark_awaiting_approval ran.
+        assert case_mid["status"] == "awaiting_approval"
+
+        second_drafted_count = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE landlord_id = :lid "
+                    "AND action = 'drafted' AND payload ->> 'message_id' = :mid"
+                ),
+                {"lid": landlord_id, "mid": second_message_id},
+            )
+        ).scalar_one()
+        assert second_drafted_count == 1  # M2's own drafted marker exists
+
+        second_draft_id = await _pending_draft_id(db_session, case_id=case["id"])
+        assert second_draft_id != first_draft_id  # D2, not D1 -- D1 is now stale
+
+        # Proves the bug WOULD be live without the fix: the thread has no
+        # live interrupt right now (stuck at next=('mark_awaiting_approval',)),
+        # so a resume attempt for D2 correctly finds nothing to resume --
+        # if redelivery were (wrongly) skipped forever, D2 would be stuck
+        # exactly like this permanently.
+        with pytest.raises(CaseNotAwaitingApprovalError):
+            await resume_case_thread(
+                case_id=uuid.UUID(case["id"]),
+                draft_id=second_draft_id,
+                resume_value={"action": "approved"},
+            )
+
+        # "Process restarts" -- mark_awaiting_approval works again.
+        monkeypatch.setattr(graph_mod, "mark_awaiting_approval", original_mark_awaiting_approval)
+        _patch_client(monkeypatch, _happy_path_fake_messages(body="third attempt draft"))
+
+        # Redelivery of M2 -- must NOT be silently skipped just because the
+        # case already looks non-'open' (that's leftover from M1); must
+        # self-heal.
+        await enqueue_classification(uuid.UUID(second_message_id), uuid.UUID(landlord_id))
+
+        case_after = await _case_row(db_session, landlord_id=landlord_id)
+        assert case_after["status"] == "awaiting_approval"  # now genuinely from M2's own run
+
+        draft_rows = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE landlord_id = :lid ORDER BY created_at"),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        # D1 (stale from M1->M2), D2 (stale -- superseded by the healed
+        # re-run's own stale-then-insert), D3 (pending -- the healed draft).
+        assert len(draft_rows) == 3
+        assert draft_rows[0]["status"] == "stale"
+        assert draft_rows[1]["status"] == "stale"
+        assert draft_rows[2]["status"] == "pending"
+
+        third_draft_id = await _pending_draft_id(db_session, case_id=case["id"])
+        assert third_draft_id not in (first_draft_id, second_draft_id)
+
+        # The case is genuinely approvable again.
+        result = await resume_case_thread(
+            case_id=uuid.UUID(case["id"]),
+            draft_id=third_draft_id,
+            resume_value={"action": "approved"},
+        )
+        assert "__interrupt__" not in result
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 # ---------------------------------------------------------------------------
 # 9. case_id is None is a REAL reachable path (unknown sender), not just a
 #    defensive invariant -- the graph must end unpaused.

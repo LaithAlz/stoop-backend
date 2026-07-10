@@ -56,7 +56,8 @@ but a real, discovered cost tradeoff — worth a dedicated completion
 signal for that path if it turns out to matter in production.
 
 Crash-window coherence with #43's ``mark_awaiting_approval`` (safety
-review MEDIUM, #43 fix round)
+review MEDIUM, #43 fix round; REPRODUCED as MAJOR and fixed again, same
+issue's second review round — see "Round 2" below)
 ------------------------------------------------------------------------
 ``draft_response`` and ``mark_awaiting_approval`` are TWO SEPARATE nodes
 (``app/agent/graph.py``'s case-scoped graph) — LangGraph commits
@@ -66,29 +67,66 @@ node completes, independently of whether the NEXT node
 (``mark_awaiting_approval``, which flips ``cases.status`` to
 ``'awaiting_approval'``) ever runs at all. A crash in that exact window
 (the durable marker written, the case-status transition not yet reached)
-combined with the OLD completion check (``'drafted'`` alone, regardless of
-case status) would have skipped every future redelivery of this message
-FOREVER — leaving the case stuck at whatever status it was in BEFORE this
-run (``'open'`` for a brand-new case), which is ``AUTO_STALE_ELIGIBLE``
-(``app/agent/case_lifecycle.py``): a case could silently auto-resolve
-14 days later with an un-acted, never-shown ``pending`` draft still
-sitting on it — the audit trail would look "complete" while the actual
-approval workflow silently never happened.
+combined with the ORIGINAL completion check (``'drafted'`` alone,
+regardless of case status) would have skipped every future redelivery of
+this message FOREVER.
 
-Fixed: :data:`_ALREADY_COMPLETED_SQL`'s ``'drafted'`` branch now ALSO
-requires the case (joined via ``audit_log.case_id`` — already populated
-on every ``'drafted'`` row, see ``draft_response.py``) to have a status
-OTHER than ``'open'`` — i.e., that ``mark_awaiting_approval`` (or any
-other transition away from ``'open'``) actually ran. The ``'degraded_mode'``
-branch is UNCHANGED (unconditional): that exit never touches
-``cases.status`` at all (module docstring "Shadow mode (#43)" in
-``app/agent/graph.py``), so there is nothing further to wait for there.
-If the join condition is false (crash window hit), ``already_completed``
-is correctly ``False`` and a redelivery RE-RUNS the graph from scratch —
-a second (paid) draft/classification pass, but the SAME stale-then-insert
-absorption every other re-run already relies on, and the case reliably
-reaches ``awaiting_approval`` this time. A rare, bounded extra cost is
-preferable to a case silently stuck forever.
+Round 1 fix (INSUFFICIENT, reproduced live in round 2): required the case
+(joined via ``audit_log.case_id``) to have a status OTHER than ``'open'``
+— reasoning: "if it's not 'open', ``mark_awaiting_approval`` must have
+run." **FALSE in general** — a case can be non-``'open'`` for a reason
+completely UNRELATED to THIS message's own run: a SECOND message landing
+on a case that is ALREADY ``'awaiting_approval'`` (from an EARLIER
+message's successful completion) inherits that same non-``'open'`` status
+regardless of whether ITS OWN ``mark_awaiting_approval`` ever executes.
+Reproduced directly (``tests/test_agent_shadow_interrupt.py::
+test_second_message_crash_on_already_awaiting_approval_case_heals_on_redelivery``):
+M1 completes fully (case ``awaiting_approval``, draft D1 pending). M2
+arrives, its OWN ``draft_response`` commits (D1 staled, D2 pending,
+``'drafted'`` marker written for M2), then a crash before M2's OWN
+``mark_awaiting_approval``. The round-1 check saw ``'drafted'`` for M2 AND
+``status <> 'open'`` (true, but leftover from M1) → wrongly "complete".
+Every redelivery of M2 was then a silent no-op FOREVER: the thread sat at
+``next=('mark_awaiting_approval',)`` with NO live interrupt, so
+``resume_case_thread`` for D2 would raise ``CaseNotAwaitingApprovalError``
+too — D2 was permanently unapprovable unless some THIRD, unrelated tenant
+message happened to arrive later. Exactly the forbidden silent-dead-end
+class never-break rule #2 exists to prevent.
+
+Round 2 fix — key completion to THIS message's OWN run reaching a
+paused/terminal state, never the case's ambient historical status
+------------------------------------------------------------------------
+Two schema-free design options were on the table (a migration-backed
+dedicated marker was the other — rejected: ``audit_log.action`` is a fixed
+``CHECK`` list, schema-v1.md doc-first + migration + round-trip for one
+value not otherwise needed is disproportionate when a schema-free fix is
+sound). Chosen: when a ``'drafted'`` marker exists for this message (and
+no ``'degraded_mode'`` marker — that branch is unconditionally complete,
+unchanged), ALSO inspect the case's OWN checkpointed thread directly
+(:func:`_thread_reached_terminal_or_paused_state` — compiles the case
+graph and calls ``aget_state(config)``, exactly the same introspection
+``app/agent/graph.py::resume_case_thread`` already relies on):
+
+- ``snapshot.next`` EMPTY → the thread ran all the way to ``END`` (the
+  degraded/emergency exit, OR ``await_approval``'s own documented
+  case_id/draft_id-``None`` skip-the-pause branches) — genuinely done.
+- ``snapshot.interrupts`` NON-EMPTY → legitimately paused at a LIVE
+  ``await_approval`` interrupt — genuinely done (this is the normal,
+  overwhelmingly common case: no extra work needed to reach this
+  conclusion beyond the state read).
+- ``snapshot.next`` NON-EMPTY and ``snapshot.interrupts`` EMPTY → a task
+  was SCHEDULED but never executed (the crash window) — NOT complete.
+  Redelivery correctly re-runs: a plain ``ainvoke`` restarts the run from
+  ``START`` (verified semantics, module docstring in ``app/agent/graph.py``
+  "Stale-draft re-run"), ``draft_response``'s stale-then-insert absorbs
+  the orphaned pending draft from the crashed attempt exactly as it does
+  for any other stale draft, and the case reliably reaches
+  ``awaiting_approval`` this time.
+
+This costs one extra ``aget_state`` round trip ONLY on the (rare)
+redelivery path where a ``'drafted'`` marker already exists without a
+``'degraded_mode'`` one — never on the common "no marker yet" fast path,
+and never on the ``'degraded_mode'`` fast path either.
 
 ``message_received`` itself is now PURELY an observability/audit-trail
 line, not a gate — appended idempotently (see below) the first time this
@@ -156,33 +194,54 @@ from uuid import UUID
 
 import sentry_sdk
 import structlog
+from langchain_core.runnables import RunnableConfig
 from sqlalchemy import text
 
-from app.agent.graph import run_graph
+from app.agent.graph import compile_case_graph, run_graph
 from app.db.session import get_admin_session
 
 log = structlog.get_logger(__name__)
 
-# Completion marker — see module docstring "Gating on COMPLETION, not
+# Completion markers — see module docstring "Gating on COMPLETION, not
 # RECEIPT" and "Crash-window coherence with #43's mark_awaiting_approval".
-# Deliberately NOT keyed on 'message_received'. The 'drafted' branch
-# requires the case to have moved past 'open' (mark_awaiting_approval, or
-# any other transition, actually ran) -- 'degraded_mode' needs no such
-# check, that exit never touches cases.status at all.
-_ALREADY_COMPLETED_SQL = text(
-    "SELECT ("
-    "  EXISTS ("
-    "    SELECT 1 FROM audit_log"
-    "    WHERE action = 'degraded_mode' AND payload ->> 'message_id' = :message_id"
-    "  )"
-    "  OR EXISTS ("
-    "    SELECT 1 FROM audit_log al JOIN cases c ON c.id = al.case_id"
-    "    WHERE al.action = 'drafted'"
-    "      AND al.payload ->> 'message_id' = :message_id"
-    "      AND c.status <> 'open'"
-    "  )"
+# Deliberately NOT keyed on 'message_received'. 'degraded_mode' alone is
+# unconditionally complete (that exit never touches cases.status at all).
+# 'drafted' alone is NOT sufficient -- see _thread_reached_terminal_or_
+# paused_state below, which decides the 'drafted'-only case.
+_DEGRADED_MODE_COMPLETED_SQL = text(
+    "SELECT EXISTS ("
+    "  SELECT 1 FROM audit_log"
+    "  WHERE action = 'degraded_mode' AND payload ->> 'message_id' = :message_id"
     ")"
 )
+
+_SELECT_DRAFTED_THREAD_SQL = text(
+    "SELECT c.langgraph_thread_id"
+    "  FROM audit_log al JOIN cases c ON c.id = al.case_id"
+    " WHERE al.action = 'drafted' AND al.payload ->> 'message_id' = :message_id"
+    " LIMIT 1"
+)
+
+
+async def _thread_reached_terminal_or_paused_state(thread_id: str) -> bool:
+    """``True`` iff the case's checkpointed thread has either run all the
+    way to ``END`` (``snapshot.next`` empty) or is legitimately paused at a
+    LIVE ``await_approval`` interrupt (``snapshot.interrupts`` non-empty).
+    ``False`` when a task is SCHEDULED but was never executed (``next``
+    non-empty, no interrupt recorded) — the crash window between
+    ``draft_response`` and ``mark_awaiting_approval`` (or any later node) —
+    see module docstring "Round 2 fix". Same introspection
+    ``app/agent/graph.py::resume_case_thread`` already relies on; cheap
+    (one ``aget_state`` round trip), only ever called on the rare
+    redelivery path where a ``'drafted'`` marker already exists.
+    """
+    case_graph = compile_case_graph()
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    snapshot = await case_graph.aget_state(config)
+    if not snapshot.next:
+        return True
+    return bool(snapshot.interrupts)
+
 
 # Single-statement idempotent insert — see module docstring "Idempotent
 # INSERT, single statement" for the honest limits of this pattern.
@@ -255,9 +314,32 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
 
     try:
         async with asynccontextmanager(get_admin_session)() as session:
-            already_completed = (
-                await session.execute(_ALREADY_COMPLETED_SQL, {"message_id": str(message_id)})
+            degraded_mode_done = (
+                await session.execute(_DEGRADED_MODE_COMPLETED_SQL, {"message_id": str(message_id)})
             ).scalar_one()
+            already_completed = bool(degraded_mode_done)
+
+            if not already_completed:
+                # 'drafted' alone is NOT sufficient -- see module docstring
+                # "Round 2 fix": the case's CURRENT status can be non-'open'
+                # for reasons unrelated to THIS message's own run (e.g. it
+                # was already 'awaiting_approval' from an earlier message).
+                # Only the thread's OWN checkpoint state can answer "did
+                # THIS run reach a paused/terminal state".
+                drafted_row = (
+                    (
+                        await session.execute(
+                            _SELECT_DRAFTED_THREAD_SQL, {"message_id": str(message_id)}
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if drafted_row is not None:
+                    already_completed = await _thread_reached_terminal_or_paused_state(
+                        drafted_row["langgraph_thread_id"]
+                    )
+
             if already_completed:
                 return
             await session.execute(
