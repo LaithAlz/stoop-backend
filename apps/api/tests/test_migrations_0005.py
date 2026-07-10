@@ -507,6 +507,10 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # its own small SELECT (the pre-routing/case-scoped graph split) —
         # same background/graph context as every node above.
         "app/agent/graph.py",
+        # #43: the await_approval interrupt node flips the case to
+        # awaiting_approval before the graph pauses — same background/graph
+        # context, no HTTP request/JWT, same pre-identity rationale.
+        "app/agent/nodes/await_approval.py",
     }
 )
 
