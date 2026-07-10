@@ -27,10 +27,27 @@ completion-gate interaction with ``app/agent/graph_entry.py`` (a paused
 run already has its ``'drafted'`` completion marker written, so a
 redelivery is correctly a no-op), and that the EMERGENCY/``degraded_mode``
 interim edge fires independently of (never trapped behind) this pause.
+
+Review-round additions (this issue's own safety/spec review, second pass)
+------------------------------------------------------------------------
+- **Concurrency section** (below): the sequential tests above prove
+  correctness under STRICT ordering, but not under real concurrency. These
+  tests launch genuinely concurrent ``asyncio`` tasks — a double-resume
+  race and a resume racing a fresh ``run_graph`` re-run — and verify
+  ``app/agent/graph.py``'s per-case ``pg_advisory_xact_lock`` (module
+  docstring "Per-case serialization") actually serializes them.
+- ``test_crash_between_draft_response_and_mark_awaiting_approval_heals_on_redelivery``
+  — the crash-window coherence fix in ``app/agent/graph_entry.py``.
+- ``test_unknown_sender_never_pauses_at_interrupt`` — the corrected (no
+  longer ``# pragma: no cover``) ``case_id is None`` path in
+  ``app/agent/nodes/await_approval.py``.
+- ``test_await_approval_skips_the_pause_when_no_pending_draft_exists`` —
+  the ``draft_id is None`` defensive skip in the same module.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
@@ -47,6 +64,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 import app.agent.checkpointer as cp_mod
+import app.agent.graph as graph_mod
 import app.db.session as db_mod
 from app.agent.checkpointer import close_checkpointer, setup_checkpointer
 from app.agent.graph import (
@@ -779,5 +797,379 @@ async def test_resume_case_thread_rejects_when_draft_pending_but_never_paused(
                 draft_id=draft_id,
                 resume_value={"action": "approved"},
             )
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 8. Crash-window coherence (app/agent/graph_entry.py's completion gate).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_crash_between_draft_response_and_mark_awaiting_approval_heals_on_redelivery(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``draft_response`` commits (draft row + 'drafted' audit marker)
+    BEFORE ``mark_awaiting_approval`` ever runs -- a crash in that exact
+    window must not leave the case stuck 'open' (auto-stale ELIGIBLE, per
+    app/agent/case_lifecycle.py) with an orphaned pending draft and no way
+    to ever re-run (the OLD completion gate would have skipped every
+    future redelivery of this exact message forever)."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the heat has been out since this morning",
+    )
+    _patch_client(monkeypatch, _happy_path_fake_messages())
+
+    original_mark_awaiting_approval = graph_mod.mark_awaiting_approval
+
+    async def _boom(state: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("simulated crash between draft_response and mark_awaiting_approval")
+
+    monkeypatch.setattr(graph_mod, "mark_awaiting_approval", _boom)
+
+    try:
+        # First attempt: draft_response commits, then the simulated crash.
+        await enqueue_classification(uuid.UUID(message_id), uuid.UUID(landlord_id))
+
+        case = await _case_row(db_session, landlord_id=landlord_id)
+        assert case["status"] == "open"  # never transitioned -- the crash window
+
+        drafted_count = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE landlord_id = :lid AND action = 'drafted'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert drafted_count == 1
+
+        pending_draft_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM drafts WHERE landlord_id = :lid AND status = 'pending'"),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert pending_draft_count == 1  # orphaned -- draft exists, case never advanced
+
+        # "Process restarts" -- mark_awaiting_approval works again.
+        monkeypatch.setattr(graph_mod, "mark_awaiting_approval", original_mark_awaiting_approval)
+        _patch_client(monkeypatch, _happy_path_fake_messages(body="second attempt draft"))
+
+        # Redelivery of the SAME message (e.g. a Twilio retry) -- must NOT
+        # be skipped by the completion gate; must self-heal.
+        await enqueue_classification(uuid.UUID(message_id), uuid.UUID(landlord_id))
+
+        case_after = await _case_row(db_session, landlord_id=landlord_id)
+        assert case_after["status"] == "awaiting_approval"
+
+        draft_rows = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE landlord_id = :lid ORDER BY created_at"),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        assert len(draft_rows) == 2
+        assert draft_rows[0]["status"] == "stale"  # the orphaned first draft, now superseded
+        assert draft_rows[1]["status"] == "pending"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 9. case_id is None is a REAL reachable path (unknown sender), not just a
+#    defensive invariant -- the graph must end unpaused.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_unknown_sender_never_pauses_at_interrupt(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=None,
+        body="hi, is this the right number for 41 Palmerston?",
+    )
+    _patch_client(monkeypatch, _happy_path_fake_messages(severity="ROUTINE"))
+
+    try:
+        final_state = await run_graph(uuid.UUID(message_id))
+
+        assert "__interrupt__" not in final_state
+        assert final_state.get("draft") is None  # draft_response returned early -- no case_id
+
+        case_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM cases WHERE landlord_id = :lid"), {"lid": landlord_id}
+            )
+        ).scalar_one()
+        assert case_count == 0
+
+        case_graph = compile_case_graph()
+        config = {"configurable": {"thread_id": f"message:{message_id}"}}
+        snapshot = await case_graph.aget_state(config)
+        assert snapshot.next == ()
+        assert snapshot.interrupts == ()
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 10. draft_id is None at pause time -- defensive skip, never a stuck
+#     unapprovable interrupt.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_await_approval_skips_the_pause_when_no_pending_draft_exists(
+    db_session: AsyncSession,
+) -> None:
+    from app.agent.nodes.await_approval import await_approval
+    from app.agent.schemas import CaseContext
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_bare_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+
+    try:
+        state = {
+            "message_id": uuid.uuid4(),
+            "case_context": CaseContext(
+                case_id=uuid.UUID(case_id), landlord_id=uuid.UUID(landlord_id)
+            ),
+            "reasoning_log": [],
+        }
+        # Called directly (no compiled graph, no interrupt() context) --
+        # if this incorrectly called interrupt() it would raise a
+        # LangGraph-internal error here; instead it must return cleanly.
+        result = await await_approval(state)  # type: ignore[arg-type]
+
+        assert result.get("reasoning_log")
+        assert "couldn't find a reply" in result["reasoning_log"][-1]
+
+        case_row = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM cases WHERE id = :cid"), {"cid": case_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert case_row["status"] == "open"  # mark_awaiting_approval never ran either
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Concurrency — genuine concurrent asyncio tasks, not just sequential calls.
+# Proves app/agent/graph.py's per-case pg_advisory_xact_lock actually
+# serializes resume_case_thread against itself and against a concurrent
+# run_graph re-run (safety review MERGE-BLOCKING, this issue's own review
+# round).
+# ---------------------------------------------------------------------------
+
+
+class _DelayedFakeMessages(_FakeMessages):
+    """Same fake Anthropic client, but each ``create()`` call sleeps first
+    (an injected delay, widening the window a concurrent task can observe
+    the lock as held) and signals *started_event* the first time it's
+    called -- lets a test wait until it KNOWS the lock-holding call is
+    underway before starting a competing concurrent task, rather than
+    guessing with a bare sleep."""
+
+    def __init__(
+        self, *, responses: list[Any], delay_seconds: float, started_event: asyncio.Event
+    ) -> None:
+        super().__init__(responses=responses)
+        self._delay_seconds = delay_seconds
+        self._started_event = started_event
+
+    async def create(self, **kwargs: Any) -> Any:
+        if not self._started_event.is_set():
+            self._started_event.set()
+        await asyncio.sleep(self._delay_seconds)
+        return await super().create(**kwargs)
+
+
+async def _insert_bare_case(
+    session: AsyncSession, *, landlord_id: str, property_id: str, tenant_id: str
+) -> str:
+    case_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO cases (id, landlord_id, property_id, tenant_id, status, "
+            "langgraph_thread_id) "
+            "VALUES (:id, :landlord_id, :property_id, :tenant_id, 'open', :thread_id)"
+        ),
+        {
+            "id": case_id,
+            "landlord_id": landlord_id,
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "thread_id": str(uuid.uuid4()),
+        },
+    )
+    await session.commit()
+    return case_id
+
+
+@pytest.mark.integration
+async def test_concurrent_double_resume_exactly_one_proceeds(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two genuinely concurrent ``resume_case_thread`` calls for the SAME
+    case + draft_id + resume_value -- the per-case advisory lock must
+    serialize them so exactly one actually resumes the thread; the other
+    must observe (after waiting for the lock) that there is no longer a
+    live interrupt to resume."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the heat has been out since this morning",
+    )
+    _patch_client(monkeypatch, _happy_path_fake_messages())
+
+    try:
+        await run_graph(uuid.UUID(message_id))
+        case = await _case_row(db_session, landlord_id=landlord_id)
+        draft_id = await _pending_draft_id(db_session, case_id=case["id"])
+
+        results = await asyncio.gather(
+            resume_case_thread(
+                case_id=uuid.UUID(case["id"]),
+                draft_id=draft_id,
+                resume_value={"action": "approved"},
+            ),
+            resume_case_thread(
+                case_id=uuid.UUID(case["id"]),
+                draft_id=draft_id,
+                resume_value={"action": "approved"},
+            ),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if not isinstance(r, BaseException)]
+        failures = [r for r in results if isinstance(r, BaseException)]
+        assert len(successes) == 1, results
+        assert len(failures) == 1, results
+        assert isinstance(failures[0], CaseNotAwaitingApprovalError), failures[0]
+
+        # The thread genuinely only resumed once -- fully completed, no
+        # interrupt left over.
+        case_graph = compile_case_graph()
+        config = {"configurable": {"thread_id": case["langgraph_thread_id"]}}
+        snapshot = await case_graph.aget_state(config)
+        assert snapshot.next == ()
+        assert snapshot.interrupts == ()
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_concurrent_resume_racing_new_inbound_rerun_staleness_wins(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A landlord's approve tap (``resume_case_thread``, referencing the
+    OLD draft) races a tenant's new message (``run_graph``, which stales
+    that OLD draft and produces a fresh one) -- under the per-case lock,
+    staleness must win regardless of which one was "logically" initiated
+    first: the resume's own staleness check happens INSIDE the lock,
+    immediately before it would resume anything, so it always sees the
+    fully-committed truth, never a torn/interleaved read."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    first_message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the heat has been out since this morning",
+    )
+    _patch_client(monkeypatch, _happy_path_fake_messages(body="I'll take a look today."))
+
+    try:
+        await run_graph(uuid.UUID(first_message_id))
+        case = await _case_row(db_session, landlord_id=landlord_id)
+        first_draft_id = await _pending_draft_id(db_session, case_id=case["id"])
+
+        second_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="still no heat, it's getting cold in here",
+        )
+
+        started_event = asyncio.Event()
+        delayed_fake = _DelayedFakeMessages(
+            responses=[
+                _intent_response(),
+                _severity_response(),
+                _draft_response_message(body="I hear you, sending someone out shortly."),
+            ],
+            delay_seconds=0.4,
+            started_event=started_event,
+        )
+        _patch_client(monkeypatch, delayed_fake)
+
+        # run_graph acquires the per-case lock BEFORE its first (delayed)
+        # LLM call -- waiting for started_event guarantees the lock is
+        # already held by the time we launch the competing resume below.
+        run_graph_task = asyncio.create_task(run_graph(uuid.UUID(second_message_id)))
+        await asyncio.wait_for(started_event.wait(), timeout=5)
+
+        resume_task = asyncio.create_task(
+            resume_case_thread(
+                case_id=uuid.UUID(case["id"]),
+                draft_id=first_draft_id,
+                resume_value={"action": "approved"},
+            )
+        )
+
+        with pytest.raises(DraftStaleError) as exc_info:
+            await resume_task
+
+        await run_graph_task  # let the re-run finish cleanly
+
+        fresh_draft_id = await _pending_draft_id(db_session, case_id=case["id"])
+        assert fresh_draft_id != first_draft_id
+        assert exc_info.value.fresh_draft_id == fresh_draft_id
+        assert exc_info.value.draft_id == first_draft_id
+
+        # The thread ends up correctly paused on the FRESH draft -- the
+        # rejected resume attempt left nothing corrupted.
+        case_graph = compile_case_graph()
+        config = {"configurable": {"thread_id": case["langgraph_thread_id"]}}
+        snapshot = await case_graph.aget_state(config)
+        assert snapshot.next == ("await_approval",)
+        assert len(snapshot.interrupts) == 1
+        assert snapshot.interrupts[0].value["draft_id"] == str(fresh_draft_id)
     finally:
         await _cleanup(db_session, landlord_id)

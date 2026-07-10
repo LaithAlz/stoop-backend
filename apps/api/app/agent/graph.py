@@ -185,8 +185,10 @@ exit (that edge is checked FIRST by ``_route_after_draft_response`` and
 bypasses ``await_approval`` entirely, independent of whether any earlier
 thread on this case is still paused).
 
-Draining a pending interrupt before a stale-draft re-run (the #34
-spec-review PINNED WARNING — resolved by direct experiment, not assumption)
+Stale-draft re-run — verified NOT to need draining (the #34 spec-review
+PINNED WARNING, resolved by direct experiment — an EARLIER revision of
+this docstring drew the WRONG conclusion from a flawed experiment; see
+"Correction" below)
 ------------------------------------------------------------------------
 conversation-model.md's stale-draft rule: a new inbound message on a case
 with a pending draft must mark that draft ``stale`` and re-run the graph
@@ -200,39 +202,33 @@ on that case must also run on.
 The #34 spec review flagged this interaction as UNVERIFIED: does a plain
 ``ainvoke(new_state, config)`` on a thread that still holds a PENDING
 interrupt behave like the stale-draft rule needs? **Verified empirically
-against a real ``AsyncPostgresSaver``/Postgres checkpointer (three-call
-probe, not assumed):** it does NOT restart the run from ``START`` with the
-new input at all. LangGraph sees the thread already has a pending task
-(the interrupted ``await_approval`` attempt) and simply RE-EXECUTES THAT
-SAME PENDING TASK using the OLD checkpointed values — the new input is
-silently discarded, no exception is raised, and a brand-new (but
-functionally identical) ``Interrupt`` is produced. Left alone, this would
-mean a new tenant message arriving while a draft awaits approval would
-NEVER actually produce a fresh draft — the exact silent-staleness failure
-mode the stale-draft rule exists to prevent, just moved one layer down
-into LangGraph's own resume semantics.
+against a real ``AsyncPostgresSaver``/Postgres checkpointer, with
+genuinely DISTINGUISHABLE inputs across the two calls (a two-message
+probe keyed by ``message_id``, not the same input reused twice): YES —**
+a plain ``ainvoke(new_state, config)`` on a thread that is currently
+paused at ``interrupt()`` DOES restart the run from ``START`` using the
+NEW input, discarding whatever task was pending. There is no special
+handling needed anywhere in this module: calling ``run_graph`` again for a
+new message on the SAME case (the normal thing ``app/agent/graph_entry.py``
+already does per inbound message) transparently supersedes an
+in-progress pause — ``draft_response``'s existing stale-then-insert logic
+(marks the old pending draft ``stale``, inserts the new one) is ALL that
+is needed; the fresh run reaches ``mark_awaiting_approval -> await_approval``
+again on its own and produces a fresh pause.
 
-Fixed by :func:`_drain_pending_interrupt_if_any`, called by :func:`run_graph`
-immediately before every ``case_graph.ainvoke(...)`` call (unconditionally
-— a fresh thread's snapshot has no tasks and this is a cheap no-op, see its
-own docstring): if the thread's current state snapshot shows a task with a
-recorded ``interrupt`` (``StateSnapshot.interrupts`` non-empty — this is
-specifically HOW a live interrupt is distinguished from any other reason a
-task might be pending), resume it FIRST with a private sentinel value via
-``Command(resume=...)`` — discarding that resume's result entirely — before
-the real ``ainvoke(pre_routing_state, config)`` call. Verified (same
-probe, extended): draining first and then issuing a plain ``ainvoke`` with
-the new message's state on the now-unblocked thread DOES restart the run
-from ``START`` and DOES produce a fresh draft (``draft_response``'s
-existing stale-then-insert logic marks the old pending draft ``stale`` and
-inserts the new one, exactly as it already does for two back-to-back
-non-paused messages) and a fresh pause. This is the ONLY place that drain
-happens — ``await_approval`` itself has no branching logic on the resume
-value it receives (see that module's own docstring): the sentinel is
-purely a mechanism to unstick the checkpoint, never mistaken for a real
-approval (no approve/reject logic exists yet; that is #44/#45's resume
-value, delivered through :func:`resume_case_thread` instead, which never
-uses this sentinel).
+**Correction (this issue's own review round):** an EARLIER revision of
+this module added ``_drain_pending_interrupt_if_any`` — a step that
+resumed any pending interrupt with a private sentinel BEFORE every
+``ainvoke`` call, believing (from a FLAWED probe) that a plain ``ainvoke``
+on a paused thread silently replayed the stale pending task instead of
+restarting. That probe reused the IDENTICAL input dict for both calls,
+so it could not actually distinguish "replayed the stale task with old
+values" from "restarted fresh with new values" (both produce the same
+observed output when the input is unchanged) — a genuine methodology
+error, caught in review, corrected by re-running with distinguishable
+inputs (above). The drain step was accordingly REMOVED entirely — it was
+dead code (the test suite already passed identically without it, because
+the natural re-invocation already does the right thing).
 
 The resume seam for #44/#45 (implemented here, no HTTP endpoint — #43 scope)
 ------------------------------------------------------------------------
@@ -242,16 +238,45 @@ conversation-model.md's "staleness wins" edge case ("the approve action
 carries the draft id; if that id is already stale, the send is rejected"):
 it re-checks, at call time, that ``draft_id`` is STILL the case's one
 ``pending`` draft before ever touching the thread. If a new message
-superseded it in the meantime (the drain-and-rerun above already marked it
-``stale`` and produced a fresh pending draft), this raises
+superseded it in the meantime (a fresh ``run_graph`` call already marked
+it ``stale`` and produced a fresh pending draft), this raises
 :class:`DraftStaleError` (carrying the fresh draft's id) and the thread is
 left completely untouched — a stale resume must never resolve the WRONG
 (current, fresh) interrupt with a value meant for an old one. Only when
 the id still matches does it call ``Command(resume=...)`` on the thread.
+
+Per-case serialization — closing the TOCTOU between a resume and a
+concurrent new-inbound re-run (safety review, this issue's own review
+round, MERGE-BLOCKING)
+------------------------------------------------------------------------
+The staleness check above is not enough on its own: "check pending draft,
+then act" is a classic check-then-act race. A landlord's approve tap
+(``resume_case_thread``) can run CONCURRENTLY with a tenant's new message
+(``run_graph``) for the SAME case — both could read "draft D is pending"
+before either writes anything, then both proceed: the resume resolves
+whatever the CURRENT interrupt happens to be (which may by then be the
+FRESH one from the concurrent re-run) with a value meant for the OLD
+draft, and two truly concurrent resumes for the same draft could both
+pass the check and both call ``Command(resume=...)`` (a double-send once
+#44 exists). Fixed with :func:`_case_lock`: a Postgres
+``pg_advisory_xact_lock`` keyed on a stable pair of int4 values derived
+directly from ``case_id``'s own bits (see :func:`_case_lock_keys` — no
+``hashtext()`` needed, the UUID already has plenty of entropy), held for
+the FULL DURATION of both critical sections — :func:`run_graph`'s
+``case_graph.ainvoke(...)`` span AND :func:`resume_case_thread`'s entire
+check-then-resume span (the pending-draft re-read happens INSIDE the
+lock, immediately before ``Command(resume=...)``). Two callers for the
+SAME case_id now strictly serialize: whichever acquires the lock second
+sees the fully-committed result of the first (never a torn/interleaved
+read), so staleness is correctly detected under real concurrency, not just
+sequential tests. Verified with genuine concurrent-task tests (not just
+sequential calls) in ``tests/test_agent_shadow_interrupt.py`` — see that
+module's "Concurrency" section.
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, cast
 from uuid import UUID
@@ -262,6 +287,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.checkpointer import get_checkpointer
 from app.agent.nodes.await_approval import await_approval, mark_awaiting_approval
@@ -296,17 +322,6 @@ NODE_AWAIT_APPROVAL = "await_approval"
 _UNKNOWN_SENDER_THREAD_PREFIX = "message:"
 """Fallback checkpoint thread for a message that never attaches to a case
 (unknown sender) — see module docstring "Unknown-sender fallback thread"."""
-
-_STALE_DRAFT_DRAIN_SENTINEL: dict[str, Any] = {"__stale_draft_drain__": True}
-"""Resume value used ONLY by :func:`_drain_pending_interrupt_if_any` to
-unstick a thread whose PREVIOUS run is still paused at ``await_approval``'s
-``interrupt()`` — see module docstring "Draining a pending interrupt
-before a stale-draft re-run". Never used for a real approval/reject
-(that is :func:`resume_case_thread`'s resume value instead, which is never
-this sentinel) — ``await_approval`` itself never branches on the resume
-value it receives either way (see that node's own docstring), so this
-sentinel's only job is to let the paused attempt complete and reach
-``END``."""
 
 
 # ---------------------------------------------------------------------------
@@ -462,38 +477,61 @@ async def _resolve_thread_id(*, message_id: UUID, case_id: UUID | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Draining a pending interrupt before a stale-draft re-run — see module
-# docstring "Draining a pending interrupt before a stale-draft re-run" for
-# the full design and the empirical finding behind it.
+# Per-case serialization — see module docstring "Per-case serialization".
+# A Postgres advisory TRANSACTION lock (released automatically when the
+# holding session's transaction ends — commit OR rollback, both handled by
+# ``get_admin_session``) keyed on a stable, deterministic pair of int4
+# values derived directly from the case's own UUID bits (no ``hashtext()``
+# needed — the UUID is already 128 bits of good entropy; splitting it in
+# half gives two independent 32-bit keys with no extra hashing step).
 # ---------------------------------------------------------------------------
 
+_ADVISORY_LOCK_SQL = text("SELECT pg_advisory_xact_lock(:part1, :part2)")
 
-async def _drain_pending_interrupt_if_any(
-    case_graph: CompiledStateGraph[AgentState, None, AgentState, AgentState],
-    config: RunnableConfig,
-) -> None:
-    """If *config*'s thread is currently paused at a live ``interrupt()``
-    (``StateSnapshot.interrupts`` non-empty — this is specifically how a
-    genuinely-interrupted task is distinguished from any other reason a
-    task might be pending), resume it with a private, discarded sentinel
-    FIRST so the pending ``await_approval`` attempt completes and the
-    thread reaches ``END`` before the caller's own fresh ``ainvoke`` runs.
+_UINT32_UPPER_BOUND = 0xFFFFFFFF
+_INT32_OVERFLOW_THRESHOLD = 0x80000000
+_UINT32_RANGE_SIZE = 0x100000000
 
-    A no-op (cheap: one ``aget_state`` round trip) for a brand-new thread
-    (no checkpoint yet — ``snapshot.tasks`` is empty) or a thread that has
-    already run to completion (no pending tasks) — both verified
-    empirically to return an empty snapshot/no pending tasks, never an
-    error. Safe to call unconditionally before every
-    ``case_graph.ainvoke(...)`` in :func:`run_graph`.
+
+def _case_lock_keys(case_id: UUID) -> tuple[int, int]:
+    """Two independent Postgres ``int4`` (signed 32-bit) values derived
+    from *case_id* for ``pg_advisory_xact_lock``'s two-argument overload.
+    ``UUID.int`` is a 128-bit unsigned integer; the low and high 32 bits
+    are each masked out and re-interpreted as signed (Postgres ``int4``
+    range) — deterministic, same case_id always yields the same pair,
+    different case_ids yield different pairs (a UUID collision would be
+    required for two different cases to share a pair, which is the same
+    collision resistance the UUID primary key itself already relies on)."""
+    raw = case_id.int
+    part1 = raw & _UINT32_UPPER_BOUND
+    part2 = (raw >> 32) & _UINT32_UPPER_BOUND
+    if part1 >= _INT32_OVERFLOW_THRESHOLD:
+        part1 = part1 - _UINT32_RANGE_SIZE
+    if part2 >= _INT32_OVERFLOW_THRESHOLD:
+        part2 = part2 - _UINT32_RANGE_SIZE
+    return part1, part2
+
+
+@asynccontextmanager
+async def _case_lock(case_id: UUID) -> AsyncIterator[AsyncSession]:
+    """Hold a Postgres ``pg_advisory_xact_lock`` keyed on *case_id* for the
+    duration of the ``async with`` block — see module docstring "Per-case
+    serialization". Any OTHER caller (another ``run_graph`` invocation for
+    the SAME case, or a concurrent :func:`resume_case_thread` call) trying
+    to acquire the SAME key blocks at the DATABASE level until this block
+    exits (commit on clean exit, rollback on exception — either way the
+    lock releases with the transaction, via ``get_admin_session``). Yields
+    the lock-holding session so a caller can perform a read INSIDE the
+    locked span using the SAME connection (see :func:`resume_case_thread`'s
+    staleness re-read) without an extra pool checkout, though this is not
+    required — any other session's reads/writes made while this lock is
+    held are still fully serialized against other holders of this same
+    key, regardless of which connection performs them.
     """
-    snapshot = await case_graph.aget_state(config)
-    if not snapshot.interrupts:
-        return
-    log.info(
-        "graph_drained_pending_interrupt_before_rerun",
-        thread_id=config["configurable"]["thread_id"],
-    )
-    await case_graph.ainvoke(Command(resume=_STALE_DRAFT_DRAIN_SENTINEL), config=config)
+    part1, part2 = _case_lock_keys(case_id)
+    async with asynccontextmanager(get_admin_session)() as session:
+        await session.execute(_ADVISORY_LOCK_SQL, {"part1": part1, "part2": part2})
+        yield session
 
 
 # ---------------------------------------------------------------------------
@@ -530,13 +568,26 @@ class DraftStaleError(RuntimeError):
 class CaseNotAwaitingApprovalError(RuntimeError):
     """Raised by :func:`resume_case_thread` when *draft_id* IS the case's
     current pending draft, but the case's thread has no live interrupt to
-    resume at all — a KNOWN, discovered gap (not fixed here, out of #43's
-    scope): ``draft_response``'s degraded-mode exit (EMERGENCY /
-    ``draft_guard_failed``) still inserts a ``pending`` draft, but routes
-    to ``degraded_mode`` instead of ``await_approval`` (module docstring
-    "Shadow mode (#43)"), so that draft is never actually paused behind an
-    interrupt. Distinct from :class:`DraftStaleError`: the draft id is
-    CORRECT here, there is simply nothing paused to approve."""
+    resume at all. TWO known causes collapse into this same exception
+    (both mean "there is nothing paused to resume right now", the caller's
+    remedy is the same either way — refresh and look again):
+
+    1. A KNOWN, discovered gap (not fixed here, out of #43's scope):
+       ``draft_response``'s degraded-mode exit (EMERGENCY /
+       ``draft_guard_failed``) still inserts a ``pending`` draft, but
+       routes to ``degraded_mode`` instead of ``mark_awaiting_approval``
+       (module docstring "Shadow mode (#43)"), so that draft is never
+       actually paused behind an interrupt.
+    2. A genuine concurrent-resume race (safety review, "Per-case
+       serialization"): under :func:`_case_lock`, a SECOND concurrent
+       ``resume_case_thread`` call for the same draft blocks until the
+       FIRST one finishes; by the time it acquires the lock, the FIRST
+       call has already resumed the thread to completion (no interrupt
+       left), so it correctly lands here rather than double-resuming.
+
+    Distinct from :class:`DraftStaleError`: the draft id is CORRECT here,
+    there is simply nothing paused to approve (whether because it never
+    was, or because someone else just resumed it)."""
 
     def __init__(self, *, case_id: UUID, draft_id: UUID) -> None:
         self.case_id = case_id
@@ -553,33 +604,37 @@ async def resume_case_thread(*, case_id: UUID, draft_id: UUID, resume_value: Any
     (reject/edit-and-send) call once those endpoints exist (this issue,
     #43, implements the mechanics and tests only; no HTTP surface).
 
-    Re-checks, at call time, that *draft_id* is STILL the case's one
-    ``pending`` draft before ever touching the thread (raises
-    :class:`DraftStaleError` otherwise), AND that the thread actually has a
-    live interrupt to resume (raises :class:`CaseNotAwaitingApprovalError`
-    otherwise — see that class's own docstring). Only when both hold does
-    this call ``Command(resume=resume_value)`` on the resolved thread and
-    return the resulting state.
+    The ENTIRE check-then-resume span runs inside :func:`_case_lock` (see
+    module docstring "Per-case serialization") — the pending-draft
+    staleness re-read happens INSIDE the lock, immediately before
+    ``Command(resume=...)``, so a concurrent ``run_graph`` re-run for the
+    same case (or a concurrent second resume attempt) can never race this
+    check. Raises :class:`DraftStaleError` if *draft_id* is no longer the
+    case's pending draft, or :class:`CaseNotAwaitingApprovalError` if the
+    thread has no live interrupt to resume (see that class's own
+    docstring for both ways that can happen). Only when both checks pass
+    does this call ``Command(resume=resume_value)`` on the resolved
+    thread and return the resulting state.
     """
-    async with asynccontextmanager(get_admin_session)() as session:
+    async with _case_lock(case_id) as session:
         pending_row = (
             (await session.execute(_SELECT_PENDING_DRAFT_ID_SQL, {"case_id": str(case_id)}))
             .mappings()
             .one_or_none()
         )
-    fresh_draft_id: UUID | None = pending_row["id"] if pending_row is not None else None
-    if fresh_draft_id != draft_id:
-        raise DraftStaleError(case_id=case_id, draft_id=draft_id, fresh_draft_id=fresh_draft_id)
+        fresh_draft_id: UUID | None = pending_row["id"] if pending_row is not None else None
+        if fresh_draft_id != draft_id:
+            raise DraftStaleError(case_id=case_id, draft_id=draft_id, fresh_draft_id=fresh_draft_id)
 
-    thread_id = await _select_case_thread_id(case_id)
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
-    case_graph = compile_case_graph()
+        thread_id = await _select_case_thread_id(case_id)
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        case_graph = compile_case_graph()
 
-    snapshot = await case_graph.aget_state(config)
-    if not snapshot.interrupts:
-        raise CaseNotAwaitingApprovalError(case_id=case_id, draft_id=draft_id)
+        snapshot = await case_graph.aget_state(config)
+        if not snapshot.interrupts:
+            raise CaseNotAwaitingApprovalError(case_id=case_id, draft_id=draft_id)
 
-    result = await case_graph.ainvoke(Command(resume=resume_value), config=config)
+        result = await case_graph.ainvoke(Command(resume=resume_value), config=config)
     return cast("AgentState", result)
 
 
@@ -598,10 +653,12 @@ async def run_graph(message_id: UUID) -> AgentState:
     ``__interrupt__`` marker (the run paused, it did not raise; see
     :func:`app.agent.nodes.await_approval.await_approval`'s docstring).
 
-    Before invoking the case-scoped graph, drains any PENDING interrupt
-    already sitting on this case's thread from an earlier message — see
-    module docstring "Draining a pending interrupt before a stale-draft
-    re-run" for why this must happen first.
+    When a case is known, the entire case-graph invoke span runs inside
+    :func:`_case_lock` (see module docstring "Per-case serialization") —
+    serializing this call against any concurrent ``run_graph`` OR
+    :func:`resume_case_thread` call for the SAME case, so a landlord's
+    approve tap can never race a tenant's new message into resolving the
+    wrong draft.
 
     Only ``message_id`` is needed — ``identify_property`` re-derives every
     other identifier (``landlord_id``/``property_id``/``tenant_id``) from
@@ -632,14 +689,17 @@ async def run_graph(message_id: UUID) -> AgentState:
     case_graph = compile_case_graph()
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-    # Stale-draft rule (#43): a new message may land on a case whose
-    # thread is still paused at await_approval's interrupt() from an
-    # earlier message. See module docstring "Draining a pending interrupt
-    # before a stale-draft re-run" for why this must run BEFORE the
-    # ainvoke below, not after.
-    await _drain_pending_interrupt_if_any(case_graph, config)
-
-    case_result = await case_graph.ainvoke(pre_routing_state, config=config)
+    if case_context.case_id is not None:
+        # Per-case serialization (safety review, "Per-case serialization")
+        # — never let a concurrent resume_case_thread call for this SAME
+        # case interleave with this invoke span.
+        async with _case_lock(case_context.case_id):
+            case_result = await case_graph.ainvoke(pre_routing_state, config=config)
+    else:
+        # Unknown-sender fallback thread (module docstring "Unknown-sender
+        # fallback thread") — no case exists to serialize by, and nothing
+        # else can race a per-message thread anyway.
+        case_result = await case_graph.ainvoke(pre_routing_state, config=config)
     final_state = cast("AgentState", case_result)
 
     log.info(

@@ -55,6 +55,41 @@ pipeline for it. Rare in practice (unknown senders should be uncommon)
 but a real, discovered cost tradeoff — worth a dedicated completion
 signal for that path if it turns out to matter in production.
 
+Crash-window coherence with #43's ``mark_awaiting_approval`` (safety
+review MEDIUM, #43 fix round)
+------------------------------------------------------------------------
+``draft_response`` and ``mark_awaiting_approval`` are TWO SEPARATE nodes
+(``app/agent/graph.py``'s case-scoped graph) — LangGraph commits
+``draft_response``'s own output (the draft row + the ``'drafted'`` audit
+row this module's completion check was already reading) as soon as THAT
+node completes, independently of whether the NEXT node
+(``mark_awaiting_approval``, which flips ``cases.status`` to
+``'awaiting_approval'``) ever runs at all. A crash in that exact window
+(the durable marker written, the case-status transition not yet reached)
+combined with the OLD completion check (``'drafted'`` alone, regardless of
+case status) would have skipped every future redelivery of this message
+FOREVER — leaving the case stuck at whatever status it was in BEFORE this
+run (``'open'`` for a brand-new case), which is ``AUTO_STALE_ELIGIBLE``
+(``app/agent/case_lifecycle.py``): a case could silently auto-resolve
+14 days later with an un-acted, never-shown ``pending`` draft still
+sitting on it — the audit trail would look "complete" while the actual
+approval workflow silently never happened.
+
+Fixed: :data:`_ALREADY_COMPLETED_SQL`'s ``'drafted'`` branch now ALSO
+requires the case (joined via ``audit_log.case_id`` — already populated
+on every ``'drafted'`` row, see ``draft_response.py``) to have a status
+OTHER than ``'open'`` — i.e., that ``mark_awaiting_approval`` (or any
+other transition away from ``'open'``) actually ran. The ``'degraded_mode'``
+branch is UNCHANGED (unconditional): that exit never touches
+``cases.status`` at all (module docstring "Shadow mode (#43)" in
+``app/agent/graph.py``), so there is nothing further to wait for there.
+If the join condition is false (crash window hit), ``already_completed``
+is correctly ``False`` and a redelivery RE-RUNS the graph from scratch —
+a second (paid) draft/classification pass, but the SAME stale-then-insert
+absorption every other re-run already relies on, and the case reliably
+reaches ``awaiting_approval`` this time. A rare, bounded extra cost is
+preferable to a case silently stuck forever.
+
 ``message_received`` itself is now PURELY an observability/audit-trail
 line, not a gate — appended idempotently (see below) the first time this
 process sees the message, regardless of whether the graph goes on to
@@ -129,12 +164,23 @@ from app.db.session import get_admin_session
 log = structlog.get_logger(__name__)
 
 # Completion marker — see module docstring "Gating on COMPLETION, not
-# RECEIPT". Deliberately NOT keyed on 'message_received'.
+# RECEIPT" and "Crash-window coherence with #43's mark_awaiting_approval".
+# Deliberately NOT keyed on 'message_received'. The 'drafted' branch
+# requires the case to have moved past 'open' (mark_awaiting_approval, or
+# any other transition, actually ran) -- 'degraded_mode' needs no such
+# check, that exit never touches cases.status at all.
 _ALREADY_COMPLETED_SQL = text(
-    "SELECT EXISTS ("
-    "  SELECT 1 FROM audit_log"
-    "  WHERE action IN ('drafted', 'degraded_mode')"
-    "    AND payload ->> 'message_id' = :message_id"
+    "SELECT ("
+    "  EXISTS ("
+    "    SELECT 1 FROM audit_log"
+    "    WHERE action = 'degraded_mode' AND payload ->> 'message_id' = :message_id"
+    "  )"
+    "  OR EXISTS ("
+    "    SELECT 1 FROM audit_log al JOIN cases c ON c.id = al.case_id"
+    "    WHERE al.action = 'drafted'"
+    "      AND al.payload ->> 'message_id' = :message_id"
+    "      AND c.status <> 'open'"
+    "  )"
     ")"
 )
 
