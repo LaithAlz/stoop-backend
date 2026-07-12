@@ -49,6 +49,19 @@
 `PATCH /v1/me` — body: any of `full_name`, `phone`, `timezone`,
 `voice_profile`. Emergency notifications are not a settable preference.
 
+**v1.9 amendment (2026-07-12 — #57 implementation):** `PATCH` never
+lazily provisions — a caller with no live `landlords` row (never
+provisioned, or soft-deleted) gets the same 403 `account_deleted` as
+`GET`/`require_landlord`, and nothing is written. `timezone` is `NOT NULL`
+in schema-v1.md; an explicit `null` 422s with code `invalid_field` rather
+than a raw `NotNullViolation`. Issue #57's own acceptance criteria
+additionally lists "notification prefs" and "quiet-hours overrides" as
+settable here — neither has a column on `landlords` in schema-v1.md, and
+this shape (the four fields above) already predates that AC. NOT
+implemented pending a schema-doc-first decision (add the columns, or
+confirm quiet-hours stays property-scoped only per the `Property.
+quiet_hours` field above and drop the AC bullet).
+
 `GET/PATCH /v1/me` use `require_user` directly (the provisioning path — a
 brand-new auth user has no `landlords` row yet, and this lazily creates
 one), not `require_landlord`. `GET /v1/me`'s own upsert now filters
@@ -80,6 +93,15 @@ Provisions a Twilio number (#53); 201 → full `Property`.
   "created_at": "…" }
 ```
 
+**v1.9 amendment (2026-07-12 — #54 implementation):** `DELETE` can also
+409 with code `has_dependents` when the property survives the
+`has_open_cases` check but still has FK-referencing `tenants`/`cases`/
+`messages` rows (`ON DELETE RESTRICT`, schema-v1.md) — surfaced cleanly
+instead of a raw 500 on the underlying `IntegrityError`. `GET`/`PATCH`/
+`DELETE /v1/properties/{id}` 404 with code `property_not_found` for a
+missing or cross-tenant id (the two are indistinguishable by design — never
+leak cross-tenant existence).
+
 ## Tenants & Vendors
 
 `GET/POST /v1/properties/{id}/tenants` · `PATCH/DELETE /v1/tenants/{id}`
@@ -87,6 +109,18 @@ Tenant body/shape: `name?`, `phone`, `unit?`, `vulnerable_occupant?`, `notes?`.
 
 `GET/POST /v1/vendors` · `PATCH/DELETE /v1/vendors/{id}`
 Vendor shape: `name`, `trade`, `phone`, `notes?`, `working_hours?`, `active`.
+
+**v1.9 amendment (2026-07-12 — #54 implementation):** `DELETE` on both
+resources is a SOFT delete (`active = false`, returns the updated row) —
+neither `tenants` nor `vendors` has a `deleted_at` column (schema-v1.md),
+and both are referenced by `ON DELETE RESTRICT` FKs (`cases`/`messages` →
+`tenants`; `cases` → `vendors`), so a hard delete is often structurally
+impossible anyway once history exists. Idempotent: deleting an
+already-inactive row just re-confirms the state. 404 codes:
+`tenant_not_found` / `vendor_not_found`, same cross-tenant-safe
+non-disclosure as `property_not_found` above. `GET /v1/properties/{id}/
+tenants` is unpaginated (per-property tenant counts are small); `GET
+/v1/vendors` follows the standard cursor convention.
 
 ## Queue (the dashboard's main read)
 
@@ -174,9 +208,39 @@ oldest-first):
       "body": "…", "media": [], "at": "…" },
     { "kind": "audit", "actor": "agent", "action": "classified",
       "payload": { "severity": "urgent", "rules_fired": ["…"] }, "at": "…" },
-    { "kind": "draft", "status": "pending", "body": "…", "at": "…" }
+    { "kind": "draft", "id": "…", "status": "pending", "body": "…", "at": "…" }
   ] }
 ```
+404 with code `case_not_found` for a missing or cross-tenant id (same
+non-disclosure convention as `property_not_found`).
+
+**v1.9 amendments (2026-07-12 — #55 implementation):**
+- **`draft` timeline entries gain `id`** (the draft's uuid) — closes one of
+  PR #190's three catalogued contract gaps: the dashboard needs it to wire
+  approve/undo/reject actions from inside the thread view, exactly like
+  `GET /v1/queue`'s `draft_id`. Additive field, not a breaking change.
+- **`payload.summary` surfacing** (PR #190's second gap) needed no contract
+  change: the audit timeline entry was always specified as the full,
+  opaque `audit_log.payload` object, so `summary` (schema-v1 v1.7) surfaces
+  automatically once `classify_severity` writes it — implementations must
+  pass the payload column through verbatim, never reconstruct a narrower
+  shape.
+- **Media captions** (PR #190's third gap) remain UNRESOLVED — `messages.
+  media` (schema-v1.md) is `[{url, content_type}]` with no caption
+  sub-key, and captioning is MMS-pipeline work (#46) that hasn't landed.
+  Flagged, not invented.
+- **`GET /v1/messages` is NOT specified.** Issue #55's acceptance criteria
+  additionally lists a "channel view per tenant" endpoint, but no shape for
+  it exists anywhere in this doc, and PR #190's frontend rebuild already
+  consumes `GET /v1/cases/{id}`'s timeline as the conversation view
+  instead. Not implemented pending a doc-first decision: either specify a
+  real `GET /v1/messages` shape, or confirm the case timeline supersedes it
+  and drop the AC bullet.
+- **Pagination cursor validation:** a malformed `cursor` on any
+  cursor-paginated list (`GET /v1/properties`, `GET /v1/vendors`,
+  `GET /v1/cases`) 400s with code `invalid_cursor` rather than 500ing or
+  silently ignoring it.
+
 `POST /v1/cases/{id}/resolve` — body `{ "reason": "landlord" }` → 200.
 `POST /v1/cases/{id}/ask-vendor` — body `{ "vendor_id": "…", "note?": "…" }`
 → 201 `{ "draft_id": "…" }` (vendor draft enters the same queue, #115).

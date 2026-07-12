@@ -18,6 +18,12 @@ still duplicate these helpers locally (``test_agent_nodes.py``,
 ``test_agent_draft_response.py``, ``test_webhooks_twilio_sms.py``, and
 others) is explicitly OUT OF SCOPE for this extraction — a follow-up, not
 done unilaterally here.
+
+``insert_vendor``/``insert_case``/``insert_audit_log``/``insert_draft``
+were added for #54/#55/#57's new router test modules
+(``test_properties_router.py``, ``test_tenants_router.py``,
+``test_vendors_router.py``, ``test_cases_router.py``) — same shape
+convention as every helper above.
 """
 
 from __future__ import annotations
@@ -153,10 +159,128 @@ async def insert_message(
     return message_id
 
 
+async def insert_vendor(
+    session: AsyncSession,
+    landlord_id: str,
+    *,
+    trade: str = "plumbing",
+    active: bool = True,
+    name: str = "Test Vendor",
+) -> str:
+    vendor_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO vendors (id, landlord_id, name, trade, phone, active) "
+            "VALUES (:id, :landlord_id, :name, :trade, :phone, :active)"
+        ),
+        {
+            "id": vendor_id,
+            "landlord_id": landlord_id,
+            "name": name,
+            "trade": trade,
+            "phone": fresh_phone(),
+            "active": active,
+        },
+    )
+    await session.commit()
+    return vendor_id
+
+
+async def insert_case(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    property_id: str,
+    tenant_id: str,
+    status: str = "open",
+    severity: str | None = None,
+    title: str | None = None,
+) -> str:
+    case_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO cases (id, landlord_id, property_id, tenant_id, status, severity, "
+            "title, langgraph_thread_id) "
+            "VALUES (:id, :landlord_id, :property_id, :tenant_id, :status, :severity, :title, "
+            ":thread_id)"
+        ),
+        {
+            "id": case_id,
+            "landlord_id": landlord_id,
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "status": status,
+            "severity": severity,
+            "title": title,
+            "thread_id": f"thread-{uuid.uuid4()}",
+        },
+    )
+    await session.commit()
+    return case_id
+
+
+async def insert_audit_log(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    case_id: str | None = None,
+    actor: str = "agent",
+    action: str = "classified",
+    payload: dict[str, Any] | None = None,
+) -> int:
+    result = await session.execute(
+        text(
+            "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+            "VALUES (:landlord_id, :case_id, :actor, :action, CAST(:payload AS jsonb)) "
+            "RETURNING id"
+        ),
+        {
+            "landlord_id": landlord_id,
+            "case_id": case_id,
+            "actor": actor,
+            "action": action,
+            "payload": json.dumps(payload or {}),
+        },
+    )
+    await session.commit()
+    return int(result.scalar_one())
+
+
+async def insert_draft(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    case_id: str,
+    status: str = "pending",
+    body: str = "test draft body",
+) -> str:
+    draft_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO drafts (id, landlord_id, case_id, recipient, body, prompt_version, "
+            "status) "
+            "VALUES (:id, :landlord_id, :case_id, 'tenant', :body, 'v1', :status)"
+        ),
+        {
+            "id": draft_id,
+            "landlord_id": landlord_id,
+            "case_id": case_id,
+            "body": body,
+            "status": status,
+        },
+    )
+    await session.commit()
+    return draft_id
+
+
 __all__: list[str] = [
     "fresh_phone",
+    "insert_audit_log",
+    "insert_case",
+    "insert_draft",
     "insert_landlord",
     "insert_message",
     "insert_property",
     "insert_tenant",
+    "insert_vendor",
 ]

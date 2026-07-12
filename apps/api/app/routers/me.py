@@ -108,6 +108,7 @@ endpoint (#53 onward) must use ``require_landlord`` + the ordinary request
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
@@ -119,6 +120,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audit import record_audit_log
 from app.db.session import get_admin_session
 from app.deps import ACCOUNT_DELETED_CODE, ACCOUNT_DELETED_MESSAGE, require_user
 from app.errors import AppError
@@ -153,6 +155,21 @@ class MeResponse(BaseModel):
     created_at: datetime
 
 
+class MeUpdateRequest(BaseModel):
+    """``PATCH /v1/me`` body — api-contracts.md: "any of full_name, phone,
+    timezone, voice_profile. Emergency notifications are not a settable
+    preference." There is no notification-preference or quiet-hours-override
+    field here: ``landlords`` (schema-v1.md) has no such column, and
+    api-contracts.md's ``PATCH /v1/me`` shape does not list one either — see
+    this module's PATCH endpoint docstring for the full gap note.
+    """
+
+    full_name: str | None = None
+    phone: str | None = None
+    timezone: str | None = None
+    voice_profile: dict[str, Any] | None = None
+
+
 # ---------------------------------------------------------------------------
 # Upsert SQL — race-safe, single statement
 # ---------------------------------------------------------------------------
@@ -176,6 +193,29 @@ _UPSERT_SQL = text(
 # writes anything; just distinguishes "the WHERE clause suppressed an
 # UPDATE against a soft-deleted row" from anything else.
 _DELETED_CHECK_SQL = text("SELECT deleted_at FROM landlords WHERE auth_user_id = :auth_user_id")
+
+# ---------------------------------------------------------------------------
+# PATCH SQL
+# ---------------------------------------------------------------------------
+
+_SELECT_LIVE_PROFILE_SQL = text(
+    """
+    SELECT id, email, full_name, timezone, voice_profile, price_cohort,
+           subscription_tier, subscription_status, created_at
+    FROM landlords WHERE auth_user_id = :auth_user_id AND deleted_at IS NULL
+    """
+)
+
+# `WHERE deleted_at IS NULL` in the UPDATE itself (not just the pre-check
+# SELECT above) -- same atomicity rationale as GET /v1/me's upsert: a
+# soft-delete racing between the SELECT and this UPDATE must never resurrect
+# or silently apply a write to a deleted row.
+_UPDATE_SQL_TEMPLATE = (
+    "UPDATE landlords SET {set_clause}, updated_at = now() "
+    "WHERE auth_user_id = :auth_user_id AND deleted_at IS NULL "
+    "RETURNING id, email, full_name, timezone, voice_profile, price_cohort, "
+    "subscription_tier, subscription_status, created_at"
+)
 
 # ---------------------------------------------------------------------------
 # Endpoint
@@ -277,6 +317,136 @@ async def get_me(
         )
 
     log.info("me_upserted", landlord_id=str(row["id"]))
+
+    return MeResponse(
+        id=row["id"],
+        email=row["email"],
+        full_name=row["full_name"],
+        timezone=row["timezone"],
+        voice_profile=row["voice_profile"],
+        price_cohort=row["price_cohort"],
+        subscription_tier=row["subscription_tier"],
+        subscription_status=row["subscription_status"],
+        created_at=row["created_at"],
+    )
+
+
+@router.patch("/me", response_model=MeResponse)
+async def update_me(
+    body: MeUpdateRequest,
+    user: Annotated[AuthUser, Depends(require_user)],
+    session: Annotated[AsyncSession, Depends(get_admin_session)],
+) -> MeResponse:
+    """Update the authenticated landlord's settable profile fields.
+
+    ``require_user`` + ``get_admin_session``, NOT ``require_landlord`` — same
+    reasoning as ``GET /v1/me`` (module docstring): this is still the
+    ``/v1/me`` provisioning surface, and a brand-new auth user who PATCHes
+    before ever GETting has no ``landlords`` row for ``require_landlord`` to
+    resolve. Unlike GET, PATCH never creates a row — a missing/soft-deleted
+    row is always 403 ``account_deleted`` here (no upsert-on-PATCH).
+
+    Body: any of ``full_name``, ``phone``, ``timezone``, ``voice_profile``
+    (api-contracts.md's ``PATCH /v1/me`` shape, verbatim). Emergency
+    notifications are NOT a settable preference here by construction: there
+    is no notification-preference field on this model, and none on
+    ``landlords`` in schema-v1.md — the severity contract is not something
+    this endpoint (or any endpoint) can turn off.
+
+    Gap note: issue #57's own acceptance criteria additionally lists
+    "notification prefs" and "quiet-hours overrides" as settable via this
+    endpoint. Neither has a column on ``landlords`` in schema-v1.md, and
+    api-contracts.md's ``PATCH /v1/me`` shape lists only the four fields
+    above — per the hard "never invent a column/shape" rule, these are NOT
+    implemented here. Flagged as a gap for a schema-doc-first decision
+    (either add the columns, or confirm quiet-hours stays property-scoped
+    only and drop the AC bullet).
+
+    Raises
+    ------
+    AppError
+        403 ``account_deleted`` if no live ``landlords`` row exists for this
+        ``auth_user_id`` — collapses "never provisioned" and "soft-deleted"
+        into the same response, exactly like ``require_landlord`` and
+        ``GET /v1/me``.
+        422 ``invalid_field`` if ``timezone`` is explicitly set to ``null``
+        (``landlords.timezone`` is ``NOT NULL`` in schema-v1.md) — rejected
+        before any write, never a raw 500 ``NotNullViolation``.
+    """
+    structlog.contextvars.bind_contextvars(auth_user_id=str(user.user_id))
+
+    existing = (
+        (await session.execute(_SELECT_LIVE_PROFILE_SQL, {"auth_user_id": str(user.user_id)}))
+        .mappings()
+        .one_or_none()
+    )
+    if existing is None:
+        raise AppError(
+            status_code=403,
+            code=ACCOUNT_DELETED_CODE,
+            message=ACCOUNT_DELETED_MESSAGE,
+        )
+
+    provided = body.model_dump(exclude_unset=True)
+    if not provided:
+        return MeResponse(
+            id=existing["id"],
+            email=existing["email"],
+            full_name=existing["full_name"],
+            timezone=existing["timezone"],
+            voice_profile=existing["voice_profile"],
+            price_cohort=existing["price_cohort"],
+            subscription_tier=existing["subscription_tier"],
+            subscription_status=existing["subscription_status"],
+            created_at=existing["created_at"],
+        )
+
+    if "timezone" in provided and provided["timezone"] is None:
+        raise AppError(status_code=422, code="invalid_field", message="timezone cannot be null.")
+
+    set_clauses: list[str] = []
+    params: dict[str, Any] = {"auth_user_id": str(user.user_id)}
+    for field, value in provided.items():
+        if field == "voice_profile":
+            set_clauses.append("voice_profile = CAST(:voice_profile AS jsonb)")
+            params["voice_profile"] = None if value is None else json.dumps(value)
+        else:
+            set_clauses.append(f"{field} = :{field}")
+            params[field] = value
+
+    update_sql = text(_UPDATE_SQL_TEMPLATE.format(set_clause=", ".join(set_clauses)))
+    row = (await session.execute(update_sql, params)).mappings().one_or_none()
+
+    if row is None:
+        # Same race the GET upsert guards against: the row was soft-deleted
+        # between the SELECT above and this UPDATE. Confirm, don't assume.
+        deleted_row = (
+            (await session.execute(_DELETED_CHECK_SQL, {"auth_user_id": str(user.user_id)}))
+            .mappings()
+            .one_or_none()
+        )
+        if deleted_row is not None and deleted_row["deleted_at"] is not None:
+            raise AppError(
+                status_code=403,
+                code=ACCOUNT_DELETED_CODE,
+                message=ACCOUNT_DELETED_MESSAGE,
+            )
+        raise RuntimeError(
+            "PATCH /v1/me update returned no row and no soft-deleted "
+            "landlord row was found for this auth_user_id -- invariant "
+            "violation"
+        )
+
+    if "voice_profile" in provided and row["voice_profile"] != existing["voice_profile"]:
+        await record_audit_log(
+            session,
+            landlord_id=str(row["id"]),
+            actor="landlord",
+            action="settings_changed",
+            payload={"resource": "me", "field": "voice_profile"},
+        )
+
+    log.info("me_updated", landlord_id=str(row["id"]))
 
     return MeResponse(
         id=row["id"],
