@@ -303,8 +303,9 @@ consistent position, just possibly not the one the client expected).
 ```
 - 409 `draft_stale` if a newer tenant message invalidated it — body
   includes `"fresh_draft_id"`. Idempotent on repeat.
-- 409 `already_sent` if the draft is already `sending`/`sent` (a
-  concurrent caller's approve/the sender already claimed it).
+- Repeat approve on an already `approved`/`sending`/`sent` draft is 200
+  idempotent (same stored `scheduled_send_at`/`undo_until`), never a 409 —
+  `already_sent` belongs to the undo/reject paths only.
 - Undo window is +5s from the dashboard (approve-by-SMS: +5min — see
   Webhooks).
 `DELETE /v1/drafts/{id}/approve` → 200 `{ "status": "pending" }`
