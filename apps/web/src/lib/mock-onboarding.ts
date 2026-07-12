@@ -3,11 +3,25 @@
  * Mock-first, same doctrine as the other Clarity screens (app.index.tsx,
  * app.conversations.*): no real auth/API calls happen here. Field names
  * mirror `schema-v1.md` / `api-contracts.md` where a real column exists —
- * see the CONTRACT GAP notes below for the one place this wizard's shape
- * (issue #113's AC) diverges from what's actually documented.
+ * see the CONTRACT GAP note below (on `Tone`) for the one place this
+ * wizard's shape diverges from issue #113's AC.
  */
 
-/** `landlords.voice_profile` shape (schema-v1.md): `{tone, samples}`. */
+/**
+ * `landlords.voice_profile` shape (schema-v1.md:352): `{tone: text,
+ * samples: text[]}`.
+ *
+ * CONTRACT GAP: issue #113's AC says "Voice profile stored per
+ * property," but the schema puts `voice_profile` on `landlords`, not
+ * `properties` — confirmed by the agent's own context loader
+ * (`apps/api/app/agent/nodes/load_context.py`, `_load_voice_profile`),
+ * which reads it with `SELECT voice_profile FROM landlords WHERE id =
+ * :landlord_id`, never by `property_id`. This wizard follows the real
+ * schema (one voice profile per landlord account, shared across every
+ * property they own) rather than silently reshaping the AC's words to
+ * fit — `OnboardingState.voiceSamples`/`.tone` below become that single
+ * per-landlord `voice_profile`, not a per-property field.
+ */
 export type Tone = "warm" | "direct" | "formal" | "casual";
 
 export interface ToneOption {
@@ -121,7 +135,10 @@ export interface OnboardingState {
   account: OnboardingAccount;
   property: OnboardingProperty;
   tenants: OnboardingTenant[];
+  /** Becomes `landlords.voice_profile.samples` — per-landlord, not
+   * per-property; see the CONTRACT GAP note on `Tone` above. */
   voiceSamples: string[];
+  /** Becomes `landlords.voice_profile.tone` — same per-landlord note. */
   tone: Tone;
   houseRules: HouseRules;
   backupContact: BackupContact;

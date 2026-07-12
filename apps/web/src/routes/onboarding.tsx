@@ -1,5 +1,12 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useEffect, useRef, useState } from "react";
+import {
+  cloneElement,
+  isValidElement,
+  useEffect,
+  useRef,
+  useState,
+  type ReactElement,
+} from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -51,19 +58,45 @@ import {
  * Step order: welcome → account → your first property → tenants →
  * how Stoop texts (voice sample + tone + house rules) → backup
  * contact & emergency basics → done (provision → tenant notice →
- * test round-trip). This groups every field issue #113's AC calls for
+ * test round-trip). This covers every field issue #113's AC calls for
  * (house rules, heating season, backup contact, voice-profile capture,
  * tenant disclosure + confirm-sent checkbox, first-message test) with
  * one deliberate reshuffle from the AC's literal "property details"
- * grouping — heating season moved next to house rules (same
- * `properties` table neighbourhood in schema-v1.md) and backup contact
- * moved to its own emergency-framed step — see the shipping report for
- * the full rationale.
+ * grouping: heating season moved next to house rules (same
+ * `properties` table neighbourhood in schema-v1.md as `quiet_hours`,
+ * and the same "rules Stoop follows" narrative as tone/voice), and
+ * backup contact moved to its own step so it can sit next to the
+ * emergency-escalation explanation (`SeverityPlaque` + the plain-English
+ * "who we call next" copy) instead of being one more field on the
+ * property-basics form.
+ *
+ * Dropped from the old (Heritage) onboarding: lease basics (rent/deposit/
+ * lease end — no `properties` column for any of these in schema-v1.md)
+ * and vendor capture. The vendor drop is scope, not a schema gap: the
+ * `vendors` table is real and fully schema-backed (schema-v1.md's
+ * `vendors` table — name/trade/phone/notes/working_hours/active); it's
+ * just that issue #113's AC never lists a vendor-capture step, so this
+ * wizard leaves it to Properties → Add vendor (already built,
+ * app.properties_.$id_.settings.tsx) rather than inventing a step the AC
+ * doesn't ask for. (The one genuinely ungrounded field in the old
+ * Heritage vendor step was `vendorAfterHours` — no matching schema-v1.md
+ * column — which is why that field specifically never made it into the
+ * settings screen's mock `Vendor` type either.)
+ *
+ * Voice-sample minimum (founder-vetoable ruling, orchestrator synthesis
+ * of issue #113's AC — "3–5 pasted real replies" — and this wizard's own
+ * skip pattern): ≥3 non-empty samples if the step is engaged at all
+ * (Continue blocks below that with a plain-English error), but the step
+ * stays fully skippable via "Skip for now" — voice/drafting is Full Plan
+ * territory per the welcome step's own free-vs-paid framing, so deferring
+ * it entirely (skip) has to stay as valid a path as clearing the AC's bar.
  *
  * A11y: each step focuses its own `<h1>` on mount (a fresh mount per
  * step, since the active step unmounts/remounts rather than persisting
  * hidden siblings) — the #190 focus-management pattern applied to a
- * multi-step flow instead of a route change.
+ * multi-step flow instead of a route change. Every `Field` with an error
+ * wires `aria-invalid` + `aria-describedby` onto its control (matching
+ * design-system.tsx's established error pattern, ~line 305).
  */
 
 export const Route = createFileRoute("/onboarding")({
@@ -74,7 +107,7 @@ export const Route = createFileRoute("/onboarding")({
       {
         name: "description",
         content:
-          "Set up your first property on Stoop. Six short steps, about five minutes — the Emergency Line is free, forever.",
+          "Set up your first property on Stoop. Five short steps, about five minutes — the Emergency Line is free, forever.",
       },
     ],
   }),
@@ -246,6 +279,17 @@ function OnboardingPage() {
 const inputClass =
   "h-12 w-full rounded-clarity-md border-[1.5px] border-clarity-line-strong bg-clarity-panel px-3.5 font-clarity-sans text-[15px] text-clarity-ink placeholder:text-clarity-ink-dim/60";
 
+/**
+ * Wires the error <-> control association design-system.tsx already
+ * establishes (~line 305): the error `<p>` gets a stable id, and the
+ * single form control this `Field` wraps gets `aria-invalid` +
+ * `aria-describedby` pointing at it — via `cloneElement` so every call
+ * site gets this for free instead of wiring it by hand at each one.
+ * Only fires when both `htmlFor` and `error` are set, which in this file
+ * is exactly the single-input fields (name/email/phone/address/etc.) —
+ * the multi-input rows (quiet hours, heating season) and the ChipGroup
+ * rows never pass `htmlFor`, so they're untouched.
+ */
 function Field({
   label,
   htmlFor,
@@ -259,6 +303,15 @@ function Field({
   error?: string;
   children: React.ReactNode;
 }) {
+  const errorId = htmlFor ? `${htmlFor}-err` : undefined;
+  const control =
+    error && errorId && isValidElement(children)
+      ? cloneElement(children as ReactElement<Record<string, unknown>>, {
+          "aria-invalid": true,
+          "aria-describedby": errorId,
+        })
+      : children;
+
   return (
     <div>
       {htmlFor ? (
@@ -273,9 +326,10 @@ function Field({
           {label}
         </span>
       )}
-      {children}
+      {control}
       {error ? (
         <p
+          id={errorId}
           role="alert"
           className="mt-1.5 font-clarity-sans text-xs font-semibold text-clarity-emergency"
         >
@@ -473,7 +527,7 @@ function WelcomeStep({ onNext }: { onNext: () => void }) {
           Let's get Stoop answering your tenants.
         </h1>
         <p className="mt-3 font-clarity-sans text-sm leading-relaxed text-clarity-ink-dim">
-          Six short steps, about five minutes. You'll end with a live number you can text yourself
+          Five short steps, about five minutes. You'll end with a live number you can text yourself
           right now.
         </p>
 
@@ -871,7 +925,17 @@ function VoiceStep({
   onBack: () => void;
   onNext: () => void;
 }) {
+  const [submitted, setSubmitted] = useState(false);
   const activeTone = toneOptions.find((t) => t.value === state.tone);
+
+  // Founder-vetoable ruling (see the file header): the AC's "3–5 pasted
+  // real replies" only binds if the landlord engages this step at all —
+  // Skip still defers voice capture entirely, since drafting is Full
+  // Plan territory, not something the free Emergency Line needs.
+  const filledSamples = state.voiceSamples.filter((s) => s.trim()).length;
+  const errVoice = filledSamples < 3 ? "Add at least 3 real replies so drafts sound like you." : "";
+  const showVoiceError = submitted && Boolean(errVoice);
+  const valid = !errVoice;
 
   return (
     <WizardChrome
@@ -879,7 +943,12 @@ function VoiceStep({
       title="How Stoop texts your tenants."
       subtitle="Paste a few of your real replies so drafts sound like you, then set the rules Stoop should follow."
       onBack={onBack}
-      onNext={onNext}
+      onNext={() => {
+        setSubmitted(true);
+        if (valid) onNext();
+      }}
+      nextDisabled={submitted && !valid}
+      skip={onNext}
     >
       <section>
         <h2 className="font-clarity-sans text-[11px] font-bold uppercase tracking-[0.14em] text-clarity-ink-dim">
@@ -898,6 +967,8 @@ function VoiceStep({
                   value={sample}
                   onChange={(e) => onUpdateSample(i, e.target.value)}
                   placeholder={`e.g. "Hey Sam, thanks for flagging — I'll get Tony out there Thursday morning."`}
+                  aria-invalid={showVoiceError || undefined}
+                  aria-describedby={showVoiceError ? "voice-samples-err" : undefined}
                   className="min-h-20 w-full rounded-clarity-md border-[1.5px] border-clarity-line-strong bg-clarity-panel px-3.5 py-3 font-clarity-sans text-sm leading-relaxed text-clarity-ink placeholder:text-clarity-ink-dim/60"
                 />
               </div>
@@ -923,6 +994,16 @@ function VoiceStep({
               <Plus className="size-4" aria-hidden="true" />
               Add another example
             </button>
+          )}
+
+          {showVoiceError && (
+            <p
+              id="voice-samples-err"
+              role="alert"
+              className="font-clarity-sans text-xs font-semibold text-clarity-emergency"
+            >
+              {errVoice}
+            </p>
           )}
         </div>
 
