@@ -28,7 +28,11 @@ convention):
    ``message_id``/type conflicts and returns no row.
 4. The two new types never collide with each other OR with ``needs_eyes``
    for the SAME ``message_id`` (three independent dedupe slots).
-5. Downgrade to 0008 drops both indexes and restores the narrower CHECK;
+5. Downgrade FAILS CLOSED (raises, rolls back, stays at head) when a live
+   ``tenant_ack`` row exists — safety review, 2026-07-12: the real
+   rollback hazard is a loud Postgres constraint-violation error, not
+   silent data loss.
+6. Downgrade to 0008 drops both indexes and restores the narrower CHECK;
    re-upgrade to head restores everything (full round-trip).
 
 Run with:
@@ -314,6 +318,57 @@ async def test_tenant_ack_degraded_retry_and_needs_eyes_do_not_collide(
         )
     ).scalar_one()
     assert count == 3
+
+
+# ---------------------------------------------------------------------------
+# 4b. Downgrade FAILS CLOSED when a live tenant_ack/degraded_retry row
+# exists — safety review, 2026-07-12: the real rollback hazard is a LOUD
+# Postgres constraint-violation error, not silent data loss (see the
+# migration's own module docstring "ROUND-TRIP"). This test uses its OWN
+# committed row (not the auto-rollback `conn` fixture) because the
+# downgrade runs in a SEPARATE `alembic` subprocess/connection that would
+# never see an uncommitted row from a held transaction.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_downgrade_fails_closed_when_tenant_ack_row_exists(db: AsyncEngine) -> None:
+    landlord_id: str | None = None
+    async with db.connect() as setup_conn:
+        trans = await setup_conn.begin()
+        landlord_id = await _insert_landlord(setup_conn)
+        await setup_conn.execute(
+            text(
+                "INSERT INTO notifications (landlord_id, type, channel, payload) "
+                "VALUES (:landlord_id, 'tenant_ack', 'sms', "
+                "CAST(:payload AS jsonb))"
+            ),
+            {"landlord_id": landlord_id, "payload": json.dumps({"message_id": str(uuid.uuid4())})},
+        )
+        await trans.commit()
+
+    try:
+        loop = asyncio.get_running_loop()
+        with pytest.raises(RuntimeError, match="notifications_type_check"):
+            await loop.run_in_executor(None, lambda: _alembic("downgrade", "0008"))
+
+        # FAILS CLOSED: the failed downgrade transaction rolled back --
+        # still at head, nothing corrupted.
+        async with db.connect() as verify_conn:
+            version = (
+                await verify_conn.execute(text("SELECT version_num FROM alembic_version"))
+            ).scalar_one()
+            assert version == "0009"
+    finally:
+        async with db.connect() as cleanup_conn:
+            trans = await cleanup_conn.begin()
+            await cleanup_conn.execute(
+                text("DELETE FROM notifications WHERE landlord_id = :lid"), {"lid": landlord_id}
+            )
+            await cleanup_conn.execute(
+                text("DELETE FROM landlords WHERE id = :lid"), {"lid": landlord_id}
+            )
+            await trans.commit()
 
 
 # ---------------------------------------------------------------------------

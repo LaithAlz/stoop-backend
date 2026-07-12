@@ -248,6 +248,48 @@ async def test_degraded_mode_classification_failed_hard_hit_skips_new_artifacts(
 
 
 @pytest.mark.integration
+async def test_degraded_mode_hard_hit_does_not_fire_activation_alert(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deliberate scope choice (module docstring "Two DIFFERENT Sentry
+    alerts"): the webhook's OWN ``_alert_tenant_hard_fire`` already pages
+    for a HARD hit -- this leg must NOT double-page the same fact."""
+    import app.agent.nodes.degraded_mode as degraded_mode_mod
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        degraded_mode_mod.sentry_sdk,
+        "capture_message",
+        lambda *a, **k: calls.append({"args": a, "kwargs": k}),
+    )
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        prefilter=PrefilterResult(hard_hit=True, categories=["fire"]).model_dump_json(),
+    )
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id), property_id=uuid.UUID(property_id)
+            ),
+            "classification_failed": True,
+            "reasoning_log": [],
+        }
+        await degraded_mode(state)
+        assert calls == []
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_degraded_mode_classification_failed_hard_hit_audit_not_deduped(
     db_session: AsyncSession,
 ) -> None:
@@ -363,6 +405,62 @@ async def test_degraded_mode_classification_failed_soft_annotation_escalates_bli
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
+async def test_degraded_mode_soft_annotation_fires_sentry_activation_alert(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chaos test (issue #109 AC line 5 / safety-review round): a
+    degraded-mode ACTIVATION pages Sentry at ``level="warning"``,
+    distinct from the write-failure ``level="error"`` page."""
+    import app.agent.nodes.degraded_mode as degraded_mode_mod
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_capture_message(
+        message: str, *, level: str | None = None, extras: dict[str, object] | None = None
+    ) -> None:
+        calls.append({"message": message, "level": level, "extras": extras})
+
+    monkeypatch.setattr(degraded_mode_mod.sentry_sdk, "capture_message", _fake_capture_message)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        prefilter=PrefilterResult(hard_hit=False, soft_annotations=["leak"]).model_dump_json(),
+    )
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "classification_failed": True,
+            "reasoning_log": [],
+        }
+        await degraded_mode(state)
+
+        assert len(calls) == 1
+        assert calls[0]["level"] == "warning"
+        extras = calls[0]["extras"]
+        assert isinstance(extras, dict)
+        assert extras["leg"] == "soft_annotation_escalated"
+        assert extras["message_id"] == message_id
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 # ---------------------------------------------------------------------------
 # classification_failed — no keywords at all -> queue holding ack + retry
 # (#109)
@@ -417,6 +515,10 @@ async def test_degraded_mode_classification_failed_no_keywords_queues_retry(
         assert retry_row["attempt"] == 0
         assert retry_row["next_attempt_at"] is not None
         assert "failed_at" in retry_row["payload"]
+        # Re-animation guard snapshot (safety review): the case was 'open'
+        # when this retry was queued -- app/agent/degraded_mode_sweep.py's
+        # _case_has_moved_on compares against this later.
+        assert retry_row["payload"]["case_status_at_failure"] == "open"
 
         audit_row = (
             (
@@ -429,6 +531,57 @@ async def test_degraded_mode_classification_failed_no_keywords_queues_retry(
             .one()
         )
         assert audit_row["payload"]["leg"] == "queued_for_retry"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_degraded_mode_no_keywords_fires_sentry_activation_alert(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chaos test (issue #109 AC line 5 / safety-review round): the
+    no-keyword leg ALSO pages Sentry at activation, not just on write
+    failure -- see module docstring "Two DIFFERENT Sentry alerts"."""
+    import app.agent.nodes.degraded_mode as degraded_mode_mod
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_capture_message(
+        message: str, *, level: str | None = None, extras: dict[str, object] | None = None
+    ) -> None:
+        calls.append({"message": message, "level": level, "extras": extras})
+
+    monkeypatch.setattr(degraded_mode_mod.sentry_sdk, "capture_message", _fake_capture_message)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await factories.insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "classification_failed": True,
+            "reasoning_log": [],
+        }
+        await degraded_mode(state)
+
+        assert len(calls) == 1
+        assert calls[0]["level"] == "warning"
+        extras = calls[0]["extras"]
+        assert isinstance(extras, dict)
+        assert extras["leg"] == "queued_for_retry"
     finally:
         await _cleanup(db_session, landlord_id)
 

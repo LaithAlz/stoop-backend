@@ -62,8 +62,14 @@ prefilter's DURABLE ``messages.prefilter`` snapshot (never re-run — same
   ``tenant_ack`` row (same holding ack) PLUS a ``degraded_retry`` marker
   that schedules re-classification attempts at ``failed_at + {1, 5, 15}
   minutes`` via ``notifications.next_attempt_at`` (the existing sweeper-key
-  column — no new column). The landlord is NOT paged yet. See
-  ``app/agent/degraded_mode_sweep.py`` for the sweep that drives these
+  column — no new column). The landlord is NOT paged yet. The
+  ``degraded_retry`` row ALSO snapshots the case's CURRENT status into
+  ``payload.case_status_at_failure`` (``None`` when no case was ever
+  attached) — the re-animation guard
+  (``app/agent/degraded_mode_sweep.py::_case_has_moved_on``) compares
+  against this later to detect "the case moved on before the retry became
+  due" and refuses to re-run classification against a stale case state.
+  See ``app/agent/degraded_mode_sweep.py`` for the sweep that drives these
   attempts and escalates to a genuine ``needs_eyes`` row if all three
   fail — this node only creates the INITIAL marker.
 
@@ -117,6 +123,24 @@ package already use. At most one artifact of each type ever exists per
 this call (never duplicated on a redelivered/retried run); the HARD-hit
 leg's audit row is deliberately NOT gated this way (see above).
 
+Two DIFFERENT Sentry alerts — do not conflate them (safety-review round,
+2026-07-12, corrected a MAJOR spec gap: the AC's "Sentry alert on
+degraded-mode activation" was previously ONLY implemented for the write
+-FAILURE case below, never for a successful activation itself)
+------------------------------------------------------------------------
+1. **Activation alert** (:func:`_alert_degraded_mode_activation`,
+   ``level="warning"``) — fires on a GENUINE NEW degraded-mode event: the
+   SOFT-annotation escalation, the no-keyword retry-queue, and (in
+   ``app/agent/degraded_mode_sweep.py``) the sweep's own
+   ``retry_exhausted`` escalation. This IS the AC's "Sentry alert on
+   degraded-mode activation" — a person should be paged that classification
+   fell back to degraded mode, not just that this node's own writes broke.
+2. **Write-failure alert** (below, ``level="error"``) — fires when this
+   node's OWN notification/audit writes THEMSELVES raise. A completely
+   different, worse failure mode (the ONE node whose job is "make sure a
+   person finds out" failing silently) — kept as its own page, at a
+   higher severity, never merged with (1).
+
 Never silent on the node's OWN DB failure either (safety review MEDIUM,
 carried over from #34)
 ------------------------------------------------------------------------
@@ -126,11 +150,6 @@ this node logs, pages via ``sentry_sdk.capture_message`` (uuids/reason
 strings/exception type name only — never a message body or phone number,
 rule #5), and still returns a normal partial state update (never raises) —
 the graph run itself is never aborted by a degraded-mode write failure.
-This is also the Sentry alert the issue's AC asks for ("Sentry alert on
-degraded-mode activation") for the failure case; the SUCCESS case (an
-artifact was actually created) is recorded durably in ``audit_log``
-instead of paging anyone — a normal degraded-mode activation is an
-expected, handled event, not an incident.
 
 Never-break rule #5: only uuids/booleans/short reason strings/exception
 type names/category names ever reach ``log.*`` calls or Sentry here.
@@ -192,19 +211,28 @@ all three are exhausted) — imported here only for the FIRST scheduling at
 creation time (``attempt=0``)."""
 
 HOLDING_ACK_TEMPLATE = (
-    "Got your message — it's been passed to {first_name} and you'll hear back soon. If "
-    "this is a life-threatening emergency, call 911."
+    "Got your message — it's been passed to {first_name}. If this is a "
+    "life-threatening emergency, call 911."
 )
 """Verbatim from ``docs/02-product/emergency-prefilter.md``'s "Holding ack
 (template, no LLM)" section — copy-guardian reviews this exact string.
-Not versioned like ``prompts/v{n}.py`` (this is not an LLM prompt, it is a
-fixed SMS template with one substitution slot); a wording change is a copy
--guardian-reviewed edit to this constant, not a new version file."""
+
+Copy-guardian ruling (safety-review round, 2026-07-12): the original
+template's trailing "...and you'll hear back soon" clause is REMOVED.
+``docs/02-product/plain-language-rules.md`` rule 4 ("concrete over
+relative ... never 'soon'") applies here with extra force, not less: this
+template fires PRECISELY when classification is down — "soon" is a
+timeline this code has no way to honor at the moment it's sent. Same
+reasoning the prompts-v2 "soon" removal already established for
+``draft_response.py``'s own copy. Not versioned like ``prompts/v{n}.py``
+(this is not an LLM prompt, it is a fixed SMS template with one
+substitution slot); a further wording change is a copy-guardian-reviewed
+edit to this constant (and to emergency-prefilter.md's own template text,
+in the same commit), not a new version file."""
 
 _FALLBACK_LANDLORD_LABEL = "your landlord"
 """Used when ``landlords.full_name`` is unset/blank — keeps the template
-grammatical ("...passed to your landlord and you'll hear back soon...")
-without inventing a name."""
+grammatical ("...passed to your landlord.") without inventing a name."""
 
 
 def render_holding_ack(first_name: str | None) -> str:
@@ -277,6 +305,15 @@ _SELECT_MESSAGE_FOR_DEGRADED_SQL = text(
 
 _SELECT_LANDLORD_FULL_NAME_SQL = text("SELECT full_name FROM landlords WHERE id = :landlord_id")
 
+# Safety-review round (re-animation guard, see app/agent/degraded_mode_
+# sweep.py's own docstring "Re-animation guard"): snapshotted into the
+# degraded_retry row's payload at CREATION time so the sweep can later
+# detect "the case moved on since this failure was recorded" by comparing
+# its CURRENT status against this snapshot -- never a hardcoded absolute
+# check against 'open' (a case can legitimately be in any open-family
+# status the moment classification fails for a NEW message on it).
+_SELECT_CASE_STATUS_SQL = text("SELECT status FROM cases WHERE id = :case_id")
+
 # Idempotent via uq_notifications_tenant_ack_dedupe (schema-v1.md v1.8,
 # migration 0009) — see module docstring "Why NOT needs_eyes...".
 _INSERT_TENANT_ACK_SQL = text(
@@ -324,6 +361,36 @@ def _resolve_reasons(state: AgentState) -> list[str]:
     if state.get("draft_guard_failed"):
         reasons.append(REASON_DRAFT_GUARD_FAILED)
     return reasons or [_REASON_UNKNOWN]
+
+
+def _alert_degraded_mode_activation(*, message_id: UUID, case_id: UUID | None, leg: str) -> None:
+    """Sentry alert on a genuine NEW degraded-mode ACTIVATION (issue #109
+    AC line 5: "Sentry alert on degraded-mode activation") — ``level=
+    "warning"``, deliberately DISTINCT from the ``level="error"`` page in
+    :func:`degraded_mode`'s own outer except-block: that one means "this
+    node's OWN writes just failed"; this one means "the writes succeeded,
+    and a person should know a message just fell back to degraded mode."
+    Metadata only (uuids + the ``leg`` name) — never a message body or
+    phone number, rule #5.
+
+    Scope (safety-review round, 2026-07-12): called for the SOFT-annotation
+    escalation and the no-keyword retry-queue leg (both NEW in this
+    issue), and by ``app/agent/degraded_mode_sweep.py`` for the sweep's own
+    ``retry_exhausted`` escalation. Deliberately NOT called for the
+    HARD-hit leg (the webhook's own ``_alert_tenant_hard_fire`` already
+    pages for that exact fact — a second page here would double-alert the
+    same event) nor for the UNCHANGED generic leg
+    (``_handle_generic_degraded`` — ``severity_emergency``/
+    ``draft_guard_failed`` are #34 territory, not this issue's scope)."""
+    sentry_sdk.capture_message(
+        f"degraded_mode activated: {leg}",
+        level="warning",
+        extras={
+            "message_id": str(message_id),
+            "case_id": str(case_id) if case_id is not None else None,
+            "leg": leg,
+        },
+    )
 
 
 async def _handle_generic_degraded(
@@ -471,10 +538,29 @@ async def _handle_classification_failed(
         else:
             leg = "queued_for_retry"
             now = datetime.now(UTC)
+
+            # Re-animation guard (safety review, this round): snapshot the
+            # case's CURRENT status so app/agent/degraded_mode_sweep.py can
+            # later detect "this case moved on since the failure was
+            # recorded" by comparing, never by re-deriving from a
+            # hardcoded 'open' check -- see that module's own docstring
+            # "Re-animation guard".
+            case_status_at_failure: str | None = None
+            if case_id is not None:
+                case_status_row = (
+                    (await session.execute(_SELECT_CASE_STATUS_SQL, {"case_id": str(case_id)}))
+                    .mappings()
+                    .one_or_none()
+                )
+                case_status_at_failure = (
+                    case_status_row["status"] if case_status_row is not None else None
+                )
+
             retry_payload = {
                 **payload,
                 "leg": leg,
                 "failed_at": now.isoformat(),
+                "case_status_at_failure": case_status_at_failure,
             }
             # attempt count lives in the real `notifications.attempt` column
             # (schema default 0) -- app/agent/degraded_mode_sweep.py owns
@@ -509,6 +595,14 @@ async def _handle_classification_failed(
                     "payload": json.dumps({**payload, "leg": leg}),
                 },
             )
+
+    # Outside the DB transaction on purpose (same convention as
+    # app/agent/emergency.py's fire_emergency_protocol call site): only
+    # page once the durable artifacts this alert announces are actually
+    # committed, and only for a GENUINE new activation (any_created),
+    # never a redelivered/retried no-op.
+    if any_created:
+        _alert_degraded_mode_activation(message_id=message_id, case_id=case_id, leg=leg)
 
     log.warning(
         "degraded_mode_classification_failed_handled",

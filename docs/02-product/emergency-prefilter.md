@@ -119,8 +119,15 @@ Classification budget: **20 seconds** end-to-end (generous; typical is
 | no keywords at all | tenant gets the holding ack; message queued for re-classification (retry at 1, 5, 15 min); if still failing at 15 min, landlord gets the needs-your-eyes notification anyway |
 
 **Holding ack (template, no LLM):** "Got your message — it's been passed
-to ⟨landlord first name⟩ and you'll hear back soon. If this is a
-life-threatening emergency, call 911."
+to ⟨landlord first name⟩. If this is a life-threatening emergency, call
+911."
+
+(Copy-guardian ruling, #109 safety-review round: the earlier draft's
+trailing "...and you'll hear back soon" clause is removed — rule 4 of
+`plain-language-rules.md`, "concrete over relative ... never 'soon'",
+applies with extra force here: this template fires precisely when
+classification is down, so "soon" is a timeline the system cannot
+actually promise at the moment it's sent.)
 
 The invariant: **no tenant message ever sits unacknowledged and invisible
 because an API was down.** Worst case, the landlord reads raw texts for an

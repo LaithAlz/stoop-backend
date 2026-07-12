@@ -17,6 +17,7 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -161,6 +162,25 @@ async def _insert_case(
     return case_id
 
 
+async def _link_message_to_case(session: AsyncSession, *, message_id: str, case_id: str) -> None:
+    await session.execute(
+        text(
+            "INSERT INTO message_cases (message_id, case_id) VALUES (:mid, :cid) "
+            "ON CONFLICT (message_id, case_id) DO NOTHING"
+        ),
+        {"mid": message_id, "cid": case_id},
+    )
+    await session.commit()
+
+
+async def _set_case_status(session: AsyncSession, *, case_id: str, status: str) -> None:
+    await session.execute(
+        text("UPDATE cases SET status = :status, updated_at = now() WHERE id = :cid"),
+        {"status": status, "cid": case_id},
+    )
+    await session.commit()
+
+
 async def _insert_degraded_retry(
     session: AsyncSession,
     *,
@@ -170,11 +190,34 @@ async def _insert_degraded_retry(
     attempt: int,
     next_attempt_at: datetime,
     failed_at: datetime,
+    case_status_at_failure: str | None = "open",
 ) -> str:
-    """Directly seeds a ``degraded_retry`` notification row (bypassing
-    ``degraded_mode()`` itself) so each test can place the row at whatever
-    attempt/schedule point it wants to exercise."""
+    """Directly seeds a ``degraded_retry`` notification row PLUS its
+    companion ``tenant_ack`` row (bypassing ``degraded_mode()`` itself, but
+    matching what it ALWAYS creates together in real production -- see
+    that function's own no-keyword branch) so each test can place the row
+    at whatever attempt/schedule point it wants to exercise. Seeding the
+    ``tenant_ack`` row too matters: without it, a sweep tick whose
+    ``run_graph`` call fails classification AGAIN re-enters
+    ``degraded_mode()``'s OWN no-keyword branch, which would then create a
+    genuinely NEW ``tenant_ack`` row (none existed) and fire ITS OWN
+    "queued_for_retry" activation alert — a test artifact that would
+    contaminate assertions about the SWEEP's own alerts/side effects.
+    ``case_status_at_failure`` defaults to ``"open"`` — matching every
+    existing test's case (seeded 'open' via ``_insert_case`` and never
+    changed) so the re-animation guard
+    (:func:`app.agent.degraded_mode_sweep._case_has_moved_on`) is a no-op
+    by default; tests exercising that guard pass a different value or
+    actually change the case's status before sweeping."""
     notification_id = str(uuid.uuid4())
+    payload = {
+        "message_id": message_id,
+        "case_id": case_id,
+        "reasons": ["classification_failed"],
+        "leg": "queued_for_retry",
+        "failed_at": failed_at.isoformat(),
+        "case_status_at_failure": case_status_at_failure,
+    }
     await session.execute(
         text(
             "INSERT INTO notifications "
@@ -188,14 +231,26 @@ async def _insert_degraded_retry(
             "case_id": case_id,
             "attempt": attempt,
             "next_attempt_at": next_attempt_at,
-            "payload": (
-                '{"message_id": "'
-                + message_id
-                + '", "case_id": '
-                + (f'"{case_id}"' if case_id else "null")
-                + ', "reasons": ["classification_failed"], "leg": "queued_for_retry", '
-                '"failed_at": "' + failed_at.isoformat() + '"}'
-            ),
+            "payload": json.dumps(payload),
+        },
+    )
+    tenant_ack_payload = {
+        "message_id": message_id,
+        "case_id": case_id,
+        "reasons": ["classification_failed"],
+        "body": "Got your message -- it's been passed to your landlord. If this is a "
+        "life-threatening emergency, call 911.",
+    }
+    await session.execute(
+        text(
+            "INSERT INTO notifications (landlord_id, case_id, type, channel, status, payload) "
+            "VALUES (:landlord_id, :case_id, 'tenant_ack', 'sms', 'pending', "
+            "CAST(:payload AS jsonb))"
+        ),
+        {
+            "landlord_id": landlord_id,
+            "case_id": case_id,
+            "payload": json.dumps(tenant_ack_payload),
         },
     )
     await session.commit()
@@ -323,7 +378,10 @@ async def test_sweep_ignores_not_yet_due_rows(db_session: AsyncSession) -> None:
         row = (
             (
                 await db_session.execute(
-                    text("SELECT status, attempt FROM notifications WHERE landlord_id = :lid"),
+                    text(
+                        "SELECT status, attempt FROM notifications "
+                        "WHERE landlord_id = :lid AND type = 'degraded_retry'"
+                    ),
                     {"lid": landlord_id},
                 )
             )
@@ -611,6 +669,403 @@ async def test_sweep_resolves_when_reclassification_succeeds(
 
 
 @pytest.mark.integration
+async def test_sweep_escalation_fires_sentry_activation_alert(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chaos test (issue #109 AC line 5 / safety-review round): the
+    sweep's OWN 15-minute escalation ALSO pages Sentry at
+    ``level="warning"`` — see ``degraded_mode_sweep.py``'s module
+    docstring "Sentry activation alert"."""
+    import app.agent.degraded_mode_sweep as sweep_mod
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_capture_message(
+        message: str, *, level: str | None = None, extras: dict[str, object] | None = None
+    ) -> None:
+        calls.append({"message": message, "level": level, "extras": extras})
+
+    monkeypatch.setattr(sweep_mod.sentry_sdk, "capture_message", _fake_capture_message)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await factories.insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    failed_at = datetime.now(UTC) - timedelta(minutes=16)
+    await _insert_degraded_retry(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        message_id=message_id,
+        attempt=2,
+        next_attempt_at=datetime.now(UTC) - timedelta(seconds=1),
+        failed_at=failed_at,
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[_intent_response(), _garbage_severity_response(), _garbage_severity_response()]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        outcomes = await sweep_degraded_mode_retries()
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "escalated"
+
+        assert len(calls) == 1
+        assert calls[0]["level"] == "warning"
+        extras = calls[0]["extras"]
+        assert isinstance(extras, dict)
+        assert extras["leg"] == "retry_exhausted"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Re-animation guard (safety review HIGH/MAJOR)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_sweep_supersedes_when_case_resolved_by_newer_message(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1 was queued for retry while the case was 'open'; M2 arrives and
+    the case is resolved before the retry becomes due. The due retry must
+    no-op (never re-run classification, never touch ``cases``) with a
+    durable audit trail."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+
+    m1_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="m1: not sure what's going on",
+    )
+    await _link_message_to_case(db_session, message_id=m1_id, case_id=case_id)
+
+    # M2 arrives later, is handled normally (not modeled here -- this test
+    # seeds only the END state), and the case is resolved.
+    m2_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="m2: actually nevermind, it's fixed now, thanks",
+    )
+    await _link_message_to_case(db_session, message_id=m2_id, case_id=case_id)
+    await _set_case_status(db_session, case_id=case_id, status="resolved")
+
+    failed_at = datetime.now(UTC) - timedelta(minutes=2)
+    await _insert_degraded_retry(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        message_id=m1_id,
+        attempt=0,
+        next_attempt_at=datetime.now(UTC) - timedelta(seconds=1),
+        failed_at=failed_at,
+        case_status_at_failure="open",
+    )
+
+    import app.agent.degraded_mode_sweep as sweep_mod
+
+    async def _run_graph_must_not_be_called(message_id: uuid.UUID) -> None:
+        raise AssertionError("run_graph must not be called for a superseded candidate")
+
+    monkeypatch.setattr(sweep_mod, "run_graph", _run_graph_must_not_be_called)
+
+    try:
+        outcomes = await sweep_degraded_mode_retries()
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "superseded"
+
+        retry_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT status, next_attempt_at, payload FROM notifications "
+                        "WHERE landlord_id = :lid AND type = 'degraded_retry'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert retry_row["status"] == "exhausted"
+        assert retry_row["next_attempt_at"] is None
+        assert retry_row["payload"]["outcome"] == "superseded"
+
+        # The case is UNTOUCHED -- still 'resolved', never dragged back.
+        case_status = (
+            await db_session.execute(
+                text("SELECT status FROM cases WHERE id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert case_status == "resolved"
+
+        needs_eyes_count = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM notifications WHERE landlord_id = :lid "
+                    "AND type = 'needs_eyes'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert needs_eyes_count == 0
+
+        audit_legs = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload ->> 'leg' FROM audit_log WHERE landlord_id = :lid "
+                        "AND action = 'degraded_mode'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert "retry_superseded" in audit_legs
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sweep_supersedes_when_newer_inbound_exists_status_unchanged(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Condition B alone: the case is STILL 'open' (status unchanged), but
+    a newer inbound message already exists on it -- M1 is no longer the
+    case's latest unhandled inbound, so the retry must still supersede."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+
+    m1_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="m1: not sure what's going on",
+    )
+    await _link_message_to_case(db_session, message_id=m1_id, case_id=case_id)
+
+    m2_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="m2: also, the bathroom fan is loud",
+    )
+    await _link_message_to_case(db_session, message_id=m2_id, case_id=case_id)
+    # Case status deliberately LEFT as 'open' -- only condition B fires.
+
+    failed_at = datetime.now(UTC) - timedelta(minutes=2)
+    await _insert_degraded_retry(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        message_id=m1_id,
+        attempt=0,
+        next_attempt_at=datetime.now(UTC) - timedelta(seconds=1),
+        failed_at=failed_at,
+        case_status_at_failure="open",
+    )
+
+    import app.agent.degraded_mode_sweep as sweep_mod
+
+    async def _run_graph_must_not_be_called(message_id: uuid.UUID) -> None:
+        raise AssertionError("run_graph must not be called for a superseded candidate")
+
+    monkeypatch.setattr(sweep_mod, "run_graph", _run_graph_must_not_be_called)
+
+    try:
+        outcomes = await sweep_degraded_mode_retries()
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "superseded"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sweep_proceeds_normally_when_case_unchanged_and_no_newer_message(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Baseline/regression: neither re-animation signal fires -- the sweep
+    proceeds to reclassify exactly as before this guard existed."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="not sure what's going on",
+    )
+    await _link_message_to_case(db_session, message_id=message_id, case_id=case_id)
+
+    failed_at = datetime.now(UTC) - timedelta(minutes=2)
+    await _insert_degraded_retry(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        message_id=message_id,
+        attempt=0,
+        next_attempt_at=datetime.now(UTC) - timedelta(seconds=1),
+        failed_at=failed_at,
+        case_status_at_failure="open",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[_intent_response(), _garbage_severity_response(), _garbage_severity_response()]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        outcomes = await sweep_degraded_mode_retries()
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "rescheduled"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Exception handling never silently loops forever (safety HIGH + spec
+# MAJOR -- THE blocker finding)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_sweep_pages_sentry_on_every_persistent_exception_and_escalates_after_bound(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A candidate whose ``run_graph`` raises PERSISTENTLY must page
+    Sentry on EVERY tick (never a silent loop) and, once
+    ``_MAX_CANDIDATE_EXCEPTIONS`` is reached, force-escalate to a genuine
+    ``needs_eyes`` row via the SAME ``_escalate`` path."""
+    import app.agent.degraded_mode_sweep as sweep_mod
+
+    sentry_calls: list[dict[str, object]] = []
+
+    def _fake_capture_message(
+        message: str, *, level: str | None = None, extras: dict[str, object] | None = None
+    ) -> None:
+        sentry_calls.append({"message": message, "level": level, "extras": extras})
+
+    monkeypatch.setattr(sweep_mod.sentry_sdk, "capture_message", _fake_capture_message)
+
+    async def _boom(message_id: uuid.UUID) -> None:
+        raise RuntimeError("simulated run_graph crash")
+
+    monkeypatch.setattr(sweep_mod, "run_graph", _boom)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="not sure what's going on",
+    )
+    failed_at = datetime.now(UTC) - timedelta(minutes=2)
+    await _insert_degraded_retry(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        message_id=message_id,
+        attempt=0,
+        next_attempt_at=datetime.now(UTC) - timedelta(seconds=1),
+        failed_at=failed_at,
+        case_status_at_failure="open",
+    )
+
+    try:
+        for tick in range(sweep_mod._MAX_CANDIDATE_EXCEPTIONS):  # noqa: SLF001
+            outcomes = await sweep_degraded_mode_retries()
+            # error-level pages accumulate one per tick regardless of
+            # outcome -- checked precisely after the loop below.
+            if tick < sweep_mod._MAX_CANDIDATE_EXCEPTIONS - 1:  # noqa: SLF001
+                assert outcomes == []
+
+        # After the bound: the last tick force-escalated.
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "escalated_by_exception"
+
+        error_calls = [c for c in sentry_calls if c["level"] == "error"]
+        assert len(error_calls) == sweep_mod._MAX_CANDIDATE_EXCEPTIONS  # noqa: SLF001
+        for call in error_calls:
+            extras = call["extras"]
+            assert isinstance(extras, dict)
+            assert extras["exc_type"] == "RuntimeError"
+
+        warning_calls = [c for c in sentry_calls if c["level"] == "warning"]
+        assert len(warning_calls) == 1
+        warning_extras = warning_calls[0]["extras"]
+        assert isinstance(warning_extras, dict)
+        assert warning_extras["leg"] == "retry_exhausted_exception"
+
+        retry_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT status, next_attempt_at FROM notifications "
+                        "WHERE landlord_id = :lid AND type = 'degraded_retry'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert retry_row["status"] == "exhausted"
+        assert retry_row["next_attempt_at"] is None
+
+        needs_eyes_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload FROM notifications "
+                        "WHERE landlord_id = :lid AND type = 'needs_eyes'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert needs_eyes_row["payload"]["leg"] == "retry_exhausted_exception"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_sweep_one_candidate_failure_never_aborts_the_tick(
     db_session: AsyncSession,
 ) -> None:
@@ -642,7 +1097,10 @@ async def test_sweep_one_candidate_failure_never_aborts_the_tick(
         row = (
             (
                 await db_session.execute(
-                    text("SELECT status, attempt FROM notifications WHERE landlord_id = :lid"),
+                    text(
+                        "SELECT status, attempt FROM notifications "
+                        "WHERE landlord_id = :lid AND type = 'degraded_retry'"
+                    ),
                     {"lid": landlord_id},
                 )
             )

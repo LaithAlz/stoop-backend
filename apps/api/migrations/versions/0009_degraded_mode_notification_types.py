@@ -44,10 +44,38 @@ ROUND-TRIP
 values via their partial predicates, though Postgres does not actually
 enforce an ordering dependency here — dropped first purely for
 readability/symmetry with upgrade()), then restores the narrower CHECK.
-Any `tenant_ack`/`degraded_retry` row inserted under this revision would
-violate the narrower CHECK on downgrade — acceptable, no writer emits
-either value before this migration exists, same acceptance-of-data-risk
-note migration 0003's CHECK-narrowing downgrade already established.
+
+**The real hazard is rolling back AFTER live `tenant_ack`/`degraded_retry`
+rows exist — and it is a LOUD failure, not a silent one** (safety review,
+2026-07-12; corrects an earlier revision of this docstring that
+mis-analogized this to migration 0003's column-DROP, which genuinely IS
+silent data loss). `ALTER TABLE ... ADD CONSTRAINT ... CHECK (...)`
+validates the new constraint against EVERY EXISTING ROW at ALTER time —
+if any row's `type` is `tenant_ack` or `degraded_retry`, restoring the
+narrower CHECK below raises a Postgres constraint-violation error, and
+(this migration file's DDL runs inside alembic's own transactional-DDL
+wrapper) the entire `downgrade()` transaction rolls back: the database is
+left exactly at revision 0009, unchanged, nothing corrupted, nothing
+silently dropped. This FAILS CLOSED by construction — no code in this
+migration needs to detect the hazard itself; Postgres's own constraint
+machinery already refuses.
+
+An operator who genuinely needs to roll back past this revision with live
+rows of either type must resolve them FIRST, as an explicit, deliberate,
+out-of-migration action — e.g.:
+
+    DELETE FROM notifications WHERE type IN ('tenant_ack', 'degraded_retry');
+
+(or convert them to another type first, if the data is worth keeping in
+some other shape). This migration deliberately does NOT perform that
+DELETE itself inside `downgrade()` — `notifications` is not append-only
+(rule #2 only covers `messages`/`audit_log`/`message_status_events`), so
+an in-migration DELETE would be legitimate, but making a schema downgrade
+SILENTLY destroy live send-intent rows (a tenant's queued holding ack; an
+in-flight reclassification retry) by default is a worse failure mode than
+the migration simply refusing to run — a human should look at what those
+rows represent before deciding to delete them, not have a `downgrade`
+invocation do it for them.
 """
 
 from __future__ import annotations
@@ -90,8 +118,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Exactly reverse upgrade(): drop both new indexes, restore the
-    narrower CHECK. See module docstring "ROUND-TRIP" for the accepted
-    data-loss note."""
+    narrower CHECK. FAILS CLOSED (raises, rolls back, does not run) if any
+    `tenant_ack`/`degraded_retry` row currently exists — see module
+    docstring "ROUND-TRIP" for the full hazard analysis and the manual
+    remediation an operator must perform first."""
     op.execute("DROP INDEX IF EXISTS uq_notifications_tenant_ack_dedupe")
     op.execute("DROP INDEX IF EXISTS uq_notifications_degraded_retry_dedupe")
     op.execute("ALTER TABLE notifications DROP CONSTRAINT notifications_type_check")

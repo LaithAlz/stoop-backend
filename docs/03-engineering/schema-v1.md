@@ -287,8 +287,10 @@
 > path v1.1 already used for `messages.party`:
 > 1. **`tenant_ack`** (`channel='sms'`) — the durable, NOT-YET-SENT holding
 >    -ack SMS to the tenant when classification fails (the templated
->    "Got your message ... you'll hear back soon" text,
->    `emergency-prefilter.md`'s "Holding ack" section). Exactly the same
+>    "Got your message — it's been passed to ⟨landlord first name⟩..."
+>    text, `emergency-prefilter.md`'s "Holding ack" section — amended
+>    2026-07-12, copy-guardian ruling: the "...and you'll hear back soon"
+>    clause was removed, see that doc's own note). Exactly the same
 >    shape as the existing, already-anticipated-but-unused `emergency_sms`
 >    row (a durable send-intent for #108's future sender to drain) — kept
 >    as its OWN type rather than reusing `emergency_sms` because the two
