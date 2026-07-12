@@ -34,6 +34,20 @@ order (founder directive): **#34+#43 → #109/#108 → #44/#45 → #50 → #111*
 so if you build Phase 4 first, the send helper moves there and Phase 3 reuses
 it; either way the "one send seam" fence holds).
 
+**Campaign status (as of 2026-07-12):** Phase 1 (#34) MERGED — PR #185
+(squash `69abba4`). Phase 2 (#43) MERGED — PR #187 (squash `a61b95e`,
+2026-07-10; three pre-merge catches recorded as archaeology A23). Phase 4's
+**#109 degraded half MERGED** — PR #188 (squash `161e24c`, 2026-07-12;
+live DB at migration head **0009**, which adds the `tenant_ack`/
+`degraded_retry` notification types). Still open: **#108** (escalation
+chain + first sender — in flight), **#44/#45** (Phase 3), **#50**, **#111**.
+Standing deployment gap until #108 lands: nothing schedules
+`sweep_degraded_mode_retries` and no sender exists, so `tenant_ack`/
+`needs_eyes` rows accumulate undelivered — see the DEPLOYMENT-GATING FACT
+docstring in `app/agent/degraded_mode_sweep.py` and architecture-contract
+weak point 2. Treat the merged phases' sections below as contracts to
+preserve, not work to do.
+
 Definitions used throughout:
 - **Tier-0 prefilter** — deterministic regex emergency filter
   (`apps/api/app/agent/prefilter.py`), runs in the webhook before any LLM.
@@ -155,17 +169,20 @@ cd apps/api && export DATABASE_URL='postgresql+asyncpg://stoop:stoop@localhost:5
    git -C /Users/laith/Businesses/LandlordAI fetch --all --quiet && git -C /Users/laith/Businesses/LandlordAI log --oneline -1 origin/main   # contains the eval-harness merge
    gh pr list --repo LaithAlz/stoop-backend --state open                     # no stale campaign PRs
    git -C /Users/laith/Businesses/LandlordAI status --short                  # clean tree (or your own branch only)
-   cd apps/api && uv run alembic upgrade head && uv run alembic current      # head = 0008
+   cd apps/api && uv run alembic upgrade head && uv run alembic current      # head = 0009 (as of 2026-07-12)
    cd apps/api && uv run ruff check . && uv run mypy app                     # clean baseline
    ```
 
-   If `alembic current` is not `0008` → run against local Docker Postgres
+   If `alembic current` is not `0009` → run against local Docker Postgres
    only; never point `DATABASE_URL` at the live pooler for dev work
    (`stoop-run-and-operate`).
 
 ---
 
 ## PHASE 1 — #34: wire the StateGraph with the Postgres checkpointer
+
+**STATUS: MERGED — PR #185 (squash `69abba4`).** The gates G1–G3 below are
+now invariants to preserve, not work to do.
 
 **What exists (all on main after Phase 0):** six node functions, each
 `async def node(state: AgentState) -> dict` — `identify_property`,
@@ -261,6 +278,15 @@ audit rows are data and stay (audit_log is append-only — never delete).
 ---
 
 ## PHASE 2 — #43: shadow mode — interrupt() before any send
+
+**STATUS: MERGED — PR #187 (squash `a61b95e`, 2026-07-10)**, after three
+pre-merge catches (archaeology A23: dead-code drain from a flawed probe,
+TOCTOU resume, stuck-draft crash window). Load-bearing contract learned
+there, pinned in `app/agent/nodes/await_approval.py` and on issue #44: the
+whole node re-executes on every resume; nothing before a raising
+`interrupt()` commits; plain `ainvoke` on a paused thread RESTARTS from
+START — so **#44's send must be a SEPARATE node behind a conditional edge,
+never code after `interrupt()`**.
 
 Shadow mode = the graph drafts everything but can send nothing.
 
@@ -379,6 +405,20 @@ rows.
 
 ## PHASE 4 — #108 emergency executor + #109 degraded mode
 
+**STATUS (2026-07-12): the #109 degraded half is MERGED — PR #188 (squash
+`161e24c`; migration 0009). #108 is still open (in flight).** What #188
+shipped: the `degraded_mode` graph node (holding-ack `tenant_ack` intents,
+blind `needs_eyes` escalation), the 1/5/15-min re-classification retry
+sweep (`app/agent/degraded_mode_sweep.py`) with per-exception Sentry paging
++ a bounded exception counter that force-escalates (A24), and `degraded_mode`
+audit rows. Explicitly OUT of #188's scope, still owed by #108/deployment:
+the cron/scheduler that calls the sweep, and the sender that actually
+delivers `tenant_ack`/`needs_eyes` — until both exist the no-keyword leg's
+invariant is provisional (the sweep module's DEPLOYMENT-GATING FACT
+docstring). The #109 subsection below is the plan that was implemented —
+verify against the merged code, and treat the #108 subsection as the
+remaining work.
+
 **Seams already built for you (do not re-plumb the webhook):**
 - `app/agent/emergency.py::fire_emergency_protocol` — the single execution
   seam; today logs only. The webhook has ALREADY written the durable
@@ -428,9 +468,16 @@ unacknowledged because an API was down.** 20 s end-to-end budget + one retry
 | SOFT annotation present | immediate `needs_eyes` notification with the raw text **in the notification payload** (DB rows may carry it; app logs and Sentry NEVER may — never-break rule #5) + holding ack to tenant |
 | No keywords | holding ack; re-classify at 1/5/15 min; still failing at 15 min → `needs_eyes` anyway |
 
-Holding ack — template, no LLM, verbatim from `emergency-prefilter.md`:
-"Got your message — it's been passed to ⟨landlord first name⟩ and you'll
-hear back soon. If this is a life-threatening emergency, call 911."
+Holding ack — template, no LLM, the SHIPPED copy (constant
+`app/agent/nodes/degraded_mode.py::HOLDING_ACK_TEMPLATE`, matching
+`emergency-prefilter.md`'s corrected template):
+"Got your message — it's been passed to ⟨landlord first name⟩. If this is
+a life-threatening emergency, call 911."
+(The doc's earlier draft ended "…and you'll hear back soon" — the "soon"
+clause was REMOVED by copy-guardian ruling in the #109 review round:
+plain-language rule 4, never "soon", applies with extra force in the one
+message sent while classification is down. See archaeology A24 — do not
+quote the old wording back into existence.)
 All degraded events → `degraded_mode` audit rows + a Sentry alert
 (metadata only). Required chaos test: mock classification to fail → observe
 holding ack sent (fake Twilio), `needs_eyes` row, audit rows, Sentry event.
@@ -536,15 +583,16 @@ grep -rn "messages.create\|<the send helper name you introduced>" apps/api/app -
 
 Volatile claims and their one-line re-verification commands:
 
-| Claim (as of 2026-07-05/06) | Re-verify with |
+| Claim (as of 2026-07-05/06 unless dated otherwise) | Re-verify with |
 |---|---|
-| Issues 34/43/44/45/50/108/109/111 open, ACs as quoted | `for n in 34 43 44 45 108 109 50 111; do gh issue view $n --repo LaithAlz/stoop-backend --json state,title -q '"\(.title): \(.state)"'; done` |
+| Issue states — #34/#43/#109 closed via PRs #185/#187/#188; #44/#45/#50/#108/#111 remaining (as of 2026-07-12) | `for n in 34 43 44 45 108 109 50 111; do gh issue view $n --repo LaithAlz/stoop-backend --json state,title -q '"\(.title): \(.state)"'; done` |
+| Shipped holding-ack copy (no "soon") + sweep still uncalled outside tests | `grep -n -A2 "HOLDING_ACK_TEMPLATE = " apps/api/app/agent/nodes/degraded_mode.py; grep -rn "sweep_degraded_mode_retries" apps/api/app --include='*.py' \| grep -v degraded_mode_sweep` |
 | Eval gate GREEN (gate 9: 20/20, release_blocked=False, as of 2026-07-06) | `cd apps/api && python3 -c "import json; print(json.load(open('evals/results/last-run.json'))['summary'])"` |
 | Eval-harness work merged (PR #177, squash `3ddd15e`, 2026-07-06) | `git log --oneline -3 main` shows the #177 squash; `gh pr view 177 --repo LaithAlz/stoop-backend --json state` |
 | `graph_entry.enqueue_classification` still the stub #34 replaces | `grep -n "stub" apps/api/app/agent/graph_entry.py` |
 | `fire_emergency_protocol` still the #108 no-op seam | `grep -n "no-op\|#108" apps/api/app/agent/emergency.py` |
 | No outbound-send call site exists anywhere | `grep -rn "messages.create\|send_sms" apps/api/app --include='*.py' \| grep -vi anthropic` |
-| Migrations head = 0008 | `ls apps/api/migrations/versions/ \| tail -3` |
+| Migrations head = 0009 (as of 2026-07-12) | `ls apps/api/migrations/versions/ \| tail -3` |
 | `uq_drafts_one_pending` / `uq_notifications_message_dedupe` shapes | `grep -n "uq_drafts_one_pending\|uq_notifications_message_dedupe" docs/03-engineering/schema-v1.md` |
 | langgraph 1.2.7 / checkpoint-postgres 3.1.0 installed; `interrupt`/`Command` importable | `cd apps/api && uv run python -c "from langgraph.types import interrupt, Command; import importlib.metadata as m; print(m.version('langgraph'))"` |
 | safety-reviewer matrix covers #44/#45/#108/#109 + agent//webhooks/ | `grep -n "safety-reviewer" -A 3 docs/03-engineering/dev-agents.md` |
