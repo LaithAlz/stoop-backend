@@ -87,12 +87,33 @@ export interface TimelineDraftEntry {
 
 export interface TimelineAuditEntry {
   kind: "audit";
+  /** api-contracts.md's `GET /v1/cases/{id}` example: `"actor": "agent"`. */
+  actor: "agent";
   action: "classified";
-  /** The plain-English `summary` key on the `audit_log` 'classified'
-   * payload (schema-v1 v1.7 amendment, api-contracts.md v1.1) — same
-   * source as the queue card's `why`, rendered here as the thread's
-   * always-visible margin note. */
-  summary: string;
+  payload: {
+    severity: Severity;
+    /** Terse rule-fragment audit trail (api-contracts.md's queue example:
+     * `rules_fired`) — kept even though this screen doesn't render it,
+     * so the mock payload shape matches the doc, not just the one field
+     * the UI happens to use. */
+    rules_fired: string[];
+    /**
+     * The plain-English `summary` key schema-v1's v1.7 amendment adds to
+     * the `audit_log` 'classified' payload — same source as the queue
+     * card's `why`, rendered here as the thread's always-visible margin
+     * note.
+     *
+     * CONTRACT GAP: the `GET /v1/cases/{id}` example in api-contracts.md
+     * predates v1.7 and shows this payload as only `{severity,
+     * rules_fired}` — it doesn't yet show `summary` on the *timeline's*
+     * audit payload (only the flatter `/v1/queue` card's `why` is
+     * documented as reading it). Whether the cases-detail endpoint's
+     * audit entry also carries `summary` needs to go in the next
+     * contract amendment; mock data assumes yes, since the thread's
+     * margin note has nowhere else to read it from.
+     */
+    summary: string;
+  };
   at: string;
 }
 
@@ -191,8 +212,13 @@ export const queue: QueueItem[] = [
       },
       {
         kind: "audit",
+        actor: "agent",
         action: "classified",
-        summary: mariaWhy,
+        payload: {
+          severity: "emergency",
+          rules_fired: ["active water intrusion", "safety risk unresolved by tenant"],
+          summary: mariaWhy,
+        },
         at: "12:47 AM",
       },
     ],
@@ -228,7 +254,7 @@ export const queue: QueueItem[] = [
         kind: "message",
         direction: "outbound",
         party: "tenant",
-        body: "Thanks for flagging it — can you send a quick photo of the sink and how much water there is?",
+        body: "Thanks for flagging it — can you send a quick photo?",
         media: [],
         at: "8:14 AM",
       },
@@ -241,6 +267,14 @@ export const queue: QueueItem[] = [
         at: "8:20 AM",
       },
       {
+        kind: "message",
+        direction: "outbound",
+        party: "tenant",
+        body: "How much water is pooling under there?",
+        media: [],
+        at: "8:21 AM",
+      },
+      {
         kind: "draft",
         draftId: "d-jesse-sink-1",
         status: "pending",
@@ -249,8 +283,13 @@ export const queue: QueueItem[] = [
       },
       {
         kind: "audit",
+        actor: "agent",
         action: "classified",
-        summary: jesseWhy,
+        payload: {
+          severity: "urgent",
+          rules_fired: ["water damage risk, not active flooding", "next-day vendor slot available"],
+          summary: jesseWhy,
+        },
         at: "8:22 AM",
       },
     ],
@@ -290,8 +329,13 @@ export const queue: QueueItem[] = [
       },
       {
         kind: "audit",
+        actor: "agent",
         action: "classified",
-        summary: samWhy,
+        payload: {
+          severity: "routine",
+          rules_fired: ["non-emergency admin question", "answer already in house rules"],
+          summary: samWhy,
+        },
         at: "6:42 PM",
       },
     ],
@@ -308,8 +352,9 @@ export function getConversation(id: string): QueueItem | undefined {
 }
 
 /** Fallback margin-note copy for a case with no agent-written `why` yet
- * (see the v1.1 amendment note on `TimelineAuditEntry.summary` above — rows
- * classified before that field shipped have `why: null`). Shared by Home's
+ * (see the v1.1 amendment note on `TimelineAuditEntry.payload.summary`
+ * above — rows classified before that field shipped have `why: null`).
+ * Shared by Home's
  * queue and the conversation thread so the same case never shows two
  * different fallback sentences depending which screen you view it from. */
 export const DEFAULT_WHY = "I drafted this from your house rules and past replies.";

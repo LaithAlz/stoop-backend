@@ -80,7 +80,12 @@ function ConversationErrorComponent({ reset }: { reset: () => void }) {
 }
 
 function ConversationPage() {
-  const item = Route.useLoaderData();
+  // The loader above always throws notFound() before returning undefined,
+  // so `Route.useLoaderData()` never actually resolves to `undefined` here
+  // — narrowed once, right after the hook call, so every access below
+  // reads a plain `QueueItem` instead of re-litigating its (type-only,
+  // never true at runtime) possible undefined-ness at each site.
+  const item = Route.useLoaderData() as QueueItem;
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -93,7 +98,7 @@ function ConversationPage() {
   );
   const draftEntry = item.timeline.find((e): e is TimelineDraftEntry => e.kind === "draft");
   const auditEntry = item.timeline.find((e): e is TimelineAuditEntry => e.kind === "audit");
-  const why = auditEntry?.summary ?? item.why ?? DEFAULT_WHY;
+  const why = auditEntry?.payload.summary ?? item.why ?? DEFAULT_WHY;
   const caseOpen = item.status !== "resolved";
 
   return (
