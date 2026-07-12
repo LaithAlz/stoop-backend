@@ -14,8 +14,11 @@ bun run lint       # eslint .
 bun run format     # prettier --write .
 ```
 
-There is **no `test` or `typecheck` script** — type errors surface only via
-`bun run build` or the editor. Never claim "web tests pass"; there are none.
+There is **no `test` or `typecheck` script**, and **nothing in the pipeline
+typechecks** — `vite build` transpiles without running tsc, so pure type
+errors pass a green build. For a real check run `bunx tsc --noEmit`
+(typescript is in devDependencies); otherwise type errors surface only in
+the editor. Never claim "web tests pass"; there are none.
 
 ## No web CI — lint + build ARE the gate
 
@@ -30,8 +33,10 @@ in the PR body.
   `docs/mockups/07-clarity-redesign.html`, adopted by the dashboard rebuild
   (PR #181, components under `src/components/clarity/`). Match it screen by
   screen; `docs/README.md` §mockups is the ranking of record.
-- 06 "Heritage light" is the PREVIOUS authority — legacy screens not yet
-  rebuilt still use it; do not build anything new on it. 01–04 (Brownstone
+- 06 "Heritage light" is the PREVIOUS app authority — do not build new APP
+  screens on it, but it REMAINS the contract for the marketing site and for
+  app screens not yet rebuilt (`docs/README.md` §mockups). A new marketing
+  page is built on Heritage, not Clarity. 01–04 (Brownstone
   et al.) are explored directions only. Note: root `CLAUDE.md`'s one-line
   mockup note predates this — `docs/README.md` wins.
 - The dashboard reads mock data (`src/lib/mock-app.ts`); there is no API
@@ -41,9 +46,9 @@ in the PR body.
 ## Copy rules (root rule 8 — enforced on every customer-visible string)
 
 Plain English (never "triage"), no legal/LTB mentions on marketing pages,
-never "founding/cohort/spot counts" — say "early access". Exact prices only:
-free Emergency Line / $10 Full Plan / $5 early-access (grandfathered) /
-PMs $1.50/door. Full ruleset: `docs/02-product/plain-language-rules.md` and
+never "founding/cohort/spot counts" — say "early access". Prices: exactly the
+list in root rule 8 (one home — never restate or improvise a price here).
+Full ruleset: `docs/02-product/plain-language-rules.md` and
 `.claude/skills/stoop-docs-and-writing/SKILL.md`. Any string a landlord,
 tenant, or visitor reads gets a copy review before the PR.
 

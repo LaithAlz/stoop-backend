@@ -59,9 +59,9 @@ tool-specific files. Volatile facts below are stamped "as of 2026-07-12".
 
 Founder-elevated (same force as the eight above):
 
-9. **Paid eval runs are founder-gated.** A real run costs ~74–85¢ and 15–25
-   min (as of 2026-07-06). Never fire one autonomously. Machinery testing is
-   free with `EVAL_DRY_RUN=1`.
+9. **Paid eval runs are founder-gated.** Never fire one autonomously.
+   Machinery testing is free with `EVAL_DRY_RUN=1`. Cost/duration figures
+   live in ONE home: `stoop-change-control` rule 9.
 10. **Live Supabase dry-run before merging any migration touching roles,
     GRANTs, or RLS.** Local Docker Postgres runs as superuser and is blind to
     privilege bugs (migration 0004 passed locally, failed live).
@@ -131,7 +131,10 @@ tests spray asyncpg `TimeoutError`s against the CORRECT `stoop:stoop` URL:
    `completed success`.
 9. Red check → read the log, fix, push, re-watch. Never merge red; there is
    no override path. Blocking review findings → fix and re-review.
-10. Merge (human gate / standing founder directive only):
+10. Merge also requires a SENIOR-REVIEW LGTM on the final PR diff — a fresh
+    reviewer (strongest model available), separate from step 4's passes,
+    with every BLOCKING finding resolved (`stoop-change-control` §2.7).
+11. Merge (human gate / standing founder directive only):
     `gh pr merge <N> --repo LaithAlz/stoop-backend --squash --delete-branch`.
 
 ## Frozen artifacts — never edit in place
@@ -146,7 +149,7 @@ tests spray asyncpg `TimeoutError`s against the CORRECT `stoop:stoop` URL:
 ## Router — read the deep doc BEFORE you act
 
 The files under `.claude/skills/<name>/SKILL.md` are **plain markdown
-reference docs** (~4,700 lines of institutional knowledge). The `.claude/`
+reference docs** (~4,400 lines of institutional knowledge). The `.claude/`
 path and the YAML header at the top of each are conventions of a different
 agent tool — ignore them; open the files with your normal file tools and read
 them like any other doc. They are dense, current, and each ends with

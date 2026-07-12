@@ -10,6 +10,9 @@ typing). Facts here stamped as of 2026-07-12.
 cd apps/api
 uv sync                                   # deps (installs Python 3.12 if missing)
 uv run uvicorn app.main:app --reload      # run; needs .env (cwd-relative autoload)
+# ^ with a real ANTHROPIC_API_KEY in .env, every inbound webhook message now
+#   triggers a real PAID LLM classification (graph wired since PR #185) —
+#   use a fake key or a mocked Anthropic client for local end-to-end poking.
 uv run alembic upgrade head               # migrate — head is 0009 (as of 2026-07-12)
 uv run ruff check . && uv run ruff format --check . && uv run mypy app   # must be green pre-commit
 ```

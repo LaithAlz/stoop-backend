@@ -589,7 +589,7 @@ Volatile claims and their one-line re-verification commands:
 | Shipped holding-ack copy (no "soon") + sweep still uncalled outside tests | `grep -n -A2 "HOLDING_ACK_TEMPLATE = " apps/api/app/agent/nodes/degraded_mode.py; grep -rn "sweep_degraded_mode_retries" apps/api/app --include='*.py' \| grep -v degraded_mode_sweep` |
 | Eval gate GREEN (gate 9: 20/20, release_blocked=False, as of 2026-07-06) | `cd apps/api && python3 -c "import json; print(json.load(open('evals/results/last-run.json'))['summary'])"` |
 | Eval-harness work merged (PR #177, squash `3ddd15e`, 2026-07-06) | `git log --oneline -3 main` shows the #177 squash; `gh pr view 177 --repo LaithAlz/stoop-backend --json state` |
-| `graph_entry.enqueue_classification` still the stub #34 replaces | `grep -n "stub" apps/api/app/agent/graph_entry.py` |
+| `enqueue_classification` runs the real graph (PR #185) | `grep -n "run_graph\|compile_case_graph" apps/api/app/agent/graph_entry.py` |
 | `fire_emergency_protocol` still the #108 no-op seam | `grep -n "no-op\|#108" apps/api/app/agent/emergency.py` |
 | No outbound-send call site exists anywhere | `grep -rn "messages.create\|send_sms" apps/api/app --include='*.py' \| grep -vi anthropic` |
 | Migrations head = 0009 (as of 2026-07-12) | `ls apps/api/migrations/versions/ \| tail -3` |
