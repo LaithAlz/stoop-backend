@@ -205,3 +205,71 @@ async def test_vulnerable_occupant_validation(session: AsyncSession) -> None:
             TenantCreateRequest(phone="+14165550005", vulnerable_occupant="not_a_real_value")
     finally:
         await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_update_phone_explicit_null_rejected(session: AsyncSession) -> None:
+    """``phone`` is NOT NULL in schema-v1.md (senior review on PR #195, B3)."""
+    landlord_id = await factories.insert_landlord(session)
+    property_id = await factories.insert_property(session, landlord_id)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        created = await create_tenant(
+            uuid.UUID(property_id), TenantCreateRequest(phone="+14165550006"), (landlord, session)
+        )
+        with pytest.raises(AppError) as exc_info:
+            await update_tenant(created.id, TenantUpdateRequest(phone=None), (landlord, session))
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "invalid_field"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_duplicate_phone_on_create_returns_409(session: AsyncSession) -> None:
+    """``UNIQUE (property_id, phone)`` (senior review on PR #195, A1)."""
+    landlord_id = await factories.insert_landlord(session)
+    property_id = await factories.insert_property(session, landlord_id)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        await create_tenant(
+            uuid.UUID(property_id),
+            TenantCreateRequest(phone="+14165550007", name="First"),
+            (landlord, session),
+        )
+        with pytest.raises(AppError) as exc_info:
+            await create_tenant(
+                uuid.UUID(property_id),
+                TenantCreateRequest(phone="+14165550007", name="Duplicate"),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "duplicate_phone"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_duplicate_phone_on_update_returns_409(session: AsyncSession) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    property_id = await factories.insert_property(session, landlord_id)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        await create_tenant(
+            uuid.UUID(property_id),
+            TenantCreateRequest(phone="+14165550008", name="First"),
+            (landlord, session),
+        )
+        second = await create_tenant(
+            uuid.UUID(property_id),
+            TenantCreateRequest(phone="+14165550009", name="Second"),
+            (landlord, session),
+        )
+        with pytest.raises(AppError) as exc_info:
+            await update_tenant(
+                second.id, TenantUpdateRequest(phone="+14165550008"), (landlord, session)
+            )
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "duplicate_phone"
+    finally:
+        await _cleanup(session, landlord_id)

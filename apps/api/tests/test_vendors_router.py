@@ -6,6 +6,8 @@ Marker: ``integration``. Same direct-handler-call harness as
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import re
 import subprocess
@@ -112,6 +114,73 @@ async def test_create_list_update_delete_vendor_roundtrip(session: AsyncSession)
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("field", ["name", "trade", "phone", "active"])
+async def test_update_not_nullable_field_explicit_null_rejected(
+    session: AsyncSession, field: str
+) -> None:
+    """Every NOT NULL patchable column (senior review on PR #195, B3)."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        created = await create_vendor(
+            VendorCreateRequest(name="NN test", trade="general", phone="+14165551999"),
+            (landlord, session),
+        )
+        with pytest.raises(AppError) as exc_info:
+            await update_vendor(
+                created.id, VendorUpdateRequest(**{field: None}), (landlord, session)
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "invalid_field"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_duplicate_phone_on_create_returns_409(session: AsyncSession) -> None:
+    """``UNIQUE (landlord_id, phone)`` (senior review on PR #195, A1)."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        await create_vendor(
+            VendorCreateRequest(name="First", trade="general", phone="+14165552100"),
+            (landlord, session),
+        )
+        with pytest.raises(AppError) as exc_info:
+            await create_vendor(
+                VendorCreateRequest(name="Duplicate", trade="hvac", phone="+14165552100"),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "duplicate_phone"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_duplicate_phone_on_update_returns_409(session: AsyncSession) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        await create_vendor(
+            VendorCreateRequest(name="First", trade="general", phone="+14165552200"),
+            (landlord, session),
+        )
+        second = await create_vendor(
+            VendorCreateRequest(name="Second", trade="general", phone="+14165552201"),
+            (landlord, session),
+        )
+        with pytest.raises(AppError) as exc_info:
+            await update_vendor(
+                second.id, VendorUpdateRequest(phone="+14165552200"), (landlord, session)
+            )
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "duplicate_phone"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_list_vendors_cursor_pagination(session: AsyncSession) -> None:
     landlord_id = await factories.insert_landlord(session)
     landlord = Landlord(id=uuid.UUID(landlord_id))
@@ -149,6 +218,29 @@ async def test_list_vendors_invalid_cursor_returns_400(session: AsyncSession) ->
     try:
         with pytest.raises(AppError) as exc_info:
             await list_vendors((landlord, session), cursor="not-a-valid-cursor!!")
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == "invalid_cursor"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_list_vendors_crafted_cursor_non_uuid_id_returns_400(session: AsyncSession) -> None:
+    """A cursor that is well-formed base64+JSON but carries a non-uuid
+    ``id`` must still 400 ``invalid_cursor`` — not reach the caller's
+    ``CAST(:cursor_id AS uuid)`` as a raw 500 (senior review on PR #195,
+    B2). Hand-crafts the cursor rather than going through ``encode_cursor``
+    (which only ever produces valid ones) to simulate a malicious/corrupt
+    client-supplied value.
+    """
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    crafted = base64.urlsafe_b64encode(
+        json.dumps({"k": "2026-07-04T12:00:00+00:00", "id": "not-a-uuid"}).encode("utf-8")
+    ).decode("ascii")
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await list_vendors((landlord, session), cursor=crafted)
         assert exc_info.value.status_code == 400
         assert exc_info.value.code == "invalid_cursor"
     finally:

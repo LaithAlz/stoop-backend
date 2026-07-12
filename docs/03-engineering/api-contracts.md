@@ -132,6 +132,12 @@ non-disclosure as `property_not_found` above. `GET /v1/properties/{id}/
 tenants` is unpaginated (per-property tenant counts are small); `GET
 /v1/vendors` follows the standard cursor convention.
 
+**v1.10 amendment (2026-07-12 — senior review on PR #195, A1):** create/
+update on either resource 409s with code `duplicate_phone` on a unique
+-constraint collision — `tenants` has `UNIQUE (property_id, phone)`,
+`vendors` has `UNIQUE (landlord_id, phone)` (schema-v1.md) — instead of a
+raw 500 on the underlying `IntegrityError`.
+
 ## Queue (the dashboard's main read)
 
 `GET /v1/queue` → one card per case needing action, ordered
@@ -249,7 +255,35 @@ non-disclosure convention as `property_not_found`).
 - **Pagination cursor validation:** a malformed `cursor` on any
   cursor-paginated list (`GET /v1/properties`, `GET /v1/vendors`,
   `GET /v1/cases`) 400s with code `invalid_cursor` rather than 500ing or
-  silently ignoring it.
+  silently ignoring it — including a cursor that is well-formed base64/JSON
+  but carries a non-uuid `id` (crafted/corrupt input), not just malformed
+  base64/JSON outright.
+
+**v1.11 amendment (2026-07-12 — senior review on PR #195, B1):**
+`GET /v1/cases/{id}`'s `message`/pre-case-`audit` timeline entries are NOT
+`messages.case_id = :id` lookups — `messages` is append-only (rule #2) and
+the webhook (its sole writer) always inserts `case_id = NULL` (case
+identity isn't known yet); the durable link is the `message_cases
+(message_id, case_id)` join table (`app/agent/nodes/identify_case.py`'s own
+module docstring). Implementations MUST correlate via `message_cases`
+(OR'd with a direct `case_id` match, for any future write path that ever
+sets it at insert time). The same applies to exactly two `audit_log`
+action types that are `case_id`-NULL forever by construction —
+`message_received` and `emergency_triggered` — both of which carry
+`payload->>'message_id'` and correlate the same way; every other action
+this codebase writes (`classified`, `drafted`, `draft_stale`,
+`degraded_mode`, case-lifecycle actions) sets `case_id` directly and needs
+no join.
+
+**v1.11 amendment (2026-07-12 — senior review on PR #195, A3):**
+`GET /v1/cases`'s sort key (`last_activity_at`) is MUTABLE — a case bumped
+by new activity after a client has already fetched a page can "skip
+ahead" past a cursor computed from an older snapshot (jump from a later
+page back into an earlier one, or vice versa), unlike a monotonically
+-increasing key such as `created_at`. This is a known, accepted keyset
+-pagination caveat, not a bug: the remedy is simply re-fetching page 1
+(no stale-cursor error is raised — a stale cursor still resolves to SOME
+consistent position, just possibly not the one the client expected).
 
 `POST /v1/cases/{id}/resolve` — body `{ "reason": "landlord" }` → 200.
 `POST /v1/cases/{id}/ask-vendor` — body `{ "vendor_id": "…", "note?": "…" }`

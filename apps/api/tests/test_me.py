@@ -1230,6 +1230,42 @@ async def test_patch_me_timezone_null_rejected_422(
 
 
 @pytest.mark.integration
+async def test_patch_me_phone_null_rejected_422(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """``phone`` is the emergency-call target (schema-v1.md) — an explicit
+    JSON null must never silently clear it (senior review on PR #195, A4).
+    ``landlords.phone`` IS nullable in schema-v1.md, so this is a deliberate
+    business rule, not a NOT NULL DB constraint."""
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch8@example.com")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            response = await client.patch(
+                "/v1/me",
+                json={"phone": None},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "invalid_field"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
 async def test_patch_me_never_provisioned_returns_403_account_deleted(
     private_key: EllipticCurvePrivateKey,
     jwks_payload: dict[str, Any],

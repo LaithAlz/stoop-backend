@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import uuid
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
@@ -52,15 +53,25 @@ def encode_cursor(order_key: datetime, row_id: str) -> str:
 def decode_cursor(cursor: str) -> tuple[datetime, str]:
     """Decode a cursor produced by :func:`encode_cursor`.
 
+    Validates ``id`` is a well-formed uuid (every ``id`` column callers key
+    a keyset query off is a uuid) — a crafted cursor with valid base64/JSON
+    but a non-uuid ``id`` (e.g. ``"id": "'; drop--"``) would otherwise reach
+    the caller's ``CAST(:cursor_id AS uuid)`` and raise a raw, uncaught
+    ``DataError`` (500) instead of the standard error envelope (senior
+    review on PR #195, B2).
+
     Raises
     ------
     InvalidCursorError
-        The cursor is not valid base64/JSON, or is missing the expected keys.
+        The cursor is not valid base64/JSON, is missing the expected keys,
+        or ``id`` is not a valid uuid.
     """
     try:
         raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
         payload: dict[str, Any] = json.loads(raw.decode("utf-8"))
-        return datetime.fromisoformat(payload["k"]), str(payload["id"])
+        row_id = str(payload["id"])
+        uuid.UUID(row_id)  # shape-validate only; raises ValueError if malformed
+        return datetime.fromisoformat(payload["k"]), row_id
     except (binascii.Error, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
         raise InvalidCursorError("invalid cursor") from exc
 

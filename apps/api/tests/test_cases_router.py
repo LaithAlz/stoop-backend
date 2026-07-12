@@ -75,6 +75,15 @@ async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
         ),
         params,
     )
+    # message_cases has FKs to both messages and cases (no explicit ON
+    # DELETE action -> NO ACTION) — must go before either.
+    await session.execute(
+        text(
+            "DELETE FROM message_cases WHERE message_id IN "
+            "(SELECT id FROM messages WHERE landlord_id = :lid)"
+        ),
+        params,
+    )
     for table in ("audit_log", "drafts", "messages", "cases", "tenants", "vendors", "properties"):
         await session.execute(text(f"DELETE FROM {table} WHERE landlord_id = :lid"), params)  # noqa: S608
     await session.execute(text("DELETE FROM landlords WHERE id = :lid"), params)
@@ -232,6 +241,18 @@ async def test_cross_tenant_case_access_returns_404(session: AsyncSession) -> No
 
 @pytest.mark.integration
 async def test_get_case_full_timeline_oldest_first_interleaved(session: AsyncSession) -> None:
+    """Production-shaped seed (senior review on PR #195, B1): ``messages``
+    is append-only and its ``case_id`` is ALWAYS ``NULL`` in production
+    (the webhook, the sole writer, never sets it — see
+    ``app/agent/nodes/identify_case.py``'s module docstring). The only
+    durable link is ``message_cases``, so this test seeds through that join
+    table instead of the impossible-in-production (and impossible under
+    real ``app_role`` — ``messages`` REVOKEs UPDATE) ``UPDATE messages SET
+    case_id`` this test used before. Also seeds a pre-case
+    ``message_received`` audit_log row (``case_id`` NULL forever,
+    correlated only via ``message_cases`` on the shared ``message_id`` —
+    the "secondary same-class" finding) to prove that correlation path too.
+    """
     landlord_id = await factories.insert_landlord(session)
     landlord = Landlord(id=uuid.UUID(landlord_id))
     try:
@@ -239,6 +260,8 @@ async def test_get_case_full_timeline_oldest_first_interleaved(session: AsyncSes
             session, landlord_id=landlord_id, status="awaiting_approval"
         )
 
+        # `insert_message` never sets `case_id` — it stays NULL, exactly
+        # like every real inbound message the webhook ever persists.
         message_id = await factories.insert_message(
             session,
             landlord_id=landlord_id,
@@ -246,9 +269,18 @@ async def test_get_case_full_timeline_oldest_first_interleaved(session: AsyncSes
             tenant_id=tenant_id,
             body="No heat since last night!",
         )
-        await session.execute(
-            text("UPDATE messages SET case_id = :case_id WHERE id = :id"),
-            {"case_id": case_id, "id": message_id},
+        await factories.insert_message_case(session, message_id=message_id, case_id=case_id)
+
+        # Pre-case audit row (app/agent/graph_entry.py's real shape):
+        # case_id NULL forever, correlated only via message_cases on the
+        # shared message_id in its payload.
+        await factories.insert_audit_log(
+            session,
+            landlord_id=landlord_id,
+            case_id=None,
+            actor="system",
+            action="message_received",
+            payload={"message_id": message_id},
         )
         await session.commit()
 
@@ -279,10 +311,16 @@ async def test_get_case_full_timeline_oldest_first_interleaved(session: AsyncSes
         assert detail.vendor is None
         assert detail.status == "awaiting_approval"
 
-        kinds = [entry.kind for entry in detail.timeline]
-        assert kinds == ["message", "audit", "draft"]
+        # Non-empty timeline is the whole point of this regression: before
+        # the message_cases-join fix, a `WHERE case_id = :case_id` query
+        # against production-shaped data (case_id always NULL) silently
+        # returned zero message/pre-case-audit rows.
+        assert detail.timeline, "timeline must not be empty for production-shaped seed data"
 
-        # oldest-first: message.at <= audit.at <= draft.at
+        kinds = [entry.kind for entry in detail.timeline]
+        assert kinds == ["message", "audit", "audit", "draft"]
+
+        # oldest-first
         ats = [entry.at for entry in detail.timeline]
         assert ats == sorted(ats)
 
@@ -290,15 +328,21 @@ async def test_get_case_full_timeline_oldest_first_interleaved(session: AsyncSes
         assert message_entry.kind == "message"
         assert message_entry.body == "No heat since last night!"  # type: ignore[union-attr]
 
-        audit_entry = detail.timeline[1]
+        received_entry = detail.timeline[1]
+        assert received_entry.kind == "audit"
+        assert received_entry.action == "message_received"  # type: ignore[union-attr]
+        assert received_entry.payload["message_id"] == message_id  # type: ignore[union-attr]
+
+        audit_entry = detail.timeline[2]
         assert audit_entry.kind == "audit"
+        assert audit_entry.action == "classified"  # type: ignore[union-attr]
         # payload.summary surfaces automatically — the trivially-resolved
         # contract gap (PR #190 review), see cases.py's module docstring.
         assert audit_entry.payload["summary"] == (  # type: ignore[union-attr]
             "No heat overnight can't wait, so I treated it as urgent."
         )
 
-        draft_entry = detail.timeline[2]
+        draft_entry = detail.timeline[3]
         assert draft_entry.kind == "draft"
         assert str(draft_entry.id) == draft_id  # type: ignore[union-attr]
         assert draft_entry.status == "pending"  # type: ignore[union-attr]

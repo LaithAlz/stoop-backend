@@ -16,6 +16,13 @@ specifically. Either way, a tenant with any case/message history can never
 be hard-deleted. ``DELETE /v1/tenants/{id}`` sets ``active = false`` and
 returns the updated row; idempotent (deleting an already-inactive tenant
 just re-confirms the state, no error).
+
+Duplicate phone (senior review on PR #195, A1): ``tenants`` has
+``UNIQUE (property_id, phone)`` (schema-v1.md). A create/update that
+collides is caught (``IntegrityError``) and surfaced as 409
+``duplicate_phone`` rather than a raw 500 — see ``api-contracts.md``'s
+Tenants & Vendors amendment for the same contract addition on the vendors
+side.
 """
 
 from __future__ import annotations
@@ -28,10 +35,12 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import Landlord, require_landlord
 from app.errors import AppError
+from app.validation import reject_explicit_null
 
 router = APIRouter(prefix="/v1", tags=["tenants"])
 
@@ -148,6 +157,14 @@ async def _get_tenant_or_404(
     return row
 
 
+def _duplicate_phone_error() -> AppError:
+    return AppError(
+        status_code=409,
+        code="duplicate_phone",
+        message="A tenant with this phone number already exists for this property.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -190,18 +207,21 @@ async def create_tenant(
 
     await _get_property_or_404(session, landlord_id=landlord_id, property_id=str(property_id))
 
-    result = await session.execute(
-        _INSERT_SQL,
-        {
-            "landlord_id": landlord_id,
-            "property_id": str(property_id),
-            "name": body.name,
-            "phone": body.phone,
-            "unit": body.unit,
-            "vulnerable_occupant": body.vulnerable_occupant,
-            "notes": body.notes,
-        },
-    )
+    try:
+        result = await session.execute(
+            _INSERT_SQL,
+            {
+                "landlord_id": landlord_id,
+                "property_id": str(property_id),
+                "name": body.name,
+                "phone": body.phone,
+                "unit": body.unit,
+                "vulnerable_occupant": body.vulnerable_occupant,
+                "notes": body.notes,
+            },
+        )
+    except IntegrityError as exc:
+        raise _duplicate_phone_error() from exc
     new_id = result.scalar_one()
     row = await _get_tenant_or_404(session, landlord_id=landlord_id, tenant_id=str(new_id))
     return _row_to_tenant(row)
@@ -221,6 +241,9 @@ async def update_tenant(
 
     provided = body.model_dump(exclude_unset=True)
     if provided:
+        # phone is NOT NULL in schema-v1.md (senior review on PR #195, B3).
+        reject_explicit_null(provided, not_nullable_fields=["phone"])
+
         set_clauses = [f"{field} = :{field}" for field in provided]
         set_clauses.append("updated_at = now()")
         params: dict[str, object] = {"id": tid, "landlord_id": landlord_id, **provided}
@@ -229,7 +252,10 @@ async def update_tenant(
             + ", ".join(set_clauses)
             + " WHERE id = :id AND landlord_id = :landlord_id"
         )
-        await session.execute(update_sql, params)
+        try:
+            await session.execute(update_sql, params)
+        except IntegrityError as exc:
+            raise _duplicate_phone_error() from exc
 
     row = await _get_tenant_or_404(session, landlord_id=landlord_id, tenant_id=tid)
     return _row_to_tenant(row)

@@ -328,6 +328,31 @@ async def test_update_quiet_hours_explicit_null_rejected(session: AsyncSession) 
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("field", ["label", "address_line1", "city", "province"])
+async def test_update_not_nullable_text_field_explicit_null_rejected(
+    session: AsyncSession, field: str
+) -> None:
+    """Every NOT NULL patchable column, not just quiet_hours/heating_season
+    (senior review on PR #195, B3) — an explicit JSON null must 422, never
+    reach the DB as a raw IntegrityError/500."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(label="NN test", address_line1="1 NN St", city="Toronto"),
+            (landlord, session),
+        )
+        with pytest.raises(AppError) as exc_info:
+            await update_property(
+                prop.id, PropertyUpdateRequest(**{field: None}), (landlord, session)
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "invalid_field"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_delete_blocked_by_open_case_returns_409(session: AsyncSession) -> None:
     landlord_id = await factories.insert_landlord(session)
     landlord = Landlord(id=uuid.UUID(landlord_id))

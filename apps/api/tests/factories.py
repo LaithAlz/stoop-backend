@@ -159,6 +159,21 @@ async def insert_message(
     return message_id
 
 
+async def insert_message_case(session: AsyncSession, *, message_id: str, case_id: str) -> None:
+    """Link a message to a case via ``message_cases`` — the ONLY durable
+    link in production (``messages.case_id`` is always ``NULL``; see
+    ``app/agent/nodes/identify_case.py``'s module docstring). Tests that
+    need a case-scoped message in their seed data MUST use this instead of
+    an ``UPDATE messages SET case_id = ...`` (impossible under ``app_role``
+    in production — ``messages`` is append-only, rule #2 — and not
+    representative of how a message ever actually gets linked)."""
+    await session.execute(
+        text("INSERT INTO message_cases (message_id, case_id) VALUES (:message_id, :case_id)"),
+        {"message_id": message_id, "case_id": case_id},
+    )
+    await session.commit()
+
+
 async def insert_vendor(
     session: AsyncSession,
     landlord_id: str,
@@ -280,6 +295,7 @@ __all__: list[str] = [
     "insert_draft",
     "insert_landlord",
     "insert_message",
+    "insert_message_case",
     "insert_property",
     "insert_tenant",
     "insert_vendor",

@@ -125,6 +125,7 @@ from app.db.session import get_admin_session
 from app.deps import ACCOUNT_DELETED_CODE, ACCOUNT_DELETED_MESSAGE, require_user
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthUser
+from app.validation import reject_explicit_null
 
 log = structlog.get_logger(__name__)
 
@@ -383,6 +384,14 @@ async def update_me(
         422 ``invalid_field`` if ``timezone`` is explicitly set to ``null``
         (``landlords.timezone`` is ``NOT NULL`` in schema-v1.md) — rejected
         before any write, never a raw 500 ``NotNullViolation``.
+        422 ``invalid_field`` if ``phone`` is explicitly set to ``null``
+        (senior review on PR #195, A4) — ``landlords.phone`` IS nullable in
+        schema-v1.md, so this is a deliberate BUSINESS rule, not a DB
+        constraint: it is the emergency-call target (schema-v1.md:
+        "emergency calls go here"), so silently clearing it via a JSON-null
+        accident must never happen. A landlord who genuinely wants to clear
+        it is a product decision for a future, explicit "clear phone"
+        affordance, not this endpoint's implicit behavior today.
     """
     structlog.contextvars.bind_contextvars(auth_user_id=str(user.user_id))
 
@@ -412,8 +421,7 @@ async def update_me(
             created_at=existing["created_at"],
         )
 
-    if "timezone" in provided and provided["timezone"] is None:
-        raise AppError(status_code=422, code="invalid_field", message="timezone cannot be null.")
+    reject_explicit_null(provided, not_nullable_fields=["timezone", "phone"])
 
     set_clauses: list[str] = []
     params: dict[str, Any] = {"auth_user_id": str(user.user_id)}

@@ -32,6 +32,31 @@ Timeline contract-gap follow-ups (PR #190 review) addressed here:
   captioning is MMS-pipeline work (#46) that hasn't landed. Flagged as a
   genuine gap, not trivially resolvable without inventing an undocumented
   JSON key.
+
+**BLOCKING fix (senior review on PR #195): ``messages.case_id`` is ALWAYS
+NULL in production.** ``messages`` is append-only (never-break rule #2);
+the webhook (the sole writer) always inserts ``case_id = NULL`` because
+case identity isn't known at insert time, and no later UPDATE is ever
+possible — ``app/agent/nodes/identify_case.py``'s own module docstring
+("``messages`` is append-only — case linkage goes through
+``message_cases``") is explicit that the durable link is the
+``message_cases (message_id, case_id)`` join table, never
+``messages.case_id`` itself. The timeline's messages query below
+therefore joins through ``message_cases`` (the exact pattern
+``app/agent/degraded_mode_sweep.py``'s ``_SELECT_NEWER_INBOUND_EXISTS_SQL``
+already uses), OR'd with a direct ``m.case_id = :case_id`` match for any
+future write path that ever inserts a message with ``case_id`` already
+known (e.g. a same-transaction outbound send). Same story for two
+"pre-case" ``audit_log`` action types that are ALSO ``case_id``-NULL
+forever by construction (``message_received`` —
+``app/agent/graph_entry.py`` — and ``emergency_triggered`` —
+``app/routers/webhooks/twilio.py`` — both fire before ``identify_case``
+ever assigns a case): both carry ``payload->>'message_id'``, so they are
+correlated the same way, via ``message_cases`` on that shared
+``message_id``. Every OTHER ``audit_log`` action this codebase writes
+(``classified``, ``drafted``, ``draft_stale``, ``degraded_mode``, the
+``case_lifecycle`` actions) sets ``case_id`` directly at insert time (a
+case already exists by the time they run) and needs no such join.
 """
 
 from __future__ import annotations
@@ -183,14 +208,49 @@ _SELECT_VENDOR_REF_SQL = text(
 # "every multi-tenant query scoped by landlord_id" convention), so these
 # stay safe even if ever reused/called without get_case's own upstream
 # ownership check on the `cases` row (spec review, #54/#55/#57).
+#
+# `messages.case_id = :case_id` is OR'd in for any future write path that
+# ever inserts a message with `case_id` already known (module docstring
+# "BLOCKING fix") — production rows today all have `case_id IS NULL` and
+# match only via the `message_cases` EXISTS clause instead.
 _SELECT_MESSAGES_SQL = text(
-    "SELECT direction, party, body, media, created_at FROM messages "
-    "WHERE case_id = :case_id AND landlord_id = :landlord_id ORDER BY created_at ASC"
+    """
+    SELECT m.direction, m.party, m.body, m.media, m.created_at
+    FROM messages m
+    WHERE m.landlord_id = :landlord_id
+      AND (
+        m.case_id = :case_id
+        OR EXISTS (
+          SELECT 1 FROM message_cases mc
+          WHERE mc.message_id = m.id AND mc.case_id = :case_id
+        )
+      )
+    ORDER BY m.created_at ASC
+    """
 )
 
+# `audit_log.case_id = :case_id` covers every action written WITH a case
+# already known (classified/drafted/draft_stale/degraded_mode/case_
+# lifecycle actions). The EXISTS clause covers the two "pre-case" action
+# types that are case_id-NULL forever by construction (module docstring):
+# `message_received` (app/agent/graph_entry.py) and `emergency_triggered`
+# (app/routers/webhooks/twilio.py), both of which stash `message_id` in
+# their own payload instead.
 _SELECT_AUDIT_SQL = text(
-    "SELECT actor, action, payload, created_at FROM audit_log "
-    "WHERE case_id = :case_id AND landlord_id = :landlord_id ORDER BY created_at ASC"
+    """
+    SELECT a.actor, a.action, a.payload, a.created_at
+    FROM audit_log a
+    WHERE a.landlord_id = :landlord_id
+      AND (
+        a.case_id = :case_id
+        OR EXISTS (
+          SELECT 1 FROM message_cases mc
+          WHERE mc.case_id = :case_id
+            AND mc.message_id::text = a.payload ->> 'message_id'
+        )
+      )
+    ORDER BY a.created_at ASC
+    """
 )
 
 _SELECT_DRAFTS_SQL = text(

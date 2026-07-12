@@ -68,6 +68,7 @@ from app.pagination import (
     decode_cursor,
     paginate_rows,
 )
+from app.validation import reject_explicit_null
 
 router = APIRouter(prefix="/v1", tags=["properties"])
 
@@ -132,10 +133,14 @@ _PROPERTY_COLUMNS = (
     "p.backup_contact, p.created_at, COALESCE(oc.open_case_count, 0) AS open_case_count"
 )
 
+# landlord_id filter here is belt-and-braces (senior review, A2): the
+# outer query already scopes `p` to this landlord, so a case row from a
+# different landlord could never join to it via `oc.property_id = p.id`
+# anyway — but explicit is the established convention everywhere else.
 _OPEN_CASE_COUNT_JOIN = (
     "LEFT JOIN ("
     "SELECT property_id, COUNT(*) AS open_case_count FROM cases "
-    "WHERE status = ANY(:open_statuses) GROUP BY property_id"
+    "WHERE status = ANY(:open_statuses) AND landlord_id = :landlord_id GROUP BY property_id"
     ") oc ON oc.property_id = p.id"
 )
 
@@ -156,7 +161,8 @@ _INSERT_SQL = text(
 )
 
 _COUNT_OPEN_CASES_SQL = text(
-    "SELECT COUNT(*) FROM cases WHERE property_id = :id AND status = ANY(:open_statuses)"
+    "SELECT COUNT(*) FROM cases "
+    "WHERE property_id = :id AND landlord_id = :landlord_id AND status = ANY(:open_statuses)"
 )
 
 _DELETE_SQL = text("DELETE FROM properties WHERE id = :id AND landlord_id = :landlord_id")
@@ -307,16 +313,22 @@ async def update_property(
     if not provided:
         return _row_to_property(existing)
 
-    # quiet_hours/heating_season are NOT NULL in schema-v1.md — reject an
-    # explicit null rather than attempting a write that the DB would bounce
-    # as an IntegrityError.
-    for not_nullable_field in ("quiet_hours", "heating_season"):
-        if not_nullable_field in provided and provided[not_nullable_field] is None:
-            raise AppError(
-                status_code=422,
-                code="invalid_field",
-                message=f"{not_nullable_field} cannot be null.",
-            )
+    # label/address_line1/city/province/quiet_hours/heating_season are all
+    # NOT NULL in schema-v1.md — reject an explicit null for any of them
+    # rather than attempting a write the DB would bounce as an
+    # IntegrityError (senior review on PR #195, B3; postal_code/
+    # house_rules/backup_contact are genuinely nullable, so absent below).
+    reject_explicit_null(
+        provided,
+        not_nullable_fields=[
+            "label",
+            "address_line1",
+            "city",
+            "province",
+            "quiet_hours",
+            "heating_season",
+        ],
+    )
 
     set_clauses: list[str] = []
     params: dict[str, Any] = {"id": prop_id, "landlord_id": landlord_id}
@@ -362,7 +374,8 @@ async def delete_property(
 
     open_count = (
         await session.execute(
-            _COUNT_OPEN_CASES_SQL, {"id": prop_id, "open_statuses": _OPEN_STATUSES_LIST}
+            _COUNT_OPEN_CASES_SQL,
+            {"id": prop_id, "landlord_id": landlord_id, "open_statuses": _OPEN_STATUSES_LIST},
         )
     ).scalar_one()
     if open_count > 0:

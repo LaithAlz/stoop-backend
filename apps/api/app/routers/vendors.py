@@ -13,6 +13,11 @@ explicit-``landlord_id`` rationale.
 no explicit ``ON DELETE`` clause (Postgres default ``NO ACTION``), which
 still blocks an immediate hard delete while a referencing row exists.
 Sets ``active = false``; idempotent.
+
+Duplicate phone (senior review on PR #195, A1): ``vendors`` has
+``UNIQUE (landlord_id, phone)`` (schema-v1.md). A create/update that
+collides is caught (``IntegrityError``) and surfaced as 409
+``duplicate_phone`` rather than a raw 500.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import Landlord, require_landlord
@@ -37,6 +43,7 @@ from app.pagination import (
     decode_cursor,
     paginate_rows,
 )
+from app.validation import reject_explicit_null
 
 router = APIRouter(prefix="/v1", tags=["vendors"])
 
@@ -133,6 +140,14 @@ async def _get_vendor_or_404(
     return row
 
 
+def _duplicate_phone_error() -> AppError:
+    return AppError(
+        status_code=409,
+        code="duplicate_phone",
+        message="A vendor with this phone number already exists.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -180,18 +195,23 @@ async def create_vendor(
     landlord, session = landlord_and_session
     landlord_id = str(landlord.id)
 
-    result = await session.execute(
-        _INSERT_SQL,
-        {
-            "landlord_id": landlord_id,
-            "name": body.name,
-            "trade": body.trade,
-            "phone": body.phone,
-            "notes": body.notes,
-            "working_hours": None if body.working_hours is None else _dump_json(body.working_hours),
-            "active": body.active,
-        },
-    )
+    try:
+        result = await session.execute(
+            _INSERT_SQL,
+            {
+                "landlord_id": landlord_id,
+                "name": body.name,
+                "trade": body.trade,
+                "phone": body.phone,
+                "notes": body.notes,
+                "working_hours": None
+                if body.working_hours is None
+                else _dump_json(body.working_hours),
+                "active": body.active,
+            },
+        )
+    except IntegrityError as exc:
+        raise _duplicate_phone_error() from exc
     new_id = result.scalar_one()
     row = await _get_vendor_or_404(session, landlord_id=landlord_id, vendor_id=str(new_id))
     return _row_to_vendor(row)
@@ -211,6 +231,11 @@ async def update_vendor(
 
     provided = body.model_dump(exclude_unset=True)
     if provided:
+        # name/trade/phone/active are all NOT NULL in schema-v1.md (senior
+        # review on PR #195, B3; notes/working_hours are genuinely
+        # nullable, so absent below).
+        reject_explicit_null(provided, not_nullable_fields=["name", "trade", "phone", "active"])
+
         set_clauses: list[str] = []
         params: dict[str, Any] = {"id": vid, "landlord_id": landlord_id}
         for field, value in provided.items():
@@ -226,7 +251,10 @@ async def update_vendor(
             + ", ".join(set_clauses)
             + " WHERE id = :id AND landlord_id = :landlord_id"
         )
-        await session.execute(update_sql, params)
+        try:
+            await session.execute(update_sql, params)
+        except IntegrityError as exc:
+            raise _duplicate_phone_error() from exc
 
     row = await _get_vendor_or_404(session, landlord_id=landlord_id, vendor_id=vid)
     return _row_to_vendor(row)
