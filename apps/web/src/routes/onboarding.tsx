@@ -152,7 +152,6 @@ function prefersReducedMotion(): boolean {
 function OnboardingPage() {
   const [step, setStep] = useState<OnboardingStep>("welcome");
   const [state, setState] = useOnboardingState();
-  const tenantCounter = useRef(1);
 
   useEffect(() => {
     trackEvent("onboarding_step_viewed", { props: { step } });
@@ -172,13 +171,16 @@ function OnboardingPage() {
       tenants: s.tenants.map((t) => (t.id === id ? { ...t, ...patch } : t)),
     }));
   const addTenant = () => {
-    tenantCounter.current += 1;
+    // Collision-proof id generated at EVENT time (never render time, so SSR
+    // discipline holds). A counter ref reset on remount collided with
+    // rehydrated localStorage rows — typing then edited BOTH rows (PR #192
+    // senior review, BLOCKING).
     setState((s) => ({
       ...s,
       tenants: [
         ...s.tenants,
         {
-          id: `tenant-new-${tenantCounter.current}`,
+          id: `tenant-new-${crypto.randomUUID()}`,
           name: "",
           phone: "",
           unit: "",
@@ -1432,6 +1434,16 @@ function DoneStep({
 
                 <Link
                   to="/app"
+                  onClick={() => {
+                    // Setup is done — stop persisting names/phones/voice
+                    // samples in plaintext localStorage (PII hygiene,
+                    // PR #192 senior review advisory).
+                    try {
+                      localStorage.removeItem(STORAGE_KEY);
+                    } catch {
+                      /* storage unavailable — nothing to clear */
+                    }
+                  }}
                   className="mt-7 flex min-h-14 w-full items-center justify-center gap-2 rounded-clarity-md border-[1.5px] border-clarity-brand-deep bg-clarity-brand font-clarity-sans text-base font-extrabold text-clarity-brand-on shadow-clarity-banner"
                 >
                   Go to your dashboard
