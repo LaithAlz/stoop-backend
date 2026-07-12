@@ -165,10 +165,12 @@ async def test_rows_without_ack_token_never_collide(conn: AsyncConnection) -> No
 
 @pytest.mark.integration
 async def test_emergency_call_rows_without_ack_token_never_collide(conn: AsyncConnection) -> None:
-    """Every emergency_call row starts with NO ack_token (the webhook's own
-    INSERT never sets one — handle_emergency_trigger enriches it later) —
-    multiple such rows for DIFFERENT messages must never collide on the
-    ack_token index."""
+    """A row with no ``ack_token`` key at all (this test's own bare INSERT,
+    standing in for e.g. a legacy/edge row from before the webhook's own
+    INSERT started writing one at creation time — safety review,
+    2026-07-12, finding N1) — multiple such rows for DIFFERENT messages
+    must never collide on the ack_token index (NULL-safe partial unique
+    index, see this migration's own docstring)."""
     landlord_id = await _insert_landlord(conn)
     for _ in range(3):
         payload = json.dumps({"message_id": str(uuid.uuid4()), "categories": ["fire"]})

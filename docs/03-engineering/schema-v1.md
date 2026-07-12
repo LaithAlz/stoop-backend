@@ -311,7 +311,14 @@
 >    now drains every `pending`/`failed` `tenant_ack` row on each
 >    scheduler tick, resending on failure until genuinely delivered. See
 >    `app/agent/degraded_mode_sweep.py`'s own module docstring
->    ("DEPLOYMENT-GATING FACT") for the full closure note.
+>    ("DEPLOYMENT-GATING FACT") for the full closure note. **Safety review,
+>    2026-07-12 (finding N2):** `'failed'` is TRANSIENT-only (stays in the
+>    drain sweep's own retry set); a genuinely TERMINAL outcome for
+>    `tenant_ack`/`emergency_sms` (today: no stored tenant phone to send
+>    to at all — see `emergency_chain.py`'s own "Known limitation") lands
+>    on `'exhausted'` instead, the SAME terminal value #2 below already
+>    uses — no new CHECK value, just reusing the existing one for a second
+>    type.
 > 2. **`degraded_retry`** (`channel='push'` — placeholder; this type is
 >    never delivered to anyone, see below) — an internal-only marker for
 >    the "no keywords at all" degraded-mode leg: classification failed,

@@ -174,6 +174,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import secrets
 from collections.abc import Coroutine
 from contextlib import AbstractAsyncContextManager
 from contextlib import asynccontextmanager as _acm
@@ -184,6 +185,7 @@ import sentry_sdk
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent import emergency_chain, prefilter
@@ -475,13 +477,33 @@ _INSERT_NEEDS_EYES_SQL = text(
 
 _INSERT_EMERGENCY_NOTIFICATION_SQL = text(
     """
-    INSERT INTO notifications (landlord_id, case_id, type, channel, status, payload)
-    VALUES (:landlord_id, NULL, 'emergency_call', 'voice', 'pending', CAST(:payload AS jsonb))
+    INSERT INTO notifications (
+        landlord_id, case_id, type, channel, status, payload, next_attempt_at
+    )
+    VALUES (
+        :landlord_id, NULL, 'emergency_call', 'voice', 'pending', CAST(:payload AS jsonb), now()
+    )
     ON CONFLICT ((payload ->> 'message_id'), type) WHERE type IN ('emergency_call', 'needs_eyes')
     DO NOTHING
     RETURNING id
     """
 )
+# Safety review, 2026-07-12 (finding N1, BLOCKING): the row is now BORN
+# ENRICHED -- ``next_attempt_at = now()`` (sweep-visible from the instant
+# this INSERT commits, no separate "enrich" step/transaction/module
+# required) AND the ack token lives in ``payload`` from the very first
+# write (see ``notification_payload`` below). This closes the "pre-enrich
+# window": previously, a crash/failure in ``app/agent/emergency_chain.py``'s
+# OWN separate enrich transaction (which used to run AFTER this INSERT,
+# in a DIFFERENT module/transaction/request phase) could strand a row at
+# ``next_attempt_at IS NULL`` forever -- durably persisted, but invisible
+# to the sweep, with no redelivery to save it (Twilio already got its 200,
+# or the artifact-creation failure already 5xx'd and a retry would just
+# hit ON CONFLICT and skip re-enriching). See
+# ``app/agent/emergency_chain.py``'s module docstring "The instant +
+# durable sweep hybrid" for the full before/after account, and its sweep
+# SELECT's own ``next_attempt_at IS NULL`` clause for belt 2 (healing any
+# row that somehow still lacks it).
 
 _INSERT_EMERGENCY_AUDIT_SQL = text(
     """
@@ -547,6 +569,32 @@ async def _ensure_needs_eyes_notification(
     return row is not None
 
 
+_MAX_ACK_TOKEN_INSERT_ATTEMPTS = 3
+"""Safety review, 2026-07-12 (finding 4, LOW): ``uq_notifications_ack_token``
+(schema-v1.md v1.9, migration 0010) is a genuine UNIQUE index over a
+random ``secrets.token_urlsafe(24)`` value (~144 bits of entropy) — a
+collision is astronomically unlikely, but "unlikely" is not "impossible",
+and the unique index means Postgres WILL raise on one. Regenerating and
+retrying a bounded few times, inline, makes the index truly fail-safe
+instead of merely fail-loud (a real collision would otherwise 500 the
+whole webhook request over something a fresh random token trivially
+fixes)."""
+
+
+def _is_ack_token_collision(exc: IntegrityError) -> bool:
+    """``True`` iff *exc* is a UNIQUE VIOLATION on
+    ``uq_notifications_ack_token`` specifically — never swallows any OTHER
+    integrity error (e.g. a genuine schema/FK problem), which must still
+    propagate and 5xx normally."""
+    orig = getattr(exc, "orig", None)
+    constraint_name = getattr(orig, "constraint_name", None)
+    if constraint_name == "uq_notifications_ack_token":
+        return True
+    # Defensive fallback across driver/version differences in whether
+    # constraint_name is populated -- never the primary detection path.
+    return "uq_notifications_ack_token" in str(exc)
+
+
 async def _ensure_tenant_emergency_artifacts(
     *,
     landlord_id: UUID,
@@ -558,15 +606,20 @@ async def _ensure_tenant_emergency_artifacts(
     artifacts, in order (the actual voice call / safety SMS / escalation
     chain is #108 — see ``app/agent/emergency.py``):
 
-    1. ``notifications`` (``type='emergency_call'``, ``status='pending'``)
-       — inserted idempotently via ``uq_notifications_message_dedupe``
+    1. ``notifications`` (``type='emergency_call'``, ``status='pending'``,
+       ``next_attempt_at=now()`` — BORN ENRICHED, safety review 2026-07-12
+       finding N1: see ``_INSERT_EMERGENCY_NOTIFICATION_SQL``'s own
+       comment) — inserted idempotently via ``uq_notifications_message_dedupe``
        (schema-v1.md v1.3, migration 0006); this INSERT is the single
        idempotency GATE for the whole group, enforced by Postgres itself
        (safe across concurrent processes — module docstring point 3): if
        it returns no row (already existed — a genuine duplicate delivery,
        artifacts already created), nothing below runs either, so a retry
        can never double-log the audit entry or double-invoke the seam
-       call.
+       call. The ``payload`` also carries a fresh ``ack_token`` — see
+       :data:`_MAX_ACK_TOKEN_INSERT_ATTEMPTS` for what happens on the
+       (astronomically unlikely) event that token collides with an
+       existing row's.
     2. ``audit_log`` ``emergency_triggered`` (``actor='prefilter'``,
        payload = rules fired — never the message body, rule #5) — only
        written when (1) actually created a new row.
@@ -574,43 +627,65 @@ async def _ensure_tenant_emergency_artifacts(
        actually created a new row.
 
     ``case_id`` is NULL throughout: this runs pre-routing (#110 owns case
-    attach; conversation-model.md). Runs on its OWN isolated session — see
-    module docstring "Transaction design". Returns ``True`` if this call
-    created the artifacts (a genuine new escalation), ``False`` if they
-    already existed (idempotent no-op) — the caller uses this to decide
-    whether to alert (consolidated review item 3: alert only on genuine
-    creation, never on a redelivery of an already-escalated message)."""
-    notification_payload = {
-        "message_id": str(message_id),
-        "property_id": str(property_id),
-        "categories": prefilter_result.categories,
-    }
+    attach; conversation-model.md). Runs on its OWN isolated session PER
+    ATTEMPT — see module docstring "Transaction design". Returns ``True``
+    if this call created the artifacts (a genuine new escalation),
+    ``False`` if they already existed (idempotent no-op) — the caller uses
+    this to decide whether to alert (consolidated review item 3: alert
+    only on genuine creation, never on a redelivery of an
+    already-escalated message)."""
+    notification_id: UUID | None = None
 
-    async with _isolated_session() as session:
-        notification_row = (
-            (
-                await session.execute(
-                    _INSERT_EMERGENCY_NOTIFICATION_SQL,
-                    {"landlord_id": str(landlord_id), "payload": json.dumps(notification_payload)},
+    for attempt in range(_MAX_ACK_TOKEN_INSERT_ATTEMPTS):
+        notification_payload = {
+            "message_id": str(message_id),
+            "property_id": str(property_id),
+            "categories": prefilter_result.categories,
+            "ack_token": secrets.token_urlsafe(24),
+        }
+        try:
+            async with _isolated_session() as session:
+                notification_row = (
+                    (
+                        await session.execute(
+                            _INSERT_EMERGENCY_NOTIFICATION_SQL,
+                            {
+                                "landlord_id": str(landlord_id),
+                                "payload": json.dumps(notification_payload),
+                            },
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
                 )
-            )
-            .mappings()
-            .one_or_none()
-        )
 
-        if notification_row is None:
-            # Idempotent no-op: an earlier attempt already created this
-            # message's emergency artifacts (enforced by Postgres's own
-            # unique index, safe even under genuinely concurrent retries).
-            return False
+                if notification_row is None:
+                    # Idempotent no-op: an earlier attempt already created
+                    # this message's emergency artifacts (enforced by
+                    # Postgres's own unique index, safe even under
+                    # genuinely concurrent retries).
+                    return False
 
-        notification_id: UUID = notification_row["id"]
+                notification_id = notification_row["id"]
 
-        audit_payload = {"rules_fired": prefilter_result.categories, "message_id": str(message_id)}
-        await session.execute(
-            _INSERT_EMERGENCY_AUDIT_SQL,
-            {"landlord_id": str(landlord_id), "payload": json.dumps(audit_payload)},
-        )
+                audit_payload = {
+                    "rules_fired": prefilter_result.categories,
+                    "message_id": str(message_id),
+                }
+                await session.execute(
+                    _INSERT_EMERGENCY_AUDIT_SQL,
+                    {"landlord_id": str(landlord_id), "payload": json.dumps(audit_payload)},
+                )
+            break  # committed cleanly -- stop retrying
+        except IntegrityError as exc:
+            is_last_attempt = attempt == _MAX_ACK_TOKEN_INSERT_ATTEMPTS - 1
+            if _is_ack_token_collision(exc) and not is_last_attempt:
+                log.warning("emergency_ack_token_collision_retrying", attempt=attempt)
+                continue
+            raise
+
+    if notification_id is None:  # pragma: no cover — invariant: break only reached after a set id
+        raise RuntimeError("emergency artifact insert loop exited without a notification id")
 
     # Outside the DB transaction on purpose: emergency.py does no DB access
     # of its own (see its module docstring) -- calling it after the

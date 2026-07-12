@@ -157,8 +157,16 @@ async def _seed(
 
 
 # ---------------------------------------------------------------------------
-# Local helper — seed an emergency_call notification exactly as the webhook
-# (app/routers/webhooks/twilio.py::_ensure_tenant_emergency_artifacts) does.
+# Local helpers — seed an emergency_call notification.
+#
+# ``_insert_emergency_call_notification`` deliberately mirrors the webhook's
+# PRE-N1 shape (no ``next_attempt_at``, no ``ack_token``) -- a legacy/edge
+# row that has NOT been born-enriched. Kept on purpose (not updated to the
+# new shape) so it keeps exercising this module's OWN belt-2 healing (the
+# sweep's ``next_attempt_at IS NULL`` clause + ``_CLAIM_STEP_SQL``'s
+# fallback ack_token) independently of the webhook's belt-1 fix. Tests
+# that specifically exercise belt 1 (the webhook's born-enriched INSERT)
+# use ``_insert_born_enriched_emergency_call_notification`` below instead.
 # ---------------------------------------------------------------------------
 
 
@@ -183,6 +191,48 @@ async def _insert_emergency_call_notification(
             "payload": json.dumps(
                 {"message_id": message_id, "property_id": property_id, "categories": categories}
             ),
+        },
+    )
+    await session.commit()
+    return notification_id
+
+
+async def _insert_born_enriched_emergency_call_notification(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    message_id: str,
+    property_id: str,
+    categories: list[str],
+    ack_token: str,
+    next_attempt_at: datetime,
+) -> str:
+    """Seed a row EXACTLY as the (post-N1) webhook's own INSERT now does —
+    ``app/routers/webhooks/twilio.py::_INSERT_EMERGENCY_NOTIFICATION_SQL``:
+    ``next_attempt_at`` and ``ack_token`` both set in the SAME statement
+    that creates the row, "born enriched" — sweep-recoverable the instant
+    it is durable, with no dependency on ``handle_emergency_trigger`` (or
+    even ``fire_emergency_protocol``) ever being invoked at all."""
+    notification_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO notifications "
+            "(id, landlord_id, case_id, type, channel, status, payload, next_attempt_at) "
+            "VALUES (:id, :landlord_id, NULL, 'emergency_call', 'voice', 'pending', "
+            "CAST(:payload AS jsonb), :next_attempt_at)"
+        ),
+        {
+            "id": notification_id,
+            "landlord_id": landlord_id,
+            "payload": json.dumps(
+                {
+                    "message_id": message_id,
+                    "property_id": property_id,
+                    "categories": categories,
+                    "ack_token": ack_token,
+                }
+            ),
+            "next_attempt_at": next_attempt_at,
         },
     )
     await session.commit()
@@ -829,63 +879,50 @@ async def test_acknowledge_by_token_resolves_and_acks(
 
 
 @pytest.mark.integration
-async def test_crash_before_t0_send_is_recovered_by_the_next_sweep_tick(
+async def test_crash_in_the_pre_enrich_window_is_recovered_by_the_next_sweep_tick(
     db_session: AsyncSession, fake_sender: FakeTwilioSender
 ) -> None:
-    """Simulates a process crash between ``handle_emergency_trigger``'s
-    durable enrichment (ack token + next_attempt_at=now committed) and its
-    OWN immediate send attempt — reproducing the exact enrichment write
-    without ever calling the immediate-send half, then proving the very
-    next sweep tick (standing in for "process restarts, ticker wakes")
-    performs the T+0 landlord call + tenant safety SMS that never
-    happened. This is the core crash-safety guarantee (task requirement:
-    "rows stay pending and resume on restart")."""
-    landlord_id, property_id, tenant_id = await _seed(db_session)
+    """Safety review, 2026-07-12 (finding N1, BLOCKING) — extends the crash
+    test to the "pre-enrich window" itself: the row is seeded EXACTLY as
+    the (post-fix) webhook's own INSERT now does —
+    ``app/routers/webhooks/twilio.py::_INSERT_EMERGENCY_NOTIFICATION_SQL``
+    sets ``next_attempt_at = now()`` and a fresh ``ack_token`` in the SAME
+    statement that creates the row — and NEITHER
+    ``app.agent.emergency.fire_emergency_protocol`` NOR
+    ``emergency_chain.handle_emergency_trigger`` is EVER invoked, simulating
+    a crash strictly BEFORE either one runs (the earliest possible crash
+    point, one step earlier than the previous revision's own separate
+    enrich transaction could reach). Proves belt 1 alone — durable at
+    INSERT time — is sufficient: the very next sweep tick still performs
+    the T+0 landlord call AND the tenant safety SMS with zero dependency on
+    this module's own T+0 code path ever having run."""
+    landlord_id, property_id, tenant_id = await _seed(
+        db_session, full_name="Sam Lee", tenant_name="Maria"
+    )
     message_id = await factories.insert_message(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
         tenant_id=tenant_id,
     )
-    notification_id = await _insert_emergency_call_notification(
+    now = datetime.now(UTC)
+    notification_id = await _insert_born_enriched_emergency_call_notification(
         db_session,
         landlord_id=landlord_id,
         message_id=message_id,
         property_id=property_id,
         categories=["fire"],
+        ack_token="born-enriched-crash-test-token",  # noqa: S106 -- test fixture, not a secret
+        next_attempt_at=now,
     )
 
     try:
-        # Reproduce ONLY handle_emergency_trigger's first (durable) write —
-        # simulating a crash immediately after it commits.
-        now = datetime.now(UTC)
-        await db_session.execute(
-            emergency_chain._ENRICH_EMERGENCY_CALL_SQL,  # noqa: SLF001
-            {
-                "id": notification_id,
-                "extra": '{"ack_token": "crash-test-token"}',
-                "next_attempt_at": now,
-            },
+        assert len(fake_sender.calls) == 0, (
+            "no send should have happened yet -- handle_emergency_trigger was never called"
         )
-        await db_session.execute(
-            emergency_chain._INSERT_EMERGENCY_SMS_SQL,  # noqa: SLF001
-            {
-                "landlord_id": landlord_id,
-                "payload": json.dumps(
-                    {
-                        "message_id": message_id,
-                        "property_id": property_id,
-                        "category": "fire",
-                        "body": "...",
-                    }
-                ),
-            },
-        )
-        await db_session.commit()
 
-        assert len(fake_sender.calls) == 0, "no send should have happened yet — simulated crash"
-
-        # "process restarts" — the scheduler's next tick finds the row due.
+        # "process restarts" — the scheduler's next tick finds the row due,
+        # with no help from handle_emergency_trigger at all.
         outcomes = await emergency_chain.run_emergency_chain_sweep(now=now + timedelta(seconds=1))
 
         assert len(outcomes) == 1
@@ -896,6 +933,79 @@ async def test_crash_before_t0_send_is_recovered_by_the_next_sweep_tick(
 
         notif = await _fetch_notification(db_session, notification_id)
         assert notif["attempt"] == 1
+        assert notif["payload"]["ack_token"] == "born-enriched-crash-test-token"  # noqa: S105
+
+        sms_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT status FROM notifications WHERE type = 'emergency_sms' "
+                        "AND landlord_id = :lid"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert sms_row["status"] == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_forcing_the_residual_header_read_to_fail_is_recovered_by_next_sweep_tick(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safety review, 2026-07-12 (finding N1) — ``handle_emergency_trigger``
+    no longer does any durable write of its own; its only remaining DB
+    touch is the (now RESIDUAL — belt 1 already enriched the row before
+    this ever runs) read-only ``_load_trigger_header``. Force THAT to
+    raise, simulating a crash/DB hiccup inside ``handle_emergency_trigger``
+    itself, and prove the next sweep tick still calls the landlord and
+    texts the tenant regardless — the row was already durably due before
+    this function was ever invoked, so its failure changes nothing about
+    recoverability."""
+    landlord_id, property_id, tenant_id = await _seed(db_session)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    now = datetime.now(UTC)
+    notification_id = await _insert_born_enriched_emergency_call_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        categories=["fire"],
+        ack_token="residual-path-test-token",  # noqa: S106 -- test fixture, not a secret
+        next_attempt_at=now,
+    )
+
+    async def _boom(_notification_id: uuid.UUID) -> tuple[uuid.UUID, datetime]:
+        raise RuntimeError("simulated failure reading the notification header")
+
+    monkeypatch.setattr(emergency_chain, "_load_trigger_header", _boom)
+
+    try:
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            await emergency_chain.handle_emergency_trigger(
+                notification_id=uuid.UUID(notification_id),
+                message_id=uuid.UUID(message_id),
+                property_id=uuid.UUID(property_id),
+                categories=["fire"],
+            )
+        assert len(fake_sender.calls) == 0, "the header read raised before any send was attempted"
+
+        outcomes = await emergency_chain.run_emergency_chain_sweep(now=now + timedelta(seconds=1))
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "processed"
+        assert len(fake_sender.calls) == 2
+        kinds = {c.kind for c in fake_sender.calls}
+        assert kinds == {"call", "sms"}
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -915,28 +1025,18 @@ async def test_lost_race_on_concurrent_claim_never_double_sends(
         property_id=property_id,
         tenant_id=tenant_id,
     )
-    notification_id = await _insert_emergency_call_notification(
+    now = datetime.now(UTC)
+    notification_id = await _insert_born_enriched_emergency_call_notification(
         db_session,
         landlord_id=landlord_id,
         message_id=message_id,
         property_id=property_id,
         categories=["fire"],
+        ack_token="race-test-ack-token",  # noqa: S106 -- test fixture, not a secret
+        next_attempt_at=now,
     )
 
     try:
-        now = datetime.now(UTC)
-        ack_token_fixture = "race-test-ack-token"  # noqa: S105 -- an ack token, not a password
-        # Enrich first (both racers need next_attempt_at set + ack_token).
-        await db_session.execute(
-            emergency_chain._ENRICH_EMERGENCY_CALL_SQL,  # noqa: SLF001
-            {
-                "id": notification_id,
-                "extra": json.dumps({"ack_token": ack_token_fixture}),
-                "next_attempt_at": now,
-            },
-        )
-        await db_session.commit()
-
         candidate = emergency_chain.EmergencyCallCandidate(
             notification_id=uuid.UUID(notification_id),
             landlord_id=uuid.UUID(landlord_id),
@@ -944,7 +1044,7 @@ async def test_lost_race_on_concurrent_claim_never_double_sends(
             message_id=uuid.UUID(message_id),
             property_id=uuid.UUID(property_id),
             categories=["fire"],
-            ack_token=ack_token_fixture,
+            ack_token="race-test-ack-token",  # noqa: S106 -- test fixture, not a secret
             chain_started_at=now,
         )
 
@@ -1133,9 +1233,15 @@ async def test_sms_drain_sweep_marks_failed_and_retries_on_the_next_tick(
 
 
 @pytest.mark.integration
-async def test_sms_drain_sweep_no_tenant_phone_is_terminal_failed(
+async def test_sms_drain_sweep_no_tenant_phone_is_terminal_exhausted(
     db_session: AsyncSession, fake_sender: FakeTwilioSender
 ) -> None:
+    """Safety review, 2026-07-12 (finding N2) — ``no_tenant_phone`` is
+    TERMINAL, not transient: it must land on ``'exhausted'`` (schema-v1.md's
+    CHECK already allows it), never ``'failed'`` — ``'failed'`` stays in
+    ``_SELECT_DUE_SMS_DRAIN_SQL``'s own retry set, so marking a genuinely
+    unfixable row ``'failed'`` would have the sweep silently re-attempt (and
+    re-fail) it forever. A SECOND tick must be a true no-op."""
     landlord_id, property_id, _tenant_id = await _seed(db_session, with_tenant=False)
     message_id = await factories.insert_message(
         db_session,
@@ -1153,6 +1259,16 @@ async def test_sms_drain_sweep_no_tenant_phone_is_terminal_failed(
         assert len(fake_sender.calls) == 0
 
         notif = await _fetch_notification(db_session, notification_id)
-        assert notif["status"] == "failed"
+        assert notif["status"] == "exhausted"
+
+        # Second tick: 'exhausted' is excluded from the sweep's own
+        # status IN ('pending', 'failed') selection -- nothing to do.
+        second_outcomes = await emergency_chain.run_sms_drain_sweep()
+        assert second_outcomes == []
+        assert len(fake_sender.calls) == 0
+
+        notif_after = await _fetch_notification(db_session, notification_id)
+        assert notif_after["status"] == "exhausted"
+        assert notif_after["attempt"] == notif["attempt"], "a no-op tick must not re-claim the row"
     finally:
         await _cleanup(db_session, landlord_id)

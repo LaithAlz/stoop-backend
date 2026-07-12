@@ -95,6 +95,7 @@ fail-safe direction as everywhere else in this module.
 
 from __future__ import annotations
 
+import html
 import time
 from datetime import datetime
 from typing import Annotated
@@ -291,8 +292,20 @@ async def ack_page(token: str) -> HTMLResponse:
             "Tap the button below to let Stoop know you've got it. This stops the calls and texts."
         )
 
-    html = _ACK_PAGE_TEMPLATE.format(heading=heading, body=body, token=token)
-    return HTMLResponse(content=html, status_code=200, headers=_NO_STORE_HEADERS)
+    # Safety review, 2026-07-12 (finding 4, LOW) -- html.escape() the token
+    # before interpolating it into the page. Every token that reaches this
+    # line matched a real row via emergency_chain.resolve_ack_token, and
+    # every token this codebase ever GENERATES is secrets.token_urlsafe(24)
+    # (url-safe base64: letters/digits/``-``/``_`` only -- never an HTML
+    # metacharacter), so this is defense-in-depth against a raw path
+    # parameter being interpolated into HTML at all, not a fix for a
+    # presently-reachable XSS: never rely on "the value happens to be safe
+    # today" as the only reason unescaped user-controlled input reaches a
+    # template.
+    page_html = _ACK_PAGE_TEMPLATE.format(
+        heading=heading, body=body, token=html.escape(token, quote=True)
+    )
+    return HTMLResponse(content=page_html, status_code=200, headers=_NO_STORE_HEADERS)
 
 
 @router.post("/ack/{token}", response_model=AckResponse)

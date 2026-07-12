@@ -21,6 +21,7 @@ Harness
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -496,8 +497,8 @@ async def test_hard_hit_tenant_message_creates_emergency_artifacts_exactly_once(
             (
                 await db_session.execute(
                     text(
-                        "SELECT type, channel, status FROM notifications "
-                        "WHERE landlord_id = :lid AND type = 'emergency_call'"
+                        "SELECT type, channel, status, next_attempt_at, payload "
+                        "FROM notifications WHERE landlord_id = :lid AND type = 'emergency_call'"
                     ),
                     {"lid": landlord_id},
                 )
@@ -507,6 +508,82 @@ async def test_hard_hit_tenant_message_creates_emergency_artifacts_exactly_once(
         )
         assert notification_row["channel"] == "voice"
         assert notification_row["status"] == "pending"
+        # Safety review, 2026-07-12 (finding N1, BLOCKING) -- BORN ENRICHED:
+        # next_attempt_at + ack_token are set in the SAME INSERT that
+        # creates the row, not by a later, separate enrichment step (see
+        # app/agent/emergency_chain.py's module docstring "The instant +
+        # durable sweep hybrid").
+        assert notification_row["next_attempt_at"] is not None
+        assert notification_row["payload"]["ack_token"]
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_hard_hit_ack_token_collision_is_retried_not_500d(
+    db_session: AsyncSession,
+) -> None:
+    """Safety review, 2026-07-12 (finding 4, LOW) — an ``ack_token``
+    collision at INSERT time (``uq_notifications_ack_token``, an
+    astronomically unlikely but genuinely possible UNIQUE violation on a
+    random ``secrets.token_urlsafe(24)`` value) must be caught and
+    retried with a fresh token, never surfaced as a raw 500."""
+    landlord_id = await _insert_landlord(db_session)
+    to_number = _fresh_phone()
+    from_number = _fresh_phone()
+    await _insert_property(db_session, landlord_id, twilio_number=to_number)
+
+    colliding_token = f"collision-{uuid.uuid4().hex}"  # noqa: S105 -- test fixture, not a secret
+    # Pre-seed a row already holding this exact token -- the very next
+    # generated token (forced below) will collide with it.
+    await db_session.execute(
+        text(
+            "INSERT INTO notifications (landlord_id, case_id, type, channel, status, payload) "
+            "VALUES (:lid, NULL, 'emergency_call', 'voice', 'pending', CAST(:payload AS jsonb))"
+        ),
+        {
+            "lid": landlord_id,
+            "payload": json.dumps({"message_id": str(uuid.uuid4()), "ack_token": colliding_token}),
+        },
+    )
+    await db_session.commit()
+
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid,
+        from_number=from_number,
+        to_number=to_number,
+        body="there is a fire in the kitchen!",
+    )
+
+    fresh_token = f"fresh-{uuid.uuid4().hex}"  # noqa: S105 -- test fixture, not a secret
+    forced_tokens = iter([colliding_token, fresh_token])
+
+    try:
+        with patch(
+            "app.routers.webhooks.twilio.secrets.token_urlsafe",
+            side_effect=lambda _n: next(forced_tokens),
+        ):
+            response = await _post_sms(params)
+
+        assert response.status_code == 200
+
+        notification_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload FROM notifications WHERE landlord_id = :lid "
+                        "AND type = 'emergency_call' AND payload ->> 'message_id' IS NOT NULL "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert notification_row["payload"]["ack_token"] == fresh_token
+        assert notification_row["payload"]["ack_token"] != colliding_token
     finally:
         await _cleanup(db_session, landlord_id)
 

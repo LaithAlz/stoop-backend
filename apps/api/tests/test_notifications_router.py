@@ -35,6 +35,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncGenerator
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -354,6 +355,51 @@ async def test_get_ack_page_does_not_acknowledge(db_session: AsyncSession) -> No
         )
         assert notif["status"] == "pending"
         assert notif["acknowledged_at"] is None
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_get_ack_page_escapes_the_token_in_the_html_response(
+    db_session: AsyncSession,
+) -> None:
+    """Safety review, 2026-07-12 (finding 4, LOW) — the ack page must
+    ``html.escape()`` the token before interpolating it into
+    ``_ACK_PAGE_TEMPLATE``, defense-in-depth against a raw path parameter
+    ever reaching an HTML template unescaped (see
+    ``app/routers/notifications.py``'s own comment on why this is
+    defense-in-depth today, not a fix for a presently-reachable XSS: every
+    token this codebase actually GENERATES is a plain
+    ``secrets.token_urlsafe(24)`` value with no HTML metacharacters)."""
+    landlord_id = await factories.insert_landlord(db_session)
+    # No literal ``/`` in the token -- Starlette's default (single path
+    # segment) ``{token}`` converter would 404 on one before this handler
+    # ever runs, which would test routing, not escaping.
+    malicious_token = '"><img src=x onerror=alert(1)>'  # noqa: S105 -- an XSS payload, not a secret
+    notification_id = str(uuid.uuid4())
+    await db_session.execute(
+        text(
+            "INSERT INTO notifications (id, landlord_id, case_id, type, channel, status, payload) "
+            "VALUES (:id, :landlord_id, NULL, 'emergency_call', 'voice', 'pending', "
+            "CAST(:payload AS jsonb))"
+        ),
+        {
+            "id": notification_id,
+            "landlord_id": landlord_id,
+            "payload": json.dumps({"ack_token": malicious_token}),
+        },
+    )
+    await db_session.commit()
+
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get(f"/ack/{quote(malicious_token, safe='')}")
+
+        assert response.status_code == 200
+        assert "<img src=x onerror=alert(1)>" not in response.text
+        assert "&lt;img src=x onerror=alert(1)&gt;" in response.text
     finally:
         await _cleanup(db_session, landlord_id)
 

@@ -333,6 +333,18 @@ the message. The GET/POST split closes this: a passive prefetch only ever
 renders the (inert) confirmation page; only a genuine form submission (a
 real tap) reaches the mutating `POST`.
 
+Both `GET`/`POST /ack/{token}` may also return 429 with the stable code
+`rate_limited` (a modest, per-token, in-memory fixed-window limit —
+`app/routers/notifications.py`'s own module docstring "Rate limiting")
+if that one token is hit too many times in a short window. This never
+affects the underlying escalation chain itself — the landlord/backup
+contact keep being called and texted on schedule regardless of whether
+their own ack attempts are being throttled; only this one HTTP request is
+rejected. `rate_limited` joins this doc's stable error-code vocabulary
+(alongside `draft_stale`, `already_sent`, `has_open_cases`,
+`email_required`, `account_deleted`) — codes are stable snake_case
+strings per this doc's own "Conventions" section.
+
 ## Billing (Train 2)
 
 `POST /v1/billing/checkout` — body `{ "plan": "full" }` → `{ "checkout_url": "…" }`

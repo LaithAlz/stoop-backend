@@ -38,23 +38,52 @@ explicitly says not to re-plumb), and that handler's crash-recovery
 `emergency_call` notification INSERT itself is the one that created a new
 row — a crash exactly inside this module would NOT be retried by Twilio.
 
-Fixed by never depending on that retry for correctness:
-:func:`handle_emergency_trigger` FIRST durably enriches the already-created
-``emergency_call`` row with an ack token and ``next_attempt_at = now()``
-(making attempt 0 immediately "due") and creates the ``emergency_sms``
-row (the tenant safety SMS's durable send-intent — schema-v1.md's
-"already-anticipated-but-unused" row, finally drained here), in one short
-transaction. ONLY AFTER that commits does it attempt the real T+0 Twilio
-calls, via the EXACT SAME code path
-(:func:`run_emergency_chain_sweep` / :func:`_run_candidate_safely`) the
-periodic 60-second ticker (``app/scheduler.py``) uses for every later step.
-If the process crashes at ANY point — before, during, or after the actual
-sends — the row's due state is already durable, so the very next sweep
-tick (within 60s of restart) picks it up and performs whatever the crash
-interrupted. There is no in-process timer anywhere in this module; the
-ticker only wakes and reads due rows (never-break-adjacent design
-constraint from the issue: "retries/chain state = data ... never in-process
-timers for the SCHEDULE").
+Safety review, 2026-07-12 (finding N1, BLOCKING) — CORRECTED account, born
+enriched, not enriched-after-the-fact
+--------------------------------------------------------------------------
+An earlier revision fixed this by having :func:`handle_emergency_trigger`
+FIRST durably enrich the already-created ``emergency_call`` row (ack token
++ ``next_attempt_at = now()``) in its OWN short transaction, THEN attempt
+the real T+0 sends. That left a real "pre-enrich silence window": a crash
+between the webhook's ``emergency_call`` INSERT and THIS module's
+enrichment transaction committing left the row at ``next_attempt_at IS
+NULL`` forever — durable, but invisible to the sweep (which required
+``next_attempt_at IS NOT NULL``), with nothing left to retry it (Twilio
+already got its 200 for the SMS webhook).
+
+Fixed properly by moving the enrichment ONE LEVEL UP: the webhook's own
+``emergency_call`` INSERT
+(``app/routers/webhooks/twilio.py::_INSERT_EMERGENCY_NOTIFICATION_SQL``)
+now sets ``next_attempt_at = now()`` AND writes a fresh ``ack_token``
+into ``payload``, in the SAME transaction/statement that creates the row
+— "born enriched". The row is sweep-recoverable the INSTANT it is
+durable, with ZERO dependency on this module ever running at all, let
+alone completing. Belt 2 (defense in depth for a legacy/edge row that
+somehow still lacks this): :data:`_SELECT_DUE_EMERGENCY_CALLS_SQL` also
+treats a ``next_attempt_at IS NULL`` row as due (ordered first via
+``NULLS FIRST``), and :data:`_CLAIM_STEP_SQL` supplies a fresh
+``ack_token`` at claim time for any row that still lacks one.
+
+:func:`handle_emergency_trigger` is therefore now a purely BEST-EFFORT
+immediate attempt at processing step 0 — it does no durable write of its
+own (see its own docstring): it reads back ``landlord_id``/``created_at``
+and delegates to :func:`_run_candidate_safely`, the EXACT SAME claim-
+guarded code path (:func:`_process_due_row`) the periodic 60-second
+ticker (``app/scheduler.py``) uses for every later step (and now ALSO for
+step 0, on a crash-recovered or healed row). ``_process_due_row`` creates
+the durable ``emergency_sms`` row (the tenant safety SMS's send-intent —
+schema-v1.md's "already-anticipated-but-unused" row, finally drained
+here) atomically with ITS OWN claim of step 0, so whichever caller ends
+up processing step 0 — the T+0 immediate attempt, or a later sweep tick
+— creates it exactly once, with the same guarantee. If the process
+crashes at ANY point — before, during, or after ``handle_emergency_
+trigger`` runs, or even if it's never invoked at all — the row's due
+state is already durable, so the very next sweep tick (within 60s of
+restart) picks it up and performs whatever never happened. There is no
+in-process timer anywhere in this module; the ticker only wakes and reads
+due rows (never-break-adjacent design constraint from the issue:
+"retries/chain state = data ... never in-process timers for the
+SCHEDULE").
 
 Idempotency — every attempt exactly-once per claim
 --------------------------------------------------------------------------
@@ -512,6 +541,64 @@ class ActionOutcome:
     reason: str | None = None  # set only when status == "skipped"
 
 
+_SELECT_EMERGENCY_SMS_ROW_SQL = text(
+    """
+    SELECT id, attempt FROM notifications
+    WHERE type = 'emergency_sms' AND payload ->> 'message_id' = :message_id
+      AND status IN ('pending', 'failed')
+    """
+)
+
+
+async def _claim_emergency_sms_for_send(message_id: UUID) -> bool:
+    """Atomically claim the ``emergency_sms`` row for *message_id* — SELECT
+    its current ``attempt``, then compare-and-swap it via the SAME
+    ``_CLAIM_SMS_DRAIN_SQL`` the SMS-drain sweep uses (:func:`
+    _process_sms_drain_candidate`) — BEFORE the T+0 inline send below is
+    allowed to proceed (safety review, 2026-07-12, finding 3, MINOR).
+
+    Without this, the inline send (triggered by
+    ``app/agent/emergency_chain.py::handle_emergency_trigger``'s
+    immediate call, OR by a later ``emergency_call`` sweep tick reaching
+    step 0) and the INDEPENDENT ``run_sms_drain_sweep`` tick had no shared
+    gate: both could see the SAME ``emergency_sms`` row as "not yet sent"
+    at the same instant and each send the tenant safety text — a
+    sub-second-window double-text. Claiming here, via the identical
+    attempt-based compare-and-swap the drain sweep itself uses, means
+    whichever of the two gets there first wins; the other finds the
+    attempt already bumped and skips sending, mirroring the
+    ``emergency_call`` row's own claim discipline (:data:`_CLAIM_STEP_SQL`)
+    exactly, just for the ``emergency_sms`` row instead.
+
+    Returns ``False`` when there is nothing left to claim (already sent/
+    exhausted by the other path, or genuinely missing) — the caller must
+    NOT send in that case.
+    """
+    async with _acm(get_admin_session)() as session:
+        row = (
+            (await session.execute(_SELECT_EMERGENCY_SMS_ROW_SQL, {"message_id": str(message_id)}))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            return False
+        claimed = (
+            (
+                await session.execute(
+                    _CLAIM_SMS_DRAIN_SQL,
+                    {
+                        "id": str(row["id"]),
+                        "old_attempt": row["attempt"],
+                        "new_attempt": row["attempt"] + 1,
+                    },
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        return claimed is not None
+
+
 async def _execute_action(
     sender: TwilioSender,
     action: str,
@@ -520,6 +607,7 @@ async def _execute_action(
     categories: list[str],
     notification_id: UUID,
     ack_token: str,
+    message_id: UUID,
 ) -> ActionOutcome:
     if not ctx.twilio_number:
         return ActionOutcome(action=action, status="skipped", reason="no_twilio_number")
@@ -575,6 +663,14 @@ async def _execute_action(
         if action == _ACTION_TENANT_SAFETY_SMS:
             if not ctx.tenant_phone:
                 return ActionOutcome(action=action, status="skipped", reason="no_tenant_phone")
+            if not await _claim_emergency_sms_for_send(message_id):
+                # Lost the race to a concurrent run_sms_drain_sweep tick
+                # (or this step somehow ran twice) -- see
+                # _claim_emergency_sms_for_send's own docstring. NEVER
+                # send twice.
+                return ActionOutcome(
+                    action=action, status="skipped", reason="already_claimed_elsewhere"
+                )
             _, body = render_tenant_safety_sms(categories)
             sid = await sender.send_sms(to=ctx.tenant_phone, from_=from_number, body=body)
             return ActionOutcome(action=action, status="sent", sid=sid)
@@ -644,11 +740,39 @@ def _candidate_from_row(row: dict[str, Any]) -> EmergencyCallCandidate:
 _CLAIM_STEP_SQL = text(
     """
     UPDATE notifications
-    SET attempt = :new_attempt, next_attempt_at = :next_attempt_at, updated_at = now()
+    SET attempt = :new_attempt,
+        next_attempt_at = :next_attempt_at,
+        updated_at = now(),
+        payload = CASE
+                    WHEN payload ->> 'ack_token' IS NULL
+                    THEN payload || jsonb_build_object(
+                           'ack_token', CAST(:fallback_ack_token AS text)
+                         )
+                    ELSE payload
+                  END
     WHERE id = :id AND status = 'pending' AND attempt = :old_attempt AND acknowledged_at IS NULL
-    RETURNING id
+    RETURNING id, payload ->> 'ack_token' AS ack_token
     """
 )
+# The explicit ``CAST(:fallback_ack_token AS text)`` above is required, not
+# cosmetic: asyncpg must know the wire type of every bind parameter before
+# it can send the (binary) protocol message, and ``jsonb_build_object``'s
+# variadic ``"any"`` signature gives the planner nothing to infer a plain
+# string literal's type FROM inside a ``CASE`` branch that may not even
+# execute -- Postgres raises ``IndeterminateDatatypeError`` on ``$3`` (the
+# token) without it. Discovered running this round's own tests (every
+# claim was raising and silently degrading to ``"processing_error"``).
+# Safety review, 2026-07-12 (finding N1, belt 2 -- healing): every row born
+# via app/routers/webhooks/twilio.py's INSERT already carries an ack_token
+# from the start, so the CASE above is normally a no-op (ELSE branch). It
+# only fires for a healed legacy/edge row the sweep picked up via its own
+# ``next_attempt_at IS NULL`` clause -- claiming such a row now ALSO
+# guarantees it leaves with a real ack_token, atomically, in the SAME
+# statement that claims it, so every OTHER step (the T+2m ack-link SMS,
+# the voice call's own action_url, etc.) always has one to use. The
+# caller always passes a freshly generated ``:fallback_ack_token`` even
+# though it is discarded in the overwhelmingly common (ELSE) case --
+# cheaper than a second round trip to check first.
 
 _INSERT_ATTEMPT_AUDIT_SQL = text(
     """
@@ -685,7 +809,15 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
     ``next_attempt_at`` is computed from ``candidate.chain_started_at``,
     never from "now" at claim time, so a late-running tick never
     stretches the schedule (see :class:`EmergencyCallCandidate`'s own
-    docstring)."""
+    docstring).
+
+    The AUTHORITATIVE ``ack_token`` used for this step's actions is
+    whatever :data:`_CLAIM_STEP_SQL` returns (never
+    ``candidate.ack_token`` from the original SELECT) — safety review,
+    2026-07-12, finding N1 belt 2: this is what makes a healed
+    (previously ``next_attempt_at IS NULL``) legacy row usable the moment
+    it's claimed, even though its ack_token didn't exist at SELECT time.
+    """
     step = candidate.attempt
     new_attempt = step + 1
     next_at = candidate.chain_started_at + timedelta(minutes=next_offset_minutes(new_attempt))
@@ -700,6 +832,7 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
                         "old_attempt": candidate.attempt,
                         "new_attempt": new_attempt,
                         "next_attempt_at": next_at,
+                        "fallback_ack_token": secrets.token_urlsafe(24),
                     },
                 )
             )
@@ -708,6 +841,42 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
         )
         if claim_row is None:
             return "lost_race"
+
+        ack_token = cast("str | None", claim_row["ack_token"])
+
+        if step == 0:
+            # Create the durable ``emergency_sms`` send-intent row for the
+            # tenant safety text -- atomically, in the SAME transaction as
+            # THIS claim (safety review, 2026-07-12, finding N1 belt 1
+            # follow-through). ``_CLAIM_STEP_SQL``'s own optimistic-
+            # concurrency check (``attempt = :old_attempt``) already
+            # guarantees step 0 is claimed by exactly one caller ever --
+            # the T+0 immediate call (:func:`handle_emergency_trigger`) on
+            # the common path, or a later sweep tick recovering from a
+            # crash/healed row -- so piggybacking this INSERT on the same
+            # claim gives it the identical exactly-once guarantee for
+            # free, with no separate idempotency mechanism (an ``ON
+            # CONFLICT`` dedupe index, a payload marker, ...) needed. This
+            # is also what makes recovery complete regardless of WHEN a
+            # crash happens: before, during, or after
+            # ``handle_emergency_trigger``'s own attempt, or even if that
+            # function is never invoked at all -- see module docstring
+            # "The instant + durable sweep hybrid".
+            category, body = render_tenant_safety_sms(candidate.categories)
+            await session.execute(
+                _INSERT_EMERGENCY_SMS_SQL,
+                {
+                    "landlord_id": str(candidate.landlord_id),
+                    "payload": json.dumps(
+                        {
+                            "message_id": str(candidate.message_id),
+                            "property_id": str(candidate.property_id),
+                            "category": category,
+                            "body": body,
+                        }
+                    ),
+                },
+            )
 
         ctx = await _load_context(session, candidate.message_id)
 
@@ -720,7 +889,7 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
         )
         return "context_missing"
 
-    if candidate.ack_token is None:  # pragma: no cover — invariant: enriched before first due
+    if ack_token is None:  # pragma: no cover — invariant: _CLAIM_STEP_SQL always sets one
         log.error(
             "emergency_chain_missing_ack_token", notification_id=str(candidate.notification_id)
         )
@@ -737,7 +906,8 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
                 ctx,
                 categories=candidate.categories,
                 notification_id=candidate.notification_id,
-                ack_token=candidate.ack_token,
+                ack_token=ack_token,
+                message_id=candidate.message_id,
             )
         )
 
@@ -802,16 +972,6 @@ async def _run_candidate_safely(candidate: EmergencyCallCandidate) -> str:
 # T+0 — the "instant" trigger (called by app/agent/emergency.py)
 # ---------------------------------------------------------------------------
 
-_ENRICH_EMERGENCY_CALL_SQL = text(
-    """
-    UPDATE notifications
-    SET payload = payload || CAST(:extra AS jsonb),
-        next_attempt_at = :next_attempt_at, updated_at = now()
-    WHERE id = :id AND status = 'pending' AND next_attempt_at IS NULL
-    RETURNING landlord_id, created_at
-    """
-)
-
 _INSERT_EMERGENCY_SMS_SQL = text(
     """
     INSERT INTO notifications (landlord_id, case_id, type, channel, status, payload)
@@ -819,6 +979,29 @@ _INSERT_EMERGENCY_SMS_SQL = text(
     RETURNING id
     """
 )
+
+_SELECT_EMERGENCY_CALL_HEADER_SQL = text(
+    "SELECT landlord_id, created_at FROM notifications WHERE id = :id"
+)
+
+
+async def _load_trigger_header(notification_id: UUID) -> tuple[UUID, datetime] | None:
+    """Read-only: ``(landlord_id, created_at)`` off the ALREADY-CREATED
+    ``emergency_call`` row — see :func:`handle_emergency_trigger`'s
+    docstring for why this reads rather than writes. Split out to its own
+    (tiny, DB-touching) function purely so tests can force this SPECIFIC
+    step to fail/raise without reaching for private SQL internals — see
+    ``tests/test_agent_emergency_chain.py``'s "residual enrich path"
+    coverage."""
+    async with _acm(get_admin_session)() as session:
+        row = (
+            (await session.execute(_SELECT_EMERGENCY_CALL_HEADER_SQL, {"id": str(notification_id)}))
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        return None
+    return cast("UUID", row["landlord_id"]), cast("datetime", row["created_at"])
 
 
 async def handle_emergency_trigger(
@@ -833,66 +1016,53 @@ async def handle_emergency_trigger(
     exactly once per genuinely-new escalation (gated by the webhook's own
     ``uq_notifications_message_dedupe`` INSERT — see that module).
 
+    Safety review, 2026-07-12 (finding N1, BLOCKING) — no separate durable
+    write happens in THIS function any more
+    --------------------------------------------------------------------
+    Before this revision, this function did its OWN enrichment (ack token
+    + ``next_attempt_at = now()``) in a short transaction BEFORE the real
+    T+0 sends — the row only became sweep-visible once THAT committed. A
+    crash between the webhook's own INSERT and this function's enrichment
+    commit left the row at ``next_attempt_at IS NULL`` forever: durable,
+    but invisible to the sweep (the "pre-enrich silence window").
+
+    That enrichment now happens ONE LEVEL UP, in the SAME transaction as
+    the webhook's own ``emergency_call`` INSERT
+    (``app/routers/webhooks/twilio.py::_INSERT_EMERGENCY_NOTIFICATION_SQL``
+    sets ``next_attempt_at = now()`` and a fresh ``ack_token`` at INSERT
+    time) — by the time ANYTHING calls this function, the row is ALREADY
+    durably due, with NO dependency on this function ever running at all.
+    This function is now a purely BEST-EFFORT immediate attempt at
+    processing step 0: it (1) reads back ``landlord_id``/``created_at``
+    (deliberately NOT re-plumbed as a parameter — see below) and (2)
+    delegates to :func:`_run_candidate_safely`, the SAME claim-guarded
+    path (:func:`_process_due_row`) the periodic sweep uses for every
+    later step. If ANYTHING here fails or raises — the read, the claim,
+    a Twilio call, a crash of the whole process — the row is already due,
+    so the very next sweep tick (within 60s) picks it up, independently
+    re-derives everything it needs, and performs whatever this attempt
+    didn't (:func:`_process_due_row` also creates the durable
+    ``emergency_sms`` row for step 0, atomically with ITS claim, so even
+    a crash before this function is ever invoked still gets the tenant
+    safety text sent — see that function's own docstring). Idempotency
+    against a genuine double-invocation of this function needs no
+    separate guard either: :data:`_CLAIM_STEP_SQL`'s own optimistic
+    concurrency check (``attempt = :old_attempt``) means a second call
+    always loses the race once the first has claimed step 0.
+
     Deliberately does NOT take ``landlord_id`` as a parameter (unlike the
     other fields, which match ``fire_emergency_protocol``'s existing
     signature exactly, left UNCHANGED per the campaign's "do not re-plumb
     the webhook" instruction): the webhook already wrote it onto the
-    ``emergency_call`` row it created, so step 1 below reads it straight
-    back via that same row's ``RETURNING`` clause instead of requiring a
-    new parameter/call-site edit.
-
-    1. Durably enrich the ALREADY-CREATED ``emergency_call`` row (ack
-       token + ``next_attempt_at = now()``, making attempt 0 immediately
-       due) and create the ``emergency_sms`` durable send-intent row, in
-       ONE short transaction. Idempotent: guarded by
-       ``next_attempt_at IS NULL`` — a second call (should never happen
-       given the upstream gate, but cheap defense-in-depth) is a no-op.
-    2. Attempt the real T+0 sends immediately, via the SAME
-       :func:`_run_candidate_safely` the periodic sweep uses — never
-       raises; a failure here is fully recovered by the next sweep tick
-       (the row is already due).
+    ``emergency_call`` row it created, so :func:`_load_trigger_header`
+    reads it straight back instead of requiring a new parameter/call-site
+    edit.
     """
-    now = datetime.now(UTC)
-    ack_token = secrets.token_urlsafe(24)
-    category, body = render_tenant_safety_sms(categories)
-
-    async with _acm(get_admin_session)() as session:
-        enriched = (
-            (
-                await session.execute(
-                    _ENRICH_EMERGENCY_CALL_SQL,
-                    {
-                        "id": str(notification_id),
-                        "extra": json.dumps({"ack_token": ack_token}),
-                        "next_attempt_at": now,
-                    },
-                )
-            )
-            .mappings()
-            .one_or_none()
-        )
-        if enriched is None:
-            # Already enriched by an earlier call -- see docstring above.
-            log.info("emergency_chain_already_enriched", notification_id=str(notification_id))
-            return
-
-        landlord_id = cast("UUID", enriched["landlord_id"])
-        chain_started_at = cast("datetime", enriched["created_at"])
-
-        await session.execute(
-            _INSERT_EMERGENCY_SMS_SQL,
-            {
-                "landlord_id": str(landlord_id),
-                "payload": json.dumps(
-                    {
-                        "message_id": str(message_id),
-                        "property_id": str(property_id),
-                        "category": category,
-                        "body": body,
-                    }
-                ),
-            },
-        )
+    header = await _load_trigger_header(notification_id)
+    if header is None:  # pragma: no cover — invariant: webhook always creates this row first
+        log.error("emergency_chain_notification_missing", notification_id=str(notification_id))
+        return
+    landlord_id, chain_started_at = header
 
     candidate = EmergencyCallCandidate(
         notification_id=notification_id,
@@ -901,7 +1071,7 @@ async def handle_emergency_trigger(
         message_id=message_id,
         property_id=property_id,
         categories=categories,
-        ack_token=ack_token,
+        ack_token=None,  # _process_due_row always uses whatever _CLAIM_STEP_SQL returns
         chain_started_at=chain_started_at,
     )
     outcome = await _run_candidate_safely(candidate)
@@ -917,10 +1087,20 @@ _SELECT_DUE_EMERGENCY_CALLS_SQL = text(
     SELECT id, landlord_id, attempt, payload, created_at
     FROM notifications
     WHERE type = 'emergency_call' AND status = 'pending' AND acknowledged_at IS NULL
-      AND next_attempt_at IS NOT NULL AND next_attempt_at <= :now
-    ORDER BY next_attempt_at
+      AND (next_attempt_at IS NULL OR next_attempt_at <= :now)
+    ORDER BY next_attempt_at NULLS FIRST
     """
 )
+# Safety review, 2026-07-12 (finding N1, BLOCKING, belt 2 -- "the sweep ALSO
+# treats next_attempt_at IS NULL emergency_call rows as due-and-needing-
+# enrichment"): every row THIS codebase creates today is already born
+# enriched (webhook's own INSERT sets next_attempt_at=now(), see
+# app/routers/webhooks/twilio.py's _INSERT_EMERGENCY_NOTIFICATION_SQL) --
+# the ``IS NULL`` branch exists purely to HEAL any row that somehow still
+# lacks it (a legacy row from before this fix, or a future bug elsewhere
+# that inserts one without setting it), rather than leaving it invisible
+# to the sweep forever. ``NULLS FIRST`` treats an un-enriched row as the
+# most urgent candidate, not an accident of NULL sort order.
 
 
 @dataclass(frozen=True)
@@ -983,6 +1163,15 @@ async def run_emergency_chain_sweep(*, now: datetime | None = None) -> list[Emer
 # is no next_attempt_at gating; a row is simply "due" whenever its status
 # is 'pending' or 'failed', so the sweep retries it every tick until it
 # reaches 'sent'.
+#
+# 'failed' vs. 'exhausted' (safety review, 2026-07-12, finding N2): 'failed'
+# is TRANSIENT-ONLY -- it stays in the retry set above, resent every tick.
+# A genuinely TERMINAL outcome (today: 'no_tenant_phone' -- no amount of
+# retrying supplies a phone number this message never had) is marked
+# 'exhausted' instead (schema-v1.md's CHECK already allows it, the same
+# terminal value ``degraded_retry`` uses) so a second tick is a true
+# no-op for that row, never an infinite, silently-repeating no-op send
+# attempt.
 
 _SELECT_DUE_SMS_DRAIN_SQL = text(
     """
@@ -1008,6 +1197,25 @@ _MARK_SMS_DRAIN_SENT_SQL = text(
 _MARK_SMS_DRAIN_FAILED_SQL = text(
     "UPDATE notifications SET status = 'failed', updated_at = now() WHERE id = :id"
 )
+# ``'failed'`` is TRANSIENT-ONLY -- it stays inside _SELECT_DUE_SMS_DRAIN_SQL's
+# ``status IN ('pending', 'failed')`` retry set, so the next tick tries
+# again. Never use it for an outcome that retrying can never fix.
+
+_MARK_SMS_DRAIN_EXHAUSTED_SQL = text(
+    "UPDATE notifications SET status = 'exhausted', updated_at = now() WHERE id = :id"
+)
+# Safety review, 2026-07-12 (finding N2): ``no_tenant_phone`` is TERMINAL,
+# not transient -- no number of retries changes the fact that this
+# message's row has no stored channel back to a tenant (see module
+# docstring "Known limitation"). Marking it ``'failed'`` (the previous
+# behavior) was a genuine bug dressed up as "terminal" in a comment only:
+# ``'failed'`` rows ARE re-selected by _SELECT_DUE_SMS_DRAIN_SQL every
+# tick forever, so the sweep would silently re-attempt (and re-fail) this
+# exact row on every single tick, indefinitely. ``'exhausted'`` (schema-
+# v1.md's CHECK already allows it -- the SAME terminal value
+# ``degraded_retry`` uses once ITS chain concludes) is excluded from that
+# ``IN (...)`` clause, so a genuinely unfixable row is swept ONCE, marked,
+# and never touched again -- a second tick is a true no-op for it.
 
 
 @dataclass(frozen=True)
@@ -1081,13 +1289,14 @@ async def _process_sms_drain_candidate(candidate: SmsDrainCandidate) -> str:
 
     if not ctx.tenant_phone or not ctx.twilio_number:
         # No stored channel back to this message's sender (see module
-        # docstring "Known limitation" on emergency_chain.py) -- never
-        # retried again since retrying can't change this fact. Marked
-        # 'failed' (not silently left pending forever) so it's visible,
-        # but this is a terminal outcome for this row, not a transient one.
+        # docstring "Known limitation" on emergency_chain.py) -- TERMINAL,
+        # never retried again since retrying can't change this fact.
+        # Marked 'exhausted' (not silently left pending forever, and not
+        # 'failed' -- see _MARK_SMS_DRAIN_EXHAUSTED_SQL's own comment for
+        # why 'failed' would keep this row in the retry set forever).
         async with _acm(get_admin_session)() as session:
             await session.execute(
-                _MARK_SMS_DRAIN_FAILED_SQL, {"id": str(candidate.notification_id)}
+                _MARK_SMS_DRAIN_EXHAUSTED_SQL, {"id": str(candidate.notification_id)}
             )
         log.warning(
             "sms_drain_no_tenant_phone",
