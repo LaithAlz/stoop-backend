@@ -307,10 +307,31 @@ response as approve. Records `edited: true` for trust metrics.
 
 ## Notifications / emergencies
 
-`POST /v1/notifications/{id}/ack` → 200 `{ "acknowledged_at": "…" }`
-(also reachable via tokenized GET link from SMS: `/ack/{token}`).
+`POST /v1/notifications/{id}/ack` → 200 `{ "acknowledged_at": "…" }` —
+landlord-authenticated (the dashboard "open the case" ack surface).
 `GET /v1/notifications?type=emergency_call&status=pending` for the
 dashboard's emergency banner.
+
+**v1.1 amendment (2026-07-12 — safety review finding 1, CRITICAL):** the
+tokenized SMS-link ack surface is now a **GET/POST pair**, not a single
+GET:
+
+- `GET /ack/{token}` — **side-effect-free**, always. Renders a minimal
+  HTML confirmation page (`Cache-Control: no-store`) with a button that
+  submits `POST` to the same path. Never acknowledges anything, no matter
+  who or what issues the request.
+- `POST /ack/{token}` → 200 `{ "acknowledged_at": "…" }` (idempotent,
+  same shape as the dashboard endpoint) — the ONLY path that actually
+  stamps `acknowledged_at`.
+
+An earlier revision acknowledged directly on `GET /ack/{token}`. That is
+unsafe: SMS/RCS/iMessage link-preview prefetchers and some carrier spam
+scanners issue a `GET` on any URL inside a text message to generate a
+preview, with no human involved at all — which would silently acknowledge
+a **live emergency chain** before the landlord or backup contact ever saw
+the message. The GET/POST split closes this: a passive prefetch only ever
+renders the (inert) confirmation page; only a genuine form submission (a
+real tap) reaches the mutating `POST`.
 
 ## Billing (Train 2)
 

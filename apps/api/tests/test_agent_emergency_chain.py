@@ -310,14 +310,27 @@ def test_tenant_safety_sms_is_three_numbered_lines_grade_five(category: str) -> 
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("category", ["fire", "gas_co", "security", "person"])
-def test_tenant_safety_sms_mentions_911_for_911_first_categories(category: str) -> None:
-    """Rubric judgment call #1: fire/medical/crime → 911 first. ``water``
-    is deliberately excluded — the rubric's water EMERGENCY case is about
-    active/uncontained water and electrical contact, not a 911-first
-    instruction the way fire/medical/break-in are."""
+@pytest.mark.parametrize("category", ["fire", "gas_co", "security", "person", "water"])
+def test_tenant_safety_sms_mentions_911_for_every_category(category: str) -> None:
+    """Rubric judgment call #1: fire/medical/crime → 911 first. ``water``'s
+    EMERGENCY case (active/uncontained water, electrical contact) also
+    ends on an unconditional "call 911 now" per the 2026-07-12
+    copy-guardian ruling (finding C1) — the earlier hedged "if you're not
+    sure it's safe" wording is removed."""
     _, body = emergency_chain.render_tenant_safety_sms([category])
     assert "911" in body
+
+
+@pytest.mark.unit
+def test_water_template_verbatim_after_c1_hedge_removal() -> None:
+    """Copy finding C1 (2026-07-12): the hedge is gone; the third line is
+    an unconditional, concrete instruction."""
+    _, body = emergency_chain.render_tenant_safety_sms(["water"])
+    assert body == (
+        "1. Stay away from the water.\n"
+        "2. Don't touch outlets or switches near it.\n"
+        "3. Call 911 now."
+    )
 
 
 @pytest.mark.unit
@@ -944,5 +957,202 @@ async def test_lost_race_on_concurrent_claim_never_double_sends(
         # step 0 has TWO actions (landlord_call + tenant_safety_sms) -- the
         # winner performs both, the loser performs neither.
         assert len(fake_sender.calls) == 2, "only the winner's two actions may have been sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Integration — the SMS drain sweep (safety review, 2026-07-12: spec
+# finding S1 / safety finding 3) -- resends tenant_ack/emergency_sms rows
+# until genuinely delivered, closing #109's deployment gate.
+# ---------------------------------------------------------------------------
+
+
+async def _insert_tenant_ack_notification(
+    session: AsyncSession, *, landlord_id: str, message_id: str, body: str
+) -> str:
+    notification_id = str(uuid.uuid4())
+    payload = {"message_id": message_id, "reasons": ["classification_failed"], "body": body}
+    await session.execute(
+        text(
+            "INSERT INTO notifications (id, landlord_id, case_id, type, channel, status, payload) "
+            "VALUES (:id, :landlord_id, NULL, 'tenant_ack', 'sms', 'pending', "
+            "CAST(:payload AS jsonb))"
+        ),
+        {
+            "id": notification_id,
+            "landlord_id": landlord_id,
+            "payload": json.dumps(payload),
+        },
+    )
+    await session.commit()
+    return notification_id
+
+
+@pytest.mark.integration
+async def test_sms_drain_sweep_sends_pending_tenant_ack(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    landlord_id, property_id, tenant_id = await _seed(db_session)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    notification_id = await _insert_tenant_ack_notification(
+        db_session, landlord_id=landlord_id, message_id=message_id, body="Got your message..."
+    )
+
+    try:
+        outcomes = await emergency_chain.run_sms_drain_sweep()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "sent"
+        assert outcomes[0].notification_type == "tenant_ack"
+        assert len(fake_sender.calls) == 1
+        assert fake_sender.calls[0].kind == "sms"
+        assert fake_sender.calls[0].body == "Got your message..."
+
+        notif = await _fetch_notification(db_session, notification_id)
+        assert notif["status"] == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sms_drain_sweep_resends_emergency_sms_after_initial_send_failure(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    """Safety finding 3: the tenant safety SMS is the one non-redundant
+    message in the whole chain -- a failed first attempt (at T+0) must be
+    retried by the drain sweep, not left at-most-once."""
+    landlord_id, property_id, tenant_id = await _seed(db_session)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    notification_id = await _insert_emergency_call_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        categories=["fire"],
+    )
+
+    try:
+        fake_sender.fail_sms = True
+        await emergency_chain.handle_emergency_trigger(
+            notification_id=uuid.UUID(notification_id),
+            message_id=uuid.UUID(message_id),
+            property_id=uuid.UUID(property_id),
+            categories=["fire"],
+        )
+        # T+0: landlord call succeeded, tenant safety sms FAILED.
+        assert len(fake_sender.calls) == 1
+        assert fake_sender.calls[0].kind == "call"
+
+        sms_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT status FROM notifications WHERE type = 'emergency_sms' "
+                        "AND landlord_id = :lid"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert sms_row["status"] == "failed"
+
+        # Next tick: the fault clears, the drain sweep resends successfully.
+        fake_sender.fail_sms = False
+        outcomes = await emergency_chain.run_sms_drain_sweep()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "sent"
+        assert outcomes[0].notification_type == "emergency_sms"
+        assert len(fake_sender.calls) == 2
+        assert fake_sender.calls[1].kind == "sms"
+
+        sms_row_after = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT status FROM notifications WHERE type = 'emergency_sms' "
+                        "AND landlord_id = :lid"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert sms_row_after["status"] == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sms_drain_sweep_marks_failed_and_retries_on_the_next_tick(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    landlord_id, property_id, tenant_id = await _seed(db_session)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    notification_id = await _insert_tenant_ack_notification(
+        db_session, landlord_id=landlord_id, message_id=message_id, body="Got your message..."
+    )
+
+    try:
+        fake_sender.fail_sms = True
+        first_outcomes = await emergency_chain.run_sms_drain_sweep()
+        assert first_outcomes[0].outcome == "failed"
+
+        notif = await _fetch_notification(db_session, notification_id)
+        assert notif["status"] == "failed"
+        assert notif["attempt"] == 1
+
+        fake_sender.fail_sms = False
+        second_outcomes = await emergency_chain.run_sms_drain_sweep()
+        assert second_outcomes[0].outcome == "sent"
+
+        notif_after = await _fetch_notification(db_session, notification_id)
+        assert notif_after["status"] == "sent"
+        assert notif_after["attempt"] == 2
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sms_drain_sweep_no_tenant_phone_is_terminal_failed(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    landlord_id, property_id, _tenant_id = await _seed(db_session, with_tenant=False)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=None,
+    )
+    notification_id = await _insert_tenant_ack_notification(
+        db_session, landlord_id=landlord_id, message_id=message_id, body="Got your message..."
+    )
+
+    try:
+        outcomes = await emergency_chain.run_sms_drain_sweep()
+        assert outcomes[0].outcome == "no_tenant_phone"
+        assert len(fake_sender.calls) == 0
+
+        notif = await _fetch_notification(db_session, notification_id)
+        assert notif["status"] == "failed"
     finally:
         await _cleanup(db_session, landlord_id)

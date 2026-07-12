@@ -494,3 +494,116 @@ def test_langsmith_fields_can_be_set(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert s.langsmith_api_key == "ls-test-key"
     assert s.langsmith_project == "stoop-dev"
+
+
+# ---------------------------------------------------------------------------
+# twilio_account_sid (safety review, 2026-07-12, finding 7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("blank_value", ["", "   ", "\t\n"], ids=["empty", "spaces", "tab_newline"])
+def test_twilio_account_sid_blank_always_raises(
+    monkeypatch: pytest.MonkeyPatch, blank_value: str
+) -> None:
+    """A blank Account SID has no safe "unset" fallback -- unlike
+    app_database_url/public_base_url, this field is never optional, so a
+    blank value must raise in EVERY environment, not just production."""
+    monkeypatch.delenv("TWILIO_ACCOUNT_SID", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+            twilio_account_sid=blank_value,  # noqa: S106
+        )
+    assert "TWILIO_ACCOUNT_SID" in str(exc_info.value)
+
+
+@pytest.mark.unit
+def test_twilio_account_sid_whitespace_is_stripped() -> None:
+    """Surrounding whitespace on an otherwise-valid value is trimmed, same
+    normalization convention as the other boot-gated fields."""
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        twilio_account_sid="  AC" + "1" * 32 + "  ",  # noqa: S106
+    )
+    assert s.twilio_account_sid == "AC" + "1" * 32
+
+
+@pytest.mark.unit
+def test_production_with_malformed_twilio_account_sid_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-empty but wrongly-shaped SID (typo, .env.example placeholder,
+    truncated value) must refuse to boot in production -- catching a
+    config mistake at startup, not on the first real Twilio call."""
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            environment="production",
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
+            public_base_url="https://api.stoop.example",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+            twilio_account_sid="your-twilio-account-sid-here",  # noqa: S106
+        )
+    assert "TWILIO_ACCOUNT_SID" in str(exc_info.value)
+
+
+@pytest.mark.unit
+def test_production_with_valid_twilio_account_sid_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        environment="production",
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
+        public_base_url="https://api.stoop.example",
+        supabase_url="https://x.supabase.co",
+        supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+        supabase_service_role_key="key",
+        twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        twilio_account_sid="AC" + "0" * 32,  # noqa: S106
+    )
+    assert s.twilio_account_sid == "AC" + "0" * 32
+
+
+@pytest.mark.unit
+def test_non_production_with_malformed_twilio_account_sid_is_fine() -> None:
+    """The shape gate is production-only -- dev/test placeholders that
+    don't look like a real Twilio SID must keep working unchanged."""
+    for env in ("dev", "staging"):
+        s = Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            environment=env,  # type: ignore[arg-type]
+            database_url="postgresql+asyncpg://u:p@h:5432/db",
+            supabase_url="https://x.supabase.co",
+            supabase_jwks_url="https://x.supabase.co/auth/v1/.well-known/jwks.json",
+            supabase_jwt_issuer="https://x.supabase.co/auth/v1",
+            supabase_service_role_key="key",
+            twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+            twilio_account_sid="not-a-real-sid",  # noqa: S106
+        )
+        assert s.twilio_account_sid == "not-a-real-sid"

@@ -1,8 +1,11 @@
 """In-process 60-second scheduler ticker (#108/#109) — FastAPI
-lifespan-managed, drives BOTH the emergency escalation chain sweep
-(``app/agent/emergency_chain.py::run_emergency_chain_sweep``) and the
-degraded-mode retry sweep
-(``app/agent/degraded_mode_sweep.py::sweep_degraded_mode_retries``).
+lifespan-managed, drives the emergency escalation chain sweep, the SMS
+drain sweep, and the degraded-mode retry sweep:
+- ``app/agent/emergency_chain.py::run_emergency_chain_sweep``
+- ``app/agent/emergency_chain.py::run_sms_drain_sweep`` (safety review,
+  2026-07-12, spec finding S1 / safety finding 3 — drains
+  ``tenant_ack``/``emergency_sms`` rows)
+- ``app/agent/degraded_mode_sweep.py::sweep_degraded_mode_retries``
 
 Design choice (the campaign's "sender design menu" — (a) in-process
 asyncio periodic task, RECOMMENDED for v1; matches
@@ -11,9 +14,9 @@ asyncio periodic task, RECOMMENDED for v1; matches
 emergencies every 60 s is sufficient at pilot scale"). No new
 infrastructure — started/stopped in ``app/main.py``'s lifespan, the SAME
 lifespan that already manages the LangGraph checkpointer's connection
-pool. Combining both sweeps into ONE ticker (rather than two independent
+pool. Combining all three sweeps into ONE ticker (rather than independent
 loops) stayed clean enough to keep in this single small module — see this
-file for the entire scheduler surface; if a THIRD sweep ever needs
+file for the entire scheduler surface; if a FOURTH sweep ever needs
 combining here and this file starts to sprawl, split it back out rather
 than let it bloat.
 
@@ -28,16 +31,40 @@ next tick catches up — the literal meaning of the task's "retries/chain
 state = data ... never in-process timers for the SCHEDULE" constraint:
 the timer here only decides WHEN TO LOOK, never WHAT'S DUE.
 
-One tick's exception never kills the loop
-------------------------------------------
-Each sweep call is wrapped in its OWN try/except. Both sweep functions
-already have their own internal per-candidate exception handling (see
-their module docstrings) — an exception escaping either one here
-represents an unexpected failure in the sweep's own outer bookkeeping
-(e.g. the initial due-rows SELECT itself), not a per-candidate failure.
-Logged + paged to Sentry (metadata only, rule #5); the loop continues to
-the next tick regardless — a single bad tick must never silently stop the
-entire scheduler.
+One tick's exception never kills the loop — and neither does a failure
+IN the failure-reporting itself (safety review, 2026-07-12, finding 4,
+MEDIUM)
+--------------------------------------------------------------------------
+Each sweep call is wrapped in its OWN try/except, reported via
+:func:`_safe_report`. Both sweep functions already have their own internal
+per-candidate exception handling (see their module docstrings) — an
+exception escaping either one here represents an unexpected failure in
+the sweep's own outer bookkeeping (e.g. the initial due-rows SELECT
+itself), not a per-candidate failure.
+
+An EARLIER revision's per-sweep ``except Exception: log.error(...);
+sentry_sdk.capture_message(...)`` had a real gap: if the ``log.error``/
+``sentry_sdk.capture_message`` calls THEMSELVES raised (a broken logging
+pipe, a Sentry transport exception — not hypothetical; Sentry's HTTP
+transport can itself raise under a bad network condition), that new
+exception would propagate OUT of ``_run_one_tick`` entirely uncaught,
+which would kill the ``_ticker_loop``'s ``while True`` permanently and
+silently (an unhandled exception in an ``asyncio.Task`` that nothing else
+awaits just logs "Task exception was never retrieved" and vanishes — the
+scheduler would simply stop sweeping forever, with no explicit signal).
+Fixed two ways, belt-and-braces:
+
+1. :func:`_safe_report` wraps its OWN ``log.error``/
+   ``sentry_sdk.capture_message`` calls in their OWN try/except — a
+   failure reporting one sweep's failure can never escape.
+2. :func:`_run_one_tick` itself is wrapped in an outer try/except as a
+   final backstop, and the ticker task carries a
+   ``add_done_callback`` (:func:`_on_ticker_task_done`): if the task ever
+   DOES exit for any reason other than an intentional
+   ``stop_scheduler()`` cancellation — which should be structurally
+   impossible given (1) — it is logged/paged AND THE SCHEDULER IS
+   RESTARTED, so a genuinely-unanticipated bug in this file can never
+   permanently stop the emergency chain from being swept.
 """
 
 from __future__ import annotations
@@ -48,7 +75,7 @@ import sentry_sdk
 import structlog
 
 from app.agent.degraded_mode_sweep import sweep_degraded_mode_retries
-from app.agent.emergency_chain import run_emergency_chain_sweep
+from app.agent.emergency_chain import run_emergency_chain_sweep, run_sms_drain_sweep
 
 log = structlog.get_logger(__name__)
 
@@ -60,28 +87,67 @@ settings/env/a feature flag (this module drives the emergency path)."""
 _task: asyncio.Task[None] | None = None
 
 
-async def _run_one_tick() -> None:
-    """Run both sweeps once, each independently guarded so one's failure
-    never prevents the other from running this same tick."""
+def _safe_report(log_event: str, sentry_message: str, exc: Exception) -> None:
+    """Best-effort log + Sentry page for one sweep's failure — wrapped so
+    a failure IN the reporting itself can never propagate and kill the
+    ticker loop (safety review, 2026-07-12, finding 4, MEDIUM). Metadata
+    only (event name/exception type), never a message body or phone
+    number, rule #5."""
+    try:
+        log.error(log_event, exc_type=type(exc).__name__)
+    except Exception:  # noqa: S110 -- pragma: no cover -- logging itself must never raise here
+        pass
+    try:
+        sentry_sdk.capture_message(
+            sentry_message, level="error", extras={"exc_type": type(exc).__name__}
+        )
+    except Exception:  # noqa: S110 -- pragma: no cover -- a broken Sentry transport must never raise
+        pass
+
+
+async def _run_one_tick_body() -> None:
+    """Run every sweep once, each independently guarded so one's failure
+    never prevents the others from running this same tick."""
     try:
         await run_emergency_chain_sweep()
     except Exception as exc:
-        log.error("scheduler_emergency_chain_sweep_failed", exc_type=type(exc).__name__)
-        sentry_sdk.capture_message(
+        _safe_report(
+            "scheduler_emergency_chain_sweep_failed",
             "scheduler: emergency chain sweep tick raised",
-            level="error",
-            extras={"exc_type": type(exc).__name__},
+            exc,
+        )
+
+    try:
+        await run_sms_drain_sweep()
+    except Exception as exc:
+        _safe_report(
+            "scheduler_sms_drain_sweep_failed", "scheduler: sms drain sweep tick raised", exc
         )
 
     try:
         await sweep_degraded_mode_retries()
     except Exception as exc:
-        log.error("scheduler_degraded_mode_sweep_failed", exc_type=type(exc).__name__)
-        sentry_sdk.capture_message(
+        _safe_report(
+            "scheduler_degraded_mode_sweep_failed",
             "scheduler: degraded-mode sweep tick raised",
-            level="error",
-            extras={"exc_type": type(exc).__name__},
+            exc,
         )
+
+
+async def _run_one_tick() -> None:
+    """Outer backstop around :func:`_run_one_tick_body` — see module
+    docstring "One tick's exception never kills the loop". Should never
+    actually catch anything in practice (every sweep call inside is
+    already individually guarded via :func:`_safe_report`), but this is
+    the LAST line of defense before an exception would reach the ticker
+    task itself."""
+    try:
+        await _run_one_tick_body()
+    except Exception:  # pragma: no cover — defensive final backstop
+        try:
+            log.error("scheduler_tick_failed_unexpectedly")
+        except Exception:  # noqa: S110 -- last-resort backstop, must never itself raise
+            pass
 
 
 async def _ticker_loop(interval_seconds: float) -> None:
@@ -90,21 +156,52 @@ async def _ticker_loop(interval_seconds: float) -> None:
         await _run_one_tick()
 
 
+def _on_ticker_task_done(task: asyncio.Task[None]) -> None:
+    """Runs when the ticker task finishes, for ANY reason. A clean
+    cancellation (``stop_scheduler()``'s own doing) is expected and does
+    nothing further. Anything else — the loop somehow exiting
+    non-cancelled, which ``_run_one_tick``'s own guarantees should make
+    structurally impossible — is logged/paged and the scheduler is
+    RESTARTED (safety review, 2026-07-12, finding 4, MEDIUM): a genuinely
+    unanticipated bug here must never permanently stop the emergency chain
+    from being swept."""
+    if task.cancelled():
+        return
+
+    exc = task.exception()
+    try:
+        if exc is not None:
+            log.error("scheduler_ticker_task_died_unexpectedly", exc_type=type(exc).__name__)
+            sentry_sdk.capture_message(
+                "scheduler: ticker task died unexpectedly -- restarting",
+                level="error",
+                extras={"exc_type": type(exc).__name__},
+            )
+        else:  # pragma: no cover — _ticker_loop never returns normally (while True)
+            log.error("scheduler_ticker_task_exited_without_cancellation")
+    except Exception:  # noqa: S110 -- pragma: no cover -- reporting must never block the restart
+        pass
+
+    start_scheduler()
+
+
 def start_scheduler() -> None:
     """Start the ticker task — called once from ``app/main.py``'s
-    lifespan, AFTER checkpointer setup. Idempotent: a second call while a
-    task is already running is a no-op (defensive; the lifespan only ever
-    calls this once per process)."""
+    lifespan, AFTER checkpointer setup (and, per finding 4, from
+    :func:`_on_ticker_task_done` if the task ever dies unexpectedly).
+    Idempotent: a second call while a task is already running is a no-op."""
     global _task
     if _task is not None and not _task.done():
         return
     _task = asyncio.create_task(_ticker_loop(TICK_INTERVAL_SECONDS))
+    _task.add_done_callback(_on_ticker_task_done)
 
 
 async def stop_scheduler() -> None:
     """Cancel and await the ticker task — called from ``app/main.py``'s
     lifespan shutdown. Safe to call even if the scheduler was never
-    started (``_task is None``) or already stopped."""
+    started (``_task is None``) or already stopped. The done-callback sees
+    a genuine cancellation here and does NOT restart."""
     global _task
     if _task is None:
         return

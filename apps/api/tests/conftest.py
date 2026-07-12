@@ -26,7 +26,11 @@ _PLACEHOLDER_ENV: dict[str, str] = {
     "SUPABASE_JWT_ISSUER": "https://test.supabase.co/auth/v1",
     "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
     "TWILIO_AUTH_TOKEN": "test-twilio-auth-token",
-    "TWILIO_ACCOUNT_SID": "ACtestaccountsidtestaccountsid00",
+    # AC + 32 hex chars -- matches the real Twilio Account SID shape so the
+    # production-only format gate (app/config.py, safety review finding 7)
+    # doesn't reject it when a test explicitly constructs environment=
+    # "production" Settings for an UNRELATED assertion.
+    "TWILIO_ACCOUNT_SID": "AC" + "0" * 32,
     "ANTHROPIC_API_KEY": "test-anthropic-api-key",
 }
 
@@ -105,6 +109,18 @@ def _reset_twilio_sender() -> Iterator[None]:
     import app.integrations.twilio_send as twilio_send_mod
 
     twilio_send_mod.set_twilio_sender_for_tests(None)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_ack_rate_limiter() -> Iterator[None]:
+    """Clear the ack-surface rate limiter's in-memory state between tests
+    — same cross-test-leakage rationale as the other resets in this file:
+    a token hammered by one test must not leave a later test (which may
+    reuse a similar/short token in a tight loop) pre-throttled."""
+    import app.routers.notifications as notifications_mod
+
+    notifications_mod.reset_rate_limiter_for_tests()
     yield
 
 

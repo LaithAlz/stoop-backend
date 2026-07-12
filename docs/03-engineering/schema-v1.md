@@ -305,8 +305,13 @@
 >    tenant_ack_dedupe ON notifications ((payload ->> 'message_id')) WHERE
 >    type = 'tenant_ack'` — same NULL-safe pattern as
 >    `uq_notifications_message_dedupe` (v1.3 amendments above). `status`
->    stays `'pending'` until #108's sender exists and drains it; this issue
->    never sends anything.
+>    stayed `'pending'` until #108's sender existed to drain it (this
+>    issue, #109, never sent anything itself) — **closed 2026-07-12**:
+>    `app/agent/emergency_chain.py::run_sms_drain_sweep` (spec finding S1)
+>    now drains every `pending`/`failed` `tenant_ack` row on each
+>    scheduler tick, resending on failure until genuinely delivered. See
+>    `app/agent/degraded_mode_sweep.py`'s own module docstring
+>    ("DEPLOYMENT-GATING FACT") for the full closure note.
 > 2. **`degraded_retry`** (`channel='push'` — placeholder; this type is
 >    never delivered to anyone, see below) — an internal-only marker for
 >    the "no keywords at all" degraded-mode leg: classification failed,
@@ -339,6 +344,36 @@
 >    anchors its own dedupe index, and `degraded_retry` is the durable
 >    record of "did this message's classification ever recover on its
 >    own" (an audit-adjacent fact, not just a scratch row).
+
+> **v1.9 amendment (2026-07-12)** — migration 0010 implements this (#108
+> safety review, finding 8, LOW/doc-first). One new expression index, no
+> new column or table:
+> 1. **`uq_notifications_ack_token`** — `CREATE UNIQUE INDEX
+>    uq_notifications_ack_token ON notifications ((payload ->> 'ack_token'))
+>    WHERE payload ->> 'ack_token' IS NOT NULL`. The emergency escalation
+>    chain (`app/agent/emergency_chain.py`) generates a random,
+>    unguessable `ack_token` (`secrets.token_urlsafe(24)`) into an
+>    `emergency_call` row's `payload` at T+0 and looks it up on every
+>    `GET`/`POST /ack/{token}` request — without an index this is a
+>    sequential scan over the whole table on every tap of an SMS link.
+>    UNIQUE doubles as a data-integrity guarantee (two rows should never
+>    share the same token) — safe under the same NULL-handling Postgres
+>    already uses for every other partial unique index in this file: rows
+>    with no `ack_token` key (every type except `emergency_call`, and
+>    even `emergency_call` rows before `handle_emergency_trigger` enriches
+>    them) extract SQL `NULL` via `->>`, and Postgres unique indexes never
+>    treat two `NULL`s as equal, so those rows never collide with each
+>    other or with a real token. The `WHERE ... IS NOT NULL` partial
+>    predicate additionally keeps the index itself small (only rows that
+>    actually carry a token are indexed at all).
+> 2. **Round-trip / downgrade**: `downgrade()` drops the index — always
+>    safe, unlike migration 0009's CHECK-widening (there is no CHECK
+>    constraint here to narrow, so there is no "existing rows violate the
+>    restored constraint" failure mode to fail closed against). Dropping
+>    this index does not lose data (the `ack_token` values themselves live
+>    in `payload`, untouched) — it only means token lookups fall back to a
+>    sequential scan until the migration is re-applied, a performance
+>    regression, never a correctness one.
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────

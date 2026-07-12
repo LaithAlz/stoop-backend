@@ -62,6 +62,23 @@ The current design, in four parts:
    (caught by ``_safe_step``, logged, never re-raised) can only ever roll
    back that one side effect's own attempted work — it cannot touch the
    message row, and it cannot poison any other side effect's session.
+
+   **EXCEPTION (safety review, 2026-07-12, finding 2 — BLOCKING):** the
+   tenant emergency-artifact step (``_ensure_tenant_emergency_artifacts``)
+   is NOT wrapped in ``_safe_step`` — a failure there is logged + paged
+   (same shape as ``_safe_step``'s ``alert_on_failure``) and then
+   RE-RAISED as an ``AppError(500, ...)``, mirroring the conflict-path
+   recovery failure below (module docstring point 4). Rationale: for
+   every OTHER side effect, "the artifact never got created and nobody
+   finds out until #108's sweeper" was an acceptable tide-over (see "Ops
+   visibility tide-over" below, now closed). For the tenant HARD-hit
+   escalation specifically, silently 200-ing a failed artifact creation
+   means Twilio never retries and the landlord may simply never be
+   called — exactly the class of bug the message-row redesign above
+   already fixed for message loss; the same fix now applies to this one
+   artifact. This does NOT apply to the landlord/``needs_eyes`` side
+   effect (still ``_safe_step``, still fail-open) — only the tenant
+   emergency-artifact step carries this exception.
    Chosen over SAVEPOINTs on the shared session: independent sessions are
    simpler to reason about correctly (no reliance on autobegin/SAVEPOINT
    interaction with ``get_admin_session``'s commit-on-exit contract) and
@@ -116,13 +133,15 @@ unwrapped DB blip on the ``twilio_sid`` lookup was a real path to an
 unintended 500, which is itself a contract violation: Twilio retry-storms
 on any non-2xx).
 
-Ops visibility tide-over until #108 (consolidated review items 3/4): a
-``notifications`` row sitting at ``status='pending'`` pages nobody until
-#108's escalation sweeper exists. ``_alert_unknown_to`` and
-``_alert_tenant_hard_fire`` below both ``log.error`` AND
-``sentry_sdk.capture_message`` (uuids/category names/an HMAC-keyed digest
-of the unrecognized ``To`` number only — NEVER the raw phone number or
-message body, rule #5) so a human actually sees these today.
+Ops visibility (consolidated review items 3/4, #108 closed 2026-07-12): a
+``notifications`` row sitting at ``status='pending'`` is now actively
+worked by ``app/scheduler.py``'s 60s ticker (the escalation chain sweep
+AND the SMS-drain sweep — see ``app/agent/emergency_chain.py``).
+``_alert_unknown_to`` and ``_alert_tenant_hard_fire`` below both
+``log.error`` AND ``sentry_sdk.capture_message`` (uuids/category names/an
+HMAC-keyed digest of the unrecognized ``To`` number only — NEVER the raw
+phone number or message body, rule #5) so a human actually sees these
+immediately too, independent of the sweeper's own cadence.
 
 Neither ``/sms`` nor ``/status`` calls Twilio's REST API (no outbound send
 anywhere in either handler) — both are inbound-only receivers.
@@ -623,6 +642,16 @@ async def _run_post_persist_side_effects(
     by Postgres, safe even under concurrent retries) and isolated, so
     calling this twice (or a hundred times, concurrently) for the same
     ``message_id`` is always safe.
+
+    Raises
+    ------
+    AppError
+        500 ``tenant_emergency_artifact_failed`` if
+        ``_ensure_tenant_emergency_artifacts`` itself raises (safety
+        review, 2026-07-12, finding 2) — see module docstring "Transaction
+        design" point 2's exception. Never raised for the landlord/
+        ``needs_eyes`` side effect, which stays fail-open via
+        ``_safe_step``.
     """
     if party == "landlord":
         await _safe_step(
@@ -639,16 +668,39 @@ async def _run_post_persist_side_effects(
         return
 
     if prefilter_result.hard_hit:
-        created = await _safe_step(
-            "tenant_emergency_artifacts",
-            _ensure_tenant_emergency_artifacts(
+        try:
+            created = await _ensure_tenant_emergency_artifacts(
                 landlord_id=landlord_id,
                 property_id=property_id,
                 message_id=message_id,
                 prefilter_result=prefilter_result,
-            ),
-            alert_on_failure=True,
-        )
+            )
+        except Exception as exc:
+            # Safety review, 2026-07-12 (finding 2, BLOCKING): a fresh
+            # Tier-0 HARD delivery whose artifact creation fails must NOT
+            # 200 -- that forecloses Twilio's own retry, which is the ONLY
+            # recovery mechanism for a message whose escalation artifacts
+            # don't durably exist yet. Mirrors the conflict-path recovery
+            # failure below (module docstring point 4) -- same log event
+            # name and Sentry message _safe_step would have used, so
+            # existing ops alerting on those strings keeps working; the
+            # only change is that this one no longer swallows.
+            log.error(
+                "twilio_sms_post_persist_stage_failed",
+                stage="tenant_emergency_artifacts",
+                exc_type=type(exc).__name__,
+            )
+            sentry_sdk.capture_message(
+                "Twilio inbound webhook: post-persist side effect failed",
+                level="error",
+                extras={"stage": "tenant_emergency_artifacts", "exc_type": type(exc).__name__},
+            )
+            raise AppError(
+                status_code=500,
+                code="tenant_emergency_artifact_failed",
+                message="Temporary delivery failure -- please retry.",
+            ) from exc
+
         # Consolidated review item 3: alert ONLY when this call actually
         # created the escalation -- never on a redelivery that found it
         # already created (bounds alert volume under a replay storm).

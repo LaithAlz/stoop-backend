@@ -646,3 +646,89 @@ async def test_healthz_still_ok_with_middleware() -> None:
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert "x-request-id" in response.headers
+
+
+# ---------------------------------------------------------------------------
+# Logging hygiene pins (safety review, 2026-07-12, finding 6, MEDIUM)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_configure_logging_pins_twilio_logger_to_warning() -> None:
+    """Defense-in-depth: the Twilio SDK's own internal logger must never
+    emit at INFO or below through this app's stdout.
+
+    ``configure_logging()`` ALSO reconfigures structlog's PROCESS-WIDE
+    global state (``structlog.configure(...)``, including
+    ``cache_logger_on_first_use=True``) as its very last step. Calling the
+    real function from a test — even with ``sys.stdout`` patched to a
+    stable stream — permanently changes global structlog behavior for
+    every OTHER test that runs afterward: once
+    ``cache_logger_on_first_use`` flips ``True`` process-wide, the NEXT
+    time any OTHER module's ``structlog.get_logger()`` proxy is used for
+    the first time, it freezes itself to whatever processors/logger are
+    active AT THAT INSTANT — including a later test's own
+    ``structlog.testing.capture_logs()`` scope, whose restoration on exit
+    that frozen proxy then silently ignores. This was hit empirically
+    while first writing this test (it broke an unrelated, later test in
+    ``tests/test_request_id_middleware.py``). Patching
+    ``structlog.configure`` to a no-op for the duration of THIS call
+    sidesteps the entire hazard: the stdlib ``logging.getLogger(...)``
+    pins this test cares about happen BEFORE ``configure_logging()``'s own
+    ``structlog.configure(...)`` call, so they still take effect, while
+    structlog's global state is left completely untouched.
+    """
+    import logging
+    from unittest.mock import patch
+
+    from app.observability import configure_logging
+
+    with patch("app.observability.structlog.configure"):
+        configure_logging()
+    assert logging.getLogger("twilio").level == logging.WARNING
+
+
+@pytest.mark.unit
+def test_configure_logging_adds_ack_path_suppression_filter_to_uvicorn_access() -> None:
+    import logging
+    from unittest.mock import patch
+
+    from app.observability import _SuppressAckPathFilter, configure_logging
+
+    # See test_configure_logging_pins_twilio_logger_to_warning's docstring
+    # for why structlog.configure is stubbed out for this call.
+    with patch("app.observability.structlog.configure"):
+        configure_logging()
+    access_logger = logging.getLogger("uvicorn.access")
+    assert any(isinstance(f, _SuppressAckPathFilter) for f in access_logger.filters)
+
+
+@pytest.mark.unit
+def test_suppress_ack_path_filter_drops_ack_records_keeps_others() -> None:
+    import logging
+
+    from app.observability import _SuppressAckPathFilter
+
+    filt = _SuppressAckPathFilter()
+
+    ack_record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "GET /ack/abc123supersecret HTTP/1.1" 200',
+        args=(),
+        exc_info=None,
+    )
+    assert filt.filter(ack_record) is False
+
+    other_record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "GET /healthz HTTP/1.1" 200',
+        args=(),
+        exc_info=None,
+    )
+    assert filt.filter(other_record) is True

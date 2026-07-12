@@ -87,6 +87,20 @@ class TwilioSender(Protocol):
         ...
 
 
+_HTTP_TIMEOUT_SECONDS: float = 10.0
+"""Safety review, 2026-07-12 (finding 5, MEDIUM): the Twilio SDK's default
+``AsyncTwilioHttpClient`` has NO timeout at all — one hung carrier/network
+request would block indefinitely. The escalation-chain sweep processes
+candidates SEQUENTIALLY (never-break: never fire concurrent external calls
+for the same tick's bookkeeping), so an unbounded hang on ONE building's
+call/SMS would stall EVERY other building's due escalation behind it for
+as long as the hang lasts — this bound (10s, generous for a REST call) is
+the gate that prevents that. Bounded-gather parallelism across candidates
+was considered and left for later (optional per this finding) — the
+timeout alone closes the "stalls forever" failure mode, which is the one
+that actually matters for the zero-missed-emergency invariant."""
+
+
 class TwilioRestSender:
     """The ONLY class in this codebase that ever calls Twilio's real
     send/call REST API. See module docstring "Call-site discipline"."""
@@ -95,7 +109,7 @@ class TwilioRestSender:
         self._client = Client(
             settings.twilio_account_sid,
             settings.twilio_auth_token,
-            http_client=AsyncTwilioHttpClient(),
+            http_client=AsyncTwilioHttpClient(timeout=_HTTP_TIMEOUT_SECONDS),
         )
 
     async def send_sms(self, *, to: str, from_: str, body: str) -> str:

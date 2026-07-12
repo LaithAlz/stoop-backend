@@ -919,12 +919,24 @@ async def test_inactive_tenant_not_matched_persists_with_null_tenant_id(
 
 
 @pytest.mark.integration
-async def test_i_injected_artifact_failure_returns_200_and_message_row_survives(
+async def test_i_injected_artifact_failure_returns_5xx_message_row_survives_retry_completes(
     db_session: AsyncSession,
 ) -> None:
     """(i) Injecting a failure into the post-persist emergency-artifact
     side effect must NOT roll back the already-committed message row —
-    the regression both reviewers reproduced against an earlier revision."""
+    the regression both reviewers reproduced against an earlier revision.
+
+    Safety review, 2026-07-12 (finding 2, BLOCKING): unlike every OTHER
+    post-persist side effect, a FAILED tenant emergency-artifact creation
+    must surface as a 5xx, not a fail-open 200 — Twilio's own redelivery
+    is the only recovery mechanism for a HARD-hit message whose escalation
+    artifacts don't exist yet, mirroring the conflict-path recovery
+    failure (module docstring point 4). This test was previously named
+    ``..._returns_200_and_message_row_survives`` and asserted the OLD,
+    now-fixed fail-open behavior; it now asserts the 5xx AND that Twilio's
+    redelivery (the identical MessageSid, artifact creation no longer
+    failing) completes the artifacts exactly once.
+    """
     landlord_id = await _insert_landlord(db_session)
     to_number = _fresh_phone()
     from_number = _fresh_phone()
@@ -945,8 +957,8 @@ async def test_i_injected_artifact_failure_returns_200_and_message_row_survives(
         ):
             response = await _post_sms(params)
 
-        assert response.status_code == 200
-        assert response.text == "<Response/>"
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "tenant_emergency_artifact_failed"
 
         # The message row survives despite the injected failure -- this is
         # exactly the row that an earlier (buggy) revision silently lost.
@@ -974,6 +986,24 @@ async def test_i_injected_artifact_failure_returns_200_and_message_row_survives(
             )
         ).scalar_one()
         assert notif_count == 0
+
+        # Twilio's redelivery (same MessageSid) with the fault cleared --
+        # the SAME message row is recovered via ON CONFLICT and the
+        # artifacts are created exactly once, no duplicate escalation.
+        retry_response = await _post_sms(params)
+        assert retry_response.status_code == 200
+        assert retry_response.text == "<Response/>"
+
+        notif_count_after_retry = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM notifications "
+                    "WHERE landlord_id = :lid AND type = 'emergency_call'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert notif_count_after_retry == 1
     finally:
         await _cleanup(db_session, landlord_id)
 

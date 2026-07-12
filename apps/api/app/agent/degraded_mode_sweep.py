@@ -14,26 +14,39 @@ should invoke on a regular cadence — nothing calls this today, exactly
 like ``sweep_cases``. **The scheduler/cron wiring is explicitly out of
 this issue's scope** — this module is the callable unit, not the trigger.
 
-**DEPLOYMENT-GATING FACT (safety-review round, 2026-07-12 — record this,
-don't paper over it):** the "no keywords at all" leg's half of the
+**DEPLOYMENT-GATING FACT — CLOSED 2026-07-12 (#108, spec finding S1; record
+the closure here, don't just let it go stale in old prose):** this note
+originally recorded that the "no keywords at all" leg's half of the
 degraded-mode invariant ("no tenant message ever sits unacknowledged and
-invisible because an API was down") is NOT fully closed by this issue
-alone. The HARD-hit and SOFT-annotation legs write their durable artifacts
-IMMEDIATELY, in the same graph run that hit the failure — a landlord
-reading the ``notifications``/``audit_log`` tables (or a future dashboard)
-sees them right away, even before #108's sender exists to actually
-deliver anything. The no-keyword leg is different: its landlord-facing
-escalation (the genuine ``needs_eyes`` row) does not exist AT ALL until
-THIS module's sweep actually runs three times over 15 minutes. If nothing
-ever schedules :func:`sweep_degraded_mode_retries`, a no-keyword
-degraded-mode message sits in an intentionally-quiet holding state
-FOREVER — worse than "no send yet" (the other legs' condition today), it
-is "no escalation record yet, indefinitely." Closing this gap for real
-requires BOTH (a) a cron/scheduler invoking this module (out of scope
-here) AND (b) #108's sender actually draining ``tenant_ack``/``needs_eyes``
-rows. Until both exist, this leg's invariant is provisional, not closed —
-state this plainly to whoever plans the deployment/cutover, not just in
-code comments.
+invisible because an API was down") was NOT fully closed by issue #109
+alone, for two independent reasons: (a) nothing scheduled
+:func:`sweep_degraded_mode_retries` itself, and (b) even once scheduled,
+the queued ``tenant_ack`` holding-ack SMS had no sender to actually drain
+and deliver it — a durable row existed, but nothing ever sent the text.
+
+**Both are now closed:**
+
+(a) ``app/scheduler.py``'s 60-second ticker (#108) calls
+    :func:`sweep_degraded_mode_retries` (this module), ``run_emergency_chain_sweep``,
+    AND ``run_sms_drain_sweep`` every tick, started/stopped in
+    ``app/main.py``'s FastAPI lifespan — a real, running scheduler exists
+    for the first time.
+(b) ``app/agent/emergency_chain.py::run_sms_drain_sweep`` (safety review,
+    2026-07-12, spec finding S1) drains every ``pending``/``failed``
+    ``tenant_ack`` row on each tick, sending the holding-ack SMS via the
+    injectable Twilio sender and resending on failure until genuinely
+    delivered — the SAME drain also handles ``emergency_sms`` (the
+    unrelated #108 tenant safety text), closing the analogous "at-most-once"
+    gap safety finding 3 identified for that type.
+
+With both closed, the no-keyword leg's landlord-facing escalation
+(the genuine ``needs_eyes`` row, if all three re-classification attempts
+still fail) is now reached by a real, live sweep loop, and the tenant's
+holding ack is now genuinely delivered, not merely queued. This module's
+own code did not change to close the gap — only the deployment
+(scheduler) and the sender (drain sweep) needed to exist; this note is
+updated in place, per its own original instruction, rather than left
+stale.
 
 What one sweep tick does, per due row
 ---------------------------------------

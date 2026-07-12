@@ -349,11 +349,23 @@ async def test_downgrade_fails_closed_when_tenant_ack_row_exists(db: AsyncEngine
 
     try:
         loop = asyncio.get_running_loop()
+        # Migration 0010 (#108, ack_token index) now sits on top of 0009 --
+        # its own downgrade has no data hazard (see that migration's
+        # module docstring), so step down to 0009 in isolation FIRST, then
+        # attempt the genuinely-hazardous 0009 -> 0008 transition on its
+        # own. This keeps THIS test scoped to 0009's own fail-closed
+        # behavior, independent of whatever sits above it in the chain
+        # (a single "downgrade straight to 0008" call would instead wrap
+        # BOTH steps in one alembic transaction and roll the whole thing
+        # back on the 0009->0008 failure, landing back at 0010 -- still
+        # "fails closed", but no longer isolating 0009's own contract).
+        await loop.run_in_executor(None, lambda: _alembic("downgrade", "0009"))
+
         with pytest.raises(RuntimeError, match="notifications_type_check"):
             await loop.run_in_executor(None, lambda: _alembic("downgrade", "0008"))
 
         # FAILS CLOSED: the failed downgrade transaction rolled back --
-        # still at head, nothing corrupted.
+        # still at 0009, nothing corrupted.
         async with db.connect() as verify_conn:
             version = (
                 await verify_conn.execute(text("SELECT version_num FROM alembic_version"))

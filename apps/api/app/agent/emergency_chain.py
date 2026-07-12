@@ -89,8 +89,8 @@ paged to Sentry (level=error, metadata only — rule #5) by
 Twilio outage degrades that one action to ``"failed"`` in the attempt's
 audit row, but the chain keeps advancing on schedule regardless.
 
-Category template priority (product decision made here — flag for
-copy-guardian/founder confirmation)
+Category template priority — SETTLED 2026-07-12 (copy-guardian + safety
+sign-off)
 --------------------------------------------------------------------------
 A single inbound message can trip more than one Tier-0 HARD category at
 once (e.g. "fire" and "gas_co" together). Plain-language-rules.md caps a
@@ -98,9 +98,28 @@ tenant safety SMS at 3 numbered lines total, so this module must pick ONE
 template rather than concatenating every matched category's steps.
 :data:`_CATEGORY_PRIORITY` orders ``person`` (immediate threat to a human
 life) above ``security`` (an in-progress break-in) above ``fire`` above
-``gas_co`` above ``water`` — a defensible but NOT rubric-dictated ordering;
-flagged here explicitly for copy-guardian/founder sign-off rather than
-treated as settled doctrine.
+``gas_co`` above ``water``. Originally flagged here as a defensible-but-
+unconfirmed product decision; the 2026-07-12 copy-guardian + safety-
+reviewer round signed off on this exact ordering — no longer an open
+question, changing it now is a genuine copy/safety decision, not a typo
+fix.
+
+911-first wording vs. physical-safety-first step order (founder ruling,
+2026-07-12 — copy finding C2)
+--------------------------------------------------------------------------
+The rubric's "fire / medical / crime → 911 first" judgment call (severity-
+rubric-v1.md) governs WHEN Stoop tells the tenant to call 911 relative to
+Stoop's OWN handling (immediately, never held back pending landlord
+approval or further triage) — it does not mandate that "call 911" be the
+literal first WORD of every safety text. The ``fire`` and ``security``
+templates below deliberately order their numbered steps by PHYSICAL SAFETY
+first (get out of the unit / get somewhere safe and lock the door), THEN
+"call 911" — telling someone mid-fire to dial a phone before moving their
+feet is worse guidance, not more faithful to the rubric. (The ``person``
+template puts "call 911" as its own first step — appropriate there since
+there is no "get out" action to take first.) Kept AS BUILT per this
+ruling; see severity-rubric-v1.md's own judgment-calls section for the
+authoritative one-line clarification.
 
 Known limitation (discovered building this, not solved here — flagged, not
 silently patched over)
@@ -218,9 +237,10 @@ def actions_for_step(step: int) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 _CATEGORY_PRIORITY: tuple[str, ...] = ("person", "security", "fire", "gas_co", "water")
-"""See module docstring "Category template priority" — a product decision
-made here, flagged for copy-guardian/founder confirmation, not settled
-doctrine."""
+"""See module docstring "Category template priority" — SETTLED per the
+2026-07-12 copy-guardian + safety-reviewer joint ruling (was previously
+flagged here as an unconfirmed product decision; both are now signed off
+on this exact ordering)."""
 
 _CATEGORY_SHORT_LABELS: dict[str, str] = {
     "fire": "a fire",
@@ -243,7 +263,7 @@ _TENANT_SAFETY_SMS_TEMPLATES: dict[str, str] = {
     "water": (
         "1. Stay away from the water.\n"
         "2. Don't touch outlets or switches near it.\n"
-        "3. Call 911 if you're not sure it's safe."
+        "3. Call 911 now."
     ),
     "security": (
         "1. Get somewhere safe and lock the door.\n"
@@ -936,6 +956,239 @@ async def run_emergency_chain_sweep(*, now: datetime | None = None) -> list[Emer
 
 
 # ---------------------------------------------------------------------------
+# SMS drain sweep — tenant_ack (#109 holding ack) + emergency_sms (#108
+# tenant safety text). Safety review, 2026-07-12 (spec finding S1, MAJOR;
+# safety finding 3, MEDIUM).
+# ---------------------------------------------------------------------------
+#
+# ``tenant_ack`` (degraded_mode.py's holding-ack send-intent) and
+# ``emergency_sms`` (this module's T+0 tenant safety SMS) are both
+# ONE-SHOT, at-most-once sends today: each gets exactly ONE attempt (via
+# ``app/agent/nodes/degraded_mode.py``'s own audit trail for tenant_ack —
+# it never sends anything itself, only queues the row — and via THIS
+# module's step-0 processing for emergency_sms), and if that ONE attempt
+# fails, NOTHING ever retries it. For emergency_sms specifically — the
+# only non-redundant tenant-facing message in the whole chain (the
+# landlord/backup escalation has multiple independent contacts and
+# repeats every 15 minutes; the tenant's category-templated safety
+# instructions do not) — "at most once" is not an acceptable durability
+# guarantee. schema-v1.md's own v1.8 note said as much for tenant_ack:
+# "status stays 'pending' until #108's sender exists and drains it" — this
+# sweep is that drain, closing BOTH types' durability gap the same way:
+# resend on every tick until genuinely delivered, never capped.
+#
+# Idempotency mirrors the emergency_call chain's own claim discipline:
+# ``attempt`` (already present on every ``notifications`` row) is reused
+# purely as a concurrency-safe claim guard here, NOT a schedule -- there
+# is no next_attempt_at gating; a row is simply "due" whenever its status
+# is 'pending' or 'failed', so the sweep retries it every tick until it
+# reaches 'sent'.
+
+_SELECT_DUE_SMS_DRAIN_SQL = text(
+    """
+    SELECT id, landlord_id, type, attempt, payload
+    FROM notifications
+    WHERE type IN ('tenant_ack', 'emergency_sms') AND status IN ('pending', 'failed')
+    ORDER BY created_at
+    """
+)
+
+_CLAIM_SMS_DRAIN_SQL = text(
+    """
+    UPDATE notifications SET attempt = :new_attempt, updated_at = now()
+    WHERE id = :id AND status IN ('pending', 'failed') AND attempt = :old_attempt
+    RETURNING id
+    """
+)
+
+_MARK_SMS_DRAIN_SENT_SQL = text(
+    "UPDATE notifications SET status = 'sent', updated_at = now() WHERE id = :id"
+)
+
+_MARK_SMS_DRAIN_FAILED_SQL = text(
+    "UPDATE notifications SET status = 'failed', updated_at = now() WHERE id = :id"
+)
+
+
+@dataclass(frozen=True)
+class SmsDrainCandidate:
+    notification_id: UUID
+    landlord_id: UUID
+    notification_type: str  # 'tenant_ack' | 'emergency_sms'
+    attempt: int
+    message_id: UUID
+    body: str
+
+
+@dataclass(frozen=True)
+class SmsDrainOutcome:
+    notification_id: UUID
+    notification_type: str
+    outcome: str  # "sent" | "failed" | "lost_race" | "context_missing" | "no_tenant_phone"
+
+
+def _sms_drain_candidate_from_row(row: dict[str, Any]) -> SmsDrainCandidate | None:
+    payload = cast("dict[str, Any]", row["payload"])
+    message_id_raw = payload.get("message_id")
+    body = payload.get("body")
+    if message_id_raw is None or body is None:
+        # pragma: no cover -- invariant: always set at creation time
+        return None
+    return SmsDrainCandidate(
+        notification_id=cast("UUID", row["id"]),
+        landlord_id=cast("UUID", row["landlord_id"]),
+        notification_type=cast("str", row["type"]),
+        attempt=cast("int", row["attempt"]),
+        message_id=UUID(str(message_id_raw)),
+        body=str(body),
+    )
+
+
+async def _process_sms_drain_candidate(candidate: SmsDrainCandidate) -> str:
+    """Claim + send exactly ONE attempt for *candidate* (may raise —
+    callers must never let one candidate's exception silently stall the
+    whole tick; see :func:`run_sms_drain_sweep`)."""
+    new_attempt = candidate.attempt + 1
+
+    async with _acm(get_admin_session)() as session:
+        claim_row = (
+            (
+                await session.execute(
+                    _CLAIM_SMS_DRAIN_SQL,
+                    {
+                        "id": str(candidate.notification_id),
+                        "old_attempt": candidate.attempt,
+                        "new_attempt": new_attempt,
+                    },
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if claim_row is None:
+            return "lost_race"
+
+        ctx = await _load_context(session, candidate.message_id)
+
+    if ctx is None:  # pragma: no cover — invariant: messages are never deleted
+        log.error("sms_drain_context_missing", notification_id=str(candidate.notification_id))
+        sentry_sdk.capture_message(
+            "emergency_chain: sms drain context missing for a claimed attempt",
+            level="error",
+            extras={"notification_id": str(candidate.notification_id)},
+        )
+        return "context_missing"
+
+    if not ctx.tenant_phone or not ctx.twilio_number:
+        # No stored channel back to this message's sender (see module
+        # docstring "Known limitation" on emergency_chain.py) -- never
+        # retried again since retrying can't change this fact. Marked
+        # 'failed' (not silently left pending forever) so it's visible,
+        # but this is a terminal outcome for this row, not a transient one.
+        async with _acm(get_admin_session)() as session:
+            await session.execute(
+                _MARK_SMS_DRAIN_FAILED_SQL, {"id": str(candidate.notification_id)}
+            )
+        log.warning(
+            "sms_drain_no_tenant_phone",
+            notification_id=str(candidate.notification_id),
+            notification_type=candidate.notification_type,
+        )
+        return "no_tenant_phone"
+
+    sender = get_twilio_sender()
+    try:
+        await sender.send_sms(to=ctx.tenant_phone, from_=ctx.twilio_number, body=candidate.body)
+    except Exception as exc:
+        log.error(
+            "sms_drain_send_failed",
+            notification_id=str(candidate.notification_id),
+            notification_type=candidate.notification_type,
+            exc_type=type(exc).__name__,
+        )
+        sentry_sdk.capture_message(
+            "emergency_chain: sms drain send failed",
+            level="error",
+            extras={
+                "notification_id": str(candidate.notification_id),
+                "notification_type": candidate.notification_type,
+                "exc_type": type(exc).__name__,
+            },
+        )
+        async with _acm(get_admin_session)() as session:
+            await session.execute(
+                _MARK_SMS_DRAIN_FAILED_SQL, {"id": str(candidate.notification_id)}
+            )
+        return "failed"
+
+    async with _acm(get_admin_session)() as session:
+        await session.execute(_MARK_SMS_DRAIN_SENT_SQL, {"id": str(candidate.notification_id)})
+
+    log.info(
+        "sms_drain_sent",
+        notification_id=str(candidate.notification_id),
+        notification_type=candidate.notification_type,
+    )
+    return "sent"
+
+
+async def _run_sms_drain_candidate_safely(candidate: SmsDrainCandidate) -> str:
+    """Never-raises wrapper — same rationale as
+    :func:`_run_candidate_safely`: a row's own claim (or lack thereof) is
+    the only durable state this sweep depends on, so there is no
+    "stuck forever" risk from one candidate's exception blocking others."""
+    try:
+        return await _process_sms_drain_candidate(candidate)
+    except Exception as exc:
+        log.error(
+            "sms_drain_candidate_processing_failed",
+            notification_id=str(candidate.notification_id),
+            notification_type=candidate.notification_type,
+            exc_type=type(exc).__name__,
+        )
+        sentry_sdk.capture_message(
+            "emergency_chain: sms drain candidate processing raised",
+            level="error",
+            extras={
+                "notification_id": str(candidate.notification_id),
+                "notification_type": candidate.notification_type,
+                "exc_type": type(exc).__name__,
+            },
+        )
+        return "processing_error"
+
+
+async def run_sms_drain_sweep(*, now: datetime | None = None) -> list[SmsDrainOutcome]:
+    """DB entrypoint for one SMS-drain sweep tick — drains every
+    ``pending``/``failed`` ``tenant_ack``/``emergency_sms`` row, resending
+    until genuinely delivered. Called by ``app/scheduler.py``'s 60-second
+    ticker, in the SAME tick as :func:`run_emergency_chain_sweep` and
+    ``app/agent/degraded_mode_sweep.py::sweep_degraded_mode_retries``.
+    ``now`` is accepted for call-site symmetry with the other sweeps but
+    unused — there is no schedule here, only "not yet sent"."""
+    del now
+    async with _acm(get_admin_session)() as session:
+        rows = (await session.execute(_SELECT_DUE_SMS_DRAIN_SQL)).mappings().all()
+        candidates = [
+            c for row in rows if (c := _sms_drain_candidate_from_row(dict(row))) is not None
+        ]
+
+    outcomes: list[SmsDrainOutcome] = []
+    for candidate in candidates:
+        outcome = await _run_sms_drain_candidate_safely(candidate)
+        outcomes.append(
+            SmsDrainOutcome(
+                notification_id=candidate.notification_id,
+                notification_type=candidate.notification_type,
+                outcome=outcome,
+            )
+        )
+
+    log.info("sms_drain_sweep_complete", candidates_processed=len(outcomes))
+    return outcomes
+
+
+# ---------------------------------------------------------------------------
 # Acknowledgment — press-1 / SMS-link-tap / dashboard case-open (issue #108 AC)
 # ---------------------------------------------------------------------------
 
@@ -953,7 +1206,7 @@ _SELECT_NOTIFICATION_FOR_AUDIT_SQL = text(
 )
 
 _SELECT_NOTIFICATION_BY_TOKEN_SQL = text(
-    "SELECT id FROM notifications WHERE payload ->> 'ack_token' = :token"
+    "SELECT id, acknowledged_at FROM notifications WHERE payload ->> 'ack_token' = :token"
 )
 
 _INSERT_ACK_AUDIT_SQL = text(
@@ -1041,10 +1294,38 @@ async def acknowledge_notification(
         return cast("datetime | None", existing["acknowledged_at"])
 
 
+async def resolve_ack_token(token: str) -> tuple[UUID, datetime | None] | None:
+    """READ-ONLY lookup of *token* — ``(notification_id, acknowledged_at)``,
+    or ``None`` if *token* matches no notification. NEVER mutates anything.
+
+    Safety review, 2026-07-12 (finding 1, CRITICAL): ``GET /ack/{token}``
+    used to call :func:`acknowledge_by_token` directly, so an SMS
+    link-preview prefetcher (iMessage/RCS/carrier link scanners routinely
+    ``GET`` a URL to generate a preview, with no human involved at all)
+    could silently acknowledge a LIVE emergency chain before anyone ever
+    saw the text. ``app/routers/notifications.py``'s ``GET`` handler now
+    calls ONLY this function to render a confirmation page; the actual
+    acknowledgment happens exclusively in ``POST /ack/{token}``, which
+    calls :func:`acknowledge_by_token` below.
+    """
+    async with _acm(get_admin_session)() as session:
+        row = (
+            (await session.execute(_SELECT_NOTIFICATION_BY_TOKEN_SQL, {"token": token}))
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        return None
+    return cast("UUID", row["id"]), cast("datetime | None", row["acknowledged_at"])
+
+
 async def acknowledge_by_token(token: str, *, channel: str) -> tuple[UUID, datetime] | None:
-    """Resolve the tokenized ``GET /ack/{token}`` link to a notification id
-    and acknowledge it — ``None`` if *token* matches no notification at
-    all. See :func:`acknowledge_notification` for idempotency semantics."""
+    """Resolve the tokenized SMS-link token to a notification id and
+    ACKNOWLEDGE it — ``None`` if *token* matches no notification at all.
+    MUTATES (stamps ``acknowledged_at``) — only ever called from
+    ``POST /ack/{token}`` (see module docstring "Safety review, 2026-07-12,
+    finding 1" and :func:`resolve_ack_token`'s docstring). See
+    :func:`acknowledge_notification` for idempotency semantics."""
     async with _acm(get_admin_session)() as session:
         row = (
             (await session.execute(_SELECT_NOTIFICATION_BY_TOKEN_SQL, {"token": token}))
@@ -1071,6 +1352,8 @@ __all__: list[str] = [
     "EmergencyCallCandidate",
     "EmergencyChainOutcome",
     "EmergencyContext",
+    "SmsDrainCandidate",
+    "SmsDrainOutcome",
     "acknowledge_by_token",
     "acknowledge_notification",
     "actions_for_step",
@@ -1087,5 +1370,7 @@ __all__: list[str] = [
     "render_tenant_safety_sms",
     "render_tenant_status_sms",
     "render_voice_action_url",
+    "resolve_ack_token",
     "run_emergency_chain_sweep",
+    "run_sms_drain_sweep",
 ]
