@@ -976,3 +976,393 @@ def test_get_me_uses_admin_session_not_request_session() -> None:
         f"GET /v1/me's session dependency must be get_admin_session, got {dependency!r}"
     )
     assert dependency is not get_session
+
+
+@pytest.mark.unit
+def test_patch_me_uses_admin_session_not_request_session() -> None:
+    """Regression pin mirroring ``test_get_me_uses_admin_session_not_
+    request_session`` above: ``PATCH /v1/me`` MUST also depend on
+    ``get_admin_session``, never ``get_session``/``require_landlord``. Same
+    rationale as GET — this is still the ``/v1/me`` provisioning surface
+    (module docstring's "Session" section), and a future drive-by "simplify
+    this to require_landlord" edit must fail loudly HERE, at review/CI time,
+    not silently at the production role-separation flip (the exact failure
+    class the #54/#55/#57 spec review's CRITICAL finding on
+    ``require_landlord`` itself was about).
+    """
+    import inspect
+
+    from fastapi.params import Depends
+
+    from app.db.session import get_admin_session, get_session
+    from app.routers.me import update_me
+
+    session_param = inspect.signature(update_me, eval_str=True).parameters["session"]
+    depends_markers = [
+        meta
+        for meta in getattr(session_param.annotation, "__metadata__", ())
+        if isinstance(meta, Depends)
+    ]
+    assert len(depends_markers) == 1, (
+        f"expected exactly one Depends(...) marker on `session`, found {depends_markers!r}"
+    )
+    dependency = depends_markers[0].dependency
+
+    assert dependency is get_admin_session, (
+        f"PATCH /v1/me's session dependency must be get_admin_session, got {dependency!r}"
+    )
+    assert dependency is not get_session
+
+
+# ---------------------------------------------------------------------------
+# PATCH /v1/me (issue #57 — account settings / notification prefs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_patch_me_updates_full_name_and_timezone(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch1@example.com", full_name="Original")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            response = await client.patch(
+                "/v1/me",
+                json={"full_name": "Updated Name", "timezone": "America/Vancouver"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["full_name"] == "Updated Name"
+        assert body["timezone"] == "America/Vancouver"
+        assert body["id"] == seed.json()["id"]
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT full_name, timezone FROM landlords WHERE auth_user_id = :uid"),
+                    {"uid": sub},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["full_name"] == "Updated Name"
+        assert row["timezone"] == "America/Vancouver"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_patch_me_partial_update_preserves_other_fields(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch2@example.com", full_name="Keep Me")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            response = await client.patch(
+                "/v1/me",
+                json={"phone": "+14165551234"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # full_name untouched by a PATCH that never mentioned it.
+        assert body["full_name"] == "Keep Me"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_patch_me_no_op_body_returns_current_profile(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """An empty PATCH body (or one with no recognized keys) is a no-op read,
+    never a write — and an unrecognized/extra key (e.g. a client mistakenly
+    trying to flip emergency notifications off) is silently ignored rather
+    than erroring, since ``MeUpdateRequest`` has no such field to set in the
+    first place (api-contracts.md: "Emergency notifications are not a
+    settable preference")."""
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch3@example.com", full_name="Untouched")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            response = await client.patch(
+                "/v1/me",
+                json={"emergency_notifications": False},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 200, response.text
+        assert response.json()["full_name"] == "Untouched"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_patch_me_voice_profile_writes_audit_log_once(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch4@example.com")
+    voice_profile = {"tone": "warm, direct", "samples": ["Hey! Thanks for flagging."]}
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            r1 = await client.patch(
+                "/v1/me",
+                json={"voice_profile": voice_profile},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+            # Re-patching with the SAME value must not write a second audit row.
+            r2 = await client.patch(
+                "/v1/me",
+                json={"voice_profile": voice_profile},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert r1.status_code == 200, r1.text
+        assert r2.status_code == 200, r2.text
+        assert r1.json()["voice_profile"] == voice_profile
+
+        landlord_id = r1.json()["id"]
+        rows = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE landlord_id = :lid "
+                    "AND action = 'settings_changed'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert rows == 1
+
+        await db_session.execute(
+            text("DELETE FROM audit_log WHERE landlord_id = :lid"), {"lid": landlord_id}
+        )
+        await db_session.commit()
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_patch_me_timezone_null_rejected_422(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch5@example.com")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            response = await client.patch(
+                "/v1/me",
+                json={"timezone": None},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "invalid_field"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_patch_me_phone_null_rejected_422(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """``phone`` is the emergency-call target (schema-v1.md) — an explicit
+    JSON null must never silently clear it (senior review on PR #195, A4).
+    ``landlords.phone`` IS nullable in schema-v1.md, so this is a deliberate
+    business rule, not a NOT NULL DB constraint."""
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch8@example.com")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            response = await client.patch(
+                "/v1/me",
+                json={"phone": None},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "invalid_field"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_patch_me_never_provisioned_returns_403_account_deleted(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """PATCH never lazily provisions — a brand-new auth user who PATCHes
+    before ever GETting has no landlords row, and must get the same
+    ``account_deleted`` 403 as a soft-deleted account (never a 500, never a
+    silent row creation)."""
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch6@example.com")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.patch(
+                "/v1/me",
+                json={"full_name": "Should not be written"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert response.status_code == 403, response.text
+        assert response.json()["error"]["code"] == "account_deleted"
+
+        count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM landlords WHERE auth_user_id = :uid"), {"uid": sub}
+            )
+        ).scalar_one()
+        assert count == 0, "PATCH /v1/me must never create a landlords row"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_patch_me_soft_deleted_returns_403_account_deleted_row_untouched(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch7@example.com")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            await db_session.execute(
+                text("UPDATE landlords SET deleted_at = now() WHERE auth_user_id = :uid"),
+                {"uid": sub},
+            )
+            await db_session.commit()
+
+            row_before = (
+                (
+                    await db_session.execute(
+                        text(
+                            "SELECT full_name, updated_at FROM landlords WHERE auth_user_id = :uid"
+                        ),
+                        {"uid": sub},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+
+            response = await client.patch(
+                "/v1/me",
+                json={"full_name": "Should not apply"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 403, response.text
+        assert response.json()["error"]["code"] == "account_deleted"
+
+        row_after = (
+            (
+                await db_session.execute(
+                    text("SELECT full_name, updated_at FROM landlords WHERE auth_user_id = :uid"),
+                    {"uid": sub},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row_after["full_name"] == row_before["full_name"]
+        assert row_after["updated_at"] == row_before["updated_at"]
+    finally:
+        await _cleanup(db_session, sub)

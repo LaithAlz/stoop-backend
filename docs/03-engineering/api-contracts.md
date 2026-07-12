@@ -49,6 +49,19 @@
 `PATCH /v1/me` — body: any of `full_name`, `phone`, `timezone`,
 `voice_profile`. Emergency notifications are not a settable preference.
 
+**v1.9 amendment (2026-07-12 — #57 implementation):** `PATCH` never
+lazily provisions — a caller with no live `landlords` row (never
+provisioned, or soft-deleted) gets the same 403 `account_deleted` as
+`GET`/`require_landlord`, and nothing is written. `timezone` is `NOT NULL`
+in schema-v1.md; an explicit `null` 422s with code `invalid_field` rather
+than a raw `NotNullViolation`. Issue #57's own acceptance criteria
+additionally lists "notification prefs" and "quiet-hours overrides" as
+settable here — neither has a column on `landlords` in schema-v1.md, and
+this shape (the four fields above) already predates that AC. NOT
+implemented pending a schema-doc-first decision (add the columns, or
+confirm quiet-hours stays property-scoped only per the `Property.
+quiet_hours` field above and drop the AC bullet).
+
 `GET/PATCH /v1/me` use `require_user` directly (the provisioning path — a
 brand-new auth user has no `landlords` row yet, and this lazily creates
 one), not `require_landlord`. `GET /v1/me`'s own upsert now filters
@@ -80,6 +93,20 @@ Provisions a Twilio number (#53); 201 → full `Property`.
   "created_at": "…" }
 ```
 
+**v1.9 amendment (2026-07-12 — #54 implementation):** `DELETE` can also
+409 with code `has_dependents` when the property survives the
+`has_open_cases` check but still has FK-referencing rows — the explicit
+`ON DELETE RESTRICT` columns targeting `properties(id)` (schema-v1.md):
+`tenants.property_id`, `cases.property_id`, `messages.property_id`,
+`trust_metrics.property_id` — surfaced cleanly instead of a raw 500 on the
+underlying `IntegrityError`. `GET`/`PATCH`/`DELETE /v1/properties/{id}`
+404 with code `property_not_found` for a missing or cross-tenant id (the
+two are indistinguishable by design — never leak cross-tenant existence).
+**"Voice-profile fields"** (#54's own acceptance-criteria wording) live on
+`landlords.voice_profile` (schema-v1.md), not on `properties` — that AC is
+satisfied via `PATCH /v1/me` (below), not this endpoint; noted here so the
+two don't look like an unaddressed gap.
+
 ## Tenants & Vendors
 
 `GET/POST /v1/properties/{id}/tenants` · `PATCH/DELETE /v1/tenants/{id}`
@@ -87,6 +114,29 @@ Tenant body/shape: `name?`, `phone`, `unit?`, `vulnerable_occupant?`, `notes?`.
 
 `GET/POST /v1/vendors` · `PATCH/DELETE /v1/vendors/{id}`
 Vendor shape: `name`, `trade`, `phone`, `notes?`, `working_hours?`, `active`.
+
+**v1.9 amendment (2026-07-12 — #54 implementation):** `DELETE` on both
+resources is a SOFT delete (`active = false`, returns the updated row) —
+neither `tenants` nor `vendors` has a `deleted_at` column (schema-v1.md).
+Of the FKs targeting them, only `cases.tenant_id` is an explicit
+`ON DELETE RESTRICT`; `messages.tenant_id` and `cases.vendor_id` carry no
+explicit `ON DELETE` clause (Postgres default `NO ACTION`, schema-v1.md) —
+which still blocks an immediate hard delete while a referencing row
+exists, just not via the `RESTRICT` keyword specifically. Either way, once
+any case/message history exists a hard delete is structurally blocked, so
+soft-delete is the only viable semantics regardless of which FK fires.
+Idempotent: deleting an already-inactive row just re-confirms the state.
+404 codes:
+`tenant_not_found` / `vendor_not_found`, same cross-tenant-safe
+non-disclosure as `property_not_found` above. `GET /v1/properties/{id}/
+tenants` is unpaginated (per-property tenant counts are small); `GET
+/v1/vendors` follows the standard cursor convention.
+
+**v1.10 amendment (2026-07-12 — senior review on PR #195, A1):** create/
+update on either resource 409s with code `duplicate_phone` on a unique
+-constraint collision — `tenants` has `UNIQUE (property_id, phone)`,
+`vendors` has `UNIQUE (landlord_id, phone)` (schema-v1.md) — instead of a
+raw 500 on the underlying `IntegrityError`.
 
 ## Queue (the dashboard's main read)
 
@@ -174,9 +224,67 @@ oldest-first):
       "body": "…", "media": [], "at": "…" },
     { "kind": "audit", "actor": "agent", "action": "classified",
       "payload": { "severity": "urgent", "rules_fired": ["…"] }, "at": "…" },
-    { "kind": "draft", "status": "pending", "body": "…", "at": "…" }
+    { "kind": "draft", "id": "…", "status": "pending", "body": "…", "at": "…" }
   ] }
 ```
+404 with code `case_not_found` for a missing or cross-tenant id (same
+non-disclosure convention as `property_not_found`).
+
+**v1.9 amendments (2026-07-12 — #55 implementation):**
+- **`draft` timeline entries gain `id`** (the draft's uuid) — closes one of
+  PR #190's three catalogued contract gaps: the dashboard needs it to wire
+  approve/undo/reject actions from inside the thread view, exactly like
+  `GET /v1/queue`'s `draft_id`. Additive field, not a breaking change.
+- **`payload.summary` surfacing** (PR #190's second gap) needed no contract
+  change: the audit timeline entry was always specified as the full,
+  opaque `audit_log.payload` object, so `summary` (schema-v1 v1.7) surfaces
+  automatically once `classify_severity` writes it — implementations must
+  pass the payload column through verbatim, never reconstruct a narrower
+  shape.
+- **Media captions** (PR #190's third gap) remain UNRESOLVED — `messages.
+  media` (schema-v1.md) is `[{url, content_type}]` with no caption
+  sub-key, and captioning is MMS-pipeline work (#46) that hasn't landed.
+  Flagged, not invented.
+- **`GET /v1/messages` is NOT specified.** Issue #55's acceptance criteria
+  additionally lists a "channel view per tenant" endpoint, but no shape for
+  it exists anywhere in this doc, and PR #190's frontend rebuild already
+  consumes `GET /v1/cases/{id}`'s timeline as the conversation view
+  instead. Not implemented pending a doc-first decision: either specify a
+  real `GET /v1/messages` shape, or confirm the case timeline supersedes it
+  and drop the AC bullet.
+- **Pagination cursor validation:** a malformed `cursor` on any
+  cursor-paginated list (`GET /v1/properties`, `GET /v1/vendors`,
+  `GET /v1/cases`) 400s with code `invalid_cursor` rather than 500ing or
+  silently ignoring it — including a cursor that is well-formed base64/JSON
+  but carries a non-uuid `id` (crafted/corrupt input), not just malformed
+  base64/JSON outright.
+
+**v1.11 amendment (2026-07-12 — senior review on PR #195, B1):**
+`GET /v1/cases/{id}`'s `message`/pre-case-`audit` timeline entries are NOT
+`messages.case_id = :id` lookups — `messages` is append-only (rule #2) and
+the webhook (its sole writer) always inserts `case_id = NULL` (case
+identity isn't known yet); the durable link is the `message_cases
+(message_id, case_id)` join table (`app/agent/nodes/identify_case.py`'s own
+module docstring). Implementations MUST correlate via `message_cases`
+(OR'd with a direct `case_id` match, for any future write path that ever
+sets it at insert time). The same applies to exactly two `audit_log`
+action types that are `case_id`-NULL forever by construction —
+`message_received` and `emergency_triggered` — both of which carry
+`payload->>'message_id'` and correlate the same way; every other action
+this codebase writes (`classified`, `drafted`, `draft_stale`,
+`degraded_mode`, case-lifecycle actions) sets `case_id` directly and needs
+no join.
+
+**v1.11 amendment (2026-07-12 — senior review on PR #195, A3):**
+`GET /v1/cases`'s sort key (`last_activity_at`) is MUTABLE — a case bumped
+by new activity after a client has already fetched a page can "skip
+ahead" past a cursor computed from an older snapshot (jump from a later
+page back into an earlier one, or vice versa), unlike a monotonically
+-increasing key such as `created_at`. This is a known, accepted keyset
+-pagination caveat, not a bug: the remedy is simply re-fetching page 1
+(no stale-cursor error is raised — a stale cursor still resolves to SOME
+consistent position, just possibly not the one the client expected).
+
 `POST /v1/cases/{id}/resolve` — body `{ "reason": "landlord" }` → 200.
 `POST /v1/cases/{id}/ask-vendor` — body `{ "vendor_id": "…", "note?": "…" }`
 → 201 `{ "draft_id": "…" }` (vendor draft enters the same queue, #115).

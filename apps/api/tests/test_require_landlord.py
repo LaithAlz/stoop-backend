@@ -1,4 +1,6 @@
-"""Integration tests for the ``require_landlord`` dependency (#22).
+"""Integration tests for the ``require_landlord`` dependency (#22; two-session
+fix per the #54/#55/#57 spec review — see ``app/deps.py``'s module docstring
+"Two-session rationale").
 
 Marker: ``integration`` — requires a running Postgres instance.
 Use ``docker compose up -d`` at the repo root before running locally.
@@ -22,10 +24,32 @@ Covers:
    ``set_config``).
 4. A session that never went through ``require_landlord`` has the GUC
    unset (``current_setting(..., true)`` is NULL) — the fail-closed
-   default this dependency is the only thing that ever changes. (Full RLS
-   *enforcement* proof — a query genuinely returning zero rows — lives in
-   ``tests/test_rls_isolation.py``, which connects as ``app_role``; this
-   test is scoped to what ``require_landlord`` itself is responsible for.)
+   default this dependency is the only thing that ever changes.
+5. **The regression pin for the two-session fix**: ``require_landlord``
+   resolves the landlord and sets the GUC correctly even when the CALLER's
+   session is genuinely subject to RLS (``SET LOCAL ROLE app_role``, the
+   same technique ``tests/test_rls_isolation.py`` uses — see that module's
+   docstring for why a superuser can ``SET ROLE`` without prior
+   membership). Before the fix, this exact scenario 403'd
+   ``account_deleted`` for a real, live, committed landlord row, every
+   time, because the ``landlords`` lookup ran on the SAME app_role-scoped
+   transaction the GUC hadn't been set on yet — ``landlords``' RLS policy
+   is ``id = current_setting('app.current_landlord_id', true)::uuid``, and
+   an unset GUC reads back as SQL ``NULL``, matching zero rows. Manually
+   verified red under the pre-fix code (via ``git stash``) and green under
+   the fix — see this PR's report for the transcript.
+
+Cross-loop pool hazard note: tests below that use ``require_landlord`` now
+touch the module-level ADMIN engine (``app.db.session.engine``, via
+``get_admin_session`` — the two-session fix) IN ADDITION to each test's own
+``db_engine`` fixture. ``asyncio_default_fixture_loop_scope = "function"``
+means every test gets its own event loop; a connection pooled by the
+module-level singleton engine during one test is bound to that test's
+(now-closed) loop, and reusing it from a later test's new loop raises
+``RuntimeError: got Future ... attached to a different loop`` (the exact
+failure class ``tests/test_me.py``'s ``dispose_app_engine`` fixture already
+guards against). ``_dispose_admin_engine`` below is that same guard,
+reproduced here for the same reason.
 
 Run with:
     DATABASE_URL=postgresql+asyncpg://stoop:stoop@localhost:5432/stoop \\
@@ -47,6 +71,7 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
+import app.db.session as db_session_mod
 from app.deps import Landlord, require_landlord
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthUser
@@ -97,6 +122,15 @@ async def db_engine(_migrate_once: None) -> AsyncGenerator[AsyncEngine, None]:
     await engine.dispose()
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_admin_engine() -> AsyncGenerator[None, None]:
+    """Dispose the module-level admin engine before/after each test — see
+    module docstring's "Cross-loop pool hazard note"."""
+    await db_session_mod.engine.dispose()
+    yield
+    await db_session_mod.engine.dispose()
+
+
 @pytest_asyncio.fixture
 async def session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
     """A plain AsyncSession — stands in for the one ``get_session`` yields.
@@ -110,34 +144,49 @@ async def session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
             await sess.rollback()
 
 
-async def _insert_landlord(
-    session: AsyncSession,
+async def _insert_landlord_committed(
+    db_engine: AsyncEngine,
     *,
     auth_user_id: str,
     soft_deleted: bool = False,
 ) -> str:
-    """Insert a landlords row and return its id. Does NOT commit — the
-    caller's session is rolled back at teardown by the ``session`` fixture.
+    """Insert a landlords row on its OWN connection and COMMIT it.
 
-    ``deleted_at`` is always a bind parameter (a Python ``datetime`` or
-    ``None``), never conditionally-built SQL text, to keep this a plain
-    parameterized INSERT regardless of which case is being seeded.
+    Committing (rather than the old rollback-only pattern) is now required:
+    the two-session fix means ``require_landlord``'s lookup runs on a
+    SEPARATE admin session/connection from the caller's own ``session``
+    fixture — an uncommitted write on one connection is invisible to any
+    other connection, by ordinary transaction-isolation semantics, so the
+    row must be durably committed for that lookup to ever see it (exactly
+    like a real request would: the landlord row was provisioned and
+    committed in some earlier request entirely). Callers MUST clean up via
+    ``_delete_landlord`` in a ``finally`` block.
     """
     landlord_id = str(uuid.uuid4())
     deleted_at = datetime.now(UTC) if soft_deleted else None
-    await session.execute(
-        text(
-            "INSERT INTO landlords (id, auth_user_id, email, deleted_at) "
-            "VALUES (:id, :auth_user_id, :email, :deleted_at)"
-        ),
-        {
-            "id": landlord_id,
-            "auth_user_id": auth_user_id,
-            "email": f"{landlord_id}@example.com",
-            "deleted_at": deleted_at,
-        },
-    )
+    async with db_engine.connect() as connection:
+        trans = await connection.begin()
+        await connection.execute(
+            text(
+                "INSERT INTO landlords (id, auth_user_id, email, deleted_at) "
+                "VALUES (:id, :auth_user_id, :email, :deleted_at)"
+            ),
+            {
+                "id": landlord_id,
+                "auth_user_id": auth_user_id,
+                "email": f"{landlord_id}@example.com",
+                "deleted_at": deleted_at,
+            },
+        )
+        await trans.commit()
     return landlord_id
+
+
+async def _delete_landlord(db_engine: AsyncEngine, landlord_id: str) -> None:
+    async with db_engine.connect() as connection:
+        trans = await connection.begin()
+        await connection.execute(text("DELETE FROM landlords WHERE id = :id"), {"id": landlord_id})
+        await trans.commit()
 
 
 def _auth_user(auth_user_id: str) -> AuthUser:
@@ -150,15 +199,21 @@ def _auth_user(auth_user_id: str) -> AuthUser:
 
 
 @pytest.mark.integration
-async def test_soft_deleted_landlord_returns_403_account_deleted(session: AsyncSession) -> None:
+async def test_soft_deleted_landlord_returns_403_account_deleted(
+    db_engine: AsyncEngine, session: AsyncSession
+) -> None:
     auth_user_id = str(uuid.uuid4())
-    await _insert_landlord(session, auth_user_id=auth_user_id, soft_deleted=True)
+    landlord_id = await _insert_landlord_committed(
+        db_engine, auth_user_id=auth_user_id, soft_deleted=True
+    )
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await require_landlord(_auth_user(auth_user_id), session)
 
-    with pytest.raises(AppError) as exc_info:
-        await require_landlord(_auth_user(auth_user_id), session)
-
-    assert exc_info.value.status_code == 403
-    assert exc_info.value.code == "account_deleted"
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.code == "account_deleted"
+    finally:
+        await _delete_landlord(db_engine, landlord_id)
 
 
 # ---------------------------------------------------------------------------
@@ -186,20 +241,24 @@ async def test_missing_landlord_row_returns_403_account_deleted(session: AsyncSe
 
 
 @pytest.mark.integration
-async def test_happy_path_returns_landlord_and_sets_guc(session: AsyncSession) -> None:
+async def test_happy_path_returns_landlord_and_sets_guc(
+    db_engine: AsyncEngine, session: AsyncSession
+) -> None:
     auth_user_id = str(uuid.uuid4())
-    landlord_id = await _insert_landlord(session, auth_user_id=auth_user_id)
+    landlord_id = await _insert_landlord_committed(db_engine, auth_user_id=auth_user_id)
+    try:
+        landlord, returned_session = await require_landlord(_auth_user(auth_user_id), session)
 
-    landlord, returned_session = await require_landlord(_auth_user(auth_user_id), session)
+        assert isinstance(landlord, Landlord)
+        assert str(landlord.id) == landlord_id
+        assert returned_session is session
 
-    assert isinstance(landlord, Landlord)
-    assert str(landlord.id) == landlord_id
-    assert returned_session is session
-
-    guc_value = (
-        await session.execute(text("SELECT current_setting('app.current_landlord_id', true)"))
-    ).scalar_one()
-    assert guc_value == landlord_id
+        guc_value = (
+            await session.execute(text("SELECT current_setting('app.current_landlord_id', true)"))
+        ).scalar_one()
+        assert guc_value == landlord_id
+    finally:
+        await _delete_landlord(db_engine, landlord_id)
 
 
 # ---------------------------------------------------------------------------
@@ -216,3 +275,91 @@ async def test_session_without_require_landlord_has_guc_unset(session: AsyncSess
         await session.execute(text("SELECT current_setting('app.current_landlord_id', true)"))
     ).scalar_one()
     assert guc_value is None
+
+
+# ---------------------------------------------------------------------------
+# 5. THE REGRESSION PIN — require_landlord under REAL RLS enforcement
+# (SET LOCAL ROLE app_role, the tests/test_rls_isolation.py technique).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_require_landlord_resolves_under_real_rls_enforcement(
+    db_engine: AsyncEngine,
+) -> None:
+    """The authoritative proof for the two-session fix (app/deps.py).
+
+    Seeds a committed landlord row on an ordinary (superuser) connection,
+    then calls ``require_landlord`` with a caller ``session`` that is
+    GENUINELY ``app_role``-scoped (``SET LOCAL ROLE app_role`` on its own
+    connection/transaction, with the GUC deliberately still UNSET at call
+    time — exactly the state a fresh request-path session is in). Before
+    the fix, ``require_landlord``'s ``landlords`` lookup ran on this SAME
+    app_role-scoped, GUC-unset transaction and was rejected by RLS (zero
+    rows, since ``id = current_setting(..., true)::uuid`` can never match
+    while the GUC is NULL) — this test would have 403'd account_deleted for
+    a real landlord, exactly the production bug found in spec review.
+    After the fix, the lookup runs on a separate ADMIN session and always
+    succeeds; the GUC is then set on THIS app_role-scoped session/
+    connection, verified by reading it back on the SAME connection.
+
+    Manually confirmed red against the pre-fix single-session code (via a
+    local ``git stash`` of the ``app/deps.py`` fix) and green against the
+    fix — see this PR's report for the transcript; this test is what stays
+    in the suite permanently.
+    """
+    auth_user_id = str(uuid.uuid4())
+    landlord_id = str(uuid.uuid4())
+
+    # Seed + commit on an ordinary (superuser) connection — durably visible
+    # to any later transaction, including require_landlord's own internal
+    # admin-session lookup.
+    async with db_engine.connect() as seed_connection:
+        trans = await seed_connection.begin()
+        await seed_connection.execute(
+            text("INSERT INTO landlords (id, auth_user_id, email) VALUES (:id, :auth, :email)"),
+            {"id": landlord_id, "auth": auth_user_id, "email": f"{landlord_id}@example.com"},
+        )
+        await trans.commit()
+
+    try:
+        async with db_engine.connect() as connection:
+            trans = await connection.begin()
+            try:
+                # From here on, current_user is app_role for the rest of
+                # this transaction — genuinely subject to the landlords
+                # RLS policy, not the local superuser bypass.
+                await connection.execute(text("SET LOCAL ROLE app_role"))
+
+                # Wrap this already-app_role-scoped connection in a plain
+                # AsyncSession — exactly what get_session hands a real
+                # handler, just constructed manually here instead of via
+                # the FastAPI dependency graph.
+                app_role_session = AsyncSession(bind=connection)
+
+                # Precondition: the GUC is genuinely unset at call time —
+                # this is the exact chicken-and-egg state the bug required.
+                guc_before = (
+                    await connection.execute(
+                        text("SELECT current_setting('app.current_landlord_id', true)")
+                    )
+                ).scalar_one()
+                assert guc_before is None
+
+                landlord, returned_session = await require_landlord(
+                    _auth_user(auth_user_id), app_role_session
+                )
+
+                assert str(landlord.id) == landlord_id
+                assert returned_session is app_role_session
+
+                guc_after = (
+                    await connection.execute(
+                        text("SELECT current_setting('app.current_landlord_id', true)")
+                    )
+                ).scalar_one()
+                assert guc_after == landlord_id
+            finally:
+                await trans.rollback()
+    finally:
+        await _delete_landlord(db_engine, landlord_id)
