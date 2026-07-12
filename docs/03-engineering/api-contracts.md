@@ -17,6 +17,12 @@
   `request_id` is server-generated as `req_` + 32 hex chars unless the
   caller supplies a well-formed `X-Request-ID` request header, in which
   case that value is honored and echoed back unchanged (not re-prefixed).
+  **The error object MAY carry additional, endpoint-specific fields**
+  alongside `code`/`message`/`request_id` (amendment, #44/#45 safety
+  review) — e.g. `POST /v1/drafts/{id}/approve`'s 409 `draft_stale` carries
+  `fresh_draft_id`. Any such extra field is documented in that endpoint's
+  own section, same as `fresh_draft_id` below; the three reserved keys
+  always win on a naming collision (server-enforced, never client-supplied).
 - IDs are uuids as strings. Timestamps ISO-8601 UTC (`2026-06-11T14:02:00Z`).
 - **Pagination**: `?limit=` (default 25, max 100) + `?cursor=`; responses
   carry `"next_cursor": string|null`. Lists are newest-first.
@@ -297,13 +303,25 @@ consistent position, just possibly not the one the client expected).
 ```
 - 409 `draft_stale` if a newer tenant message invalidated it — body
   includes `"fresh_draft_id"`. Idempotent on repeat.
+- 409 `already_sent` if the draft is already `sending`/`sent` (a
+  concurrent caller's approve/the sender already claimed it).
 - Undo window is +5s from the dashboard (approve-by-SMS: +5min — see
   Webhooks).
 `DELETE /v1/drafts/{id}/approve` → 200 `{ "status": "pending" }`
-(cancels within the undo window; 409 `already_sent` after).
-`POST /v1/drafts/{id}/reject` — body `{ "note?": "…" }` → 200.
-`POST /v1/drafts/{id}/edit-and-send` — body `{ "body": "…" }` → same
-response as approve. Records `edited: true` for trust metrics.
+(cancels within the undo window; idempotent if already `pending`).
+- 409 `already_sent` once the sender has actually claimed/sent it
+  (`sending`/`sent`).
+- 409 `draft_not_undoable` (amendment, #44/#45 safety review) if the draft
+  is `stale`/`rejected`/`cancelled` — distinct from `already_sent`: the
+  draft never went out, "already gone out" would be a false statement for
+  these three; there is simply nothing approved left to undo.
+`POST /v1/drafts/{id}/reject` — body `{ "note?": "…" }` → 200. 409
+`already_sent` if a concurrent approve already won (reject no longer
+applies); 409 `draft_stale` (+ `fresh_draft_id`) if genuinely superseded by
+a newer tenant message.
+`POST /v1/drafts/{id}/edit-and-send` — body `{ "body": "…" }` (rejected if
+empty or whitespace-only) → same response as approve. Records
+`edited: true` for trust metrics.
 
 ## Notifications / emergencies
 

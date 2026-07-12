@@ -49,6 +49,18 @@ that resends 'sending' rows past some age) would risk exactly the
 double-send this design avoids without a `twilio_sid` idempotency key from
 the provider, which this issue does not have.
 
+The edited/empty-``final_body`` guard (safety review, this round)
+--------------------------------------------------------------------
+An edited draft (``edited=true``) whose ``final_body`` is somehow empty
+(structurally shouldn't happen — routers/drafts.py's edit-and-send handler
+always sets both together — but this module never assumes that elsewhere)
+is refused outright: logged loudly and Sentry-paged, the row left stuck
+``'sending'`` (same stuck-row semantics as any other send failure above) —
+NEVER silently falling back to ``drafts.body`` (the ORIGINAL text the
+landlord explicitly edited away). Sending the original text back after a
+landlord deliberately replaced it would be a silent, wrong-content send —
+strictly worse than a stuck row.
+
 Session discipline — never hold a DB connection across the network call
 ------------------------------------------------------------------------
 Mirrors every other node in this package (e.g. ``draft_response.py``'s own
@@ -81,6 +93,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
+import sentry_sdk
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -212,7 +225,27 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
     recipient: str = claimed["recipient"]
     edited: bool = claimed["edited"]
     landlord_id: UUID = claimed["landlord_id"]
-    body: str = claimed["final_body"] if edited and claimed["final_body"] else claimed["body"]
+
+    if edited and not claimed["final_body"]:
+        # Defensive (safety review, this round): an edited draft with no
+        # final_body is a structural invariant violation (routers/
+        # drafts.py's edit-and-send handler always sets both together) —
+        # NEVER silently fall back to `body` (the original text the
+        # landlord explicitly replaced). Loud, never a silent send of the
+        # wrong text.
+        log.error(
+            "draft_sender_edited_draft_missing_final_body",
+            draft_id=str(draft_id),
+            case_id=str(case_id),
+        )
+        sentry_sdk.capture_message(
+            "draft_sender: edited draft has no final_body -- refusing to send the "
+            "original, unedited text",
+            level="error",
+            extras={"draft_id": str(draft_id), "case_id": str(case_id)},
+        )
+        return
+    body: str = claimed["final_body"] if edited else claimed["body"]
 
     async with asynccontextmanager(get_admin_session)() as session:
         property_id, severity, tenant_id, vendor_id, to_e164 = await _load_recipient_context(

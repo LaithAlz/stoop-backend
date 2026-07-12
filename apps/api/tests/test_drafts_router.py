@@ -875,9 +875,127 @@ async def test_edit_and_send_rejects_empty_body(
 
 
 @pytest.mark.integration
+async def test_edit_and_send_rejects_whitespace_only_body(
+    private_key: EllipticCurvePrivateKey, jwks_payload: dict[str, Any], db_session: AsyncSession
+) -> None:
+    """Finding #4 (safety review, INFO/defensive): ``Field(min_length=1)``
+    alone lets a whitespace-only string through — must also be rejected."""
+    sub = str(uuid.uuid4())
+    landlord_id, case_id, draft_id = await _seed_pending_draft_direct(db_session, auth_user_id=sub)
+    token = _mint_token(private_key, sub=sub)
+
+    try:
+        async with _mocked_jwks(jwks_payload):
+            async with _client() as client:
+                response = await client.post(
+                    f"/v1/drafts/{draft_id}/edit-and-send",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"body": "   "},
+                )
+
+        assert response.status_code == 422, response.text
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_no_auth_header_returns_401(db_session: AsyncSession) -> None:
     async with _client() as client:
         response = await client.post(f"/v1/drafts/{uuid.uuid4()}/approve")
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "missing_token"
+
+
+# ---------------------------------------------------------------------------
+# 5. Finding #5 (spec-guardian, MAJOR) — undo of a draft that never
+#    approved (stale/rejected/cancelled) must NOT say "already gone out";
+#    that's a false statement for these three. Distinct, accurate code.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("seed_status", ["stale", "rejected", "cancelled"])
+async def test_undo_on_never_approved_draft_returns_draft_not_undoable(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+    seed_status: str,
+) -> None:
+    sub = str(uuid.uuid4())
+    landlord_id = await _seed_landlord_with_auth(db_session, auth_user_id=sub)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await factories.insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    draft_id = await factories.insert_draft(
+        db_session, landlord_id=landlord_id, case_id=case_id, status=seed_status
+    )
+    token = _mint_token(private_key, sub=sub)
+
+    try:
+        async with _mocked_jwks(jwks_payload):
+            async with _client() as client:
+                response = await client.delete(
+                    f"/v1/drafts/{draft_id}/approve", headers={"Authorization": f"Bearer {token}"}
+                )
+
+        assert response.status_code == 409, response.text
+        assert response.json()["error"]["code"] == "draft_not_undoable"
+        # NEVER the "already gone out" code -- a false statement for a
+        # draft that was never approved in the first place.
+        assert response.json()["error"]["code"] != "already_sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_reject_conflict_reconciliation_when_concurrent_approve_won_returns_already_sent(
+    db_session: AsyncSession,
+) -> None:
+    """Finding #5 (spec-guardian, MAJOR): ``_reconcile_reject_conflict``
+    must not report ``draft_stale`` when the reason reject no longer
+    applies is a concurrent APPROVE having already won the race -- that is
+    NOT staleness (no newer tenant message superseded anything); it is the
+    same "already gone out" family the normal pre-check in ``_reject``
+    already uses for the identical status set. Exercised directly against
+    the fixed reconciliation helper for a deterministic repro (a genuine
+    race is exercised at the HTTP layer by
+    ``test_approve_concurrent_requests_exactly_one_audit_row`` elsewhere in
+    this module; this test pins the EXACT reconciliation outcome once a
+    concurrent approve has already won, rather than relying on winning a
+    race non-deterministically)."""
+    from app.deps import Landlord
+    from app.errors import AppError
+    from app.routers import drafts as drafts_router
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await factories.insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    # Simulates the state a concurrent APPROVE would have already produced
+    # by the time a losing REJECT's own reconciliation runs.
+    draft_id = await factories.insert_draft(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        status="approved",
+        scheduled_send_at=datetime.now(UTC) + timedelta(seconds=5),
+    )
+
+    try:
+        landlord = Landlord(id=uuid.UUID(landlord_id))
+        with pytest.raises(AppError) as exc_info:
+            await drafts_router._reconcile_reject_conflict(
+                db_session,
+                landlord=landlord,
+                draft_id=uuid.UUID(draft_id),
+                case_id=uuid.UUID(case_id),
+            )
+        assert exc_info.value.code == "already_sent"
+        assert exc_info.value.status_code == 409
+    finally:
+        await _cleanup(db_session, landlord_id)

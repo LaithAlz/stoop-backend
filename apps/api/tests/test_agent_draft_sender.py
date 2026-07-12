@@ -406,6 +406,55 @@ async def test_run_sender_loop_stops_on_stop_event(db_session: AsyncSession) -> 
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
+async def test_edited_draft_with_empty_final_body_never_sends_original_text(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding #4 (safety review, INFO/defensive): an edited draft whose
+    ``final_body`` is somehow empty must NEVER silently fall back to
+    ``drafts.body`` (the ORIGINAL text the landlord explicitly replaced) —
+    refused loudly (logged + Sentry-paged), left stuck ``'sending'``, same
+    as any other send failure."""
+    import app.agent.draft_sender as draft_sender_mod
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_capture_message(
+        message: str, *, level: str | None = None, extras: dict[str, object] | None = None
+    ) -> None:
+        calls.append({"message": message, "level": level, "extras": extras})
+
+    monkeypatch.setattr(draft_sender_mod.sentry_sdk, "capture_message", _fake_capture_message)
+
+    landlord_id, case_id, draft_id = await _seed_approved_draft(
+        db_session, edited=True, final_body=None
+    )
+    sender = _FakeSmsSender()
+    try:
+        claimed = await sender_tick(sender=sender)
+        assert claimed == 1  # claimed the row -- refused before ever calling send_sms
+        assert sender.calls == []  # NEVER sent the original text
+
+        status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+        assert status == "sending"  # stuck, visible -- never silently re-attempted
+
+        assert len(calls) == 1
+        assert calls[0]["level"] == "error"
+
+        message_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM messages WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert message_count == 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 def test_sms_sender_protocol_is_a_runtime_checkable_shape() -> None:
     """Cheap unit-level pin: SmsSender is the ONE seam the ticker depends
     on — a fake implementing just `send_sms` satisfies it structurally."""

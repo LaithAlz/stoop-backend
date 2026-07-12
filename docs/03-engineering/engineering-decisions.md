@@ -440,6 +440,55 @@ specific and more recent than mere inactivity.
 **Where:** `apps/api/app/agent/case_lifecycle.py`;
 `apps/api/migrations/versions/0008_cases_pending_resolved_at.py`; PR #173.
 
+### Degraded-path drafts are approvable/rejectable via the SAME endpoints (#44-pinned decision, closed)
+
+**What:** A pending draft inserted by `draft_response`'s degraded-mode exit
+(an LLM-classified EMERGENCY, or the draft's own hard-guard failing twice)
+never actually pauses behind a live `interrupt()` — `_route_after_draft_
+response` routes straight to `degraded_mode -> END` instead of `mark_
+awaiting_approval -> await_approval`, so `cases.status` never becomes
+`awaiting_approval` and no LangGraph interrupt is ever created for that
+draft. #43 (the shadow-mode pause) left this open, pinned on issue #44 for
+whoever built the approve/reject endpoints to decide. **Decided: these
+drafts ARE approvable/rejectable/editable from the dashboard, via the
+identical four endpoints** — a landlord must not lose the ability to act
+on a safe-fallback or EMERGENCY-drafted reply just because the interim
+degraded-mode routing never paused it.
+**Why:** Implemented as a sanctioned SECOND path
+(`_finalize_never_paused_draft`), never by loosening `resume_case_thread`
+itself (which would risk the double-resume hazard its own concurrency
+tests pin). `resolve_draft_decision` (the actual entry point
+`routers/drafts.py` calls) picks between `resume_case_thread` (a live
+interrupt genuinely exists) and the non-graph fallback (never paused) by
+peeking `cases.status` — `awaiting_approval` implies a live interrupt
+UNLESS a later message's own degraded-mode exit drained it while leaving
+`cases.status` untouched (the "trap," a distinct, separately safety-fixed
+finding — see this entry's own follow-up below). Both paths call the
+IDENTICAL write helpers (`apply_approve_or_edit`/`apply_rejection`) under
+the same per-case advisory lock, so there is exactly one place that ever
+marks a draft `approved`/`rejected`, regardless of entry path.
+**The trap (safety review, follow-up round):** `cases.status ==
+'awaiting_approval'` alone is not proof a live interrupt exists — a case
+can sit at `awaiting_approval` (set by an EARLIER message) while a LATER
+message's own fresh re-run on the SAME thread drains the interrupt via its
+OWN degraded-mode exit, without ever revisiting `cases.status`. Naively
+re-raising `CaseNotAwaitingApprovalError` here (as the genuine
+concurrent-resume race correctly does) would 409 `draft_stale` with
+`fresh_draft_id` equal to the very id the caller just submitted — an
+infinite, permanently-unsendable retry loop. Fixed: `resolve_draft_
+decision` distinguishes this case (the draft is STILL pending) from the
+genuine race (the draft is NO LONGER pending — a concurrent winner already
+resolved it) and falls through to the same non-graph fallback only for the
+former.
+**Where:** `apps/api/app/agent/graph.py` (`resolve_draft_decision`,
+`_finalize_never_paused_draft`, `CaseNotAwaitingApprovalError`'s own
+docstring — causes 1/2/3); `apps/api/app/agent/nodes/finalize_draft_
+decision.py`; tests:
+`apps/api/tests/test_agent_finalize_draft_decision.py` (`test_degraded_
+path_pending_draft_is_approvable_via_fallback`, `test_trap_awaiting_
+approval_case_drained_interrupt_still_approvable`); issue #44 (comment
+closing the pin).
+
 ---
 
 ## 7. The LLM layer

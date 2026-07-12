@@ -152,12 +152,20 @@ class AgentState(TypedDict, total=False):
         ``resolve_draft_decision``) — ``{"action": "approve" | "reject" |
         "edit_and_send", ...}`` (see
         ``app/agent/nodes/finalize_draft_decision.py`` for the exact
-        vocabulary). ``None``/absent on every run that never reaches a
-        resume (i.e. every ordinary, non-approval-related graph run) —
-        this key only ever exists on a resumed attempt. Consumed
-        EXCLUSIVELY by ``app.agent.graph``'s ``_route_after_await_approval``
-        conditional edge to pick the next node; no node reads this key for
-        any other purpose. Never a message body or phone number — the
+        vocabulary). Explicitly ``None`` on every run that never completes a
+        FRESH resume this invocation — seeded ``None`` in ``run_graph``'s
+        initial state, and explicitly reset to ``None`` by BOTH of
+        ``await_approval``'s skip-the-pause branches (see that module's own
+        docstring "Hardening" — safety review finding: LangGraph's
+        last-write-wins merge means a key nothing explicitly overwrites
+        otherwise CARRIES FORWARD in the checkpoint indefinitely, not just
+        "for the resumed attempt" as an earlier revision of this docstring
+        incorrectly claimed — a genuinely stale value from an EARLIER
+        resume on the same thread could otherwise reach a LATER,
+        unrelated pass through this same node). Consumed EXCLUSIVELY by
+        ``app.agent.graph``'s ``_route_after_await_approval`` conditional
+        edge to pick the next node; no node reads this key for any other
+        purpose. Never a message body or phone number — the
         ``edit_and_send`` action's ``body`` key is landlord-authored
         replacement SMS text, already stored durably in ``drafts.
         final_body``, not something this key introduces a new home for.

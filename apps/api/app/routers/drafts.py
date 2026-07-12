@@ -3,8 +3,15 @@
 reject/edit-and-send loop.
 
 Canonical shapes: ``docs/03-engineering/api-contracts.md``'s "Drafts (the
-approve loop)" section, implemented here as written (this file does not
-deviate from that doc — no same-PR contract update needed).
+approve loop)" section. Two same-PR contract amendments (spec-guardian,
+this round): the error envelope's documented convention now states the
+error object MAY carry endpoint-specific extra fields (``fresh_draft_id``
+as the worked example — the shape itself was already implemented, only the
+CONVENTION note was missing), and a NEW ``draft_not_undoable`` code
+(distinct from ``already_sent``) for undoing a draft that is
+``stale``/``rejected``/``cancelled`` — "already gone out" is a false
+statement for those three; see ``_draft_not_undoable_error``'s own
+docstring.
 
 Auth / scoping
 --------------
@@ -76,7 +83,7 @@ from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -103,6 +110,8 @@ _DRAFT_STALE_CODE = "draft_stale"
 _DRAFT_STALE_MESSAGE = "A newer message changed this conversation — review the fresh draft."
 _ALREADY_SENT_CODE = "already_sent"
 _ALREADY_SENT_MESSAGE = "This reply has already gone out."
+_DRAFT_NOT_UNDOABLE_CODE = "draft_not_undoable"
+_DRAFT_NOT_UNDOABLE_MESSAGE = "This reply isn't approved, so there's nothing to undo."
 
 # drafts.status values (schema-v1.md CHECK) an approve/edit-and-send call
 # treats as "already actioned, respond idempotently" vs. "no longer
@@ -135,6 +144,19 @@ class RejectResponse(BaseModel):
 
 class EditAndSendRequest(BaseModel):
     body: str = Field(min_length=1)
+
+    @field_validator("body")
+    @classmethod
+    def _reject_whitespace_only(cls, value: str) -> str:
+        """``Field(min_length=1)`` alone lets a whitespace-only string
+        ("   ") through — a real edit must have actual content (safety
+        review, this round). Validated via strip-then-check; the ORIGINAL
+        value (not the stripped one) is returned so a landlord's
+        intentional leading/trailing space in an otherwise-real edit is
+        never silently altered."""
+        if not value.strip():
+            raise ValueError("body must not be empty or whitespace-only")
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +224,18 @@ def _draft_stale_error(fresh_draft_id: UUID | None) -> AppError:
 
 def _already_sent_error() -> AppError:
     return AppError(status_code=409, code=_ALREADY_SENT_CODE, message=_ALREADY_SENT_MESSAGE)
+
+
+def _draft_not_undoable_error() -> AppError:
+    """Distinct from :func:`_already_sent_error` (safety-guardian, MAJOR,
+    this round): "already gone out" is a FALSE statement for a draft that
+    is ``stale``/``rejected``/``cancelled`` — it never sent, it simply
+    isn't (or is no longer) in a state undo applies to. Reserve
+    ``already_sent`` for the true "the sender already claimed/sent it"
+    reality (``sending``/``sent``)."""
+    return AppError(
+        status_code=409, code=_DRAFT_NOT_UNDOABLE_CODE, message=_DRAFT_NOT_UNDOABLE_MESSAGE
+    )
 
 
 def _approve_response_from_row(draft: dict[str, Any]) -> ApproveResponse:
@@ -296,9 +330,25 @@ async def _approve_or_edit(
 async def _reconcile_reject_conflict(
     session: AsyncSession, *, landlord: Landlord, draft_id: UUID, case_id: UUID
 ) -> RejectResponse:
+    """Called after :func:`resolve_draft_decision` raises either seam
+    exception for a reject attempt — mirrors :func:`_reconcile_concurrent_
+    conflict`'s reconciliation, but for reject's own outcomes.
+
+    Distinguishes two DIFFERENT realities that both fall through here
+    (safety-guardian, MAJOR, this round — the ORIGINAL version conflated
+    them into a single, sometimes-inaccurate ``draft_stale``): a concurrent
+    APPROVE winning the race is NOT staleness (no newer message superseded
+    anything — the draft is simply already approved/being sent/sent), so it
+    gets the SAME accurate ``already_sent`` code the normal pre-check in
+    :func:`_reject` already uses for that exact status family. Only a
+    GENUINE supersession (superseded by a newer message, or otherwise
+    gone) falls to ``draft_stale``.
+    """
     refreshed = await _load_draft(session, draft_id=draft_id, landlord_id=landlord.id)
     if refreshed is not None and refreshed["status"] == "rejected":
         return RejectResponse(status="rejected")
+    if refreshed is not None and refreshed["status"] in _APPROVED_FAMILY_STATUSES:
+        raise _already_sent_error()
     fresh_id = await _fresh_pending_draft_id(session, case_id=case_id)
     raise _draft_stale_error(fresh_id)
 
@@ -371,8 +421,13 @@ async def _undo(*, session: AsyncSession, landlord: Landlord, draft_id: UUID) ->
     if draft["status"] == "pending":
         # Already undone, or never approved to begin with — idempotent.
         return UndoResponse(status="pending")
-    # sending / sent / stale / rejected / cancelled — nothing left to undo.
-    raise _already_sent_error()
+    if draft["status"] in ("sending", "sent"):
+        # The TRUE "already gone out" reality.
+        raise _already_sent_error()
+    # stale / rejected / cancelled — never approved (or no longer is), so
+    # "already gone out" would be a FALSE statement (safety-guardian,
+    # MAJOR, this round): distinct, accurate code.
+    raise _draft_not_undoable_error()
 
 
 # ---------------------------------------------------------------------------

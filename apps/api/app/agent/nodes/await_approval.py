@@ -159,6 +159,39 @@ node (``finalize_approval`` / ``finalize_rejection``) this docstring's
 previous paragraph already mandated — the actual DB writes/audit rows/
 send-scheduling live there, never here.
 
+Hardening — a stale ``approval_resume`` surviving in the checkpoint
+(safety review, this round)
+------------------------------------------------------------------------
+LangGraph's default last-write-wins merge (no reducer, see
+``app/agent/state.py``'s "Accumulation note") means a key nothing
+explicitly overwrites on a given invocation simply CARRIES FORWARD
+unchanged in the thread's persisted checkpoint state — forever, not just
+"for the resumed attempt." Once a thread has resumed even once,
+``state["approval_resume"]`` holds that resume's value from then on,
+across every FUTURE invocation on the SAME thread (the same case, re-used
+for every message it ever receives), until something explicitly
+overwrites it again. The two skip-the-pause branches below (``case_id is
+None``; ``draft_id is None``) previously returned without mentioning this
+key at all — meaning a LATER pause on the SAME thread that happens to hit
+a skip branch would complete WITHOUT ever reaching ``interrupt()``, and
+therefore without ever getting a chance to overwrite the stale value, and
+the graph would proceed STRAIGHT to ``_route_after_await_approval`` in
+that SAME invocation (a skip branch returns normally, no raise — unlike a
+genuine pause) — dispatching on WHATEVER STALE ACTION the thread happened
+to resume with last time, not the current situation at all. Defused today
+only by coincidence: ``finalize_approval``/``finalize_rejection`` both
+guard on ``case_context.case_id``/pending-draft lookups that happen to
+no-op harmlessly for the specific skip conditions that exist today — not
+a structural guarantee, and a future skip branch or a future change to
+either finalize node could silently stop being harmless. Fixed by both
+skip branches explicitly returning ``"approval_resume": None`` — a fresh
+pause can ONLY ever produce a dispatchable value via an actual
+``interrupt()`` resume (the one place this key is ever set to something
+other than ``None``). See
+``tests/test_agent_finalize_draft_decision.py::
+test_await_approval_skip_branch_clears_stale_approval_resume`` for the
+regression this fixes.
+
 Never-break rule #5: only uuids/booleans ever reach ``log.*`` calls here —
 never a message body or phone number. The ``reasoning_log`` line is
 landlord-facing copy (approval-card, CLAUDE.md rule #8): warm, plain
@@ -244,7 +277,11 @@ async def await_approval(state: AgentState) -> dict[str, Any]:
 
     if case_id is None:
         log.error("await_approval_missing_case_id", message_id=str(message_id))
-        return {}
+        # See module docstring "Hardening" — explicitly clear any stale
+        # value from an earlier resume on this SAME thread, rather than
+        # silently leaving it in place for _route_after_await_approval to
+        # (mis)dispatch on.
+        return {"approval_resume": None}
 
     async with asynccontextmanager(get_admin_session)() as session:
         pending_row = (
@@ -262,7 +299,9 @@ async def await_approval(state: AgentState) -> dict[str, Any]:
             "I couldn't find a reply to hold for your approval just now — nothing was sent; "
             "this will be retried."
         )
-        return {"reasoning_log": reasoning_log}
+        # See module docstring "Hardening" — same explicit clear as the
+        # case_id-is-None branch above.
+        return {"reasoning_log": reasoning_log, "approval_resume": None}
 
     log.info(
         "await_approval_paused",

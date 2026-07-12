@@ -39,6 +39,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from anthropic.types import ToolUseBlock
+from langgraph.graph import END
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
@@ -46,18 +47,22 @@ import app.db.session as db_mod
 from app.agent.checkpointer import close_checkpointer, setup_checkpointer
 from app.agent.graph import (
     DraftStaleError,
+    _route_after_await_approval,
     compile_case_graph,
     resolve_draft_decision,
     resume_case_thread,
     run_graph,
 )
+from app.agent.nodes.await_approval import await_approval
 from app.agent.nodes.finalize_draft_decision import (
     ACTION_APPROVE,
     ACTION_EDIT_AND_SEND,
     ACTION_REJECT,
 )
+from app.agent.schemas import CaseContext
 from app.integrations import anthropic as anthropic_mod
 from tests import factories
+from tests.test_agent_shadow_interrupt import _insert_bare_case
 
 _DB_URL_DEFAULT = "postgresql+asyncpg://stoop:stoop@localhost:5432/stoop"
 
@@ -248,7 +253,9 @@ def _patch_client(monkeypatch: pytest.MonkeyPatch, fake_messages: _FakeMessages)
     monkeypatch.setattr(anthropic_mod, "get_client", lambda: _FakeClient(fake_messages))
 
 
-def _happy_path_fake_messages(*, body: str = "I'll take a look today.") -> _FakeMessages:
+def _happy_path_fake_messages(
+    *, body: str = "I'll take a look today.", severity: str = "URGENT"
+) -> _FakeMessages:
     return _FakeMessages(
         responses=[
             _fake_message(
@@ -261,7 +268,7 @@ def _happy_path_fake_messages(*, body: str = "I'll take a look today.") -> _Fake
             ),
             _fake_message(
                 tool_input={
-                    "severity": "URGENT",
+                    "severity": severity,
                     "rules_fired": ["No heat, mild weather"],
                     "modifier": None,
                     "refusal_flags": [],
@@ -751,5 +758,190 @@ async def test_concurrent_approve_racing_new_inbound_staleness_wins(
 
         first_draft = await _draft_row(db_session, draft_id=first_draft_id)
         assert first_draft["status"] == "stale"  # never approved -- staleness won
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 7. THE TRAP (safety review, MEDIUM) — a case parked at 'awaiting_approval'
+#    by an EARLIER message, whose live interrupt was silently drained by a
+#    LATER message's own degraded-mode exit. Must still be approvable
+#    through the normal public seam, never a permanent 409 draft_stale
+#    loop where fresh_draft_id == draft_id.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_trap_awaiting_approval_case_drained_interrupt_still_approvable(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """msg1 pauses normally (case -> 'awaiting_approval', D1 pending, live
+    interrupt). msg2 lands on the SAME case and classifies EMERGENCY --
+    draft_response's OWN stale-then-insert still stales D1 and inserts a
+    fresh D2 (unconditional), but ``_route_after_draft_response`` routes
+    straight to ``degraded_mode -> END``, draining the live interrupt
+    WITHOUT ``mark_awaiting_approval`` ever running again. Net effect:
+    ``cases.status`` is STILL 'awaiting_approval' (msg1's own write), D2 is
+    'pending', and the thread has NO live interrupt -- exactly
+    ``CaseNotAwaitingApprovalError``'s cause 3. Approving D2 through the
+    public seam must succeed, not loop on 409 draft_stale with
+    fresh_draft_id == draft_id forever."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    first_message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the heat has been out since this morning",
+    )
+    _patch_client(monkeypatch, _happy_path_fake_messages())
+    try:
+        await run_graph(uuid.UUID(first_message_id))
+        case_id = await _find_case_id(db_session, landlord_id)
+        case = await _case_row(db_session, case_id=case_id)
+        assert case["status"] == "awaiting_approval"
+        first_draft_id = await _pending_draft_id(db_session, case_id=case_id)
+
+        second_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="actually there's smoke and I smell gas, please help",
+        )
+        _patch_client(monkeypatch, _happy_path_fake_messages(severity="EMERGENCY"))
+        second_final_state = await run_graph(uuid.UUID(second_message_id))
+        assert "__interrupt__" not in second_final_state  # drained -- degraded_mode -> END
+
+        case_after = await _case_row(db_session, case_id=case_id)
+        assert case_after["status"] == "awaiting_approval"  # STILL -- the trap
+
+        second_draft_id = await _pending_draft_id(db_session, case_id=case_id)
+        assert second_draft_id != first_draft_id
+
+        first_draft = await _draft_row(db_session, draft_id=str(first_draft_id))
+        assert first_draft["status"] == "stale"
+
+        # The thread genuinely has no live interrupt.
+        case_graph = compile_case_graph()
+        config = {"configurable": {"thread_id": case_after["langgraph_thread_id"]}}
+        snapshot = await case_graph.aget_state(config)
+        assert snapshot.interrupts == ()
+
+        # Approving the fresh (D2) draft through the SAME public seam must
+        # succeed -- not an infinite "fresh_draft_id == draft_id" 409 loop.
+        await resolve_draft_decision(
+            case_id=uuid.UUID(case_id),
+            draft_id=second_draft_id,
+            resume_value={"action": ACTION_APPROVE},
+        )
+
+        draft = await _draft_row(db_session, draft_id=str(second_draft_id))
+        assert draft["status"] == "approved"
+        assert draft["scheduled_send_at"] is not None
+
+        actions = await _audit_actions(db_session, case_id=case_id)
+        assert "approved" in actions
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_trap_awaiting_approval_case_drained_interrupt_still_rejectable(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same trap, reject instead of approve -- also must fall through to
+    the non-graph fallback rather than 409 forever."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    first_message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the heat has been out since this morning",
+    )
+    _patch_client(monkeypatch, _happy_path_fake_messages())
+    try:
+        await run_graph(uuid.UUID(first_message_id))
+        case_id = await _find_case_id(db_session, landlord_id)
+
+        second_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="actually there's smoke and I smell gas, please help",
+        )
+        _patch_client(monkeypatch, _happy_path_fake_messages(severity="EMERGENCY"))
+        await run_graph(uuid.UUID(second_message_id))
+
+        case_after = await _case_row(db_session, case_id=case_id)
+        assert case_after["status"] == "awaiting_approval"
+        second_draft_id = await _pending_draft_id(db_session, case_id=case_id)
+
+        await resolve_draft_decision(
+            case_id=uuid.UUID(case_id),
+            draft_id=second_draft_id,
+            resume_value={"action": ACTION_REJECT, "note": None},
+        )
+
+        draft = await _draft_row(db_session, draft_id=str(second_draft_id))
+        assert draft["status"] == "rejected"
+
+        case_final = await _case_row(db_session, case_id=case_id)
+        assert case_final["status"] == "open"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 8. Hardening (safety review, LOW/MEDIUM) — a stale `approval_resume` value
+#    persisted in an earlier resume's checkpoint must never leak into a
+#    LATER skip-the-pause pass on the same thread.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_await_approval_skip_branch_clears_stale_approval_resume(
+    db_session: AsyncSession,
+) -> None:
+    """A thread that already resumed once carries `approval_resume`
+    forward in its checkpoint (LangGraph's last-write-wins merge never
+    clears a key nothing explicitly overwrites). If a LATER invocation on
+    the SAME thread reaches `await_approval`'s skip-the-pause branch (no
+    pending draft), it must not silently dispatch on that stale value.
+    Exercises the node directly (same pattern as #43's own
+    ``test_await_approval_skips_the_pause_when_no_pending_draft_exists``),
+    with a stale `approval_resume` already present in the input state."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_bare_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+
+    try:
+        state = {
+            "message_id": uuid.uuid4(),
+            "case_context": CaseContext(
+                case_id=uuid.UUID(case_id), landlord_id=uuid.UUID(landlord_id)
+            ),
+            "reasoning_log": [],
+            # Simulates a STALE value carried forward in the checkpoint
+            # from an earlier, genuine resume on this same thread.
+            "approval_resume": {"action": ACTION_APPROVE},
+        }
+        result = await await_approval(state)  # type: ignore[arg-type]
+
+        # The skip branch (no pending draft) must explicitly clear it.
+        assert result.get("approval_resume") is None
+
+        # And the router must therefore never dispatch to a finalize node.
+        merged_state = {**state, **result}
+        assert _route_after_await_approval(merged_state) == END
     finally:
         await _cleanup(db_session, landlord_id)

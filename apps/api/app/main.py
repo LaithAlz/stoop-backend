@@ -116,16 +116,23 @@ def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
 
     ``exc.extra`` (#44/#45 — e.g. ``fresh_draft_id`` on a 409 ``draft_stale``)
     is merged into the ``"error"`` object alongside the three standard keys.
+    ``exc.extra`` is spread FIRST, then the three reserved keys — never the
+    other way around (safety review, this round): a dict literal's later
+    keys win on collision, so spreading ``extra`` last would let a caller
+    accidentally override the statically-reviewed ``code``/``message``/
+    ``request_id`` with whatever it happened to put in ``extra``. No
+    current call site does this, but the ordering itself is the guarantee,
+    not an audit of today's call sites.
     """
     request_id: str | None = structlog.contextvars.get_contextvars().get("request_id")
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "error": {
+                **exc.extra,
                 "code": exc.code,
                 "message": exc.message,
                 "request_id": request_id,
-                **exc.extra,
             }
         },
     )
