@@ -95,12 +95,17 @@ Provisions a Twilio number (#53); 201 → full `Property`.
 
 **v1.9 amendment (2026-07-12 — #54 implementation):** `DELETE` can also
 409 with code `has_dependents` when the property survives the
-`has_open_cases` check but still has FK-referencing `tenants`/`cases`/
-`messages` rows (`ON DELETE RESTRICT`, schema-v1.md) — surfaced cleanly
-instead of a raw 500 on the underlying `IntegrityError`. `GET`/`PATCH`/
-`DELETE /v1/properties/{id}` 404 with code `property_not_found` for a
-missing or cross-tenant id (the two are indistinguishable by design — never
-leak cross-tenant existence).
+`has_open_cases` check but still has FK-referencing rows — the explicit
+`ON DELETE RESTRICT` columns targeting `properties(id)` (schema-v1.md):
+`tenants.property_id`, `cases.property_id`, `messages.property_id`,
+`trust_metrics.property_id` — surfaced cleanly instead of a raw 500 on the
+underlying `IntegrityError`. `GET`/`PATCH`/`DELETE /v1/properties/{id}`
+404 with code `property_not_found` for a missing or cross-tenant id (the
+two are indistinguishable by design — never leak cross-tenant existence).
+**"Voice-profile fields"** (#54's own acceptance-criteria wording) live on
+`landlords.voice_profile` (schema-v1.md), not on `properties` — that AC is
+satisfied via `PATCH /v1/me` (below), not this endpoint; noted here so the
+two don't look like an unaddressed gap.
 
 ## Tenants & Vendors
 
@@ -112,11 +117,16 @@ Vendor shape: `name`, `trade`, `phone`, `notes?`, `working_hours?`, `active`.
 
 **v1.9 amendment (2026-07-12 — #54 implementation):** `DELETE` on both
 resources is a SOFT delete (`active = false`, returns the updated row) —
-neither `tenants` nor `vendors` has a `deleted_at` column (schema-v1.md),
-and both are referenced by `ON DELETE RESTRICT` FKs (`cases`/`messages` →
-`tenants`; `cases` → `vendors`), so a hard delete is often structurally
-impossible anyway once history exists. Idempotent: deleting an
-already-inactive row just re-confirms the state. 404 codes:
+neither `tenants` nor `vendors` has a `deleted_at` column (schema-v1.md).
+Of the FKs targeting them, only `cases.tenant_id` is an explicit
+`ON DELETE RESTRICT`; `messages.tenant_id` and `cases.vendor_id` carry no
+explicit `ON DELETE` clause (Postgres default `NO ACTION`, schema-v1.md) —
+which still blocks an immediate hard delete while a referencing row
+exists, just not via the `RESTRICT` keyword specifically. Either way, once
+any case/message history exists a hard delete is structurally blocked, so
+soft-delete is the only viable semantics regardless of which FK fires.
+Idempotent: deleting an already-inactive row just re-confirms the state.
+404 codes:
 `tenant_not_found` / `vendor_not_found`, same cross-tenant-safe
 non-disclosure as `property_not_found` above. `GET /v1/properties/{id}/
 tenants` is unpaginated (per-property tenant counts are small); `GET

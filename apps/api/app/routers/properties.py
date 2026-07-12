@@ -23,17 +23,24 @@ already nullable for exactly this reason).
 ``DELETE`` is a genuine hard delete (``properties`` has no ``deleted_at``
 column, unlike ``tenants``/``vendors``' ``active`` flag) — the documented
 ``has_open_cases`` 409 is the first-line business check. A property that
-survives that check but still has FK-referencing ``tenants``/``cases``/
-``messages`` rows (``ON DELETE RESTRICT``) is caught as a second-line
-``IntegrityError`` and surfaced as a clean 409 ``has_dependents`` rather
-than a raw 500 — a contract addition proposed in the same PR (see
-``api-contracts.md``'s Properties section, "DELETE" note).
+survives that check but still has FK-referencing rows is caught as a
+second-line ``IntegrityError`` and surfaced as a clean 409
+``has_dependents`` rather than a raw 500 — a contract addition proposed in
+the same PR (see ``api-contracts.md``'s Properties section, "DELETE"
+note). The explicit ``ON DELETE RESTRICT`` columns targeting
+``properties(id)`` (schema-v1.md) are ``tenants.property_id``,
+``cases.property_id``, ``messages.property_id``, and
+``trust_metrics.property_id``.
 
 Audit trail (#54 AC: "audit entries on changes that affect agent
 behavior"): a ``PATCH`` that actually changes ``house_rules`` writes an
 ``audit_log`` row (``actor='landlord'``, ``action='settings_changed'``) —
 compared against the pre-update value so a no-op PATCH (same value resent)
-never writes a spurious entry.
+never writes a spurious entry. The AC's OTHER agent-behavior-affecting
+field, "voice-profile fields," lives on ``landlords.voice_profile``
+(schema-v1.md) — not a ``properties`` column at all — so it is satisfied
+by ``PATCH /v1/me`` (``app/routers/me.py``), not by this router; see that
+module's own audit-trail note.
 """
 
 from __future__ import annotations

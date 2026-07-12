@@ -180,6 +180,19 @@ async def test_list_cases_newest_activity_first_and_pagination(session: AsyncSes
 
 
 @pytest.mark.integration
+async def test_list_cases_invalid_cursor_returns_400(session: AsyncSession) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await list_cases((landlord, session), cursor="not-a-valid-cursor!!")
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == "invalid_cursor"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_get_case_not_found_returns_404(session: AsyncSession) -> None:
     landlord_id = await factories.insert_landlord(session)
     landlord = Landlord(id=uuid.UUID(landlord_id))

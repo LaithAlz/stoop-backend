@@ -178,19 +178,24 @@ _SELECT_VENDOR_REF_SQL = text(
     "SELECT id, name, trade, phone FROM vendors WHERE id = :id AND landlord_id = :landlord_id"
 )
 
+# All three carry their own `landlord_id` column directly (schema-v1.md) —
+# explicitly scoped here too (belt-and-braces per apps/api/CLAUDE.md's
+# "every multi-tenant query scoped by landlord_id" convention), so these
+# stay safe even if ever reused/called without get_case's own upstream
+# ownership check on the `cases` row (spec review, #54/#55/#57).
 _SELECT_MESSAGES_SQL = text(
     "SELECT direction, party, body, media, created_at FROM messages "
-    "WHERE case_id = :case_id ORDER BY created_at ASC"
+    "WHERE case_id = :case_id AND landlord_id = :landlord_id ORDER BY created_at ASC"
 )
 
 _SELECT_AUDIT_SQL = text(
     "SELECT actor, action, payload, created_at FROM audit_log "
-    "WHERE case_id = :case_id ORDER BY created_at ASC"
+    "WHERE case_id = :case_id AND landlord_id = :landlord_id ORDER BY created_at ASC"
 )
 
 _SELECT_DRAFTS_SQL = text(
     "SELECT id, status, body, created_at FROM drafts "
-    "WHERE case_id = :case_id ORDER BY created_at ASC"
+    "WHERE case_id = :case_id AND landlord_id = :landlord_id ORDER BY created_at ASC"
 )
 
 
@@ -324,9 +329,10 @@ async def get_case(
             phone=vendor_row["phone"],
         )
 
-    message_rows = (await session.execute(_SELECT_MESSAGES_SQL, {"case_id": cid})).mappings().all()
-    audit_rows = (await session.execute(_SELECT_AUDIT_SQL, {"case_id": cid})).mappings().all()
-    draft_rows = (await session.execute(_SELECT_DRAFTS_SQL, {"case_id": cid})).mappings().all()
+    timeline_params = {"case_id": cid, "landlord_id": landlord_id}
+    message_rows = (await session.execute(_SELECT_MESSAGES_SQL, timeline_params)).mappings().all()
+    audit_rows = (await session.execute(_SELECT_AUDIT_SQL, timeline_params)).mappings().all()
+    draft_rows = (await session.execute(_SELECT_DRAFTS_SQL, timeline_params)).mappings().all()
 
     timeline: list[tuple[datetime, int, _TimelineEntryUnion]] = []
     for m in message_rows:

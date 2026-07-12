@@ -7,11 +7,15 @@ explicit ``landlord_id`` predicate on every query (belt-and-braces, see
 ``app/routers/properties.py``'s module docstring for the same rationale).
 
 ``DELETE`` is a SOFT delete: ``tenants`` has an ``active`` flag but no
-``deleted_at`` column (schema-v1.md), and ``cases``/``messages`` reference
-``tenants.id`` with ``ON DELETE RESTRICT`` — a tenant with any case/message
-history can never be hard-deleted anyway. ``DELETE /v1/tenants/{id}`` sets
-``active = false`` and returns the updated row; idempotent (deleting an
-already-inactive tenant just re-confirms the state, no error).
+``deleted_at`` column (schema-v1.md). Of the FKs targeting ``tenants(id)``,
+only ``cases.tenant_id`` is an explicit ``ON DELETE RESTRICT``;
+``messages.tenant_id`` carries no explicit ``ON DELETE`` clause (Postgres
+default ``NO ACTION``) — which still blocks an immediate hard delete while
+a referencing row exists, just not via the ``RESTRICT`` keyword
+specifically. Either way, a tenant with any case/message history can never
+be hard-deleted. ``DELETE /v1/tenants/{id}`` sets ``active = false`` and
+returns the updated row; idempotent (deleting an already-inactive tenant
+just re-confirms the state, no error).
 """
 
 from __future__ import annotations

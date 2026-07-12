@@ -353,6 +353,17 @@ async def update_me(
     ``landlords`` in schema-v1.md — the severity contract is not something
     this endpoint (or any endpoint) can turn off.
 
+    Audit interpretation (#57 AC: "audit entries on changes"): only
+    ``voice_profile`` writes a ``settings_changed`` audit_log row — it is
+    the one field on this endpoint that actually feeds the agent (drafts
+    are written in the landlord's voice profile). ``full_name``/``phone``/
+    ``timezone`` are contact/display metadata the agent never reads, so
+    changing them is deliberately NOT audited here, mirroring
+    ``routers/properties.py``'s same "audit agent-behavior-affecting
+    changes only" reading of the identical AC language (``house_rules``
+    there, ``voice_profile`` here — everything else on both endpoints is
+    exempt by the same logic).
+
     Gap note: issue #57's own acceptance criteria additionally lists
     "notification prefs" and "quiet-hours overrides" as settable via this
     endpoint. Neither has a column on ``landlords`` in schema-v1.md, and

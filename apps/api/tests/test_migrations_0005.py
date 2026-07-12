@@ -467,6 +467,18 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
     {
         "app/db/session.py",
         "app/routers/me.py",
+        # #54/#55/#57 spec-review fix: `require_landlord`'s `landlords`
+        # lookup by `auth_user_id` is a genuine pre-identity/chicken-and-egg
+        # case, same class as GET /v1/me's provisioning upsert — the
+        # `landlords` RLS policy is id-keyed (`id = current_setting(...)`),
+        # so this SELECT can never see its own row under `app_role` until
+        # AFTER the GUC is set to that row's id, which is exactly what this
+        # lookup exists to determine. Scoped narrowly (``asynccontextmanager
+        # (get_admin_session)()``, not a `Depends(...)` parameter) so it
+        # doesn't hold an extra admin-pool connection open for the whole
+        # request on every authenticated endpoint — see `app/deps.py`'s
+        # module docstring, "Two-session rationale".
+        "app/deps.py",
         # #40: Twilio inbound webhooks (POST /webhooks/twilio/sms,
         # /webhooks/twilio/status) — no landlord JWT exists here to
         # resolve a `landlord_id` GUC from; persisting an inbound tenant

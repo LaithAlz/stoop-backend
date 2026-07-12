@@ -8,7 +8,11 @@ explicit-``landlord_id`` rationale.
 
 ``DELETE`` is a SOFT delete: ``vendors`` has an ``active`` flag but no
 ``deleted_at`` column (schema-v1.md) — same rationale as
-``app/routers/tenants.py``. Sets ``active = false``; idempotent.
+``app/routers/tenants.py``. No FK targeting ``vendors(id)`` is an explicit
+``ON DELETE RESTRICT``; ``cases.vendor_id``/``messages.vendor_id`` carry
+no explicit ``ON DELETE`` clause (Postgres default ``NO ACTION``), which
+still blocks an immediate hard delete while a referencing row exists.
+Sets ``active = false``; idempotent.
 """
 
 from __future__ import annotations

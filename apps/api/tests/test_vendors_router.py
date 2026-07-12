@@ -143,6 +143,19 @@ async def test_list_vendors_cursor_pagination(session: AsyncSession) -> None:
 
 
 @pytest.mark.integration
+async def test_list_vendors_invalid_cursor_returns_400(session: AsyncSession) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await list_vendors((landlord, session), cursor="not-a-valid-cursor!!")
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == "invalid_cursor"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_cross_tenant_vendor_access_returns_404(session: AsyncSession) -> None:
     landlord_a_id = await factories.insert_landlord(session)
     landlord_b_id = await factories.insert_landlord(session)

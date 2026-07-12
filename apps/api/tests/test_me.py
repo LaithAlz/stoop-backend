@@ -978,6 +978,42 @@ def test_get_me_uses_admin_session_not_request_session() -> None:
     assert dependency is not get_session
 
 
+@pytest.mark.unit
+def test_patch_me_uses_admin_session_not_request_session() -> None:
+    """Regression pin mirroring ``test_get_me_uses_admin_session_not_
+    request_session`` above: ``PATCH /v1/me`` MUST also depend on
+    ``get_admin_session``, never ``get_session``/``require_landlord``. Same
+    rationale as GET — this is still the ``/v1/me`` provisioning surface
+    (module docstring's "Session" section), and a future drive-by "simplify
+    this to require_landlord" edit must fail loudly HERE, at review/CI time,
+    not silently at the production role-separation flip (the exact failure
+    class the #54/#55/#57 spec review's CRITICAL finding on
+    ``require_landlord`` itself was about).
+    """
+    import inspect
+
+    from fastapi.params import Depends
+
+    from app.db.session import get_admin_session, get_session
+    from app.routers.me import update_me
+
+    session_param = inspect.signature(update_me, eval_str=True).parameters["session"]
+    depends_markers = [
+        meta
+        for meta in getattr(session_param.annotation, "__metadata__", ())
+        if isinstance(meta, Depends)
+    ]
+    assert len(depends_markers) == 1, (
+        f"expected exactly one Depends(...) marker on `session`, found {depends_markers!r}"
+    )
+    dependency = depends_markers[0].dependency
+
+    assert dependency is get_admin_session, (
+        f"PATCH /v1/me's session dependency must be get_admin_session, got {dependency!r}"
+    )
+    assert dependency is not get_session
+
+
 # ---------------------------------------------------------------------------
 # PATCH /v1/me (issue #57 — account settings / notification prefs)
 # ---------------------------------------------------------------------------
