@@ -80,8 +80,7 @@ import {
  * app.properties_.$id_.settings.tsx) rather than inventing a step the AC
  * doesn't ask for. (The one genuinely ungrounded field in the old
  * Heritage vendor step was `vendorAfterHours` — no matching schema-v1.md
- * column — which is why that field specifically never made it into the
- * settings screen's mock `Vendor` type either.)
+ * column.)
  *
  * Voice-sample minimum (founder-vetoable ruling, orchestrator synthesis
  * of issue #113's AC — "3–5 pasted real replies" — and this wizard's own
