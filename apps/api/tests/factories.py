@@ -23,7 +23,13 @@ done unilaterally here.
 were added for #54/#55/#57's new router test modules
 (``test_properties_router.py``, ``test_tenants_router.py``,
 ``test_vendors_router.py``, ``test_cases_router.py``) — same shape
-convention as every helper above.
+convention as every helper above. ``insert_case``/``insert_draft`` gained
+further kwargs (``vendor_id``, ``recipient``, ``scheduled_send_at``,
+``edited``, ``final_body``) for #44/#45's new test modules
+(``test_agent_finalize_draft_decision.py``, ``test_drafts_router.py``,
+``test_agent_draft_sender.py``) — these bypass the graph entirely (no
+Anthropic mocking needed) to seed a case/draft directly at whatever
+status a given approve/reject/edit-and-send/sender test needs.
 """
 
 from __future__ import annotations
@@ -221,27 +227,35 @@ async def insert_case(
     landlord_id: str,
     property_id: str,
     tenant_id: str,
-    status: str = "open",
-    severity: str | None = None,
-    title: str | None = None,
+    vendor_id: str | None = None,
+    status: str = "awaiting_approval",
+    severity: str | None = "urgent",
+    title: str | None = "Test case",
 ) -> str:
+    """Seeds a ``cases`` row directly (bypassing the graph) — #44/#45's new
+    test modules exercise ``resolve_draft_decision``/the drafts router
+    against a known status, not against whatever ``run_graph`` would
+    naturally produce. Also used by #54/#55/#57's router test modules
+    (``test_properties_router.py``, ``test_cases_router.py``), which pass
+    ``status``/``severity``/``title`` explicitly."""
     case_id = str(uuid.uuid4())
     await session.execute(
         text(
-            "INSERT INTO cases (id, landlord_id, property_id, tenant_id, status, severity, "
-            "title, langgraph_thread_id) "
-            "VALUES (:id, :landlord_id, :property_id, :tenant_id, :status, :severity, :title, "
-            ":thread_id)"
+            "INSERT INTO cases (id, landlord_id, property_id, tenant_id, vendor_id, status, "
+            "severity, title, langgraph_thread_id) "
+            "VALUES (:id, :landlord_id, :property_id, :tenant_id, :vendor_id, :status, "
+            ":severity, :title, :thread_id)"
         ),
         {
             "id": case_id,
             "landlord_id": landlord_id,
             "property_id": property_id,
             "tenant_id": tenant_id,
+            "vendor_id": vendor_id,
             "status": status,
             "severity": severity,
             "title": title,
-            "thread_id": f"thread-{uuid.uuid4()}",
+            "thread_id": str(uuid.uuid4()),
         },
     )
     await session.commit()
@@ -280,22 +294,31 @@ async def insert_draft(
     *,
     landlord_id: str,
     case_id: str,
+    recipient: str = "tenant",
+    body: str = "Thanks for letting me know, I'll look into it.",
     status: str = "pending",
-    body: str = "test draft body",
+    scheduled_send_at: Any = None,
+    edited: bool = False,
+    final_body: str | None = None,
 ) -> str:
     draft_id = str(uuid.uuid4())
     await session.execute(
         text(
             "INSERT INTO drafts (id, landlord_id, case_id, recipient, body, prompt_version, "
-            "status) "
-            "VALUES (:id, :landlord_id, :case_id, 'tenant', :body, 'v1', :status)"
+            "status, scheduled_send_at, edited, final_body) "
+            "VALUES (:id, :landlord_id, :case_id, :recipient, :body, 'v1', :status, "
+            ":scheduled_send_at, :edited, :final_body)"
         ),
         {
             "id": draft_id,
             "landlord_id": landlord_id,
             "case_id": case_id,
+            "recipient": recipient,
             "body": body,
             "status": status,
+            "scheduled_send_at": scheduled_send_at,
+            "edited": edited,
+            "final_body": final_body,
         },
     )
     await session.commit()

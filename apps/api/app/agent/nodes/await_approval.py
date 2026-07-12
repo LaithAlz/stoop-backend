@@ -143,6 +143,22 @@ reason about "the critical section ends when ``ainvoke`` returns" — a
 future send appended directly here would extend that critical section in
 a way this issue never reviewed.
 
+**#44/#45 implementation of the above**: :func:`await_approval` now
+CAPTURES what ``interrupt()`` returns (``resume_value``, whatever
+``Command(resume=...)`` supplied — see
+``app/agent/nodes/finalize_draft_decision.py`` for the ``{"action": ...}``
+vocabulary) and returns it as ``{"approval_resume": resume_value}``. This
+is still "no side effects" in the sense that matters here: it is a plain
+dict construction from a value ``interrupt()`` already handed back on
+THIS attempt, not a DB write, not a send, and it only ever happens on the
+one attempt that actually resumes (every earlier attempt raises inside
+``interrupt()`` before reaching this line, so nothing about it is
+replayed). ``app/agent/graph.py``'s ``_route_after_await_approval``
+conditional edge reads ``state["approval_resume"]`` to pick the SEPARATE
+node (``finalize_approval`` / ``finalize_rejection``) this docstring's
+previous paragraph already mandated — the actual DB writes/audit rows/
+send-scheduling live there, never here.
+
 Never-break rule #5: only uuids/booleans ever reach ``log.*`` calls here —
 never a message body or phone number. The ``reasoning_log`` line is
 landlord-facing copy (approval-card, CLAUDE.md rule #8): warm, plain
@@ -255,7 +271,7 @@ async def await_approval(state: AgentState) -> dict[str, Any]:
         draft_id=str(draft_id),
     )
 
-    interrupt(
+    resume_value = interrupt(
         {
             "case_id": str(case_id),
             "draft_id": str(draft_id),
@@ -263,7 +279,11 @@ async def await_approval(state: AgentState) -> dict[str, Any]:
         }
     )
 
-    return {}
+    # See module docstring "#44/#45 implementation of the above" — the
+    # ONLY thing this node does with a resume value: hand it to state so
+    # the graph's OWN conditional edge (never this node) can dispatch to
+    # the right finalize node.
+    return {"approval_resume": resume_value}
 
 
 __all__: list[str] = ["await_approval", "mark_awaiting_approval"]

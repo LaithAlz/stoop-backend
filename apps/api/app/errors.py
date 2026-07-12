@@ -21,9 +21,18 @@ it. Any per-request detail belongs in ``code`` (a stable, non-identifying
 snake_case string), never in ``message``; this keeps ``message`` reviewable
 once, statically, instead of re-auditing every call site for what it might
 interpolate.
+
+``extra`` (#44/#45): an OPTIONAL dict of additional, JSON-serializable
+fields merged into the ``"error"`` envelope object alongside ``code``/
+``message``/``request_id`` — e.g. ``docs/03-engineering/api-contracts.md``'s
+``POST /v1/drafts/{id}/approve`` 409 ``draft_stale`` response, whose body
+"includes ``fresh_draft_id``". Same never-PII rule as ``message`` — a uuid
+(or ``None``) is the only shape any current call site uses.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 
 class AppError(Exception):
@@ -35,10 +44,19 @@ class AppError(Exception):
     string (never interpolated with user/claim/DB data) and must never
     contain token, phone number, email address, ``sub``/``auth_user_id``, or
     message-body material.
+    ``extra`` — optional additional envelope fields (see module docstring).
     """
 
-    def __init__(self, *, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        code: str,
+        message: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.extra: dict[str, Any] = extra or {}

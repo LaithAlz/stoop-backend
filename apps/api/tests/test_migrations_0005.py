@@ -537,6 +537,16 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # live here and are called from the PUBLIC /ack/{token} link and
         # the Twilio voice webhook, neither of which carries a landlord JWT.
         "app/agent/emergency_chain.py",
+        # #44/#45: the send-adjacent finalize nodes (reached only via the
+        # graph resume seam / the degraded-path fallback in
+        # app/agent/graph.py) — same background/graph context, no HTTP
+        # request/JWT, same pre-identity rationale as every node above.
+        "app/agent/nodes/finalize_draft_decision.py",
+        # #44/#45: the draft-sender ticker is a future scheduled-job
+        # entrypoint (same pre-identity rationale as case_lifecycle.
+        # sweep_cases / degraded_mode_sweep above — see its own docstring
+        # "Wiring (deliberately deferred)").
+        "app/agent/draft_sender.py",
     }
 )
 

@@ -22,7 +22,16 @@ from app.errors import AppError
 from app.integrations.supabase_auth import AuthError
 from app.middleware.request_id import RequestIDMiddleware
 from app.observability import configure_logging, init_langsmith_tracing, init_sentry
-from app.routers import cases, health, me, notifications, properties, tenants, vendors
+from app.routers import (
+    cases,
+    drafts,
+    health,
+    me,
+    notifications,
+    properties,
+    tenants,
+    vendors,
+)
 from app.routers.webhooks import twilio as webhooks_twilio
 from app.scheduler import start_scheduler, stop_scheduler
 
@@ -104,6 +113,9 @@ def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
     Same envelope shape and ``request_id`` sourcing as ``_auth_error_handler``,
     but for business-rule (non-auth) failures that need a status other than
     401 — e.g. 403 ``email_required`` on ``GET /v1/me``.
+
+    ``exc.extra`` (#44/#45 — e.g. ``fresh_draft_id`` on a 409 ``draft_stale``)
+    is merged into the ``"error"`` object alongside the three standard keys.
     """
     request_id: str | None = structlog.contextvars.get_contextvars().get("request_id")
     return JSONResponse(
@@ -113,6 +125,7 @@ def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
                 "code": exc.code,
                 "message": exc.message,
                 "request_id": request_id,
+                **exc.extra,
             }
         },
     )
@@ -134,9 +147,11 @@ def create_app() -> fastapi.FastAPI:
       4b. register AppError exception handler (status_code → standard envelope)
       5. include health router (always)
       5a. include properties/tenants/vendors/cases routers (#54/#55 —
-          always, landlord-scoped via require_landlord) and the
-          notifications router (always — POST /v1/notifications/{id}/ack
-          is landlord-authenticated; GET /ack/{token} is the public
+          always, landlord-scoped via require_landlord), the drafts router
+          (#44/#45 — the approve/reject/edit-and-send + undo endpoints;
+          landlord-scoped via require_landlord), and the notifications
+          router (always — POST /v1/notifications/{id}/ack is
+          landlord-authenticated; GET /ack/{token} is the public
           tokenized-link ack surface, #108)
       5b. include Twilio webhook router (always — no auth header, its own
           signature verification; not gated by environment since Twilio
@@ -184,6 +199,7 @@ def create_app() -> fastapi.FastAPI:
     application.include_router(tenants.router)
     application.include_router(vendors.router)
     application.include_router(cases.router)
+    application.include_router(drafts.router)
     application.include_router(notifications.router)
     application.include_router(webhooks_twilio.router)
 

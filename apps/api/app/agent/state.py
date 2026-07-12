@@ -144,6 +144,24 @@ class AgentState(TypedDict, total=False):
         Independent of ``draft_guard_failed`` — a draft can be guard-clean
         but still over length, or vice versa.
 
+    approval_resume:
+        Set by ``app.agent.nodes.await_approval.await_approval`` (#44/#45)
+        to whatever value LangGraph's ``interrupt()`` call returns on the
+        attempt that actually gets resumed (i.e. the dict passed to
+        ``Command(resume=...)`` by ``app.agent.graph.resume_case_thread``/
+        ``resolve_draft_decision``) — ``{"action": "approve" | "reject" |
+        "edit_and_send", ...}`` (see
+        ``app/agent/nodes/finalize_draft_decision.py`` for the exact
+        vocabulary). ``None``/absent on every run that never reaches a
+        resume (i.e. every ordinary, non-approval-related graph run) —
+        this key only ever exists on a resumed attempt. Consumed
+        EXCLUSIVELY by ``app.agent.graph``'s ``_route_after_await_approval``
+        conditional edge to pick the next node; no node reads this key for
+        any other purpose. Never a message body or phone number — the
+        ``edit_and_send`` action's ``body`` key is landlord-authored
+        replacement SMS text, already stored durably in ``drafts.
+        final_body``, not something this key introduces a new home for.
+
     reasoning_log:
         Append-only list of human-readable trace lines.  Every node MUST
         append at least one entry describing what it observed and decided.
@@ -183,4 +201,5 @@ class AgentState(TypedDict, total=False):
     classification_failed: bool
     draft_guard_failed: bool
     length_over_budget: bool
+    approval_resume: dict[str, Any] | None
     reasoning_log: list[str]
