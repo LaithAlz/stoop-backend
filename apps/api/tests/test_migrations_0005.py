@@ -511,6 +511,11 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # awaiting_approval before the graph pauses — same background/graph
         # context, no HTTP request/JWT, same pre-identity rationale.
         "app/agent/nodes/await_approval.py",
+        # #109: the degraded-mode re-classification sweep (a future
+        # scheduled-job entrypoint, same pre-identity rationale as
+        # case_lifecycle.sweep_cases above — see its own docstring "The
+        # scheduler seam").
+        "app/agent/degraded_mode_sweep.py",
     }
 )
 

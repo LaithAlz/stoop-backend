@@ -21,9 +21,11 @@ Proves the #34 acceptance criteria end to end:
    (close + reopen the checkpointer pool, re-instantiate the compiled
    graph, read the SAME thread's state back).
 3. ``classification_failed`` (double garbage response) routes to
-   ``degraded_mode`` instead of ``draft_response`` — a ``needs_eyes``
-   notification + ``degraded_mode`` audit row are written, never a silent
-   dead end.
+   ``degraded_mode`` instead of ``draft_response`` — with no keywords at
+   all on the seeded message (schema-v1.md v1.8 / #109), that lands on the
+   "queue a holding ack + retry" leg: a ``tenant_ack`` + ``degraded_retry``
+   notification pair and a ``degraded_mode`` audit row are written, never
+   a silent dead end.
 4. ``draft_guard_failed`` ALSO routes to ``degraded_mode`` — in addition
    to (not instead of) the draft ``draft_response`` already inserted.
 5. An LLM-classified EMERGENCY severity (a Tier-0 miss the model itself
@@ -411,21 +413,27 @@ async def test_run_graph_classification_failed_routes_to_degraded_mode(
         assert final_state.get("classification_failed") is True
         assert final_state.get("draft") is None  # draft_response never ran
 
-        # NO SILENT DEAD END -- a durable needs_eyes notification + audit row.
-        notif_row = (
+        # NO SILENT DEAD END -- no keywords on this message (schema-v1.md
+        # v1.8 / #109) means a tenant_ack (holding ack) + degraded_retry
+        # (re-classification schedule) pair, NOT an immediate needs_eyes --
+        # see app/agent/nodes/degraded_mode.py's module docstring.
+        notif_rows = (
             (
                 await db_session.execute(
                     text(
-                        "SELECT type, status, payload FROM notifications WHERE landlord_id = :lid"
+                        "SELECT type, status, payload FROM notifications WHERE landlord_id = :lid "
+                        "ORDER BY type"
                     ),
                     {"lid": landlord_id},
                 )
             )
             .mappings()
-            .one()
+            .all()
         )
-        assert notif_row["type"] == "needs_eyes"
-        assert notif_row["payload"]["reasons"] == ["classification_failed"]
+        notif_by_type = {row["type"]: row for row in notif_rows}
+        assert set(notif_by_type) == {"tenant_ack", "degraded_retry"}
+        assert notif_by_type["tenant_ack"]["payload"]["reasons"] == ["classification_failed"]
+        assert notif_by_type["degraded_retry"]["payload"]["reasons"] == ["classification_failed"]
 
         audit_actions = (
             (

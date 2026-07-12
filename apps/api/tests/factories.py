@@ -38,19 +38,23 @@ def fresh_phone() -> str:
 
 
 async def insert_landlord(
-    session: AsyncSession, *, voice_profile: dict[str, Any] | None = None
+    session: AsyncSession,
+    *,
+    voice_profile: dict[str, Any] | None = None,
+    full_name: str | None = None,
 ) -> str:
     landlord_id = str(uuid.uuid4())
     await session.execute(
         text(
-            "INSERT INTO landlords (id, auth_user_id, email, voice_profile) "
-            "VALUES (:id, :auth_id, :email, CAST(:voice_profile AS jsonb))"
+            "INSERT INTO landlords (id, auth_user_id, email, voice_profile, full_name) "
+            "VALUES (:id, :auth_id, :email, CAST(:voice_profile AS jsonb), :full_name)"
         ),
         {
             "id": landlord_id,
             "auth_id": str(uuid.uuid4()),
             "email": f"{landlord_id}@example.com",
             "voice_profile": json.dumps(voice_profile) if voice_profile is not None else None,
+            "full_name": full_name,
         },
     )
     await session.commit()

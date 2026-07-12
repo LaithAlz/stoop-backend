@@ -279,6 +279,67 @@
 >    friendlier fallback copy is a client concern, never synthesized from
 >    `rules_fired` at the data layer).
 
+> **v1.8 amendments (2026-07-11)** — migration 0009 implements these (#109,
+> degraded mode / classification-failure handling,
+> `docs/02-product/emergency-prefilter.md`'s degraded-mode table). Two new
+> `notifications.type` values — no new column/table, per the "adding a
+> value is an ALTER ... DROP/ADD CONSTRAINT" note above; same evolution
+> path v1.1 already used for `messages.party`:
+> 1. **`tenant_ack`** (`channel='sms'`) — the durable, NOT-YET-SENT holding
+>    -ack SMS to the tenant when classification fails (the templated
+>    "Got your message — it's been passed to ⟨landlord first name⟩..."
+>    text, `emergency-prefilter.md`'s "Holding ack" section — amended
+>    2026-07-12, copy-guardian ruling: the "...and you'll hear back soon"
+>    clause was removed, see that doc's own note). Exactly the same
+>    shape as the existing, already-anticipated-but-unused `emergency_sms`
+>    row (a durable send-intent for #108's future sender to drain) — kept
+>    as its OWN type rather than reusing `emergency_sms` because the two
+>    are semantically different sends (a category-templated safety
+>    instruction vs. a generic holding ack) that a future sender must be
+>    able to tell apart, and reusing `needs_eyes` was considered and
+>    rejected: `uq_notifications_message_dedupe` keys on `(message_id,
+>    type)` only, so a tenant-facing row sharing `needs_eyes`'s type would
+>    silently consume the SAME dedupe slot the landlord-facing
+>    notification for that message needs — the two must never collide.
+>    Idempotent via a new partial unique index, `uq_notifications_
+>    tenant_ack_dedupe ON notifications ((payload ->> 'message_id')) WHERE
+>    type = 'tenant_ack'` — same NULL-safe pattern as
+>    `uq_notifications_message_dedupe` (v1.3 amendments above). `status`
+>    stays `'pending'` until #108's sender exists and drains it; this issue
+>    never sends anything.
+> 2. **`degraded_retry`** (`channel='push'` — placeholder; this type is
+>    never delivered to anyone, see below) — an internal-only marker for
+>    the "no keywords at all" degraded-mode leg: classification failed,
+>    nothing (HARD or SOFT) fired the prefilter, so the landlord is NOT
+>    paged immediately. Instead this row schedules re-classification
+>    attempts at `failed_at + {1, 5, 15} minutes` via the EXISTING
+>    `next_attempt_at` sweeper-key column (no new column needed) — a
+>    future scheduled sweep (this issue adds the pure function only, see
+>    `app/agent/degraded_mode_sweep.py`; cron/scheduler wiring is a later
+>    issue's seam, same pattern as `case_lifecycle.sweep_cases()`)
+>    re-attempts classification each time it comes due. `status` is
+>    `'pending'` while in flight and `'exhausted'` once the chain
+>    concludes ONE OF TWO ways, recorded in `payload.outcome`:
+>    `"resolved"` (a later attempt succeeded — nothing further happens,
+>    this row is simply inert from then on) or `"escalated"` (all three
+>    attempts failed — a genuine, separate `needs_eyes` row is inserted at
+>    that point, via the same `uq_notifications_message_dedupe` pattern
+>    every other `needs_eyes` insert in this codebase already uses).
+>    `degraded_retry` rows are NEVER read/interpreted by anything except
+>    this sweep — deliberately kept out of `needs_eyes`'s own lifecycle
+>    (which always means "ready to tell a person, now or as soon as
+>    delivery infra exists") so a future notification-delivery consumer
+>    can safely treat every `needs_eyes` row as delivery-ready without
+>    needing to know about an in-flight retry hold. Idempotent via its own
+>    partial unique index, `uq_notifications_degraded_retry_dedupe ON
+>    notifications ((payload ->> 'message_id')) WHERE type =
+>    'degraded_retry'`.
+> 3. Both new types are covered by the SAME "never delete" rule the v1.3
+>    amendments already state for `emergency_call`/`needs_eyes` — `tenant_ack`
+>    anchors its own dedupe index, and `degraded_retry` is the durable
+>    record of "did this message's classification ever recover on its
+>    own" (an audit-adjacent fact, not just a scratch row).
+
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
 CREATE TABLE landlords (
@@ -543,7 +604,8 @@ CREATE TABLE notifications (
   landlord_id     uuid NOT NULL REFERENCES landlords(id) ON DELETE RESTRICT,
   case_id         uuid REFERENCES cases(id),
   type            text NOT NULL CHECK (type IN ('emergency_call','emergency_sms',
-                    'needs_eyes','draft_ready','recap')),
+                    'needs_eyes','draft_ready','recap','tenant_ack','degraded_retry')),
+                                                     -- 'tenant_ack'/'degraded_retry' added v1.8 (#109)
   channel         text NOT NULL CHECK (channel IN ('voice','sms','push','email')),
   status          text NOT NULL DEFAULT 'pending'
                   CHECK (status IN ('pending','sent','acknowledged','failed','exhausted')),
@@ -562,6 +624,16 @@ CREATE INDEX idx_notifications_sweep ON notifications (status, next_attempt_at);
 CREATE UNIQUE INDEX uq_notifications_message_dedupe
   ON notifications ((payload ->> 'message_id'), type)
   WHERE type IN ('emergency_call', 'needs_eyes');
+
+-- v1.8 (migration 0009, #109): same NULL-safe, per-type dedupe pattern,
+-- one partial unique index per new type -- see the v1.8 amendments note
+-- above for why these are separate from uq_notifications_message_dedupe.
+CREATE UNIQUE INDEX uq_notifications_tenant_ack_dedupe
+  ON notifications ((payload ->> 'message_id'))
+  WHERE type = 'tenant_ack';
+CREATE UNIQUE INDEX uq_notifications_degraded_retry_dedupe
+  ON notifications ((payload ->> 'message_id'))
+  WHERE type = 'degraded_retry';
 
 -- ───────────────────────── push_tokens ───────────────────────
 CREATE TABLE push_tokens (
