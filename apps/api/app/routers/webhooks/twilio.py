@@ -124,9 +124,30 @@ Ops visibility tide-over until #108 (consolidated review items 3/4): a
 of the unrecognized ``To`` number only — NEVER the raw phone number or
 message body, rule #5) so a human actually sees these today.
 
-Neither endpoint calls Twilio's REST API (no ``twilio.send`` anywhere in
-this module) — these are inbound-only receivers; sending arrives with
-#108/#45.
+Neither ``/sms`` nor ``/status`` calls Twilio's REST API (no outbound send
+anywhere in either handler) — both are inbound-only receivers.
+
+``POST /webhooks/twilio/voice`` (#108, added below) is different: it is the
+TwiML callback for calls the emergency escalation chain itself places (via
+``app/agent/emergency_chain.py``, using
+``app/integrations/twilio_send.py``) — this router still never calls
+Twilio's REST API directly, it only ANSWERS Twilio's request for what to
+say/gather next. Handles two shapes on the SAME endpoint/URL (Twilio
+distinguishes them by whether ``Digits`` is present in the form body, not
+the path — see ``render_voice_action_url`` in ``emergency_chain.py``):
+
+1. **Initial TwiML fetch** (no ``Digits`` yet) — returns a ``<Gather
+   numDigits="1">`` wrapping a spoken summary, falling through to a
+   closing ``<Say>`` if nothing is pressed within the timeout (no second
+   request in that case — Twilio just ends the call; the chain's NEXT
+   scheduled attempt, not a second leg of this same call, is what tries
+   again).
+2. **Gather completion** (``Digits`` present) — ``Digits == "1"`` calls
+   ``emergency_chain.acknowledge_notification`` (idempotent — stops the
+   chain) and speaks a short confirmation; any other digit (or none
+   matching) just speaks a closing line. Either way, always valid TwiML,
+   never a bare error status — Twilio has no useful retry story for a
+   voice callback failure the way it does for ``/sms``.
 """
 
 from __future__ import annotations
@@ -146,7 +167,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent import prefilter
+from app.agent import emergency_chain, prefilter
 from app.agent.emergency import fire_emergency_protocol
 from app.agent.graph_entry import enqueue_classification
 from app.agent.schemas import PrefilterResult
@@ -165,10 +186,16 @@ router = APIRouter(prefix="/webhooks/twilio", tags=["webhooks"])
 
 
 def _twiml_empty() -> Response:
-    """The uniform 200 response for both endpoints — an empty TwiML
+    """The uniform 200 response for ``/sms``/``/status`` — an empty TwiML
     ``<Response/>`` telling Twilio "received, no auto-reply". A fresh
     ``Response`` instance every call (never share one across requests)."""
     return Response(content="<Response/>", media_type="text/xml", status_code=200)
+
+
+def _twiml_response(xml: str) -> Response:
+    """A TwiML response carrying real markup (``/voice``, #108) — a fresh
+    ``Response`` instance every call, same convention as ``_twiml_empty``."""
+    return Response(content=xml, media_type="text/xml", status_code=200)
 
 
 async def _extract_and_verify(request: Request) -> dict[str, str]:
@@ -441,6 +468,20 @@ _INSERT_EMERGENCY_AUDIT_SQL = text(
     """
     INSERT INTO audit_log (landlord_id, case_id, actor, action, payload)
     VALUES (:landlord_id, NULL, 'prefilter', 'emergency_triggered', CAST(:payload AS jsonb))
+    """
+)
+
+# Used ONLY by /voice's initial-TwiML-fetch leg (#108) — the property label
+# for the spoken summary plus the payload's stored categories, keyed on the
+# emergency_call notification id embedded in the call's own action URL
+# (emergency_chain.render_voice_action_url). No phone number/message body
+# ever enters this query or its result (rule #5).
+_SELECT_NOTIFICATION_FOR_VOICE_SQL = text(
+    """
+    SELECT n.payload AS payload, p.label AS property_label
+    FROM notifications n
+    LEFT JOIN properties p ON p.id = (n.payload ->> 'property_id')::uuid
+    WHERE n.id = :id
     """
 )
 
@@ -924,3 +965,88 @@ async def twilio_status_webhook(
         log.error("twilio_status_processing_failed", exc_type=type(exc).__name__)
 
     return _twiml_empty()
+
+
+# ---------------------------------------------------------------------------
+# POST /webhooks/twilio/voice (#108) — TwiML callback for the emergency call
+# ---------------------------------------------------------------------------
+
+
+@router.post("/voice")
+async def twilio_voice_webhook(request: Request) -> Response:
+    """POST /webhooks/twilio/voice — TwiML callback for the emergency call
+    (``Digits=1`` → acknowledge). See module docstring for the two request
+    shapes this single endpoint answers.
+
+    Deliberately takes no ``session`` dependency of its own: every DB
+    access this handler needs goes through
+    ``app.agent.emergency_chain``'s own admin-session helpers
+    (``acknowledge_notification`` / the context lookup baked into
+    rendering the initial TwiML) — this file stays allowlisted for
+    ``get_admin_session`` via its OWN direct dependency on ``/sms``/
+    ``/status`` above, not because of anything this handler does directly.
+
+    Always 200 with valid TwiML — never a bare error status. A missing or
+    malformed ``notification_id`` query parameter (should never happen: it
+    is generated by our own ``emergency_chain.render_voice_action_url``,
+    never client-supplied) is a loud, metadata-only log line plus a
+    generic spoken apology, never a 4xx/5xx (Twilio has no useful retry
+    story for a voice callback — unlike ``/sms``, retrying would just
+    replay the exact same malformed URL).
+    """
+    params = await _extract_and_verify(request)
+
+    notification_id_raw = request.query_params.get("notification_id")
+    if not notification_id_raw:
+        log.error("twilio_voice_missing_notification_id")
+        return _twiml_response(emergency_chain.build_error_twiml())
+
+    try:
+        notification_id = UUID(notification_id_raw)
+    except ValueError:
+        log.error("twilio_voice_malformed_notification_id")
+        return _twiml_response(emergency_chain.build_error_twiml())
+
+    digits = params.get("Digits")
+    if digits == "1":
+        await emergency_chain.acknowledge_notification(
+            notification_id, actor="system", channel="voice_keypress"
+        )
+        return _twiml_response(emergency_chain.build_ack_confirmation_twiml())
+
+    if digits is not None:
+        # A digit was gathered but it wasn't "1" — no acknowledgment; the
+        # chain's own schedule (not a retry within this same call) tries
+        # again later.
+        return _twiml_response(emergency_chain.build_error_twiml())
+
+    # Initial TwiML fetch (no Digits yet) — render the spoken summary +
+    # Gather. Context comes straight off the emergency_call row's own
+    # durable state (message_id/property_id/categories), never re-derived
+    # from this request.
+    async with _isolated_session() as session:
+        row = (
+            (
+                await session.execute(
+                    _SELECT_NOTIFICATION_FOR_VOICE_SQL, {"id": str(notification_id)}
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+
+    if row is None:
+        log.error("twilio_voice_unknown_notification_id")
+        return _twiml_response(emergency_chain.build_error_twiml())
+
+    payload = row["payload"] or {}
+    categories = list(payload.get("categories") or [])
+    property_label = row["property_label"] or "the property"
+    primary_category = emergency_chain.choose_primary_category(categories)
+
+    twiml = emergency_chain.build_voice_twiml(
+        property_label=property_label,
+        category_label=emergency_chain.category_short_label(primary_category),
+        action_url=emergency_chain.render_voice_action_url(notification_id),
+    )
+    return _twiml_response(twiml)

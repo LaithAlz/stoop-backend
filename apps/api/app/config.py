@@ -121,6 +121,19 @@ class Settings(BaseSettings):
         ),
     )
 
+    twilio_account_sid: str = Field(
+        ...,
+        description=(
+            "Twilio Account SID — paired with twilio_auth_token to construct "
+            "the outbound REST client (app/integrations/twilio_send.py, #108). "
+            "Used ONLY by the emergency escalation chain today (the other "
+            "sanctioned sender, the approve-flow draft sender, is #44, "
+            "unbuilt). NEVER logged, NEVER included in any error message. "
+            "Required — the same real Twilio account referenced by "
+            "twilio_auth_token already has this SID (see .env)."
+        ),
+    )
+
     public_base_url: str | None = Field(
         default=None,
         description=(

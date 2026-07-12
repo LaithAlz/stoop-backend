@@ -22,8 +22,9 @@ from app.errors import AppError
 from app.integrations.supabase_auth import AuthError
 from app.middleware.request_id import RequestIDMiddleware
 from app.observability import configure_logging, init_langsmith_tracing, init_sentry
-from app.routers import cases, health, me, properties, tenants, vendors
+from app.routers import cases, health, me, notifications, properties, tenants, vendors
 from app.routers.webhooks import twilio as webhooks_twilio
+from app.scheduler import start_scheduler, stop_scheduler
 
 log = structlog.get_logger(__name__)
 
@@ -50,12 +51,24 @@ async def _lifespan(_app: fastapi.FastAPI) -> AsyncIterator[None]:
     so serving traffic with a broken checkpoint store is worse than not
     starting at all. Cheap to run on every process start even when the
     graph/Anthropic key goes unused this deploy.
+
+    ``start_scheduler()`` runs LAST, after both checks above pass — the
+    60-second ticker (``app/scheduler.py``, #108/#109) that drives the
+    emergency escalation chain sweep and the degraded-mode retry sweep.
+    Never raises (it only schedules an ``asyncio.Task``); shutdown
+    symmetry stops it via ``stop_scheduler()`` before the checkpointer's
+    pool closes, so no sweep tick is ever mid-flight against a
+    just-closed connection pool.
     """
     await verify_request_engine_role_separation()
     await setup_checkpointer()
+    start_scheduler()
     yield
-    # Shutdown symmetry: close the checkpointer's dedicated psycopg pool so
-    # a graceful stop doesn't abandon open sockets/worker tasks.
+    # Shutdown symmetry, reverse order: stop the scheduler first (no new
+    # sweep ticks once this returns), then close the checkpointer's
+    # dedicated psycopg pool so a graceful stop doesn't abandon open
+    # sockets/worker tasks.
+    await stop_scheduler()
     await close_checkpointer()
 
 
@@ -121,18 +134,22 @@ def create_app() -> fastapi.FastAPI:
       4b. register AppError exception handler (status_code → standard envelope)
       5. include health router (always)
       5a. include properties/tenants/vendors/cases routers (#54/#55 —
-          always, landlord-scoped via require_landlord)
+          always, landlord-scoped via require_landlord) and the
+          notifications router (always — POST /v1/notifications/{id}/ack
+          is landlord-authenticated; GET /ack/{token} is the public
+          tokenized-link ack surface, #108)
       5b. include Twilio webhook router (always — no auth header, its own
           signature verification; not gated by environment since Twilio
           must reach it in every deployment, including production)
       6. include auth-test router (always — for manual JWT verification)
       7. include debug router (non-production only)
 
-    ``lifespan=_lifespan`` runs ``verify_request_engine_role_separation``
-    then ``setup_checkpointer()`` once at ASGI startup (#22 safety review
-    item 13b; #24) — see that function's docstring for what each checks
-    and why. The role-separation check is a no-op when ``APP_DATABASE_URL``
-    is unset; checkpoint setup always runs.
+    ``lifespan=_lifespan`` runs ``verify_request_engine_role_separation``,
+    then ``setup_checkpointer()``, then ``start_scheduler()`` once at ASGI
+    startup (#22 safety review item 13b; #24; #108/#109) — see that
+    function's docstring for what each checks/starts and why. The
+    role-separation check is a no-op when ``APP_DATABASE_URL`` is unset;
+    checkpoint setup and the scheduler always run.
     """
     configure_logging()
     init_sentry()
@@ -167,6 +184,7 @@ def create_app() -> fastapi.FastAPI:
     application.include_router(tenants.router)
     application.include_router(vendors.router)
     application.include_router(cases.router)
+    application.include_router(notifications.router)
     application.include_router(webhooks_twilio.router)
 
     # auth-test: always registered so engineers can verify JWT plumbing with

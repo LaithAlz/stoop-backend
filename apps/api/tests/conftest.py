@@ -26,6 +26,7 @@ _PLACEHOLDER_ENV: dict[str, str] = {
     "SUPABASE_JWT_ISSUER": "https://test.supabase.co/auth/v1",
     "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
     "TWILIO_AUTH_TOKEN": "test-twilio-auth-token",
+    "TWILIO_ACCOUNT_SID": "ACtestaccountsidtestaccountsid00",
     "ANTHROPIC_API_KEY": "test-anthropic-api-key",
 }
 
@@ -77,6 +78,33 @@ def _reset_weather_cache() -> Iterator[None]:
     import app.integrations.weather as weather_mod
 
     weather_mod._cache_state.reset_for_tests()  # noqa: SLF001
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_scheduler() -> Iterator[None]:
+    """Forget the scheduler's module-global ticker task reference between
+    tests — same cross-loop hazard as ``_reset_checkpointer_pool`` below:
+    an ``asyncio.Task`` binds to the event loop that created it, and each
+    test runs its own loop (``asyncio_default_fixture_loop_scope=function``).
+    A task surviving across tests would be a latent cross-loop flake the
+    moment any later test awaited/cancelled it via ``stop_scheduler()``.
+    """
+    import app.scheduler as scheduler_mod
+
+    scheduler_mod.reset_scheduler_for_tests()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_twilio_sender() -> Iterator[None]:
+    """Drop any injected fake Twilio sender between tests — same
+    cross-test-leakage rationale as the JWKS/weather/checkpointer resets
+    above: a fake sender set by one test must never leak into another
+    test that expects the lazy-construction default (or a DIFFERENT fake)."""
+    import app.integrations.twilio_send as twilio_send_mod
+
+    twilio_send_mod.set_twilio_sender_for_tests(None)
     yield
 
 

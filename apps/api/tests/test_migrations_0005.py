@@ -528,6 +528,15 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # case_lifecycle.sweep_cases above — see its own docstring "The
         # scheduler seam").
         "app/agent/degraded_mode_sweep.py",
+        # #108: the emergency escalation chain's T+0 orchestration
+        # (handle_emergency_trigger, called from app/agent/emergency.py's
+        # seam) and its 60s-sweep entrypoint (run_emergency_chain_sweep,
+        # scheduled by app/scheduler.py) — same pre-identity background
+        # /webhook-triggered context as every other module above; the ack
+        # primitives (acknowledge_notification/acknowledge_by_token) also
+        # live here and are called from the PUBLIC /ack/{token} link and
+        # the Twilio voice webhook, neither of which carries a landlord JWT.
+        "app/agent/emergency_chain.py",
     }
 )
 
