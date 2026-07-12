@@ -9,7 +9,7 @@ import { DecisionCard } from "@/components/clarity/DecisionCard";
 import { SkippedCard } from "@/components/clarity/SkippedCard";
 import { HandledNote } from "@/components/clarity/HandledNote";
 import { AllClearState } from "@/components/clarity/AllClearState";
-import { queue, handledNote } from "@/lib/mock-app";
+import { queue, handledNote, DEFAULT_WHY } from "@/lib/mock-app";
 
 export const Route = createFileRoute("/app/")({
   head: () => ({
@@ -136,7 +136,7 @@ function AppQueuePage() {
                       tenantMessage={item.tenantMessage}
                       photoNote={item.hasPhoto ? item.photoCaption : undefined}
                       draftMessage={item.draftReply}
-                      why={item.why ?? "I drafted this from your house rules and past replies."}
+                      why={item.why ?? DEFAULT_WHY}
                       conversationId={item.id}
                       status={entry?.status === "sending" ? "sending" : "pending"}
                       secondsLeft={entry?.secondsLeft}

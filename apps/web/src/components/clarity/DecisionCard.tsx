@@ -1,11 +1,13 @@
 import { Link } from "@tanstack/react-router";
-import { Check, ChevronRight, Image as ImageIcon, Pencil, SkipForward } from "lucide-react";
+import { ChevronRight, Image as ImageIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Severity } from "@/components/stoop/SeverityBadge";
 import { SeverityPlaque } from "./SeverityPlaque";
 import { TimestampChip } from "./TimestampChip";
 import { MarginNote } from "./MarginNote";
 import { UndoTicket } from "./UndoTicket";
+import { DraftBubble } from "./DraftBubble";
+import { DecisionActions } from "./DecisionActions";
 
 interface DecisionCardProps {
   severity: Severity;
@@ -100,12 +102,11 @@ export function DecisionCard({
         )}
       </div>
 
-      <div className="mt-2 rounded-clarity-lg rounded-tr-clarity-sm border-[1.5px] border-dashed border-clarity-brand-border bg-clarity-brand-soft px-[15px] py-[13px] font-clarity-serif text-[15.5px] italic leading-relaxed text-clarity-ink">
-        <span className="mb-1.5 block font-clarity-sans text-[11px] font-bold not-italic uppercase tracking-[0.02em] text-clarity-brand">
-          {isSending ? `On its way to ${tenantName}` : "I'd like to reply"}
-        </span>
-        {draftMessage}
-      </div>
+      <DraftBubble
+        className="mt-2"
+        label={isSending ? `On its way to ${tenantName}` : "I'd like to reply"}
+        body={draftMessage}
+      />
 
       {isSending ? (
         <UndoTicket secondsLeft={secondsLeft} totalSeconds={totalSeconds} onUndo={onUndo} />
@@ -114,32 +115,7 @@ export function DecisionCard({
           <MarginNote linkHref={whyLinkHref} linkLabel={whyLinkLabel}>
             {why}
           </MarginNote>
-          <div className="mt-[15px] flex gap-2.5">
-            <button
-              type="button"
-              onClick={onEdit}
-              className="inline-flex min-h-12 items-center gap-1.5 rounded-clarity-md border-[1.5px] border-clarity-line-strong bg-clarity-panel px-4 font-clarity-sans text-[15px] font-extrabold text-clarity-ink-dim transition-transform duration-150 ease-clarity hover:-translate-y-px motion-reduce:transition-none motion-reduce:hover:translate-y-0"
-            >
-              <Pencil className="size-4" aria-hidden="true" />
-              Edit
-            </button>
-            <button
-              type="button"
-              onClick={onSkip}
-              className="inline-flex min-h-12 items-center gap-1.5 rounded-clarity-md border-[1.5px] border-clarity-line-strong bg-clarity-panel px-4 font-clarity-sans text-[15px] font-extrabold text-clarity-ink-dim transition-transform duration-150 ease-clarity hover:-translate-y-px motion-reduce:transition-none motion-reduce:hover:translate-y-0"
-            >
-              <SkipForward className="size-4" aria-hidden="true" />
-              Skip
-            </button>
-            <button
-              type="button"
-              onClick={onApprove}
-              className="flex min-h-[52px] flex-1 items-center justify-center gap-2 rounded-clarity-md border-[1.5px] border-clarity-brand-deep bg-clarity-brand font-clarity-sans text-base font-extrabold text-clarity-brand-on shadow-clarity-banner transition-transform duration-150 ease-clarity hover:-translate-y-px motion-reduce:transition-none motion-reduce:hover:translate-y-0"
-            >
-              <Check className="size-4" aria-hidden="true" />
-              Approve &amp; send
-            </button>
-          </div>
+          <DecisionActions onEdit={onEdit} onSkip={onSkip} onApprove={onApprove} />
         </>
       )}
     </article>
