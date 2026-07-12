@@ -2,7 +2,7 @@
 name: stoop-failure-archaeology
 description: >
   The settled-battle chronicle for the Stoop repo — every incident and
-  pre-merge catch from the founding sessions (2026-06-13 → 2026-07-06):
+  pre-merge catch from the founding sessions onward (2026-06-13 → 2026-07-12):
   symptom, root cause, fix, status, surviving artifact. Load BEFORE
   re-opening any past design decision, and on historical-smelling symptoms:
   DuplicatePreparedStatementError on the Supabase pooler; "must be able to
@@ -11,7 +11,8 @@ description: >
   "temperature is deprecated"; Pydantic extra_forbidden on wrapper-keyed
   tool output; a judge whose prose says PASS but booleans say FAIL; a Tier-0
   miss on "smelled like gas"; a draft suggesting the oven for warmth;
-  refusal text tripping guards; leaked secrets; premature merges. Also load
+  refusal text tripping guards; leaked secrets; premature merges; an
+  except-log-continue loop that paged nobody; "soon" in a doc's own template. Also load
   before proposing to remove the asyncpg pooler knobs, re-add temperature,
   switch RLS to FORCE, grant roles to postgres, or edit prompts/v1.py or
   v2.py — settled battles. Owns the incident record only; siblings own live
@@ -25,8 +26,9 @@ Git history in this repo is clean and forward-only: every incident below was cau
 failure record. Its job is to stop you from re-fighting a battle that already produced
 a ruling, and to tell you exactly which artifact enforces each ruling today.
 
-Covers the founding engineering sessions, 2026-06-13 → 2026-07-06 (~40 merged PRs,
-#123–#177, on `LaithAlz/stoop-backend`; the `test/eval-harness` rounds merged as PR #177 on 2026-07-06).
+Covers the founding engineering sessions onward, 2026-06-13 → 2026-07-12 (merged PRs
+#123–#188 on `LaithAlz/stoop-backend`; the `test/eval-harness` rounds merged as PR #177
+on 2026-07-06; the core-loop PRs #185/#187/#188 merged 2026-07-09 → 2026-07-12).
 
 **Attribution convention used throughout:** facts with a surviving repo artifact cite
 it (file / test / migration / PR). Facts that exist only in session memory are marked
@@ -75,7 +77,7 @@ the deterministic, no-I/O emergency keyword filter (`app/agent/prefilter.py`) th
 runs in the webhook before the LLM graph; it may only be escalated past, never
 de-escalated (see `apps/api/CLAUDE.md`).
 
-## The chronicle — incidents A1–A22
+## The chronicle — incidents A1–A24
 
 ### A1. Supavisor DuplicatePreparedStatementError (PR #165)
 - **Symptom:** intermittent `DuplicatePreparedStatementError` / `prepared statement "__asyncpg_stmt_xx__" already exists` against the Supabase transaction pooler (Supavisor, port 6543).
@@ -230,6 +232,14 @@ All session-verified 2026-07-05; no repo artifact. Triage runbook home: `stoop-d
 - **Status:** FIXED, merged 2026-07-10. Follow-ups tracked in #186 (pool-holding deadlock threshold ≥10 concurrent cases, idle-in-transaction timeout profiling, lock-key doc precision, langgraph ceiling pin — the semantics tests in CI are the regression guard).
 - **Surviving artifacts:** `apps/api/app/agent/graph.py` (`_case_lock`, corrected module docstring), `apps/api/app/agent/nodes/await_approval.py`, `apps/api/app/agent/graph_entry.py` (`_thread_reached_terminal_or_paused_state`), `apps/api/tests/test_agent_shadow_interrupt.py` (15 tests incl. the concurrent and crash-window ones).
 
+### A24. The #109 review round — a silent sweep loop, and a doc quoting its own rule-breaking copy (2026-07-12)
+- **Symptom(s), both caught pre-merge:** (1) the degraded-mode retry sweep's per-candidate exception handling was `log.error` + `continue` — a candidate that raised on EVERY tick would loop silently forever: no page, no escalation, no durable record beyond a log line; (2) the tenant holding-ack template, quoted VERBATIM from `docs/02-product/emergency-prefilter.md`, ended "…and you'll hear back soon" — banned relative-time copy in the one message that fires precisely when the system cannot honor any timeline.
+- **Root causes:** (1) `log.error` NEVER reaches Sentry in this codebase — `app/observability.py` configures `LoggingIntegration(level=None, event_level=None)`, so log records are breadcrumbs only, never auto-promoted to events. This is a **recurring defect class**: the identical hole was caught and fixed in `graph_entry.py`'s #34 fix round (its "Total-failure visibility" docstring records that precedent), and it reappeared in new code within days. Any failure path whose only visibility is a log line pages nobody. (2) The doctrine doc's template predated the "never 'soon'" ruling (adopted during the prompts-v2 arc — A21, where "soon" hard-failed eval gate 8's f1): **docs of record can violate rules adopted after they were written; "verbatim from the doc" is not a copy-compliance defense.**
+- **Evidence / caught by:** BOTH reviewers independently (safety review and senior review) flagged the silence loop pre-merge; the copy ruling is recorded in `HOLDING_ACK_TEMPLATE`'s docstring and in the corrected doc (session context 2026-07-12; the shipped artifacts are the record).
+- **Fix (PR #188, squash `161e24c`):** per-exception Sentry paging — every candidate failure calls `sentry_sdk.capture_message(level="error")` with metadata only (notification/message uuids + exception type name, rule #5) — PLUS a bounded per-row exception counter (`payload.exception_count`, `_MAX_CANDIDATE_EXCEPTIONS = 3`, atomic `_INCREMENT_EXCEPTION_COUNT_SQL`) that force-escalates the row (`escalation_leg="retry_exhausted_exception"`) instead of retrying forever: fail loud, then fail CLOSED into a human's queue. The copy shipped WITHOUT the "soon" clause — "Got your message — it's been passed to {first_name}. If this is a life-threatening emergency, call 911." — and `emergency-prefilter.md`'s own template text was corrected in the same change.
+- **Status:** FIXED, merged 2026-07-12. Standing lessons: (a) in review, grep new failure paths for bare `log.error`/`log.exception` with no `sentry_sdk` call and no durable escalation row — cite this entry and the `graph_entry` precedent; (b) check customer-facing copy against `docs/02-product/plain-language-rules.md` even when quoting a doc of record verbatim.
+- **Surviving artifacts:** `apps/api/app/agent/degraded_mode_sweep.py` (`_record_candidate_exception`, `_MAX_CANDIDATE_EXCEPTIONS`, `_INCREMENT_EXCEPTION_COUNT_SQL`); `apps/api/app/agent/nodes/degraded_mode.py::HOLDING_ACK_TEMPLATE` (docstring records the copy-guardian ruling); `docs/02-product/emergency-prefilter.md` (corrected template + ruling note); `apps/api/app/observability.py` (the `event_level=None` rationale comment); `apps/api/app/agent/graph_entry.py` (the precedent docstring).
+
 ## Open wounds (as of 2026-07-06)
 
 Not settled. Do not treat these as closed; do not silently "fix" them without the
@@ -247,7 +257,7 @@ normal gates (`stoop-change-control`).
 Every new production incident **and** every pre-merge catch that changed a design gets
 an entry. The convention:
 
-1. **Append an entry here** — next number (A23, A24, …), exact shape: Symptom →
+1. **Append an entry here** — next number (A25, A26, …), exact shape: Symptom →
    Root cause → Evidence → Fix → Status → Surviving artifact. Evidence must either
    name a repo artifact or carry the session-verified attribution with a date.
 2. **Add an engineering-decisions entry** — the decision record lives at
@@ -285,4 +295,5 @@ root, `/Users/laith/Businesses/LandlordAI`):
 | Open wounds still open | `for i in 174 176 170; do gh issue view $i --repo LaithAlz/stoop-backend --json number,state,title -q '"\(.number) [\(.state)] \(.title)"'; done` |
 | Migration head (was 0008 as of 2026-07-05) | `ls apps/api/migrations/versions/` |
 | Messages classification columns still deprecated / audit_log canonical | `grep -n "DEPRECATED v1.6" docs/03-engineering/schema-v1.md` |
+| A24 artifacts — bounded exception counter + shipped ack copy (no "soon") | `grep -n "_MAX_CANDIDATE_EXCEPTIONS\|retry_exhausted_exception" apps/api/app/agent/degraded_mode_sweep.py; grep -n -A2 "HOLDING_ACK_TEMPLATE = " apps/api/app/agent/nodes/degraded_mode.py` |
 | PR titles cited here | `gh pr view <N> --repo LaithAlz/stoop-backend --json title,state` |

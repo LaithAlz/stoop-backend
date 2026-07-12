@@ -13,7 +13,7 @@ description: >
   or before writing/reviewing any PR that adds an endpoint, a migration, a
   node, or a Twilio/Anthropic call. It states the system shape, every numbered
   invariant with its enforcing artifact, the case-lifecycle contract, and the
-  known-weak points as of 2026-07-05.
+  known-weak points (items 1–2 updated 2026-07-12; rest as of 2026-07-05).
 ---
 
 # Stoop architecture contract — load-bearing design, invariants, weak points
@@ -46,10 +46,12 @@ Tenant SMS ──► POST /webhooks/twilio/sms  (apps/api/app/routers/webhooks/t
    3. INSERT message + prefilter snapshot, COMMIT FIRST (its own transaction, before any
       side effect); duplicate SID → recover existing row; recovery failure → 5xx (Twilio retries)
    4. idempotent side effects, each in an isolated session, deduped by Postgres unique index
-   5. BackgroundTasks → app/agent/graph_entry.py::enqueue_classification  ◄── STUB (#34 open)
-LangGraph agent nodes (app/agent/nodes/): identify_property → load_context → identify_case
-   → classify_intent → classify_severity → draft_response — all six exist and are tested,
-   but NO StateGraph wires them; app/agent/graph.py does not exist (as of 2026-07-05)
+   5. BackgroundTasks → app/agent/graph_entry.py::enqueue_classification — runs the REAL
+      graph since PRs #185/#187 (as of 2026-07-12): app/agent/graph.py compiles the
+      StateGraph under a per-case pg_advisory_xact_lock; pre-routing segment
+      identify_property → load_context → identify_case, then classify_intent →
+      classify_severity → conditional(draft_response → mark_awaiting_approval →
+      await_approval interrupt() | degraded_mode); resume + interrupt contract: A23
 drafts queue (drafts table, one pending per case) ──► landlord approval (#44/#45, unbuilt)
    ──► send to tenant/vendor: UNBUILT BY DESIGN — no Twilio REST/send call site exists
        anywhere in app/ (webhooks are inbound-only; sending arrives with #108/#45)
@@ -83,7 +85,7 @@ Paths are repo-relative; migrations live in `apps/api/migrations/versions/`.
 | 11 | JWT verification is JWKS asymmetric-only (ES256/RS256), never HS*/`none`; JWKS fetch discipline = one cache + three cooldowns | Prevents alg-confusion attacks; cooldowns prevent a broken JWKS endpoint from being hammered or a degenerate `{"keys": []}` 200 from evicting a good cache | `app/integrations/supabase_auth.py`: `_ALLOWED_ALGORITHMS = ["ES256","RS256"]`; `_JwksState` singleton + `_FORCED_REFRESH_WINDOW_SECONDS=60`, `_DEGENERATE_FETCH_COOLDOWN_SECONDS=60`, `_FETCH_EXCEPTION_COOLDOWN_SECONDS=5` (TTL 24h) |
 | 12 | LLM budget: 20s END-TO-END shared by first attempt + single retry (12s first-attempt cap, 2s retry floor — below the floor the retry is skipped, not attempted); SDK `max_retries=0`; `temperature` OMITTED | The 20s is emergency-prefilter.md's classification budget — per-attempt readings double it; the SDK's hidden retries would too. `temperature` is deprecated on `claude-sonnet-5` (live API 400); determinism is owned by the eval gate, not a sampling knob | `app/integrations/anthropic.py`: `CLASSIFICATION_BUDGET_SECONDS=20.0`, `FIRST_ATTEMPT_TIMEOUT_CAP_SECONDS=12.0`, `MIN_RETRY_BUDGET_SECONDS=2.0`, `new_deadline()`/`attempt_timeout()`, `AsyncAnthropic(..., max_retries=0)`; tests assert the ABSENCE of `temperature` |
 | 13 | The emergency line is never gated; nothing in `agent/` reads feature flags | Never-break rules #1/#7: webhooks run on the admin engine so an RLS/GUC failure can never reject an inbound "there is a fire"; flags gate rollouts only, never safety | `app/routers/webhooks/twilio.py` (admin engine + allowlist); `app/agent/emergency.py` docstring ("flag reads are disallowed outright" in `agent/`); root `CLAUDE.md` rules 1 and 7 |
-| 14 | On classification failure, never invent a severity | After both attempts fail, `classify_severity` sets `state["classification_failed"]=True`, appends one plain reasoning line, logs — and STOPS. The durable degraded-mode record + holding ack is #109's job | `app/agent/nodes/classify_severity.py` module docstring "The degraded-mode seam" + the three-things-only failure branch |
+| 14 | On classification failure, never invent a severity | After both attempts fail, `classify_severity` sets `state["classification_failed"]=True`, appends one plain reasoning line, logs — and STOPS. The graph then routes the flag to the `degraded_mode` node (#109, built — see weak point 2) | `app/agent/nodes/classify_severity.py` module docstring "The degraded-mode seam" + the three-things-only failure branch; the conditional edge in `app/agent/graph.py` |
 
 Failed-safe direction to remember when extending any of this: prefer losing an
 optimization to losing a message; prefer refusing to boot to serving unscoped.
@@ -122,26 +124,38 @@ Vocabulary comes from `0002_core_schema.py` CHECKs and
   (session-verified 2026-07-05; no repo artifact beyond the shipped
   `app/agent/case_lifecycle.py` fix itself — see `stoop-failure-archaeology`).
 
-## Known-weak points (as of 2026-07-05) — stated plainly
+## Known-weak points — stated plainly (items 1–2 updated 2026-07-12; 3–8 as of 2026-07-05)
 
-1. **The graph is not wired.** No `StateGraph` exists anywhere in `app/`;
-   `app/agent/graph.py` does not exist; issue #34 (graph wiring + #43
-   shadow-mode interrupt) is open. `app/agent/graph_entry.py::
-   enqueue_classification` is an honest stub that only appends a
-   `message_received` audit row — and its dedupe guard is a documented,
-   ACCEPTED non-atomic check-then-insert race (`SELECT EXISTS` then `INSERT`):
-   two truly concurrent invocations for one `message_id` could double-insert.
-   Accepted because nothing today schedules concurrent tasks for the same
-   message; it becomes real the moment #30-series adds retries/parallel
-   invocations — fix it THERE with the atomic `WHERE NOT EXISTS`/unique-index
-   pattern the webhook already uses (the stub's docstring says exactly this).
-2. **Degraded mode (#109) and the emergency executor (#108) are seams only.**
-   `app/agent/emergency.py::fire_emergency_protocol` logs and returns — no
-   voice call, no safety SMS, no escalation chain. `classify_severity` on
-   double failure only sets `classification_failed` — no holding ack, no
-   landlord notification, no durable `degraded_mode` audit row.
-   `notifications` rows sit at `status='pending'` with only the webhook's
-   log+Sentry tide-over alerts (`_alert_tenant_hard_fire`) paging anyone.
+1. **RESOLVED (2026-07-12): the graph IS wired.** PR #185 (squash `69abba4`)
+   assembled `app/agent/graph.py` and replaced the `enqueue_classification`
+   stub with the real invocation; PR #187 (squash `a61b95e`, 2026-07-10)
+   added the shadow-mode `interrupt()` (`await_approval` node), the per-case
+   `pg_advisory_xact_lock`, and the checkpoint-keyed completion gate — after
+   three pre-merge catches recorded as archaeology A23 (a disproven
+   "empirical" replay claim, a TOCTOU resume, a reproduced stuck-draft
+   window). The LangGraph interrupt contract A23 pins (whole node re-executes
+   on resume; nothing before a raising `interrupt()` commits; plain `ainvoke`
+   on a paused thread RESTARTS from START) is load-bearing for #44: the send
+   must be a separate node behind a conditional edge, never code after
+   `interrupt()`.
+2. **Degraded mode (#109) is BUILT (2026-07-12); the emergency executor
+   (#108) is still a seam.** PR #188 (squash `161e24c`; migration 0009 adds
+   the `tenant_ack`/`degraded_retry` notification types): classification
+   failure routes to `app/agent/nodes/degraded_mode.py` — durable holding-ack
+   intents (`tenant_ack` rows, `HOLDING_ACK_TEMPLATE`), blind escalation
+   (`needs_eyes` with the raw text in the DB payload only, never logs —
+   rule #5), and the 1/5/15-minute re-classification retry sweep
+   (`app/agent/degraded_mode_sweep.py`) with per-exception Sentry paging and
+   a bounded exception counter (`_MAX_CANDIDATE_EXCEPTIONS = 3`) that
+   force-escalates instead of looping silently (A24). **Deployment-gating
+   fact:** nothing schedules the sweep yet and #108's sender does not exist
+   (#108 in flight) — `tenant_ack`/`needs_eyes` rows accumulate undelivered,
+   and the no-keyword leg's invariant stays PROVISIONAL until BOTH a
+   cron/scheduler and the sender are energized (the sweep module's
+   "DEPLOYMENT-GATING FACT" docstring states this plainly — repeat it in any
+   deployment/cutover plan). `app/agent/emergency.py::fire_emergency_protocol`
+   still logs and returns — no voice call, no safety SMS, no escalation
+   chain.
 3. **The web dashboard is a mock-data shell.** `apps/web/src/lib/mock-app.ts`
    feeds the routes; there is no API client, no Supabase JS dependency in
    `apps/web/package.json`, and no Supabase session in the browser. `/v1/queue`
@@ -200,8 +214,9 @@ unless a `cd` is shown; all read-only):
 
 | Claim | One-line re-verification |
 |---|---|
-| Graph still unwired / no `graph.py` | `grep -rn "StateGraph" apps/api/app/ ; ls apps/api/app/agent/graph.py 2>&1` |
-| #34 still open | `gh issue view 34 --repo LaithAlz/stoop-backend --json state` |
+| Graph wired, interrupt + case lock present (#185/#187) | `grep -n "pg_advisory_xact_lock\|add_conditional_edges" apps/api/app/agent/graph.py \| head -3` |
+| #34/#43/#109 closed; #44/#45/#108 remaining | `for n in 34 43 109 44 45 108; do gh issue view $n --repo LaithAlz/stoop-backend --json number,state -q '"\(.number) \(.state)"'; done` |
+| Degraded mode built; sweep still uncalled outside tests | `grep -n "HOLDING_ACK_TEMPLATE" apps/api/app/agent/nodes/degraded_mode.py; grep -rn "sweep_degraded_mode_retries" apps/api/app --include='*.py' \| grep -v degraded_mode_sweep` |
 | No Twilio send call site in app code | `grep -rn "twilio.rest\|from twilio\|import twilio" apps/api/app/ apps/api/pyproject.toml` |
 | Append-only REVOKEs in 0005 | `grep -n "REVOKE UPDATE, DELETE" apps/api/migrations/versions/0005_app_role_and_rls.py` |
 | One-pending-draft index | `grep -n uq_drafts_one_pending apps/api/migrations/versions/0002_core_schema.py` |
