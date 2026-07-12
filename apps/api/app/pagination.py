@@ -26,7 +26,7 @@ import binascii
 import json
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.engine import RowMapping
@@ -69,10 +69,24 @@ def decode_cursor(cursor: str) -> tuple[datetime, str]:
     try:
         raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
         payload: dict[str, Any] = json.loads(raw.decode("utf-8"))
-        row_id = str(payload["id"])
-        uuid.UUID(row_id)  # shape-validate only; raises ValueError if malformed
-        return datetime.fromisoformat(payload["k"]), row_id
-    except (binascii.Error, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+        # NORMALIZE, don't just shape-validate (senior re-review on PR #195):
+        # uuid.UUID accepts non-canonical forms ("urn:uuid:...", "{...}")
+        # that asyncpg's bind encoder rejects as raw strings -> DBAPIError
+        # 500. str(uuid.UUID(...)) canonicalizes. Likewise extreme-offset
+        # ISO datetimes pass fromisoformat but under/overflow inside
+        # asyncpg's UTC conversion -> astimezone(UTC) surfaces OverflowError
+        # here, inside the except net.
+        row_id = str(uuid.UUID(str(payload["id"])))
+        order_key = datetime.fromisoformat(payload["k"]).astimezone(UTC)
+        return order_key, row_id
+    except (
+        binascii.Error,
+        ValueError,
+        KeyError,
+        TypeError,
+        UnicodeDecodeError,
+        OverflowError,
+    ) as exc:
         raise InvalidCursorError("invalid cursor") from exc
 
 

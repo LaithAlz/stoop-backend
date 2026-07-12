@@ -225,24 +225,69 @@ async def test_list_vendors_invalid_cursor_returns_400(session: AsyncSession) ->
 
 
 @pytest.mark.integration
-async def test_list_vendors_crafted_cursor_non_uuid_id_returns_400(session: AsyncSession) -> None:
-    """A cursor that is well-formed base64+JSON but carries a non-uuid
-    ``id`` must still 400 ``invalid_cursor`` — not reach the caller's
-    ``CAST(:cursor_id AS uuid)`` as a raw 500 (senior review on PR #195,
-    B2). Hand-crafts the cursor rather than going through ``encode_cursor``
-    (which only ever produces valid ones) to simulate a malicious/corrupt
-    client-supplied value.
+@pytest.mark.parametrize(
+    ("cursor_id", "cursor_k"),
+    [
+        # plain garbage id (original B2)
+        ("not-a-uuid", "2026-07-04T12:00:00+00:00"),
+        # extreme-offset datetimes: fromisoformat accepts, UTC conversion
+        # under/overflows inside asyncpg without the astimezone(UTC)
+        # normalization in decode_cursor
+        ("0e37df36-f698-11e6-8dd4-cb9ced3df976", "0001-01-01T00:00:00+23:59"),
+        ("0e37df36-f698-11e6-8dd4-cb9ced3df976", "9999-12-31T23:59:59-23:59"),
+    ],
+)
+async def test_list_vendors_crafted_cursor_returns_400(
+    session: AsyncSession, cursor_id: str, cursor_k: str
+) -> None:
+    """A cursor that is well-formed base64+JSON but carries a payload the
+    DB bind layer would reject must 400 ``invalid_cursor`` — never a raw
+    500 (senior review on PR #195, B2 + the normalization residual:
+    ``uuid.UUID`` accepts non-canonical forms, ``fromisoformat`` accepts
+    extreme offsets; ``decode_cursor`` must NORMALIZE, not shape-check).
+    Hand-crafts cursors rather than going through ``encode_cursor`` (which
+    only ever produces valid ones).
     """
     landlord_id = await factories.insert_landlord(session)
     landlord = Landlord(id=uuid.UUID(landlord_id))
     crafted = base64.urlsafe_b64encode(
-        json.dumps({"k": "2026-07-04T12:00:00+00:00", "id": "not-a-uuid"}).encode("utf-8")
+        json.dumps({"k": cursor_k, "id": cursor_id}).encode("utf-8")
     ).decode("ascii")
     try:
         with pytest.raises(AppError) as exc_info:
             await list_vendors((landlord, session), cursor=crafted)
         assert exc_info.value.status_code == 400
         assert exc_info.value.code == "invalid_cursor"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "cursor_id",
+    [
+        # non-canonical uuid forms uuid.UUID ACCEPTS but asyncpg's bind
+        # encoder would reject as raw strings — decode_cursor NORMALIZES
+        # them to canonical form, so the query succeeds harmlessly (empty
+        # page for an unknown id). The invariant: never a raw 500 (senior
+        # re-review on PR #195, B2 residual).
+        "urn:uuid:0e37df36-f698-11e6-8dd4-cb9ced3df976",
+        "{0e37df36-f698-11e6-8dd4-cb9ced3df976}",
+    ],
+)
+async def test_list_vendors_noncanonical_uuid_cursor_is_normalized_never_500(
+    session: AsyncSession, cursor_id: str
+) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    crafted = base64.urlsafe_b64encode(
+        json.dumps({"k": "2026-07-04T12:00:00+00:00", "id": cursor_id}).encode("utf-8")
+    ).decode("ascii")
+    try:
+        # Must not raise anything — normalization makes the bind value
+        # canonical; an unknown id just yields an empty/ordinary page.
+        response = await list_vendors((landlord, session), cursor=crafted)
+        assert response.items == []
     finally:
         await _cleanup(session, landlord_id)
 
