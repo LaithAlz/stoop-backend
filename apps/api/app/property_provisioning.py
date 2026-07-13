@@ -26,7 +26,7 @@ webhook router and ``app/integrations/twilio_send.py``. Two jobs:
    — "windows are data, not sleeps" (``apps/api/CLAUDE.md``), the same
    doctrine the approve-flow's ``scheduled_send_at`` undo window already
    uses. The "window" here is a durable ``notifications`` row
-   (``type='number_release'``, schema-v1.md v1.10 amendment), not an
+   (``type='number_release'``, schema-v1.md v1.11 amendment), not an
    in-process timer — ``app/scheduler.py``'s own docstring is explicit
    that its ticker "carries NO schedule state ... never in-process timers
    for the SCHEDULE," and this module follows that same rule.
@@ -362,7 +362,7 @@ async def schedule_number_release(
     session as the property delete itself (both commit together at
     ``require_landlord``'s teardown), only when the deleted property had a
     live ``twilio_number``. Idempotent via
-    ``uq_notifications_number_release_dedupe`` (schema-v1.md v1.10) —
+    ``uq_notifications_number_release_dedupe`` (schema-v1.md v1.11) —
     guards the narrow race of two concurrent confirmed deletes for the
     same property.
 

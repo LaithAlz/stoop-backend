@@ -186,7 +186,7 @@ issue-spec doc exists for #53, unlike #1-#15).
   actually deletes: if it had a `twilio_number`, the number is **not**
   released synchronously — it enters a 24-hour grace period (a durable
   `notifications` row, `type='number_release'`, swept by the existing
-  `app/scheduler.py` 60s ticker; schema-v1.md's v1.10 amendment) before
+  `app/scheduler.py` 60s ticker; schema-v1.md's v1.11 amendment) before
   the release actually happens, a "windows are data, not sleeps" design
   mirroring the approve-flow's undo window. This is NOT an undo for the
   deleted `properties` row itself (that delete is immediate and permanent,

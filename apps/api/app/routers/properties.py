@@ -52,9 +52,10 @@ landlord, free or paid):
 **Connection-pinning tradeoff (safety review finding M4) — read before
 touching this handler.** ``create_property`` holds its
 ``require_landlord`` session/transaction (and therefore the pooled DB
-connection and the RLS GUC) open across up to ~30s of real Twilio HTTP
-calls (three sequential requests at up to 10s each — search, purchase,
-configure — plus a 4th best-effort A2P call). This is a genuine tradeoff,
+connection and the RLS GUC) open across up to ~40s of real Twilio HTTP
+calls (three REQUIRED sequential requests at up to 10s each — search,
+purchase, configure — plus a 4th best-effort A2P call, also up to 10s).
+This is a genuine tradeoff,
 not an oversight: ``require_landlord``'s own module docstring already
 forbids a mid-handler ``session.commit()`` (``SET LOCAL`` — the GUC —
 dies with the transaction), so there is no cheap way to release the

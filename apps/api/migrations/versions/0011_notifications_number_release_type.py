@@ -1,11 +1,12 @@
-"""notifications: number_release type + its dedupe index (v1.10)
+"""notifications: number_release type + its dedupe index (v1.11)
 
 Revision ID: 0011
 Revises: 0010
 Create Date: 2026-07-13 00:00:00.000000
 
-Canonical schema source: docs/03-engineering/schema-v1.md — the v1.10
-amendment (#53, property provisioning).
+Canonical schema source: docs/03-engineering/schema-v1.md — the v1.11
+amendment (#53, property provisioning; renumbered from v1.10 after PR
+#202's `cases.severity` amendment took that label first).
 
 WHY
 ---

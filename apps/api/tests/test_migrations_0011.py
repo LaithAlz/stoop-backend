@@ -4,7 +4,7 @@
 Marker: ``integration`` — requires a running Postgres instance.
 Use ``docker compose up -d`` at the repo root before running locally.
 
-Revision 0011 implements the schema-v1.md v1.10 amendments: one new
+Revision 0011 implements the schema-v1.md v1.11 amendments: one new
 ``notifications.type`` CHECK value (``number_release``) plus its own
 partial unique dedupe index (``uq_notifications_number_release_dedupe``,
 keyed on ``payload ->> 'twilio_sid'`` rather than ``message_id`` — this

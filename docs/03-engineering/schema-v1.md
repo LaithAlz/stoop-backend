@@ -426,8 +426,9 @@
 > 5. `cases.title` remains unwritten — explicitly deferred, out of this
 >    amendment's scope (tracked separately).
 
-> **v1.10 amendment (2026-07-13)** — migration 0011 implements this (#53,
-> property provisioning). No new column or table on `properties` —
+> **v1.11 amendment (2026-07-13)** — migration 0011 implements this (#53,
+> property provisioning; renumbered from v1.10 — PR #202's `cases.severity`
+> amendment took that label first). No new column or table on `properties` —
 > `twilio_number`/`twilio_sid` already existed for exactly this — but
 > deprovisioning's grace period needs one new durable, sweep-visible
 > artifact, and `properties` has no `deleted_at`/status column to hang it
@@ -739,7 +740,7 @@ CREATE TABLE notifications (
                     'needs_eyes','draft_ready','recap','tenant_ack','degraded_retry',
                     'number_release')),
                                                      -- 'tenant_ack'/'degraded_retry' added v1.8 (#109)
-                                                     -- 'number_release' added v1.10 (#53)
+                                                     -- 'number_release' added v1.11 (#53)
   channel         text NOT NULL CHECK (channel IN ('voice','sms','push','email')),
   status          text NOT NULL DEFAULT 'pending'
                   CHECK (status IN ('pending','sent','acknowledged','failed','exhausted')),
@@ -769,8 +770,8 @@ CREATE UNIQUE INDEX uq_notifications_degraded_retry_dedupe
   ON notifications ((payload ->> 'message_id'))
   WHERE type = 'degraded_retry';
 
--- v1.10 (migration 0011, #53): deprovisioning's grace-period release --
--- see the v1.10 amendments note above. Reuses idx_notifications_sweep
+-- v1.11 (migration 0011, #53): deprovisioning's grace-period release --
+-- see the v1.11 amendments note above. Reuses idx_notifications_sweep
 -- (status, next_attempt_at) above for the sweep itself; this index is only
 -- for idempotency, keyed on twilio_sid rather than message_id (this type
 -- has no message_id at all).
