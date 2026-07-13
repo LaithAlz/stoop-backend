@@ -113,10 +113,11 @@ two are indistinguishable by design — never leak cross-tenant existence).
 satisfied via `PATCH /v1/me` (below), not this endpoint; noted here so the
 two don't look like an unaddressed gap.
 
-**v1.11 amendment (2026-07-13 — #53 implementation):** this doc was
-previously silent on the provisioning request/response shape; the contract
-below is the minimal one this implementation follows (flagged for spec
-review — no issue-spec doc exists for #53, unlike #1-#15).
+**v1.12 amendment (2026-07-13 — #53 implementation, folding in the
+2026-07-13 safety review's H1 finding):** this doc was previously silent
+on the provisioning request/response shape; the contract below is the
+minimal one this implementation follows (flagged for spec review — no
+issue-spec doc exists for #53, unlike #1-#15).
 
 - **`POST /v1/properties` request gains one new, OPTIONAL field:
   `area_code`** (a 3-digit NANP area code string, e.g. `"416"`) —
@@ -132,6 +133,21 @@ review — no issue-spec doc exists for #53, unlike #1-#15).
   available Canadian local number, unfiltered. `twilio_number` in the
   response `Property` is populated on success (previously always `null`,
   per #54's own note "#53 provisioning is out of scope").
+- **Two pre-Twilio-call money guards, checked BEFORE any of the above**
+  (safety review finding H1 — every-landlord, never a plan-entitlement
+  gate; never-break rule #1: the emergency line is never paywalled):
+  - 409 `property_limit_reached` — the landlord already has
+    `settings.max_properties_per_landlord` properties (default 25). A pure
+    spend/abuse guard against a client hammering this endpoint.
+  - 409 `duplicate_property` — the landlord already has a property whose
+    `address_line1`/`city`/`province` match (case/whitespace-insensitive;
+    `postal_code` excluded from the comparison). Mirrors the existing
+    `duplicate_phone` convention in spirit (tenants/vendors) but is an
+    application-level pre-check here, not a `UNIQUE`-constraint
+    conversion — `properties` has no such constraint. This is what makes a
+    client's timeout-and-retry hit the dedupe instead of buying a second
+    number for what is, from the landlord's perspective, the same
+    property.
 - **New `POST /v1/properties` failure codes**, standard error envelope:
   - 503 `no_numbers_available` — every step of the search order above came
     back empty. No property row is created.

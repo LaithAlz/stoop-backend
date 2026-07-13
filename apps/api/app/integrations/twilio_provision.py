@@ -64,6 +64,14 @@ every provisioned number is a Canadian local number. Not configurable via
 settings/flags; this is a product fact, not a rollout knob."""
 
 
+class TwilioNumberNotFoundError(Exception):
+    """Raised by ``release_number`` when Twilio reports the SID is already
+    gone (a 404) — safety review finding M2: for a RELEASE goal this IS
+    success, not a failure. ``app/property_provisioning.py``'s sweep (and
+    its compensating-release helper) both treat this specially: marked
+    done immediately, never retried, never paged."""
+
+
 class TwilioProvisioner(Protocol):
     """Injectable seam for Twilio phone-number provisioning — see module
     docstring. Every method is a thin wrapper over ONE Twilio REST call;
@@ -104,7 +112,15 @@ class TwilioProvisioner(Protocol):
         """Release (delete) the number back to Twilio's pool — used both
         as post-failure compensation (a purchase that can't be fully
         provisioned) and as the deprovisioning grace-period's eventual
-        action."""
+        action.
+
+        Raises
+        ------
+        TwilioNumberNotFoundError
+            The SID is already gone (Twilio 404) — see that exception's
+            own docstring (safety review finding M2): callers must treat
+            this as SUCCESS, not a retryable failure.
+        """
         ...
 
 
@@ -179,6 +195,8 @@ class TwilioRestProvisioner:
         url = f"{_API_BASE}/Accounts/{self._account_sid}/IncomingPhoneNumbers/{twilio_sid}.json"
         async with self._client() as client:
             response = await client.delete(url)
+            if response.status_code == 404:
+                raise TwilioNumberNotFoundError(twilio_sid)
             response.raise_for_status()
 
 
@@ -202,6 +220,7 @@ def set_twilio_provisioner_for_tests(provisioner: TwilioProvisioner | None) -> N
 
 
 __all__: list[str] = [
+    "TwilioNumberNotFoundError",
     "TwilioProvisioner",
     "TwilioRestProvisioner",
     "get_twilio_provisioner",

@@ -36,8 +36,13 @@ Webhook URLs
 Both the inbound SMS webhook (``app/routers/webhooks/twilio.py``'s
 ``POST /sms``, #40) and the voice webhook (``POST /voice``, #108) are
 configured on every purchased number, both derived from
-``settings.public_base_url``. #108's OWN outbound calls fetch their TwiML
-from a per-call, dynamically-parameterized url (``emergency_chain.py``'s
+``settings.public_base_url`` plus :data:`SMS_WEBHOOK_PATH`/
+:data:`VOICE_WEBHOOK_PATH` — imported from that router module, where they
+are themselves derived from the ACTUAL registered route table (never a
+hand-duplicated literal here; safety review finding L3) so a future rename
+of either endpoint can never silently orphan a newly-provisioned number's
+webhook config. #108's OWN outbound calls fetch their TwiML from a
+per-call, dynamically-parameterized url (``emergency_chain.py``'s
 ``render_voice_action_url``), not from the number's account-level Voice
 URL setting — so configuring ``/voice`` here is purely a defensive default
 for the case where someone dials the property's number directly (Twilio
@@ -50,7 +55,38 @@ proxy-header fallback that makes sense for constructing an OUTBOUND
 "here's where to send future webhooks" URL to hand Twilio; if unset,
 :func:`provision_number` raises :class:`PublicBaseUrlUnconfiguredError`
 before attempting any Twilio call at all (a deployment-configuration
-error, never a per-request one — see api-contracts.md's v1.11 amendment).
+error, never a per-request one — see api-contracts.md's v1.12 amendment).
+
+Deprovisioning safety (safety review, 2026-07-13)
+----------------------------------------------------
+Three additions beyond the original design, all in
+:func:`sweep_pending_number_releases`:
+
+- **M1/L1 — claim before calling Twilio.** Every due row is claimed with a
+  single optimistic-concurrency ``UPDATE ... WHERE status='pending' AND
+  attempt=:old_attempt`` (mirrors ``app/agent/emergency_chain.py``'s own
+  claim discipline EXACTLY) before ``release_number`` is ever called —
+  two scheduler ticks (on two machines, or two overlapping ticks on one)
+  racing the same due row can never both call Twilio's release endpoint
+  for it; the loser's claim UPDATE simply returns no row and it does
+  nothing further this tick. The claim also advances ``attempt``/
+  ``next_attempt_at`` BEFORE the call, so a crash mid-release leaves the
+  row retryable on schedule rather than stuck.
+- **M2 — a 404 from Twilio (already released) is treated as SUCCESS**, not
+  a retryable failure: for a release goal, "the number doesn't exist
+  anymore" already satisfies the goal. Marked ``sent`` immediately, no
+  retry, no Sentry page — keeps the eventual exhaustion page trustworthy
+  (it means "we kept trying and Twilio kept refusing," never "the thing we
+  wanted was already true").
+- **L2 — never release a SID a LIVE ``properties`` row still references.**
+  Structurally this should never happen today (a released Twilio SID can
+  never be re-issued to a later purchase), but this is exactly the kind of
+  invariant a FUTURE number-reuse feature could silently violate — one
+  indexed ``SELECT`` before every release call closes the catastrophic
+  "release a number a tenant can still text" failure mode outright rather
+  than trusting that invariant to hold forever. A hit here marks the row
+  ``exhausted`` with a loud Sentry page (retrying would never help; the
+  schedule itself is wrong).
 """
 
 from __future__ import annotations
@@ -67,7 +103,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.session import get_admin_session
-from app.integrations.twilio_provision import TwilioProvisioner, get_twilio_provisioner
+from app.integrations.twilio_provision import (
+    TwilioNumberNotFoundError,
+    TwilioProvisioner,
+    get_twilio_provisioner,
+)
+from app.routers.webhooks.twilio import SMS_WEBHOOK_PATH, VOICE_WEBHOOK_PATH
 
 log = structlog.get_logger(__name__)
 
@@ -80,7 +121,7 @@ log = structlog.get_logger(__name__)
 NUMBER_RELEASE_GRACE_PERIOD_SECONDS: float = 24 * 60 * 60
 """24 hours between a confirmed property deletion and the actual Twilio
 release — a same-day window for a landlord/ops to notice an accidental
-deletion before the number is gone for good (api-contracts.md v1.11)."""
+deletion before the number is gone for good (api-contracts.md v1.12)."""
 
 _NUMBER_RELEASE_RETRY_INTERVAL_SECONDS: float = 15 * 60
 """On a release-call failure, retry in 15 minutes — short enough to
@@ -139,11 +180,13 @@ class ProvisionResult:
 
 def _webhook_urls() -> tuple[str, str]:
     """Return ``(sms_url, voice_url)`` for a freshly-purchased number — see
-    module docstring "Webhook URLs"."""
+    module docstring "Webhook URLs". Paths come from
+    ``app/routers/webhooks/twilio.py``'s own registered-route constants
+    (safety review finding L3), never a literal duplicated here."""
     if not settings.public_base_url:
         raise PublicBaseUrlUnconfiguredError()
     base = settings.public_base_url.rstrip("/")
-    return f"{base}/webhooks/twilio/sms", f"{base}/webhooks/twilio/voice"
+    return f"{base}{SMS_WEBHOOK_PATH}", f"{base}{VOICE_WEBHOOK_PATH}"
 
 
 async def _find_candidate_numbers(
@@ -151,7 +194,7 @@ async def _find_candidate_numbers(
 ) -> list[str]:
     """Search cascade: area code → property's province (the "nearest"
     fallback the issue's AC asks for — there is no lat/lon to search by
-    proximity at creation time; see api-contracts.md's v1.11 amendment for
+    proximity at creation time; see api-contracts.md's v1.12 amendment for
     why) → any available Canadian local number. Returns the first
     non-empty candidate list, or an empty list if every step came back
     empty."""
@@ -170,7 +213,7 @@ async def _find_candidate_numbers(
 async def release_number_best_effort(twilio_sid: str) -> None:
     """Best-effort compensating release — never raises. Used both when a
     purchase can't be fully provisioned (webhook config failure) and when
-    the caller's OWN post-purchase step (the DB insert in
+    the caller's OWN post-purchase step (the DB insert/read-back in
     ``app/routers/properties.py``) fails. A failure HERE means a real,
     billed Twilio number is now orphaned (purchased, but no ``properties``
     row will ever reference it) — logged loudly (uuid/SID-level only) so
@@ -179,6 +222,10 @@ async def release_number_best_effort(twilio_sid: str) -> None:
     provisioner = get_twilio_provisioner()
     try:
         await provisioner.release_number(twilio_sid=twilio_sid)
+    except TwilioNumberNotFoundError:
+        # Already gone -- same M2 reasoning as the sweep: for a release
+        # goal this IS success, not a failure worth paging on.
+        log.info("twilio_provisioning_compensation_release_already_gone", twilio_sid=twilio_sid)
     except Exception as exc:
         log.error(
             "twilio_provisioning_compensation_release_failed",
@@ -191,6 +238,26 @@ async def release_number_best_effort(twilio_sid: str) -> None:
             level="error",
             extras={"twilio_sid": twilio_sid, "exc_type": type(exc).__name__},
         )
+
+
+def alert_purchased_but_unrecorded(twilio_sid: str) -> None:
+    """Loud, ALWAYS-fires alert for the "purchased a real number, then
+    failed to durably record it" path (safety review finding M3) —
+    ``app/routers/properties.py`` calls this whenever its post-purchase DB
+    write (the INSERT or the read-back that follows it) fails, regardless
+    of whether the compensating :func:`release_number_best_effort` call
+    itself succeeds. Distinct from that function's own alert (which fires
+    only when the RELEASE call itself fails) — this one fires on the
+    triggering condition itself, so ops sees "a purchase had to be
+    compensated" even on the common case where the compensating release
+    succeeds cleanly. uuid/SID-level only (rule #5)."""
+    log.error("twilio_provisioning_purchased_but_db_write_failed", twilio_sid=twilio_sid)
+    sentry_sdk.capture_message(
+        "Twilio provisioning: a number was purchased but never durably "
+        "recorded -- compensating release attempted",
+        level="error",
+        extras={"twilio_sid": twilio_sid},
+    )
 
 
 async def provision_number(*, area_code: str | None, province: str) -> ProvisionResult:
@@ -247,7 +314,7 @@ async def provision_number(*, area_code: str | None, province: str) -> Provision
             a2p_status = "associated"
         except Exception as exc:
             # Never fails provisioning on this -- see module docstring and
-            # api-contracts.md's v1.11 amendment. A working, webhook
+            # api-contracts.md's v1.12 amendment. A working, webhook
             # -configured number without a campaign association is a
             # strictly better outcome than none at all.
             log.warning(
@@ -326,11 +393,38 @@ async def schedule_number_release(
     )
 
 
+_NUMBER_RELEASE_SWEEP_BATCH_LIMIT: int = 50
+"""Per-tick cap on how many due releases one sweep call processes (safety
+review, finding M1/L1) — bounds a single tick's work under a burst of
+deletions; mirrors the general "bounded work per tick" discipline every
+other sweep in this codebase already follows. Anything left over is still
+due (or becomes more overdue) and is picked up on the NEXT tick — no
+schedule state is lost, only deferred, same as every other sweep here."""
+
 _SELECT_DUE_NUMBER_RELEASES_SQL = text(
     """
     SELECT id, payload, attempt FROM notifications
     WHERE type = 'number_release' AND status = 'pending' AND next_attempt_at <= :now
     ORDER BY next_attempt_at ASC
+    LIMIT :limit
+    """
+)
+
+# Optimistic-concurrency claim (safety review, finding M1/L1) — mirrors
+# app/agent/emergency_chain.py's own _CLAIM_STEP_SQL exactly: advances
+# attempt/next_attempt_at BEFORE the Twilio call, guarded by a WHERE clause
+# that only succeeds for the FIRST caller to claim this exact (id, attempt)
+# pair. A concurrent second claim attempt (two scheduler ticks racing the
+# same due row, on one machine or two) finds attempt already bumped and
+# gets no row back -- it does nothing further this tick. This is the
+# CRITICAL fix: without it, two machines (or two overlapping ticks) can
+# both read the same due row and both call release_number for it.
+_CLAIM_NUMBER_RELEASE_SQL = text(
+    """
+    UPDATE notifications
+    SET attempt = :new_attempt, next_attempt_at = :next_attempt_at, updated_at = now()
+    WHERE id = :id AND status = 'pending' AND attempt = :old_attempt
+    RETURNING id
     """
 )
 
@@ -338,14 +432,14 @@ _MARK_RELEASED_SQL = text(
     "UPDATE notifications SET status = 'sent', updated_at = now() WHERE id = :id"
 )
 
-_MARK_RETRY_SQL = text(
-    "UPDATE notifications SET attempt = attempt + 1, next_attempt_at = :next_attempt_at, "
-    "updated_at = now() WHERE id = :id"
-)
-
 _MARK_EXHAUSTED_SQL = text(
     "UPDATE notifications SET status = 'exhausted', updated_at = now() WHERE id = :id"
 )
+
+# L2 (safety review): defensive ownership guard -- never release a SID a
+# LIVE properties row currently references. See module docstring
+# "Deprovisioning safety".
+_SELECT_LIVE_PROPERTY_FOR_SID_SQL = text("SELECT 1 FROM properties WHERE twilio_sid = :twilio_sid")
 
 
 async def sweep_pending_number_releases(*, now: datetime | None = None) -> list[str]:
@@ -354,7 +448,8 @@ async def sweep_pending_number_releases(*, now: datetime | None = None) -> list[
     ``run_emergency_chain_sweep``/``run_sms_drain_sweep``
     (``app/agent/emergency_chain.py``): reads what's due from the DB (never
     from in-process memory — ``app/scheduler.py``'s own "Crash-safety"
-    doctrine), acts, and durably records the outcome.
+    doctrine), CLAIMS each row before acting (see module docstring
+    "Deprovisioning safety", M1/L1), and durably records the outcome.
 
     Returns the list of ``twilio_sid``s actually released this tick
     (test seam / observability — callers in production discard it).
@@ -367,7 +462,12 @@ async def sweep_pending_number_releases(*, now: datetime | None = None) -> list[
 
     async with _acm(get_admin_session)() as session:
         rows = (
-            (await session.execute(_SELECT_DUE_NUMBER_RELEASES_SQL, {"now": effective_now}))
+            (
+                await session.execute(
+                    _SELECT_DUE_NUMBER_RELEASES_SQL,
+                    {"now": effective_now, "limit": _NUMBER_RELEASE_SWEEP_BATCH_LIMIT},
+                )
+            )
             .mappings()
             .all()
         )
@@ -378,7 +478,7 @@ async def sweep_pending_number_releases(*, now: datetime | None = None) -> list[
     for row in rows:
         notification_id = row["id"]
         payload = row["payload"] or {}
-        attempt = int(row["attempt"])
+        old_attempt = int(row["attempt"])
         twilio_sid = payload.get("twilio_sid")
 
         if not twilio_sid:
@@ -390,31 +490,82 @@ async def sweep_pending_number_releases(*, now: datetime | None = None) -> list[
             log.error("number_release_row_missing_twilio_sid", notification_id=str(notification_id))
             continue
 
+        is_last_attempt = old_attempt + 1 >= _NUMBER_RELEASE_MAX_ATTEMPTS
+        next_attempt_at = effective_now + timedelta(seconds=_NUMBER_RELEASE_RETRY_INTERVAL_SECONDS)
+
+        # Claim FIRST, before any Twilio call -- see _CLAIM_NUMBER_RELEASE_SQL.
+        async with _acm(get_admin_session)() as session:
+            claim_row = (
+                (
+                    await session.execute(
+                        _CLAIM_NUMBER_RELEASE_SQL,
+                        {
+                            "id": notification_id,
+                            "old_attempt": old_attempt,
+                            "new_attempt": old_attempt + 1,
+                            "next_attempt_at": next_attempt_at,
+                        },
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if claim_row is None:
+            # Lost the race -- another process/tick already claimed this
+            # row. Do nothing further this tick (test: "lost-claim race ->
+            # loser does nothing").
+            continue
+
+        # L2: never release a SID a LIVE properties row still references --
+        # see module docstring "Deprovisioning safety".
+        async with _acm(get_admin_session)() as session:
+            live_property = (
+                (
+                    await session.execute(
+                        _SELECT_LIVE_PROPERTY_FOR_SID_SQL, {"twilio_sid": twilio_sid}
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if live_property is not None:
+            async with _acm(get_admin_session)() as session:
+                await session.execute(_MARK_EXHAUSTED_SQL, {"id": notification_id})
+            log.error("number_release_blocked_live_property_owns_sid", twilio_sid=twilio_sid)
+            sentry_sdk.capture_message(
+                "Twilio number release blocked -- a LIVE property still owns this SID",
+                level="error",
+                extras={"twilio_sid": twilio_sid},
+            )
+            continue
+
         try:
             await provisioner.release_number(twilio_sid=twilio_sid)
-        except Exception as exc:
-            is_last_attempt = attempt + 1 >= _NUMBER_RELEASE_MAX_ATTEMPTS
+        except TwilioNumberNotFoundError:
+            # M2: already gone -- for a release GOAL this is success, not
+            # a retryable failure. No Sentry page (keeps the eventual
+            # exhaustion page trustworthy).
             async with _acm(get_admin_session)() as session:
-                if is_last_attempt:
+                await session.execute(_MARK_RELEASED_SQL, {"id": notification_id})
+            log.info("twilio_number_already_released", twilio_sid=twilio_sid)
+            released.append(twilio_sid)
+            continue
+        except Exception as exc:
+            if is_last_attempt:
+                async with _acm(get_admin_session)() as session:
                     await session.execute(_MARK_EXHAUSTED_SQL, {"id": notification_id})
-                    log.error(
-                        "number_release_exhausted",
-                        twilio_sid=twilio_sid,
-                        exc_type=type(exc).__name__,
-                    )
-                    sentry_sdk.capture_message(
-                        "Twilio number release exhausted its retry budget",
-                        level="error",
-                        extras={"twilio_sid": twilio_sid, "exc_type": type(exc).__name__},
-                    )
-                else:
-                    next_attempt_at = effective_now + timedelta(
-                        seconds=_NUMBER_RELEASE_RETRY_INTERVAL_SECONDS
-                    )
-                    await session.execute(
-                        _MARK_RETRY_SQL,
-                        {"id": notification_id, "next_attempt_at": next_attempt_at},
-                    )
+                log.error(
+                    "number_release_exhausted",
+                    twilio_sid=twilio_sid,
+                    exc_type=type(exc).__name__,
+                )
+                sentry_sdk.capture_message(
+                    "Twilio number release exhausted its retry budget",
+                    level="error",
+                    extras={"twilio_sid": twilio_sid, "exc_type": type(exc).__name__},
+                )
+            # else: the claim above already advanced attempt/next_attempt_at
+            # -- nothing further to do; the next due tick retries it.
             continue
 
         async with _acm(get_admin_session)() as session:
@@ -431,6 +582,7 @@ __all__: list[str] = [
     "ProvisionResult",
     "ProvisioningFailedError",
     "PublicBaseUrlUnconfiguredError",
+    "alert_purchased_but_unrecorded",
     "provision_number",
     "release_number_best_effort",
     "schedule_number_release",
