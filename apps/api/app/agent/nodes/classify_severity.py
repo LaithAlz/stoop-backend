@@ -72,16 +72,52 @@ precedent (schema-v1.md's v1.1 amendments: superseded by an append-only
 event table instead of an in-place UPDATE). The CANONICAL record here is
 instead an ``audit_log`` row: ``actor='agent'``, ``action='classified'``
 (existing vocabulary — schema-v1.md's ``audit_log.action`` CHECK already
-lists it), ``payload = {message_id, case_id, severity, rules_fired,
-modifier, refusal_flags, model, tokens_in, tokens_out, cost_cents,
-prompt_version}``. This matches ``docs/03-engineering/api-contracts.md``'s
-own timeline example (``GET /v1/cases/{id}``: ``{"kind": "audit", "actor":
-"agent", "action": "classified", "payload": {"severity": "urgent",
-"rules_fired": ["…"]}}``), extended with the token/cost/model fields this
-issue also needs recorded somewhere durable. NO message body ever enters
-this payload — only the structured fields above (per-issue reasoning
-sentences stay in ``reasoning_log``/``state["severity"]``, landlord-visible
-on the approval card, never duplicated into the audit trail).
+lists it), ``payload = {message_id, case_id, severity, summary,
+rules_fired, modifier, refusal_flags, model, tokens_in, tokens_out,
+cost_cents, prompt_version}``. This matches
+``docs/03-engineering/api-contracts.md``'s own timeline example (``GET
+/v1/cases/{id}``: ``{"kind": "audit", "actor": "agent", "action":
+"classified", "payload": {"severity": "urgent", "rules_fired": ["…"]}}``),
+extended with the token/cost/model fields this issue also needs recorded
+somewhere durable. NO message body ever enters this payload — only the
+structured fields above.
+
+**schema-v1 v1.7 amendment — the one carved-out exception to "never
+duplicated into the audit trail":** every reasoning_log line is otherwise
+transient graph state, intentionally never persisted verbatim into
+``audit_log``. This revises that ruling for exactly ONE derived value: the
+payload's new ``summary`` key (spec-guardian review, #56 PR: the margin
+note must carry the model's SUBSTANTIVE, case-specific reasoning — "No
+heat on a cold night with a baby in the unit can't wait, so I treated it
+as urgent.", schema-v1.md's own illustrative example — not a content-free
+restatement of the severity chip the dashboard already renders
+separately). Concretely: ``summary`` is ``" ".join(severity_result.
+reasoning)`` — the model's own per-issue explanation(s), already produced
+in its tool output and already appended to ``reasoning_log`` verbatim, no
+prompt/rubric change — UNLESS either:
+
+1. the model returned no ``reasoning`` at all (nothing case-specific to
+   persist), or
+2. a Tier-0 clamp just fired on this call (see "The Tier-0 clamp" above)
+   — the model's own reasoning still reflects its PRE-clamp, non-emergency
+   judgment call, and persisting it verbatim as ``summary`` would read as
+   de-escalating relative to the clamped EMERGENCY severity recorded on
+   this same row. The never-break invariant ("the agent may escalate past
+   a Tier-0 miss, never de-escalate a Tier-0 fire") extends to the TONE of
+   this landlord-facing sentence, not just the enum value.
+
+In either case ``summary`` falls back to the same deterministic sentence
+this node always appends to ``reasoning_log`` regardless (``f"I'm
+treating this as {…}."``). Rationale for the key existing at all
+(schema-v1.md v1.7): ``reasoning_log`` lives only in transient graph state
+and opaque checkpoint blobs, so nothing durable/queryable served the
+approval card's margin note (``why`` in ``GET /v1/queue``, #56) before
+this — the ``audit_log`` row is already the canonical classification
+record (v1.6 above), so this belongs on it too. Rows written before this
+change lack the key; readers treat a missing ``summary`` as ``null``
+(``GET /v1/queue`` then returns ``why: null``). No OTHER reasoning_log
+line (the Tier-0 clamp note, the modifier note) is duplicated onto the
+audit row — only this one derived ``summary`` value.
 
 **Doc-first, applied:** the five ``messages`` columns above are marked
 DEPRECATED in ``schema-v1.md`` (v1.6 amendments — never written; canonical
@@ -236,11 +272,13 @@ async def _insert_classified_audit(
     severity_result: SeverityResult,
     call_result: anthropic_mod.ToolCallResult,
     cost_cents: float,
+    summary: str,
 ) -> None:
     payload = {
         "message_id": str(message_id),
         "case_id": str(case_id) if case_id is not None else None,
         "severity": severity_result.severity.db_value,
+        "summary": summary,
         "rules_fired": severity_result.rules_fired,
         "modifier": severity_result.modifier,
         "refusal_flags": [flag.value for flag in severity_result.refusal_flags],
@@ -319,6 +357,7 @@ async def classify_severity(state: AgentState) -> dict[str, Any]:
         return {"classification_failed": True, "reasoning_log": reasoning_log}
 
     # Tier-0 clamp: never de-escalate a hard prefilter fire.
+    clamped = False
     if prefilter_result.hard_hit and severity_result.severity != Severity.EMERGENCY:
         llm_severity = severity_result.severity
         clamp_note = f"Tier-0 keyword filter fired ({', '.join(prefilter_result.categories)})"
@@ -328,6 +367,7 @@ async def classify_severity(state: AgentState) -> dict[str, Any]:
                 "rules_fired": [*severity_result.rules_fired, clamp_note],
             }
         )
+        clamped = True
         reasoning_log.append("The alarm phrasing already made this an emergency — I kept it there.")
         log.warning(
             "classify_severity_tier0_clamp",
@@ -336,11 +376,28 @@ async def classify_severity(state: AgentState) -> dict[str, Any]:
             categories=prefilter_result.categories,
         )
 
-    reasoning_log.append(f"I'm treating this as {_SEVERITY_DISPLAY[severity_result.severity]}.")
+    deterministic_summary = f"I'm treating this as {_SEVERITY_DISPLAY[severity_result.severity]}."
+    reasoning_log.append(deterministic_summary)
     for line in severity_result.reasoning:
         reasoning_log.append(line)
     if severity_result.modifier:
         reasoning_log.append(severity_result.modifier)
+
+    # audit `summary` (schema-v1 v1.7): prefer the model's own case-specific
+    # reasoning sentence(s) -- substantive content for GET /v1/queue's `why`
+    # margin note, not just a restatement of the severity chip. Falls back
+    # to the deterministic line when the model returned no reasoning at
+    # all, OR when a Tier-0 clamp just fired -- the LLM's reasoning still
+    # reflects its OWN (pre-clamp, non-emergency) judgment call in that
+    # case, and persisting it as `summary` would read as de-escalating
+    # relative to the clamped EMERGENCY severity actually recorded on this
+    # same row (never-break rule: the agent may escalate past a Tier-0
+    # miss, never de-escalate a Tier-0 fire -- that invariant extends to
+    # the tone of this landlord-facing sentence, not just the enum value).
+    if clamped or not severity_result.reasoning:
+        summary_for_audit = deterministic_summary
+    else:
+        summary_for_audit = " ".join(severity_result.reasoning)
 
     cost_cents = anthropic_mod.estimate_cost_cents(
         tokens_in=call_result.tokens_in, tokens_out=call_result.tokens_out
@@ -354,6 +411,7 @@ async def classify_severity(state: AgentState) -> dict[str, Any]:
             severity_result=severity_result,
             call_result=call_result,
             cost_cents=cost_cents,
+            summary=summary_for_audit,
         )
     else:  # pragma: no cover — invariant: landlord_id is always known by this point
         log.error("classify_severity_missing_landlord_id", message_id=str(message_id))

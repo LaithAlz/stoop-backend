@@ -287,12 +287,13 @@ async def test_classify_severity_success_writes_state_and_audit_log(
     case_id = await _insert_case(
         db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
     )
+    body = "fridge just completely died, got a week of groceries in there"
     message_id = await _insert_message(
         db_session,
         landlord_id=landlord_id,
         property_id=property_id,
         tenant_id=tenant_id,
-        body="fridge just completely died, got a week of groceries in there",
+        body=body,
     )
 
     fake_messages = _FakeMessages(
@@ -343,6 +344,13 @@ async def test_classify_severity_success_writes_state_and_audit_log(
         assert payload["severity"] == "urgent"  # lowercase db_value, not "URGENT"
         assert payload["message_id"] == message_id
         assert payload["case_id"] == case_id
+        # schema-v1 v1.7: `summary` carries the model's own case-specific
+        # reasoning sentence (already appended to reasoning_log verbatim),
+        # not the content-free generic severity line -- `GET /v1/queue`'s
+        # `why` margin note needs the REASON, not a restatement of the
+        # severity chip it renders separately (spec-guardian review, #56).
+        assert payload["summary"] == "The fridge is completely dead and groceries will spoil."
+        assert payload["summary"] in update["reasoning_log"]
         assert payload["model"] == "claude-sonnet-5"
         assert payload["tokens_in"] == 200
         assert payload["tokens_out"] == 60
@@ -351,8 +359,13 @@ async def test_classify_severity_success_writes_state_and_audit_log(
         assert "rules_fired" in payload
         assert "modifier" in payload
         assert "refusal_flags" in payload
-        # Never a message body in the audit payload.
-        assert "fridge" not in str(payload)
+        # Never the RAW tenant message body verbatim in the audit payload
+        # -- `summary`/`rules_fired` are the model's own PARAPHRASED
+        # reasoning about the issue (landlord-facing copy, already shown on
+        # the approval card via reasoning_log) and may legitimately reuse
+        # issue-specific words ("fridge") without that being the same thing
+        # as leaking the verbatim inbound SMS text.
+        assert body not in str(payload)
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -641,6 +654,14 @@ async def test_classify_severity_tier0_clamp_never_deescalates(
         )
         assert audit_row["payload"]["severity"] == "emergency"
         assert any("Tier-0" in rule for rule in audit_row["payload"]["rules_fired"])
+        # The persisted summary is the DETERMINISTIC clamped-severity line,
+        # even though the model returned non-empty reasoning ("Seems
+        # minor.") -- that reasoning reflects the model's own pre-clamp,
+        # non-emergency judgment call, and persisting it verbatim would
+        # read as de-escalating relative to the clamped EMERGENCY severity
+        # this same row records. A clamp always wins over model reasoning.
+        assert audit_row["payload"]["summary"] == "I'm treating this as an emergency."
+        assert "minor" not in audit_row["payload"]["summary"]
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -692,5 +713,132 @@ async def test_classify_severity_never_clamps_when_already_emergency(
 
         assert update["severity"].severity.value == "EMERGENCY"
         assert not any("kept it there" in line for line in update["reasoning_log"])
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_severity_summary_is_case_specific_not_generic_template(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """schema-v1 v1.7 / #56 spec-guardian fix: the persisted `summary` must
+    be the model's own substantive, case-specific reasoning -- the margin
+    note adds the REASON, since the severity chip already shows the label
+    -- never just the content-free ``f"I'm treating this as {severity}."``
+    restatement."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="heat has been out since 10pm, we have the baby this week",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                tool_input={
+                    "severity": "EMERGENCY",
+                    "rules_fired": ["no heat overnight + infant present"],
+                    "modifier": "vulnerable-occupant bump: infant",
+                    "refusal_flags": [],
+                    "reasoning": ["No heat on a cold night with a baby in the unit can't wait."],
+                }
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state = _base_state(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+        )
+        await classify_severity(state)
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text("SELECT payload FROM audit_log WHERE case_id = :cid"), {"cid": case_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        summary = audit_row["payload"]["summary"]
+        assert summary == "No heat on a cold night with a baby in the unit can't wait."
+        # Never the content-free generic template when the model gave
+        # substantive reasoning.
+        assert summary != "I'm treating this as an emergency."
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_severity_summary_falls_back_to_generic_line_when_reasoning_empty(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No clamp, but the model returned an empty ``reasoning`` list -- there
+    is nothing case-specific to persist, so `summary` falls back to the
+    same deterministic severity line always appended to reasoning_log."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="parking question, nothing urgent",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                tool_input={
+                    "severity": "ROUTINE",
+                    "rules_fired": [],
+                    "modifier": None,
+                    "refusal_flags": [],
+                    "reasoning": [],
+                }
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state = _base_state(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+        )
+        update = await classify_severity(state)
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text("SELECT payload FROM audit_log WHERE case_id = :cid"), {"cid": case_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"]["summary"] == "I'm treating this as routine."
+        assert audit_row["payload"]["summary"] in update["reasoning_log"]
     finally:
         await _cleanup(db_session, landlord_id)

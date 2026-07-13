@@ -29,6 +29,7 @@ from app.routers import (
     me,
     notifications,
     properties,
+    queue,
     tenants,
     vendors,
 )
@@ -153,11 +154,11 @@ def create_app() -> fastapi.FastAPI:
       4. register AuthError exception handler (401 → standard envelope)
       4b. register AppError exception handler (status_code → standard envelope)
       5. include health router (always)
-      5a. include properties/tenants/vendors/cases routers (#54/#55 —
-          always, landlord-scoped via require_landlord), the drafts router
-          (#44/#45 — the approve/reject/edit-and-send + undo endpoints;
-          landlord-scoped via require_landlord), and the notifications
-          router (always — POST /v1/notifications/{id}/ack is
+      5a. include properties/tenants/vendors/cases/queue routers (#54/#55/
+          #56 — always, landlord-scoped via require_landlord), the drafts
+          router (#44/#45 — the approve/reject/edit-and-send + undo
+          endpoints; landlord-scoped via require_landlord), and the
+          notifications router (always — POST /v1/notifications/{id}/ack is
           landlord-authenticated; GET /ack/{token} is the public
           tokenized-link ack surface, #108)
       5b. include Twilio webhook router (always — no auth header, its own
@@ -206,6 +207,7 @@ def create_app() -> fastapi.FastAPI:
     application.include_router(tenants.router)
     application.include_router(vendors.router)
     application.include_router(cases.router)
+    application.include_router(queue.router)
     application.include_router(drafts.router)
     application.include_router(notifications.router)
     application.include_router(webhooks_twilio.router)
