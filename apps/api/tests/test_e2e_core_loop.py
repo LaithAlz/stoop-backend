@@ -572,6 +572,11 @@ async def test_variant1_routine_urgent_loop_webhook_to_send(
                 assert card["severity"] == "urgent"
                 assert card["tenant_message"] == tenant_body
 
+                # Rule 3, asserted directly: NOTHING has been sent to the
+                # tenant before the landlord approves — not merely inferred
+                # from the draft still being 'pending'.
+                assert [c for c in fake_sender.calls if c.to == tenant_phone] == []
+
                 # --- POST /v1/drafts/{id}/approve (real endpoint) ---
                 approve_response = await client.post(
                     f"/v1/drafts/{draft_id}/approve",
