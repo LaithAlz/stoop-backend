@@ -157,6 +157,24 @@ class Settings(BaseSettings):
         ),
     )
 
+    twilio_messaging_service_sid: str | None = Field(
+        default=None,
+        description=(
+            "Optional Twilio Messaging Service SID for automatic A2P 10DLC/"
+            "CASL campaign association on newly-provisioned property numbers "
+            "(app/property_provisioning.py, #53). Unset today -- A2P "
+            "registration is still pending externally (architecture.md: "
+            "'a milestone-1 task, not an afterthought'). When unset, "
+            "POST /v1/properties still provisions a fully working number, "
+            "just without the campaign association -- logged and skipped "
+            "gracefully, never failing provisioning on it. Set this the day "
+            "a real Messaging Service + campaign exists to start associating "
+            "every NEWLY provisioned number automatically; it has no effect "
+            "on numbers provisioned before it was set (no retroactive "
+            "backfill)."
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Anthropic (agent — #26/#9+; sensitive — no default)
     # ------------------------------------------------------------------

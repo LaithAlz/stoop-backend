@@ -13,12 +13,25 @@ Shapes match ``docs/03-engineering/api-contracts.md``'s "Properties"
 section exactly. Column names are ``schema-v1.md``'s ``properties`` table,
 verbatim.
 
-Twilio provisioning (the doc's "Provisions a Twilio number (#53)" note) is
-issue #53's job, not this one's — #53 is a separate, not-yet-implemented
-issue, and ``app/integrations/twilio*.py`` is out of scope for this PR.
-``POST /v1/properties`` here creates the row with ``twilio_number`` left
-``NULL`` (schema-v1.md: "E.164; null until provisioned" — the column is
-already nullable for exactly this reason).
+Twilio provisioning (#53, ``app/property_provisioning.py`` +
+``app/integrations/twilio_provision.py``): ``POST /v1/properties``
+provisions a real Twilio number BEFORE inserting the row — search (area
+code → province → any CA number) → purchase → configure webhooks →
+best-effort A2P association — and only inserts the row once that succeeds,
+with ``twilio_number``/``twilio_sid`` populated from the start (never a
+row with them ``NULL`` on success; schema-v1.md's "null until provisioned"
+comment describes the failure/pending state, not the success path). Any
+failure releases a just-purchased number as compensation before surfacing
+a clean error — see ``property_provisioning.py``'s own docstring and
+api-contracts.md's v1.11 amendment for the full failure-code contract.
+
+``DELETE`` deprovisions: requires ``?confirm=true`` (400
+``confirmation_required`` otherwise, checked before the existing
+``has_open_cases``/``has_dependents`` checks below), then — for a property
+that had a live number — schedules a 24h-grace-period release rather than
+calling Twilio synchronously (``property_provisioning.schedule_number_
+release``; the actual release is swept by ``app/scheduler.py``). See
+api-contracts.md's v1.11 amendment.
 
 ``DELETE`` is a genuine hard delete (``properties`` has no ``deleted_at``
 column, unlike ``tenants``/``vendors``' ``active`` flag) — the documented
@@ -50,13 +63,15 @@ from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import property_provisioning
 from app.agent.case_lifecycle import OPEN_STATUSES
 from app.audit import record_audit_log
 from app.deps import Landlord, require_landlord
@@ -69,6 +84,8 @@ from app.pagination import (
     paginate_rows,
 )
 from app.validation import reject_explicit_null
+
+log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["properties"])
 
@@ -102,6 +119,12 @@ class PropertyListResponse(BaseModel):
 
 
 class PropertyCreateRequest(BaseModel):
+    """See api-contracts.md's Properties section. ``area_code`` (#53) is a
+    TRANSIENT Twilio-provisioning hint only — never persisted (no
+    ``properties`` column for it, per that section's v1.11 amendment): a
+    3-digit NANP area code biasing the number search; falls back to the
+    property's own ``province``, then any available Canadian number."""
+
     label: str
     address_line1: str
     city: str
@@ -109,6 +132,7 @@ class PropertyCreateRequest(BaseModel):
     postal_code: str | None = None
     house_rules: str | None = None
     backup_contact: dict[str, Any] | None = None
+    area_code: str | None = Field(default=None, pattern=r"^\d{3}$")
 
 
 class PropertyUpdateRequest(BaseModel):
@@ -127,9 +151,12 @@ class PropertyUpdateRequest(BaseModel):
 # SQL
 # ---------------------------------------------------------------------------
 
+# p.twilio_sid rides along for delete_property's deprovisioning step (#53)
+# — never surfaced in PropertyResponse (_row_to_property doesn't reference
+# it), same as any other internal-only column would be.
 _PROPERTY_COLUMNS = (
     "p.id, p.label, p.address_line1, p.city, p.province, p.postal_code, "
-    "p.twilio_number, p.house_rules, p.quiet_hours, p.heating_season, "
+    "p.twilio_number, p.twilio_sid, p.house_rules, p.quiet_hours, p.heating_season, "
     "p.backup_contact, p.created_at, COALESCE(oc.open_case_count, 0) AS open_case_count"
 )
 
@@ -153,9 +180,11 @@ _SELECT_ONE_SQL = text(
 _INSERT_SQL = text(
     """
     INSERT INTO properties (landlord_id, label, address_line1, city, province,
-                             postal_code, house_rules, backup_contact)
+                             postal_code, house_rules, backup_contact,
+                             twilio_number, twilio_sid)
     VALUES (:landlord_id, :label, :address_line1, :city, COALESCE(:province, 'ON'),
-            :postal_code, :house_rules, CAST(:backup_contact AS jsonb))
+            :postal_code, :house_rules, CAST(:backup_contact AS jsonb),
+            :twilio_number, :twilio_sid)
     RETURNING id
     """
 )
@@ -261,25 +290,71 @@ async def create_property(
     landlord_and_session: Annotated[tuple[Landlord, AsyncSession], Depends(require_landlord)],
 ) -> PropertyResponse:
     landlord, session = landlord_and_session
+    effective_province = body.province or "ON"
 
-    result = await session.execute(
-        _INSERT_SQL,
-        {
-            "landlord_id": str(landlord.id),
-            "label": body.label,
-            "address_line1": body.address_line1,
-            "city": body.city,
-            "province": body.province,
-            "postal_code": body.postal_code,
-            "house_rules": body.house_rules,
-            "backup_contact": json.dumps(body.backup_contact)
-            if body.backup_contact is not None
-            else None,
-        },
-    )
-    new_id = result.scalar_one()
+    try:
+        provision_result = await property_provisioning.provision_number(
+            area_code=body.area_code, province=effective_province
+        )
+    except property_provisioning.PublicBaseUrlUnconfiguredError as exc:
+        raise AppError(
+            status_code=500,
+            code="public_base_url_unconfigured",
+            message="Server is not configured for phone provisioning yet.",
+        ) from exc
+    except property_provisioning.NoNumbersAvailableError as exc:
+        raise AppError(
+            status_code=503,
+            code="no_numbers_available",
+            message="No phone numbers are available for that area right now.",
+        ) from exc
+    except property_provisioning.ProvisioningFailedError as exc:
+        raise AppError(
+            status_code=502,
+            code="provisioning_failed",
+            message="Could not provision a phone number right now.",
+        ) from exc
+
+    try:
+        result = await session.execute(
+            _INSERT_SQL,
+            {
+                "landlord_id": str(landlord.id),
+                "label": body.label,
+                "address_line1": body.address_line1,
+                "city": body.city,
+                "province": body.province,
+                "postal_code": body.postal_code,
+                "house_rules": body.house_rules,
+                "backup_contact": json.dumps(body.backup_contact)
+                if body.backup_contact is not None
+                else None,
+                "twilio_number": provision_result.phone_number,
+                "twilio_sid": provision_result.twilio_sid,
+            },
+        )
+        new_id = result.scalar_one()
+    except Exception as exc:
+        # DB write failed AFTER a successful purchase -- compensate rather
+        # than leave a purchased-but-orphaned number (never-break: no
+        # half-provisioned row, and no unreferenced live Twilio number
+        # either). See property_provisioning.py's module docstring.
+        await property_provisioning.release_number_best_effort(provision_result.twilio_sid)
+        raise AppError(
+            status_code=502,
+            code="provisioning_failed",
+            message="Could not provision a phone number right now.",
+        ) from exc
 
     row = await _get_property_or_404(session, landlord_id=str(landlord.id), property_id=str(new_id))
+
+    log.info(
+        "property_provisioned",
+        landlord_id=str(landlord.id),
+        property_id=str(new_id),
+        twilio_sid=provision_result.twilio_sid,
+        a2p_status=provision_result.a2p_status,
+    )
     return _row_to_property(row)
 
 
@@ -365,12 +440,25 @@ async def update_property(
 async def delete_property(
     property_id: UUID,
     landlord_and_session: Annotated[tuple[Landlord, AsyncSession], Depends(require_landlord)],
+    confirm: bool = False,
 ) -> None:
     landlord, session = landlord_and_session
     landlord_id = str(landlord.id)
     prop_id = str(property_id)
 
-    await _get_property_or_404(session, landlord_id=landlord_id, property_id=prop_id)
+    existing = await _get_property_or_404(session, landlord_id=landlord_id, property_id=prop_id)
+
+    # #53: deleting a property with a live phone number is irreversible for
+    # that number (deprovisioning below only delays the release, it never
+    # undoes this delete) — require an explicit ?confirm=true before doing
+    # anything else. Checked before the open-cases/dependents business
+    # checks below (api-contracts.md's v1.11 amendment).
+    if not confirm:
+        raise AppError(
+            status_code=400,
+            code="confirmation_required",
+            message="Pass ?confirm=true to delete this property.",
+        )
 
     open_count = (
         await session.execute(
@@ -395,3 +483,13 @@ async def delete_property(
             code="has_dependents",
             message="This property has related records and cannot be deleted.",
         ) from exc
+
+    twilio_sid = existing["twilio_sid"]
+    if twilio_sid:
+        # Deprovisioning (#53): the property row is already gone (hard
+        # delete, unchanged) — schedule the actual Twilio release for
+        # after the grace period rather than calling Twilio synchronously
+        # here. See property_provisioning.py's module docstring.
+        await property_provisioning.schedule_number_release(
+            session, landlord_id=landlord_id, property_id=prop_id, twilio_sid=twilio_sid
+        )
