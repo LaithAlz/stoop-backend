@@ -72,16 +72,35 @@ precedent (schema-v1.md's v1.1 amendments: superseded by an append-only
 event table instead of an in-place UPDATE). The CANONICAL record here is
 instead an ``audit_log`` row: ``actor='agent'``, ``action='classified'``
 (existing vocabulary — schema-v1.md's ``audit_log.action`` CHECK already
-lists it), ``payload = {message_id, case_id, severity, rules_fired,
-modifier, refusal_flags, model, tokens_in, tokens_out, cost_cents,
-prompt_version}``. This matches ``docs/03-engineering/api-contracts.md``'s
-own timeline example (``GET /v1/cases/{id}``: ``{"kind": "audit", "actor":
-"agent", "action": "classified", "payload": {"severity": "urgent",
-"rules_fired": ["…"]}}``), extended with the token/cost/model fields this
-issue also needs recorded somewhere durable. NO message body ever enters
-this payload — only the structured fields above (per-issue reasoning
-sentences stay in ``reasoning_log``/``state["severity"]``, landlord-visible
-on the approval card, never duplicated into the audit trail).
+lists it), ``payload = {message_id, case_id, severity, summary,
+rules_fired, modifier, refusal_flags, model, tokens_in, tokens_out,
+cost_cents, prompt_version}``. This matches
+``docs/03-engineering/api-contracts.md``'s own timeline example (``GET
+/v1/cases/{id}``: ``{"kind": "audit", "actor": "agent", "action":
+"classified", "payload": {"severity": "urgent", "rules_fired": ["…"]}}``),
+extended with the token/cost/model fields this issue also needs recorded
+somewhere durable. NO message body ever enters this payload — only the
+structured fields above.
+
+**schema-v1 v1.7 amendment — the one carved-out exception to "never
+duplicated into the audit trail":** every reasoning_log line is otherwise
+transient graph state, intentionally never persisted verbatim into
+``audit_log`` (per-issue reasoning sentences stay in ``reasoning_log``/
+``state["severity"]``, landlord-visible on the approval card only). This
+revises that ruling for exactly ONE line: the deterministic severity
+sentence this node always appends to ``reasoning_log`` (``f"I'm treating
+this as {…}."`` — see :func:`classify_severity` below), which is ALSO
+written into the payload's ``summary`` key. Rationale (schema-v1.md v1.7):
+``reasoning_log`` lives only in transient graph state and opaque
+checkpoint blobs, so nothing durable/queryable served the approval card's
+margin note (``why`` in ``GET /v1/queue``, #56) before this — the
+``audit_log`` row is already the canonical classification record (v1.6
+above), so this one sentence belongs on it too. Rows written before this
+change lack the key; readers treat a missing ``summary`` as ``null``
+(``GET /v1/queue`` then returns ``why: null``). No other reasoning_log
+line (per-issue ``reasoning`` entries, the Tier-0 clamp note, the modifier
+note) is duplicated onto the audit row — only this one, singular,
+always-present sentence.
 
 **Doc-first, applied:** the five ``messages`` columns above are marked
 DEPRECATED in ``schema-v1.md`` (v1.6 amendments — never written; canonical
@@ -236,11 +255,13 @@ async def _insert_classified_audit(
     severity_result: SeverityResult,
     call_result: anthropic_mod.ToolCallResult,
     cost_cents: float,
+    summary: str,
 ) -> None:
     payload = {
         "message_id": str(message_id),
         "case_id": str(case_id) if case_id is not None else None,
         "severity": severity_result.severity.db_value,
+        "summary": summary,
         "rules_fired": severity_result.rules_fired,
         "modifier": severity_result.modifier,
         "refusal_flags": [flag.value for flag in severity_result.refusal_flags],
@@ -336,7 +357,8 @@ async def classify_severity(state: AgentState) -> dict[str, Any]:
             categories=prefilter_result.categories,
         )
 
-    reasoning_log.append(f"I'm treating this as {_SEVERITY_DISPLAY[severity_result.severity]}.")
+    summary_sentence = f"I'm treating this as {_SEVERITY_DISPLAY[severity_result.severity]}."
+    reasoning_log.append(summary_sentence)
     for line in severity_result.reasoning:
         reasoning_log.append(line)
     if severity_result.modifier:
@@ -354,6 +376,7 @@ async def classify_severity(state: AgentState) -> dict[str, Any]:
             severity_result=severity_result,
             call_result=call_result,
             cost_cents=cost_cents,
+            summary=summary_sentence,
         )
     else:  # pragma: no cover — invariant: landlord_id is always known by this point
         log.error("classify_severity_missing_landlord_id", message_id=str(message_id))

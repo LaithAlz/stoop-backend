@@ -343,6 +343,11 @@ async def test_classify_severity_success_writes_state_and_audit_log(
         assert payload["severity"] == "urgent"  # lowercase db_value, not "URGENT"
         assert payload["message_id"] == message_id
         assert payload["case_id"] == case_id
+        # schema-v1 v1.7: the same deterministic severity sentence appended
+        # to reasoning_log is also durably recorded here (`GET /v1/queue`'s
+        # `why` fallback source, #56).
+        assert payload["summary"] == "I'm treating this as urgent."
+        assert payload["summary"] in update["reasoning_log"]
         assert payload["model"] == "claude-sonnet-5"
         assert payload["tokens_in"] == 200
         assert payload["tokens_out"] == 60
@@ -641,6 +646,9 @@ async def test_classify_severity_tier0_clamp_never_deescalates(
         )
         assert audit_row["payload"]["severity"] == "emergency"
         assert any("Tier-0" in rule for rule in audit_row["payload"]["rules_fired"])
+        # The persisted summary reflects the CLAMPED severity (EMERGENCY),
+        # never the LLM's pre-clamp ROUTINE call.
+        assert audit_row["payload"]["summary"] == "I'm treating this as an emergency."
     finally:
         await _cleanup(db_session, landlord_id)
 
