@@ -517,6 +517,13 @@ async def test_variant1_routine_urgent_loop_webhook_to_send(
         assert webhook_response.status_code == 200
         assert webhook_response.text == "<Response/>"
 
+        # DETERMINISM INVARIANT this module (alone) depends on: the webhook
+        # schedules classification via Starlette BackgroundTasks (never
+        # asyncio.create_task), and httpx's ASGITransport awaits the ASGI app
+        # — background tasks included — before _post_sms returns. That is why
+        # the graph's rows can be read synchronously below. If the webhook
+        # ever switches to create_task, or these tests move to a live-server
+        # transport, every post-webhook read here becomes racy.
         message_row = (
             (
                 await db_session.execute(
