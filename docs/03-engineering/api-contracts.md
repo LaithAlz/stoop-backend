@@ -308,6 +308,9 @@ consistent position, just possibly not the one the client expected).
   `already_sent` belongs to the undo/reject paths only.
 - Undo window is +5s from the dashboard (approve-by-SMS: +5min — see
   Webhooks).
+- The actual send dispatches on the shared 60-second scheduler tick —
+  worst case ~65s after approval; `undo_until` is unaffected and undo
+  continues to succeed until the row is actually claimed.
 `DELETE /v1/drafts/{id}/approve` → 200 `{ "status": "pending" }`
 (cancels within the undo window; idempotent if already `pending`).
 - 409 `already_sent` once the sender has actually claimed/sent it

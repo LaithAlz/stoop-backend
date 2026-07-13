@@ -505,6 +505,99 @@ async def test_no_property_twilio_number_refuses_to_send(db_session: AsyncSessio
         await _cleanup(db_session, landlord_id)
 
 
+# ---------------------------------------------------------------------------
+# 7. Wall-clock deadline (safety review, MEDIUM) -- sender_tick bounds its
+#    own worst-case duration; leftovers wait for the next tick, never lost.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """A mutable, injectable time source for ``sender_tick``'s deadline
+    check — advanced explicitly by the fake sender below rather than
+    sleeping for real seconds."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _DeadlineBlowingSender:
+    """Records every call (by recipient phone); advances a shared
+    :class:`_FakeClock` past the tick's deadline on its FIRST send,
+    simulating a slow Twilio round-trip that must not be allowed to also
+    delay claiming every OTHER due draft in the same tick."""
+
+    def __init__(self, clock: _FakeClock, *, advance_by: float) -> None:
+        self._clock = clock
+        self._advance_by = advance_by
+        self.calls: list[str] = []
+
+    async def send_sms(self, *, to_e164: str, from_e164: str, body: str) -> str:
+        self.calls.append(to_e164)
+        self._clock.now += self._advance_by
+        return f"SM{uuid.uuid4().hex}"
+
+
+@pytest.mark.integration
+async def test_sender_tick_stops_claiming_after_deadline_then_resumes_next_tick(
+    db_session: AsyncSession,
+) -> None:
+    """Two due drafts; the first send blows the (tiny, test-only) deadline.
+    The SECOND due draft must NOT be claimed in the same tick -- it stays
+    'approved' and due, claimed whole by the very next tick call. Nothing
+    lost; never abandoned mid-claim."""
+    landlord_id_a, _case_id_a, draft_id_a = await _seed_approved_draft(
+        db_session, due_in_seconds=-2.0
+    )
+    landlord_id_b, _case_id_b, draft_id_b = await _seed_approved_draft(
+        db_session, due_in_seconds=-1.0
+    )
+    clock = _FakeClock(start=0.0)
+    sender = _DeadlineBlowingSender(clock, advance_by=10.0)
+
+    try:
+        claimed_first_tick = await sender_tick(
+            sender=sender, deadline_seconds=5.0, time_source=clock
+        )
+        assert claimed_first_tick == 1
+        assert len(sender.calls) == 1
+
+        status_a = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id_a}
+            )
+        ).scalar_one()
+        assert status_a == "sent"
+
+        status_b = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id_b}
+            )
+        ).scalar_one()
+        assert status_b == "approved"  # NOT claimed this tick -- deadline already exceeded
+
+        # The next tick call (clock already past the first deadline window,
+        # but sender_tick recomputes its OWN start from time_source() every
+        # call) claims and sends the leftover draft.
+        claimed_second_tick = await sender_tick(
+            sender=sender, deadline_seconds=5.0, time_source=clock
+        )
+        assert claimed_second_tick == 1
+        assert len(sender.calls) == 2
+
+        status_b_after = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id_b}
+            )
+        ).scalar_one()
+        assert status_b_after == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id_a)
+        await _cleanup(db_session, landlord_id_b)
+
+
 def test_sms_sender_protocol_is_a_runtime_checkable_shape() -> None:
     """Cheap unit-level pin: SmsSender is the ONE seam the ticker depends
     on — a fake implementing just `send_sms` satisfies it structurally."""

@@ -33,6 +33,26 @@ file for the entire scheduler surface; if a FIFTH sweep ever needs
 combining here and this file starts to sprawl, split it back out rather
 than let it bloat.
 
+Bounding sender_tick's own worst-case duration (safety review, MEDIUM)
+------------------------------------------------------------------------
+``sender_tick`` shares this SAME single ticker task with the three sweeps
+above — a slow tick here is a slow tick for the emergency chain sweep's
+NEXT run too. Up to ``DEFAULT_BATCH_SIZE`` (25) candidate drafts, each
+risking a 10s Twilio timeout (``app/integrations/twilio_send.py``'s
+``AsyncTwilioHttpClient``), could otherwise stretch one tick to ~250s in
+the worst case. ``app/agent/draft_sender.py::sender_tick`` bounds this
+with its own wall-clock deadline (``DEFAULT_TICK_DEADLINE_SECONDS``, 25s
+by default, computed from the injectable time source at tick start): once
+exceeded it stops claiming NEW drafts for the rest of that tick (a draft
+already claimed always finishes; leftover due candidates simply wait,
+unclaimed and still ``'approved'``, for the very next tick — nothing is
+lost). This bounds sender_tick's own contribution to a single tick's
+duration to roughly ``DEFAULT_TICK_DEADLINE_SECONDS`` plus one in-flight
+send's tail latency, so the other three sweeps' own cadence is never
+starved by an unbounded draft-sending backlog. The emergency chain sweep
+still runs FIRST in ``_run_one_tick_body`` (unchanged) — this deadline is
+additive insurance for the LAST sweep in the tick, not a reordering.
+
 Crash-safety
 ------------
 The ticker itself carries NO schedule state — it only wakes every

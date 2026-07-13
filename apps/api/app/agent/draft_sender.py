@@ -82,13 +82,19 @@ never starts its own competing lifespan task. :func:`run_sender_loop`
 stop-event) remains as a fully-built, independently testable seam — kept
 for its own test coverage and as a documented alternative wiring, but is
 NOT invoked from ``app/main.py`` or ``app/scheduler.py``; the scheduler
-calls :func:`sender_tick` directly instead.
+calls :func:`sender_tick` directly instead. Because that call shares the
+SAME ticker task as the other three sweeps, :func:`sender_tick` bounds its
+own worst-case duration against a wall-clock deadline (see
+:data:`DEFAULT_TICK_DEADLINE_SECONDS`) so a large send backlog can never
+push the next tick — and thus the next emergency re-escalation sweep —
+meaningfully late.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
@@ -108,10 +114,30 @@ DEFAULT_BATCH_SIZE = 25
 candidate-selection connection open indefinitely under a large backlog."""
 
 DEFAULT_INTERVAL_SECONDS = 2.0
-"""Short relative to the 5s undo window on purpose — a due 'approved' row
-should be picked up promptly, not up to a minute late (contrast with
-#108's 60s-class escalation-chain sweep, a different domain with a much
-coarser due-time granularity)."""
+"""Short relative to the 5s undo window on purpose -- a due 'approved' row
+should be picked up promptly, not up to a minute late. This rationale
+applies ONLY to :func:`run_sender_loop`, the unused standalone seam (see
+module docstring "Wiring") -- production dispatch does not use this
+interval at all; it rides ``app/scheduler.py``'s existing 60s tick
+instead, so a due row is picked up somewhere between ~0s and ~60s later in
+production, never governed by this constant."""
+
+DEFAULT_TICK_DEADLINE_SECONDS = 25.0
+"""Wall-clock budget for one :func:`sender_tick` call (safety review,
+MEDIUM finding: ``sender_tick`` shares the single scheduler ticker task
+with the emergency chain sweep, the SMS drain sweep, and the degraded-mode
+sweep, all of which must still run promptly every tick -- see
+``app/scheduler.py``'s own module docstring "Bounding sender_tick's own
+worst-case duration"). Up to :data:`DEFAULT_BATCH_SIZE` (25) candidates
+each risking a 10s Twilio timeout (``app/integrations/twilio_send.py``'s
+``AsyncTwilioHttpClient``) could otherwise push a single tick to ~250s,
+delaying the NEXT tick (and thus the next emergency re-escalation sweep)
+by the same amount. Once exceeded, :func:`sender_tick` stops CLAIMING new
+drafts for the rest of that tick -- a draft already claimed and mid-send
+always finishes (never abandoned mid-flight); any leftover due candidates
+simply remain ``'approved'`` and due, picked up whole by the very next
+tick. Nothing is lost -- matches this module's own "the undo window is
+data, not a sleep" invariant."""
 
 # ---------------------------------------------------------------------------
 # SQL
@@ -169,6 +195,16 @@ _INSERT_SENT_AUDIT_SQL = text(
     "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
     "VALUES (:landlord_id, :case_id, 'system', 'sent', CAST(:payload AS jsonb))"
 )
+
+
+def _default_time_source() -> float:
+    """The real, monotonic clock :func:`sender_tick` budgets its wall-clock
+    deadline against -- ``asyncio.get_running_loop().time()`` per the
+    safety review's own wording ("computed from loop.time() at tick
+    start"). Injectable so tests can advance a fake clock deterministically
+    instead of sleeping for real seconds — see
+    ``tests/test_agent_draft_sender.py``'s own deadline tests."""
+    return asyncio.get_running_loop().time()
 
 
 async def _claim_draft(session: AsyncSession, draft_id: UUID) -> dict[str, Any] | None:
@@ -286,6 +322,16 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
             draft_id=str(draft_id),
             case_id=str(case_id),
         )
+        # Safety review (MEDIUM): a stuck 'sending' row must never rely on
+        # a log line alone to surface -- same paging discipline as the
+        # edited/empty-final_body guard above (uuids only, never a phone
+        # number or message body).
+        sentry_sdk.capture_message(
+            "draft_sender: no twilio_number provisioned for this property -- "
+            "refusing to send, draft left stuck 'sending'",
+            level="error",
+            extras={"draft_id": str(draft_id), "case_id": str(case_id)},
+        )
         return
 
     try:
@@ -296,6 +342,19 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
             draft_id=str(draft_id),
             case_id=str(case_id),
             exc_type=type(exc).__name__,
+        )
+        # Safety review (MEDIUM): a send failure must page, not just log --
+        # this is the row a landlord's approved reply can otherwise die in
+        # silence in (uuids/exception type only, never a phone number or
+        # message body).
+        sentry_sdk.capture_message(
+            "draft_sender: send_sms raised -- draft left stuck 'sending'",
+            level="error",
+            extras={
+                "draft_id": str(draft_id),
+                "case_id": str(case_id),
+                "exc_type": type(exc).__name__,
+            },
         )
         return
 
@@ -358,18 +417,31 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
     log.info("draft_sender_sent", draft_id=str(draft_id), case_id=str(case_id), edited=edited)
 
 
-async def sender_tick(*, sender: SmsSender, batch_size: int = DEFAULT_BATCH_SIZE) -> int:
+async def sender_tick(
+    *,
+    sender: SmsSender,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    deadline_seconds: float = DEFAULT_TICK_DEADLINE_SECONDS,
+    time_source: Callable[[], float] = _default_time_source,
+) -> int:
     """One tick: claims and processes every ``'approved'`` draft whose
-    ``scheduled_send_at`` is due, up to *batch_size*. Returns the number of
-    drafts this tick actually WON the claim race for (regardless of
-    whether each one's send ultimately succeeded — see
-    :func:`_process_claimed_draft`'s own per-draft failure handling).
+    ``scheduled_send_at`` is due, up to *batch_size* -- bounded by
+    *deadline_seconds* of wall-clock time from this call's own start (see
+    :data:`DEFAULT_TICK_DEADLINE_SECONDS`). Returns the number of drafts
+    this tick actually WON the claim race for (regardless of whether each
+    one's send ultimately succeeded — see :func:`_process_claimed_draft`'s
+    own per-draft failure handling).
 
     Safe to call repeatedly / concurrently: claiming is the single atomic
     conditional UPDATE described in the module docstring, so two
     overlapping ticks (same process or two process instances) can never
     both claim the same row.
+
+    *time_source* defaults to the real event loop clock
+    (:func:`_default_time_source`) — tests inject a fake, monotonically
+    -advanceable callable instead of sleeping for real seconds.
     """
+    start = time_source()
     async with asynccontextmanager(get_admin_session)() as session:
         candidate_rows = (
             (await session.execute(_SELECT_DUE_DRAFT_IDS_SQL, {"limit": batch_size}))
@@ -379,7 +451,21 @@ async def sender_tick(*, sender: SmsSender, batch_size: int = DEFAULT_BATCH_SIZE
     candidate_ids: list[UUID] = [row["id"] for row in candidate_rows]
 
     claimed_count = 0
-    for draft_id in candidate_ids:
+    for index, draft_id in enumerate(candidate_ids):
+        if time_source() - start >= deadline_seconds:
+            # Wall-clock budget exceeded (safety review, MEDIUM) -- stop
+            # CLAIMING new drafts for the rest of this tick. Every draft
+            # claimed above already finished processing (this loop awaits
+            # each one in turn, never abandoning a claimed row mid-send);
+            # the remaining candidates stay 'approved' and due, claimed
+            # whole by the very next tick -- nothing lost, see
+            # DEFAULT_TICK_DEADLINE_SECONDS's own docstring.
+            log.info(
+                "draft_sender_tick_deadline_reached",
+                claimed_this_tick=claimed_count,
+                remaining_candidates=len(candidate_ids) - index,
+            )
+            break
         async with asynccontextmanager(get_admin_session)() as claim_session:
             claimed = await _claim_draft(claim_session, draft_id)
         if claimed is None:
@@ -447,6 +533,7 @@ async def run_sender_loop(
 __all__: list[str] = [
     "DEFAULT_BATCH_SIZE",
     "DEFAULT_INTERVAL_SECONDS",
+    "DEFAULT_TICK_DEADLINE_SECONDS",
     "run_sender_loop",
     "sender_tick",
 ]
