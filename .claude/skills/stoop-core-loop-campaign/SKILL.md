@@ -34,19 +34,27 @@ order (founder directive): **#34+#43 → #109/#108 → #44/#45 → #50 → #111*
 so if you build Phase 4 first, the send helper moves there and Phase 3 reuses
 it; either way the "one send seam" fence holds).
 
-**Campaign status (as of 2026-07-12):** Phase 1 (#34) MERGED — PR #185
-(squash `69abba4`). Phase 2 (#43) MERGED — PR #187 (squash `a61b95e`,
-2026-07-10; three pre-merge catches recorded as archaeology A23). Phase 4's
-**#109 degraded half MERGED** — PR #188 (squash `161e24c`, 2026-07-12;
-live DB at migration head **0009**, which adds the `tenant_ack`/
-`degraded_retry` notification types). Still open: **#108** (escalation
-chain + first sender — in flight), **#44/#45** (Phase 3), **#50**, **#111**.
-Standing deployment gap until #108 lands: nothing schedules
-`sweep_degraded_mode_retries` and no sender exists, so `tenant_ack`/
-`needs_eyes` rows accumulate undelivered — see the DEPLOYMENT-GATING FACT
-docstring in `app/agent/degraded_mode_sweep.py` and architecture-contract
-weak point 2. Treat the merged phases' sections below as contracts to
-preserve, not work to do.
+**Campaign status (as of 2026-07-13): THE CORE LOOP IS COMPLETE.**
+Phase 1 (#34) MERGED — PR #185 (`69abba4`). Phase 2 (#43) MERGED — PR #187
+(`a61b95e`; archaeology A23). Phase 4 FULLY MERGED: #109 — PR #188
+(`161e24c`) AND **#108 — PR #196 (`7d1c21f`, 2026-07-13)**: escalation
+chain (born-enriched T+0 rows, GET/POST ack split, exactly-once CAS
+claims), first outbound Twilio (`app/integrations/twilio_send.py`), the
+60s scheduler (`app/scheduler.py`), migration 0010. The #188-era
+deployment gap is CLOSED — the scheduler drives all sweeps and the drain
+delivers `tenant_ack` rows. Phase 3 (#44/#45) MERGED — **PR #198**
+(`a399e76`): four draft endpoints + the sender live-bound through
+`sms_sender.py` (send allowlist = exact-set {twilio_send, emergency_chain,
+sms_sender}); dispatch rides the 60s tick with a 25s sender deadline
+(worst-case ~65s approve→send, adjudicated spec-compliant; fast-follows
+in #199). Phase 5's fake-based #50 rehearsal MERGED — **PR #201**
+(`test_e2e_core_loop.py`; #50 stays open for the credential-gated staging
+half). Also landed the same day: #56+#183 queue (**PR #200**), #197
+`cases.severity` write + trust_metrics unblock (**PR #202**), #53
+provisioning (**PR #204**, migration 0011). **Live Supabase at migration
+head 0011.** Still open: **#111** (metering), #50's staging half, #60
+(trust ladder — in flight). Treat every merged phase's section below as a
+contract to preserve, not work to do.
 
 Definitions used throughout:
 - **Tier-0 prefilter** — deterministic regex emergency filter
