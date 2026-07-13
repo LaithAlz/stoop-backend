@@ -54,7 +54,14 @@ write path that sets it at insert time), the exact pattern
 ``app/routers/cases.py``'s ``_SELECT_MESSAGES_SQL`` already established for
 the same reason: ``messages.case_id`` is always ``NULL`` in production
 (``messages`` is append-only; the webhook, the sole writer, inserts before
-case identity is known).
+case identity is known). Both this LATERAL subquery and the 'classified'
+``audit_log`` one below carry an explicit ``landlord_id = :landlord_id``
+predicate (safety review, belt-and-braces) — transitively redundant given
+the outer ``c.id`` correlation already scopes to a case that's already
+landlord-filtered, but matching ``app/routers/cases.py``'s own convention
+(``_SELECT_MESSAGES_SQL``/``_SELECT_AUDIT_SQL``, lines ~220/243) of never
+relying on transitivity alone for a cross-tenant-sensitive query, so these
+stay correct even with RLS off.
 
 Ordering — computed in Python, not SQL
 -----------------------------------------
@@ -186,7 +193,8 @@ _SELECT_QUEUE_SQL = text(
     LEFT JOIN LATERAL (
         SELECT m.body, m.created_at
         FROM messages m
-        WHERE m.party = 'tenant'
+        WHERE m.landlord_id = :landlord_id
+          AND m.party = 'tenant'
           AND m.direction = 'inbound'
           AND (
             m.case_id = c.id
@@ -201,7 +209,7 @@ _SELECT_QUEUE_SQL = text(
     LEFT JOIN LATERAL (
         SELECT a.payload
         FROM audit_log a
-        WHERE a.case_id = c.id AND a.action = 'classified'
+        WHERE a.landlord_id = :landlord_id AND a.case_id = c.id AND a.action = 'classified'
         ORDER BY a.created_at DESC
         LIMIT 1
     ) audit ON true

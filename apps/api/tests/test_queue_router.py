@@ -458,15 +458,24 @@ async def test_queue_scoped_by_landlord_cross_tenant_isolation(session: AsyncSes
         _p, _t, case_a = await _seed_awaiting_case(
             session,
             landlord_id=landlord_a_id,
+            tenant_name="Tenant A",
             classified_payload={"severity": "urgent", "rules_fired": [], "refusal_flags": []},
         )
-
-        result_b = await get_queue((landlord_b, session))
-        assert result_b.items == []
-        assert result_b.counts.total == 0
+        _p, _t, case_b = await _seed_awaiting_case(
+            session,
+            landlord_id=landlord_b_id,
+            tenant_name="Tenant B",
+            classified_payload={"severity": "urgent", "rules_fired": [], "refusal_flags": []},
+        )
+        assert case_a != case_b
 
         result_a = await get_queue((landlord_a, session))
         assert [str(item.case_id) for item in result_a.items] == [case_a]
+        assert result_a.counts.total == 1
+
+        result_b = await get_queue((landlord_b, session))
+        assert [str(item.case_id) for item in result_b.items] == [case_b]
+        assert result_b.counts.total == 1
     finally:
         await _cleanup(session, landlord_a_id)
         await _cleanup(session, landlord_b_id)
