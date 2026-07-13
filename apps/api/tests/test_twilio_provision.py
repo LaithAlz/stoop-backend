@@ -17,7 +17,7 @@ import pytest
 import respx
 
 from app.config import settings
-from app.integrations.twilio_provision import TwilioRestProvisioner
+from app.integrations.twilio_provision import TwilioNumberNotFoundError, TwilioRestProvisioner
 
 _ACCOUNT_SID = settings.twilio_account_sid
 _API_BASE = f"https://api.twilio.com/2010-04-01/Accounts/{_ACCOUNT_SID}"
@@ -142,10 +142,23 @@ async def test_release_number_sends_delete() -> None:
 
 
 @pytest.mark.unit
-async def test_release_number_raises_on_http_error() -> None:
+async def test_release_number_raises_not_found_on_404() -> None:
+    """Safety review finding M2: a 404 means the SID is already gone --
+    ``app/property_provisioning.py`` treats this as SUCCESS, not a generic
+    failure, so it must be a distinguishable exception type."""
     with respx.mock() as mock:
         mock.delete(f"{_API_BASE}/IncomingPhoneNumbers/PNabc123.json").mock(
             return_value=httpx.Response(404, json={"message": "not found"})
+        )
+        with pytest.raises(TwilioNumberNotFoundError):
+            await TwilioRestProvisioner().release_number(twilio_sid="PNabc123")
+
+
+@pytest.mark.unit
+async def test_release_number_raises_http_error_on_other_failures() -> None:
+    with respx.mock() as mock:
+        mock.delete(f"{_API_BASE}/IncomingPhoneNumbers/PNabc123.json").mock(
+            return_value=httpx.Response(500, json={"message": "server error"})
         )
         with pytest.raises(httpx.HTTPStatusError):
             await TwilioRestProvisioner().release_number(twilio_sid="PNabc123")

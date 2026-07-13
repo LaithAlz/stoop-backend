@@ -15,6 +15,7 @@ docker-compose harness every other integration test module here uses.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
@@ -22,6 +23,7 @@ import sys
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -32,6 +34,8 @@ import app.db.session as db_mod
 import app.property_provisioning as pp
 from app.config import settings
 from app.integrations import twilio_provision
+from app.integrations.twilio_provision import TwilioNumberNotFoundError
+from app.routers.webhooks.twilio import SMS_WEBHOOK_PATH, VOICE_WEBHOOK_PATH
 from tests import factories
 
 _PUBLIC_BASE_URL = "https://api.stoop.test"
@@ -50,11 +54,13 @@ class _FakeProvisioner:
     fail_configure: bool = False
     fail_associate: bool = False
     fail_release: bool = False
+    release_not_found: bool = False
 
     purchased: list[str] = field(default_factory=list)
     released: list[str] = field(default_factory=list)
     configured: list[tuple[str, str, str]] = field(default_factory=list)
     associated: list[tuple[str, str]] = field(default_factory=list)
+    release_calls: int = 0
 
     async def search_available_numbers(
         self, *, area_code: str | None = None, region: str | None = None
@@ -87,6 +93,9 @@ class _FakeProvisioner:
         self.associated.append((twilio_sid, messaging_service_sid))
 
     async def release_number(self, *, twilio_sid: str) -> None:
+        self.release_calls += 1
+        if self.release_not_found:
+            raise TwilioNumberNotFoundError(twilio_sid)
         if self.fail_release:
             raise RuntimeError("fake release failure")
         self.released.append(twilio_sid)
@@ -135,11 +144,29 @@ async def test_provision_number_uses_area_code_first(fake_provisioner: _FakeProv
     assert fake_provisioner.configured == [
         (
             result.twilio_sid,
-            f"{_PUBLIC_BASE_URL}/webhooks/twilio/sms",
-            f"{_PUBLIC_BASE_URL}/webhooks/twilio/voice",
+            f"{_PUBLIC_BASE_URL}{SMS_WEBHOOK_PATH}",
+            f"{_PUBLIC_BASE_URL}{VOICE_WEBHOOK_PATH}",
         )
     ]
     assert result.a2p_status == "skipped_unconfigured"
+
+
+@pytest.mark.unit
+def test_webhook_paths_match_the_live_route_table() -> None:
+    """Safety review finding L3: these constants must actually come from
+    the registered FastAPI route table, not merely happen to equal the
+    right literal — compare against the assembled app's own route list."""
+    from app.main import app as fastapi_app
+
+    registered = {
+        route.path
+        for route in fastapi_app.routes
+        if hasattr(route, "path") and getattr(route, "path", "").startswith("/webhooks/twilio")
+    }
+    assert SMS_WEBHOOK_PATH in registered
+    assert VOICE_WEBHOOK_PATH in registered
+    assert SMS_WEBHOOK_PATH == "/webhooks/twilio/sms"
+    assert VOICE_WEBHOOK_PATH == "/webhooks/twilio/voice"
 
 
 @pytest.mark.unit
@@ -523,7 +550,9 @@ async def test_sweep_retries_on_failure_then_exhausts(
             .one()
         )
         assert row["status"] == "exhausted"
-        assert row["attempt"] == pp._NUMBER_RELEASE_MAX_ATTEMPTS - 1  # noqa: SLF001
+        # The claim (M1/L1) always advances attempt BEFORE the release call,
+        # regardless of whether this turns out to be the exhausting attempt.
+        assert row["attempt"] == pp._NUMBER_RELEASE_MAX_ATTEMPTS  # noqa: SLF001
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -573,5 +602,273 @@ async def test_sweep_retries_before_exhausting(
         assert row["status"] == "pending"  # not yet exhausted
         assert row["attempt"] == 1
         assert row["next_attempt_at"] > past
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# M2 — a 404 from Twilio (already released) is treated as SUCCESS, never a
+# retryable failure and never a Sentry page.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_sweep_release_not_found_is_treated_as_success(
+    db_session: AsyncSession,
+    fake_provisioner: _FakeProvisioner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_provisioner.release_not_found = True
+    mock_capture = MagicMock()
+    monkeypatch.setattr(pp.sentry_sdk, "capture_message", mock_capture)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number="+14165551111"
+    )
+    try:
+        past = datetime.now(UTC) - timedelta(seconds=1)
+        result = await db_session.execute(
+            text(
+                "INSERT INTO notifications "
+                "(landlord_id, type, channel, status, payload, next_attempt_at) "
+                "VALUES (:lid, 'number_release', 'push', 'pending', "
+                "CAST(:payload AS jsonb), :next_attempt_at) RETURNING id"
+            ),
+            {
+                "lid": landlord_id,
+                "payload": f'{{"twilio_sid": "PN0006", "property_id": "{property_id}"}}',
+                "next_attempt_at": past,
+            },
+        )
+        notification_id = result.scalar_one()
+        await db_session.commit()
+
+        released = await pp.sweep_pending_number_releases()
+        assert released == ["PN0006"]  # a 404 counts as "released" for this goal
+        assert fake_provisioner.release_calls == 1  # zero retries
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT status, attempt FROM notifications WHERE id = :id"),
+                    {"id": notification_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["status"] == "sent"
+        mock_capture.assert_not_called()  # no Sentry page for an already-gone number
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# L2 — never release a SID a LIVE properties row still references.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_sweep_blocks_release_when_a_live_property_owns_the_sid(
+    db_session: AsyncSession,
+    fake_provisioner: _FakeProvisioner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_capture = MagicMock()
+    monkeypatch.setattr(pp.sentry_sdk, "capture_message", mock_capture)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    # A DIFFERENT, still-live property currently owns this exact SID --
+    # structurally shouldn't happen today, but the guard must fire anyway.
+    # (_cleanup below deletes every property for this landlord regardless
+    # of twilio_sid, so no separate teardown is needed for this row.)
+    await factories.insert_property(
+        db_session, landlord_id, twilio_number="+14165559999", twilio_sid="PN0007"
+    )
+    try:
+        past = datetime.now(UTC) - timedelta(seconds=1)
+        result = await db_session.execute(
+            text(
+                "INSERT INTO notifications "
+                "(landlord_id, type, channel, status, payload, next_attempt_at) "
+                "VALUES (:lid, 'number_release', 'push', 'pending', "
+                "CAST(:payload AS jsonb), :next_attempt_at) RETURNING id"
+            ),
+            {
+                "lid": landlord_id,
+                "payload": '{"twilio_sid": "PN0007", "property_id": "some-other-property"}',
+                "next_attempt_at": past,
+            },
+        )
+        notification_id = result.scalar_one()
+        await db_session.commit()
+
+        released = await pp.sweep_pending_number_releases()
+        assert released == []
+        assert fake_provisioner.release_calls == 0  # Twilio was never called
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM notifications WHERE id = :id"),
+                    {"id": notification_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["status"] == "exhausted"
+        mock_capture.assert_called_once()
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# M1/L1 — claim-before-call: lost-claim race, loser does nothing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_claim_sql_rejects_a_stale_attempt_value(db_session: AsyncSession) -> None:
+    """Deterministic, mechanism-level proof of the CAS guard: a claim
+    attempt using an ``old_attempt`` value that no longer matches the
+    row's CURRENT attempt (simulating a reader whose SELECT happened
+    before a concurrent claimant already won) returns no row."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number="+14165551111"
+    )
+    try:
+        result = await db_session.execute(
+            text(
+                "INSERT INTO notifications (landlord_id, type, channel, status, payload, attempt) "
+                "VALUES (:lid, 'number_release', 'push', 'pending', CAST(:payload AS jsonb), 0) "
+                "RETURNING id"
+            ),
+            {
+                "lid": landlord_id,
+                "payload": f'{{"twilio_sid": "PN0008", "property_id": "{property_id}"}}',
+            },
+        )
+        notification_id = result.scalar_one()
+        await db_session.commit()
+
+        # A genuine concurrent claimant wins first, advancing attempt to 1.
+        winner = (
+            (
+                await db_session.execute(
+                    pp._CLAIM_NUMBER_RELEASE_SQL,  # noqa: SLF001
+                    {
+                        "id": notification_id,
+                        "old_attempt": 0,
+                        "new_attempt": 1,
+                        "next_attempt_at": datetime.now(UTC) + timedelta(minutes=15),
+                    },
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        await db_session.commit()
+        assert winner is not None
+
+        # A second claim attempt using the NOW-STALE old_attempt=0 (as a
+        # reader whose own SELECT ran before the winner's claim committed
+        # would use) must find nothing -- the exact "loser does nothing"
+        # guarantee.
+        loser = (
+            (
+                await db_session.execute(
+                    pp._CLAIM_NUMBER_RELEASE_SQL,  # noqa: SLF001
+                    {
+                        "id": notification_id,
+                        "old_attempt": 0,
+                        "new_attempt": 1,
+                        "next_attempt_at": datetime.now(UTC) + timedelta(minutes=15),
+                    },
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        await db_session.commit()
+        assert loser is None
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sweep_concurrent_calls_release_the_same_due_row_exactly_once(
+    db_session: AsyncSession, fake_provisioner: _FakeProvisioner
+) -> None:
+    """Higher-level proof of the same guarantee, via genuine concurrency:
+    two overlapping ``sweep_pending_number_releases()`` calls racing the
+    SAME due row must result in exactly ONE actual Twilio release call --
+    the CAS claim (not application-level locking) is what makes this safe
+    regardless of how the two calls happen to interleave."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number="+14165551111"
+    )
+    try:
+        past = datetime.now(UTC) - timedelta(seconds=1)
+        await db_session.execute(
+            text(
+                "INSERT INTO notifications "
+                "(landlord_id, type, channel, status, payload, next_attempt_at) "
+                "VALUES (:lid, 'number_release', 'push', 'pending', "
+                "CAST(:payload AS jsonb), :next_attempt_at)"
+            ),
+            {
+                "lid": landlord_id,
+                "payload": f'{{"twilio_sid": "PN0009", "property_id": "{property_id}"}}',
+                "next_attempt_at": past,
+            },
+        )
+        await db_session.commit()
+
+        results = await asyncio.gather(
+            pp.sweep_pending_number_releases(), pp.sweep_pending_number_releases()
+        )
+        combined_released = results[0] + results[1]
+        assert combined_released == ["PN0009"]  # exactly one caller won the claim
+        assert fake_provisioner.release_calls == 1  # Twilio's release endpoint hit exactly once
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Per-tick batch LIMIT (safety review M1/L1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_sweep_respects_per_tick_batch_limit(
+    db_session: AsyncSession, fake_provisioner: _FakeProvisioner
+) -> None:
+    landlord_id = await factories.insert_landlord(db_session)
+    try:
+        past = datetime.now(UTC) - timedelta(seconds=1)
+        property_ids = []
+        for i in range(pp._NUMBER_RELEASE_SWEEP_BATCH_LIMIT + 5):  # noqa: SLF001
+            property_id = await factories.insert_property(
+                db_session, landlord_id, twilio_number=f"+141655500{i:02d}"
+            )
+            property_ids.append(property_id)
+            payload = f'{{"twilio_sid": "PNBATCH{i:03d}", "property_id": "{property_id}"}}'
+            await db_session.execute(
+                text(
+                    "INSERT INTO notifications "
+                    "(landlord_id, type, channel, status, payload, next_attempt_at) "
+                    "VALUES (:lid, 'number_release', 'push', 'pending', "
+                    "CAST(:payload AS jsonb), :next_attempt_at)"
+                ),
+                {"lid": landlord_id, "payload": payload, "next_attempt_at": past},
+            )
+        await db_session.commit()
+
+        released = await pp.sweep_pending_number_releases()
+        assert len(released) == pp._NUMBER_RELEASE_SWEEP_BATCH_LIMIT  # noqa: SLF001
     finally:
         await _cleanup(db_session, landlord_id)

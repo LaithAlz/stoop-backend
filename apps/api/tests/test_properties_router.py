@@ -56,23 +56,36 @@ _DB_URL_DEFAULT = "postgresql+asyncpg://stoop:stoop@localhost:5432/stoop"
 
 
 class _FakeProvisioner:
-    """Always-succeeds fake (#53) for router-level WIRING tests only — the
-    full search/purchase/compensation matrix lives in
-    ``tests/test_property_provisioning.py``. Gives every property a
-    distinct, syntactically-plausible E.164 number/SID pair."""
+    """Fake (#53) for router-level WIRING tests only — the full
+    search/purchase/compensation MATRIX lives in
+    ``tests/test_property_provisioning.py``. Always succeeds by default,
+    giving every property a distinct, syntactically-plausible E.164
+    number/SID pair; ``always_empty_search``/``fail_purchase`` let a
+    handful of router-level tests exercise the NoNumbersAvailableError/
+    ProvisioningFailedError -> HTTP-code mapping (spec MAJOR-2) without
+    duplicating the full cascade/compensation matrix here."""
 
     def __init__(self) -> None:
         self.purchased: list[str] = []
         self.released: list[str] = []
+        self.always_empty_search = False
+        self.fail_purchase = False
+        self.fixed_phone_number: str | None = None
         self._counter = 0
 
     async def search_available_numbers(
         self, *, area_code: str | None = None, region: str | None = None
     ) -> list[str]:
+        if self.always_empty_search:
+            return []
+        if self.fixed_phone_number is not None:
+            return [self.fixed_phone_number]
         self._counter += 1
         return [f"+1416555{self._counter:04d}"]
 
     async def purchase_number(self, *, phone_number: str) -> str:
+        if self.fail_purchase:
+            raise RuntimeError("fake purchase failure")
         sid = f"PN{uuid.uuid4().hex}"
         self.purchased.append(sid)
         return sid
@@ -574,5 +587,197 @@ async def test_delete_schedules_number_release_with_grace_period(
         assert row["payload"]["landlord_id"] == landlord_id
         delta = row["next_attempt_at"] - row["created_at"]
         assert 23 * 3600 < delta.total_seconds() < 25 * 3600
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# H1 (safety review, 2026-07-13) — pre-Twilio-call money guards.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_cap_returns_409_before_any_purchase(
+    session: AsyncSession,
+    _fake_twilio_provisioner: _FakeProvisioner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "max_properties_per_landlord", 2)
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        await create_property(
+            PropertyCreateRequest(label="One", address_line1="1 Cap St", city="Toronto"),
+            (landlord, session),
+        )
+        await create_property(
+            PropertyCreateRequest(label="Two", address_line1="2 Cap St", city="Toronto"),
+            (landlord, session),
+        )
+        purchased_before = len(_fake_twilio_provisioner.purchased)
+        assert purchased_before == 2
+
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(label="Three", address_line1="3 Cap St", city="Toronto"),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "property_limit_reached"
+        # The cap check runs BEFORE any Twilio call -- no purchase attempted.
+        assert len(_fake_twilio_provisioner.purchased) == purchased_before
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_duplicate_address_retry_buys_zero_numbers(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    """H1: a client retrying the SAME create (e.g. after a timeout) must
+    hit the dedupe check instead of buying a second number for what is,
+    from the landlord's perspective, the same property."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        await create_property(
+            PropertyCreateRequest(
+                label="Original", address_line1="41 Palmerston Ave", city="Toronto", province="ON"
+            ),
+            (landlord, session),
+        )
+        assert len(_fake_twilio_provisioner.purchased) == 1
+
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                # Different label + casing/whitespace -- SAME normalized address.
+                PropertyCreateRequest(
+                    label="Retry",
+                    address_line1="  41 palmerston ave  ",
+                    city="TORONTO",
+                    province="on",
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "duplicate_property"
+        assert len(_fake_twilio_provisioner.purchased) == 1  # zero additional purchases
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Spec MAJOR-1 — DB-insert-failure compensation, end-to-end.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_db_insert_failure_after_purchase_compensates_and_releases(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    """Force the property INSERT to fail (a UNIQUE-constraint collision on
+    twilio_number) after a successful fake purchase, and prove the full
+    compensation contract: 502 provisioning_failed, the purchased SID gets
+    released, and ZERO new properties rows persist."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        conflicting_number = "+14165559876"
+        await factories.insert_property(session, landlord_id, twilio_number=conflicting_number)
+        _fake_twilio_provisioner.fixed_phone_number = conflicting_number
+
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Conflict test", address_line1="1 Conflict St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.code == "provisioning_failed"
+        await session.rollback()  # clear the aborted transaction from the UNIQUE violation
+
+        assert _fake_twilio_provisioner.purchased  # the purchase DID happen
+        purchased_sid = _fake_twilio_provisioner.purchased[-1]
+        assert _fake_twilio_provisioner.released == [purchased_sid]  # released as compensation
+
+        count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM properties WHERE landlord_id = :lid "
+                    "AND label = 'Conflict test'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert count == 0  # zero new properties rows persisted
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Spec MAJOR-2 — each provisioning exception maps to its own contract code.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_public_base_url_unconfigured_returns_500(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "public_base_url", None)
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="No base url", address_line1="1 Unconfigured St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.code == "public_base_url_unconfigured"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_no_numbers_available_returns_503(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    _fake_twilio_provisioner.always_empty_search = True
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="No numbers", address_line1="1 Empty St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.code == "no_numbers_available"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_purchase_failure_returns_502(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    _fake_twilio_provisioner.fail_purchase = True
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Purchase fails", address_line1="1 Fail St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.code == "provisioning_failed"
     finally:
         await _cleanup(session, landlord_id)
