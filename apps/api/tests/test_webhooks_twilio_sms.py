@@ -21,6 +21,7 @@ Harness
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -496,8 +497,8 @@ async def test_hard_hit_tenant_message_creates_emergency_artifacts_exactly_once(
             (
                 await db_session.execute(
                     text(
-                        "SELECT type, channel, status FROM notifications "
-                        "WHERE landlord_id = :lid AND type = 'emergency_call'"
+                        "SELECT type, channel, status, next_attempt_at, payload "
+                        "FROM notifications WHERE landlord_id = :lid AND type = 'emergency_call'"
                     ),
                     {"lid": landlord_id},
                 )
@@ -507,6 +508,82 @@ async def test_hard_hit_tenant_message_creates_emergency_artifacts_exactly_once(
         )
         assert notification_row["channel"] == "voice"
         assert notification_row["status"] == "pending"
+        # Safety review, 2026-07-12 (finding N1, BLOCKING) -- BORN ENRICHED:
+        # next_attempt_at + ack_token are set in the SAME INSERT that
+        # creates the row, not by a later, separate enrichment step (see
+        # app/agent/emergency_chain.py's module docstring "The instant +
+        # durable sweep hybrid").
+        assert notification_row["next_attempt_at"] is not None
+        assert notification_row["payload"]["ack_token"]
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_hard_hit_ack_token_collision_is_retried_not_500d(
+    db_session: AsyncSession,
+) -> None:
+    """Safety review, 2026-07-12 (finding 4, LOW) — an ``ack_token``
+    collision at INSERT time (``uq_notifications_ack_token``, an
+    astronomically unlikely but genuinely possible UNIQUE violation on a
+    random ``secrets.token_urlsafe(24)`` value) must be caught and
+    retried with a fresh token, never surfaced as a raw 500."""
+    landlord_id = await _insert_landlord(db_session)
+    to_number = _fresh_phone()
+    from_number = _fresh_phone()
+    await _insert_property(db_session, landlord_id, twilio_number=to_number)
+
+    colliding_token = f"collision-{uuid.uuid4().hex}"  # noqa: S105 -- test fixture, not a secret
+    # Pre-seed a row already holding this exact token -- the very next
+    # generated token (forced below) will collide with it.
+    await db_session.execute(
+        text(
+            "INSERT INTO notifications (landlord_id, case_id, type, channel, status, payload) "
+            "VALUES (:lid, NULL, 'emergency_call', 'voice', 'pending', CAST(:payload AS jsonb))"
+        ),
+        {
+            "lid": landlord_id,
+            "payload": json.dumps({"message_id": str(uuid.uuid4()), "ack_token": colliding_token}),
+        },
+    )
+    await db_session.commit()
+
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid,
+        from_number=from_number,
+        to_number=to_number,
+        body="there is a fire in the kitchen!",
+    )
+
+    fresh_token = f"fresh-{uuid.uuid4().hex}"  # noqa: S105 -- test fixture, not a secret
+    forced_tokens = iter([colliding_token, fresh_token])
+
+    try:
+        with patch(
+            "app.routers.webhooks.twilio.secrets.token_urlsafe",
+            side_effect=lambda _n: next(forced_tokens),
+        ):
+            response = await _post_sms(params)
+
+        assert response.status_code == 200
+
+        notification_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload FROM notifications WHERE landlord_id = :lid "
+                        "AND type = 'emergency_call' AND payload ->> 'message_id' IS NOT NULL "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert notification_row["payload"]["ack_token"] == fresh_token
+        assert notification_row["payload"]["ack_token"] != colliding_token
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -919,12 +996,24 @@ async def test_inactive_tenant_not_matched_persists_with_null_tenant_id(
 
 
 @pytest.mark.integration
-async def test_i_injected_artifact_failure_returns_200_and_message_row_survives(
+async def test_i_injected_artifact_failure_returns_5xx_message_row_survives_retry_completes(
     db_session: AsyncSession,
 ) -> None:
     """(i) Injecting a failure into the post-persist emergency-artifact
     side effect must NOT roll back the already-committed message row —
-    the regression both reviewers reproduced against an earlier revision."""
+    the regression both reviewers reproduced against an earlier revision.
+
+    Safety review, 2026-07-12 (finding 2, BLOCKING): unlike every OTHER
+    post-persist side effect, a FAILED tenant emergency-artifact creation
+    must surface as a 5xx, not a fail-open 200 — Twilio's own redelivery
+    is the only recovery mechanism for a HARD-hit message whose escalation
+    artifacts don't exist yet, mirroring the conflict-path recovery
+    failure (module docstring point 4). This test was previously named
+    ``..._returns_200_and_message_row_survives`` and asserted the OLD,
+    now-fixed fail-open behavior; it now asserts the 5xx AND that Twilio's
+    redelivery (the identical MessageSid, artifact creation no longer
+    failing) completes the artifacts exactly once.
+    """
     landlord_id = await _insert_landlord(db_session)
     to_number = _fresh_phone()
     from_number = _fresh_phone()
@@ -945,8 +1034,8 @@ async def test_i_injected_artifact_failure_returns_200_and_message_row_survives(
         ):
             response = await _post_sms(params)
 
-        assert response.status_code == 200
-        assert response.text == "<Response/>"
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "tenant_emergency_artifact_failed"
 
         # The message row survives despite the injected failure -- this is
         # exactly the row that an earlier (buggy) revision silently lost.
@@ -974,6 +1063,24 @@ async def test_i_injected_artifact_failure_returns_200_and_message_row_survives(
             )
         ).scalar_one()
         assert notif_count == 0
+
+        # Twilio's redelivery (same MessageSid) with the fault cleared --
+        # the SAME message row is recovered via ON CONFLICT and the
+        # artifacts are created exactly once, no duplicate escalation.
+        retry_response = await _post_sms(params)
+        assert retry_response.status_code == 200
+        assert retry_response.text == "<Response/>"
+
+        notif_count_after_retry = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM notifications "
+                    "WHERE landlord_id = :lid AND type = 'emergency_call'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert notif_count_after_retry == 1
     finally:
         await _cleanup(db_session, landlord_id)
 

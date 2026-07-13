@@ -62,6 +62,23 @@ The current design, in four parts:
    (caught by ``_safe_step``, logged, never re-raised) can only ever roll
    back that one side effect's own attempted work — it cannot touch the
    message row, and it cannot poison any other side effect's session.
+
+   **EXCEPTION (safety review, 2026-07-12, finding 2 — BLOCKING):** the
+   tenant emergency-artifact step (``_ensure_tenant_emergency_artifacts``)
+   is NOT wrapped in ``_safe_step`` — a failure there is logged + paged
+   (same shape as ``_safe_step``'s ``alert_on_failure``) and then
+   RE-RAISED as an ``AppError(500, ...)``, mirroring the conflict-path
+   recovery failure below (module docstring point 4). Rationale: for
+   every OTHER side effect, "the artifact never got created and nobody
+   finds out until #108's sweeper" was an acceptable tide-over (see "Ops
+   visibility tide-over" below, now closed). For the tenant HARD-hit
+   escalation specifically, silently 200-ing a failed artifact creation
+   means Twilio never retries and the landlord may simply never be
+   called — exactly the class of bug the message-row redesign above
+   already fixed for message loss; the same fix now applies to this one
+   artifact. This does NOT apply to the landlord/``needs_eyes`` side
+   effect (still ``_safe_step``, still fail-open) — only the tenant
+   emergency-artifact step carries this exception.
    Chosen over SAVEPOINTs on the shared session: independent sessions are
    simpler to reason about correctly (no reliance on autobegin/SAVEPOINT
    interaction with ``get_admin_session``'s commit-on-exit contract) and
@@ -116,17 +133,40 @@ unwrapped DB blip on the ``twilio_sid`` lookup was a real path to an
 unintended 500, which is itself a contract violation: Twilio retry-storms
 on any non-2xx).
 
-Ops visibility tide-over until #108 (consolidated review items 3/4): a
-``notifications`` row sitting at ``status='pending'`` pages nobody until
-#108's escalation sweeper exists. ``_alert_unknown_to`` and
-``_alert_tenant_hard_fire`` below both ``log.error`` AND
-``sentry_sdk.capture_message`` (uuids/category names/an HMAC-keyed digest
-of the unrecognized ``To`` number only — NEVER the raw phone number or
-message body, rule #5) so a human actually sees these today.
+Ops visibility (consolidated review items 3/4, #108 closed 2026-07-12): a
+``notifications`` row sitting at ``status='pending'`` is now actively
+worked by ``app/scheduler.py``'s 60s ticker (the escalation chain sweep
+AND the SMS-drain sweep — see ``app/agent/emergency_chain.py``).
+``_alert_unknown_to`` and ``_alert_tenant_hard_fire`` below both
+``log.error`` AND ``sentry_sdk.capture_message`` (uuids/category names/an
+HMAC-keyed digest of the unrecognized ``To`` number only — NEVER the raw
+phone number or message body, rule #5) so a human actually sees these
+immediately too, independent of the sweeper's own cadence.
 
-Neither endpoint calls Twilio's REST API (no ``twilio.send`` anywhere in
-this module) — these are inbound-only receivers; sending arrives with
-#108/#45.
+Neither ``/sms`` nor ``/status`` calls Twilio's REST API (no outbound send
+anywhere in either handler) — both are inbound-only receivers.
+
+``POST /webhooks/twilio/voice`` (#108, added below) is different: it is the
+TwiML callback for calls the emergency escalation chain itself places (via
+``app/agent/emergency_chain.py``, using
+``app/integrations/twilio_send.py``) — this router still never calls
+Twilio's REST API directly, it only ANSWERS Twilio's request for what to
+say/gather next. Handles two shapes on the SAME endpoint/URL (Twilio
+distinguishes them by whether ``Digits`` is present in the form body, not
+the path — see ``render_voice_action_url`` in ``emergency_chain.py``):
+
+1. **Initial TwiML fetch** (no ``Digits`` yet) — returns a ``<Gather
+   numDigits="1">`` wrapping a spoken summary, falling through to a
+   closing ``<Say>`` if nothing is pressed within the timeout (no second
+   request in that case — Twilio just ends the call; the chain's NEXT
+   scheduled attempt, not a second leg of this same call, is what tries
+   again).
+2. **Gather completion** (``Digits`` present) — ``Digits == "1"`` calls
+   ``emergency_chain.acknowledge_notification`` (idempotent — stops the
+   chain) and speaks a short confirmation; any other digit (or none
+   matching) just speaks a closing line. Either way, always valid TwiML,
+   never a bare error status — Twilio has no useful retry story for a
+   voice callback failure the way it does for ``/sms``.
 """
 
 from __future__ import annotations
@@ -134,6 +174,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import secrets
 from collections.abc import Coroutine
 from contextlib import AbstractAsyncContextManager
 from contextlib import asynccontextmanager as _acm
@@ -144,9 +185,10 @@ import sentry_sdk
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent import prefilter
+from app.agent import emergency_chain, prefilter
 from app.agent.emergency import fire_emergency_protocol
 from app.agent.graph_entry import enqueue_classification
 from app.agent.schemas import PrefilterResult
@@ -165,10 +207,16 @@ router = APIRouter(prefix="/webhooks/twilio", tags=["webhooks"])
 
 
 def _twiml_empty() -> Response:
-    """The uniform 200 response for both endpoints — an empty TwiML
+    """The uniform 200 response for ``/sms``/``/status`` — an empty TwiML
     ``<Response/>`` telling Twilio "received, no auto-reply". A fresh
     ``Response`` instance every call (never share one across requests)."""
     return Response(content="<Response/>", media_type="text/xml", status_code=200)
+
+
+def _twiml_response(xml: str) -> Response:
+    """A TwiML response carrying real markup (``/voice``, #108) — a fresh
+    ``Response`` instance every call, same convention as ``_twiml_empty``."""
+    return Response(content=xml, media_type="text/xml", status_code=200)
 
 
 async def _extract_and_verify(request: Request) -> dict[str, str]:
@@ -429,18 +477,52 @@ _INSERT_NEEDS_EYES_SQL = text(
 
 _INSERT_EMERGENCY_NOTIFICATION_SQL = text(
     """
-    INSERT INTO notifications (landlord_id, case_id, type, channel, status, payload)
-    VALUES (:landlord_id, NULL, 'emergency_call', 'voice', 'pending', CAST(:payload AS jsonb))
+    INSERT INTO notifications (
+        landlord_id, case_id, type, channel, status, payload, next_attempt_at
+    )
+    VALUES (
+        :landlord_id, NULL, 'emergency_call', 'voice', 'pending', CAST(:payload AS jsonb), now()
+    )
     ON CONFLICT ((payload ->> 'message_id'), type) WHERE type IN ('emergency_call', 'needs_eyes')
     DO NOTHING
     RETURNING id
     """
 )
+# Safety review, 2026-07-12 (finding N1, BLOCKING): the row is now BORN
+# ENRICHED -- ``next_attempt_at = now()`` (sweep-visible from the instant
+# this INSERT commits, no separate "enrich" step/transaction/module
+# required) AND the ack token lives in ``payload`` from the very first
+# write (see ``notification_payload`` below). This closes the "pre-enrich
+# window": previously, a crash/failure in ``app/agent/emergency_chain.py``'s
+# OWN separate enrich transaction (which used to run AFTER this INSERT,
+# in a DIFFERENT module/transaction/request phase) could strand a row at
+# ``next_attempt_at IS NULL`` forever -- durably persisted, but invisible
+# to the sweep, with no redelivery to save it (Twilio already got its 200,
+# or the artifact-creation failure already 5xx'd and a retry would just
+# hit ON CONFLICT and skip re-enriching). See
+# ``app/agent/emergency_chain.py``'s module docstring "The instant +
+# durable sweep hybrid" for the full before/after account, and its sweep
+# SELECT's own ``next_attempt_at IS NULL`` clause for belt 2 (healing any
+# row that somehow still lacks it).
 
 _INSERT_EMERGENCY_AUDIT_SQL = text(
     """
     INSERT INTO audit_log (landlord_id, case_id, actor, action, payload)
     VALUES (:landlord_id, NULL, 'prefilter', 'emergency_triggered', CAST(:payload AS jsonb))
+    """
+)
+
+# Used ONLY by /voice's initial-TwiML-fetch leg (#108) — the property label
+# for the spoken summary plus the payload's stored categories, keyed on the
+# emergency_call notification id embedded in the call's own action URL
+# (emergency_chain.render_voice_action_url). No phone number/message body
+# ever enters this query or its result (rule #5).
+_SELECT_NOTIFICATION_FOR_VOICE_SQL = text(
+    """
+    SELECT n.payload AS payload, p.label AS property_label
+    FROM notifications n
+    LEFT JOIN properties p ON p.id = (n.payload ->> 'property_id')::uuid
+    WHERE n.id = :id
     """
 )
 
@@ -487,6 +569,32 @@ async def _ensure_needs_eyes_notification(
     return row is not None
 
 
+_MAX_ACK_TOKEN_INSERT_ATTEMPTS = 3
+"""Safety review, 2026-07-12 (finding 4, LOW): ``uq_notifications_ack_token``
+(schema-v1.md v1.9, migration 0010) is a genuine UNIQUE index over a
+random ``secrets.token_urlsafe(24)`` value (~144 bits of entropy) — a
+collision is astronomically unlikely, but "unlikely" is not "impossible",
+and the unique index means Postgres WILL raise on one. Regenerating and
+retrying a bounded few times, inline, makes the index truly fail-safe
+instead of merely fail-loud (a real collision would otherwise 500 the
+whole webhook request over something a fresh random token trivially
+fixes)."""
+
+
+def _is_ack_token_collision(exc: IntegrityError) -> bool:
+    """``True`` iff *exc* is a UNIQUE VIOLATION on
+    ``uq_notifications_ack_token`` specifically — never swallows any OTHER
+    integrity error (e.g. a genuine schema/FK problem), which must still
+    propagate and 5xx normally."""
+    orig = getattr(exc, "orig", None)
+    constraint_name = getattr(orig, "constraint_name", None)
+    if constraint_name == "uq_notifications_ack_token":
+        return True
+    # Defensive fallback across driver/version differences in whether
+    # constraint_name is populated -- never the primary detection path.
+    return "uq_notifications_ack_token" in str(exc)
+
+
 async def _ensure_tenant_emergency_artifacts(
     *,
     landlord_id: UUID,
@@ -498,15 +606,20 @@ async def _ensure_tenant_emergency_artifacts(
     artifacts, in order (the actual voice call / safety SMS / escalation
     chain is #108 — see ``app/agent/emergency.py``):
 
-    1. ``notifications`` (``type='emergency_call'``, ``status='pending'``)
-       — inserted idempotently via ``uq_notifications_message_dedupe``
+    1. ``notifications`` (``type='emergency_call'``, ``status='pending'``,
+       ``next_attempt_at=now()`` — BORN ENRICHED, safety review 2026-07-12
+       finding N1: see ``_INSERT_EMERGENCY_NOTIFICATION_SQL``'s own
+       comment) — inserted idempotently via ``uq_notifications_message_dedupe``
        (schema-v1.md v1.3, migration 0006); this INSERT is the single
        idempotency GATE for the whole group, enforced by Postgres itself
        (safe across concurrent processes — module docstring point 3): if
        it returns no row (already existed — a genuine duplicate delivery,
        artifacts already created), nothing below runs either, so a retry
        can never double-log the audit entry or double-invoke the seam
-       call.
+       call. The ``payload`` also carries a fresh ``ack_token`` — see
+       :data:`_MAX_ACK_TOKEN_INSERT_ATTEMPTS` for what happens on the
+       (astronomically unlikely) event that token collides with an
+       existing row's.
     2. ``audit_log`` ``emergency_triggered`` (``actor='prefilter'``,
        payload = rules fired — never the message body, rule #5) — only
        written when (1) actually created a new row.
@@ -514,43 +627,65 @@ async def _ensure_tenant_emergency_artifacts(
        actually created a new row.
 
     ``case_id`` is NULL throughout: this runs pre-routing (#110 owns case
-    attach; conversation-model.md). Runs on its OWN isolated session — see
-    module docstring "Transaction design". Returns ``True`` if this call
-    created the artifacts (a genuine new escalation), ``False`` if they
-    already existed (idempotent no-op) — the caller uses this to decide
-    whether to alert (consolidated review item 3: alert only on genuine
-    creation, never on a redelivery of an already-escalated message)."""
-    notification_payload = {
-        "message_id": str(message_id),
-        "property_id": str(property_id),
-        "categories": prefilter_result.categories,
-    }
+    attach; conversation-model.md). Runs on its OWN isolated session PER
+    ATTEMPT — see module docstring "Transaction design". Returns ``True``
+    if this call created the artifacts (a genuine new escalation),
+    ``False`` if they already existed (idempotent no-op) — the caller uses
+    this to decide whether to alert (consolidated review item 3: alert
+    only on genuine creation, never on a redelivery of an
+    already-escalated message)."""
+    notification_id: UUID | None = None
 
-    async with _isolated_session() as session:
-        notification_row = (
-            (
-                await session.execute(
-                    _INSERT_EMERGENCY_NOTIFICATION_SQL,
-                    {"landlord_id": str(landlord_id), "payload": json.dumps(notification_payload)},
+    for attempt in range(_MAX_ACK_TOKEN_INSERT_ATTEMPTS):
+        notification_payload = {
+            "message_id": str(message_id),
+            "property_id": str(property_id),
+            "categories": prefilter_result.categories,
+            "ack_token": secrets.token_urlsafe(24),
+        }
+        try:
+            async with _isolated_session() as session:
+                notification_row = (
+                    (
+                        await session.execute(
+                            _INSERT_EMERGENCY_NOTIFICATION_SQL,
+                            {
+                                "landlord_id": str(landlord_id),
+                                "payload": json.dumps(notification_payload),
+                            },
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
                 )
-            )
-            .mappings()
-            .one_or_none()
-        )
 
-        if notification_row is None:
-            # Idempotent no-op: an earlier attempt already created this
-            # message's emergency artifacts (enforced by Postgres's own
-            # unique index, safe even under genuinely concurrent retries).
-            return False
+                if notification_row is None:
+                    # Idempotent no-op: an earlier attempt already created
+                    # this message's emergency artifacts (enforced by
+                    # Postgres's own unique index, safe even under
+                    # genuinely concurrent retries).
+                    return False
 
-        notification_id: UUID = notification_row["id"]
+                notification_id = notification_row["id"]
 
-        audit_payload = {"rules_fired": prefilter_result.categories, "message_id": str(message_id)}
-        await session.execute(
-            _INSERT_EMERGENCY_AUDIT_SQL,
-            {"landlord_id": str(landlord_id), "payload": json.dumps(audit_payload)},
-        )
+                audit_payload = {
+                    "rules_fired": prefilter_result.categories,
+                    "message_id": str(message_id),
+                }
+                await session.execute(
+                    _INSERT_EMERGENCY_AUDIT_SQL,
+                    {"landlord_id": str(landlord_id), "payload": json.dumps(audit_payload)},
+                )
+            break  # committed cleanly -- stop retrying
+        except IntegrityError as exc:
+            is_last_attempt = attempt == _MAX_ACK_TOKEN_INSERT_ATTEMPTS - 1
+            if _is_ack_token_collision(exc) and not is_last_attempt:
+                log.warning("emergency_ack_token_collision_retrying", attempt=attempt)
+                continue
+            raise
+
+    if notification_id is None:  # pragma: no cover — invariant: break only reached after a set id
+        raise RuntimeError("emergency artifact insert loop exited without a notification id")
 
     # Outside the DB transaction on purpose: emergency.py does no DB access
     # of its own (see its module docstring) -- calling it after the
@@ -582,6 +717,16 @@ async def _run_post_persist_side_effects(
     by Postgres, safe even under concurrent retries) and isolated, so
     calling this twice (or a hundred times, concurrently) for the same
     ``message_id`` is always safe.
+
+    Raises
+    ------
+    AppError
+        500 ``tenant_emergency_artifact_failed`` if
+        ``_ensure_tenant_emergency_artifacts`` itself raises (safety
+        review, 2026-07-12, finding 2) — see module docstring "Transaction
+        design" point 2's exception. Never raised for the landlord/
+        ``needs_eyes`` side effect, which stays fail-open via
+        ``_safe_step``.
     """
     if party == "landlord":
         await _safe_step(
@@ -598,16 +743,39 @@ async def _run_post_persist_side_effects(
         return
 
     if prefilter_result.hard_hit:
-        created = await _safe_step(
-            "tenant_emergency_artifacts",
-            _ensure_tenant_emergency_artifacts(
+        try:
+            created = await _ensure_tenant_emergency_artifacts(
                 landlord_id=landlord_id,
                 property_id=property_id,
                 message_id=message_id,
                 prefilter_result=prefilter_result,
-            ),
-            alert_on_failure=True,
-        )
+            )
+        except Exception as exc:
+            # Safety review, 2026-07-12 (finding 2, BLOCKING): a fresh
+            # Tier-0 HARD delivery whose artifact creation fails must NOT
+            # 200 -- that forecloses Twilio's own retry, which is the ONLY
+            # recovery mechanism for a message whose escalation artifacts
+            # don't durably exist yet. Mirrors the conflict-path recovery
+            # failure below (module docstring point 4) -- same log event
+            # name and Sentry message _safe_step would have used, so
+            # existing ops alerting on those strings keeps working; the
+            # only change is that this one no longer swallows.
+            log.error(
+                "twilio_sms_post_persist_stage_failed",
+                stage="tenant_emergency_artifacts",
+                exc_type=type(exc).__name__,
+            )
+            sentry_sdk.capture_message(
+                "Twilio inbound webhook: post-persist side effect failed",
+                level="error",
+                extras={"stage": "tenant_emergency_artifacts", "exc_type": type(exc).__name__},
+            )
+            raise AppError(
+                status_code=500,
+                code="tenant_emergency_artifact_failed",
+                message="Temporary delivery failure -- please retry.",
+            ) from exc
+
         # Consolidated review item 3: alert ONLY when this call actually
         # created the escalation -- never on a redelivery that found it
         # already created (bounds alert volume under a replay storm).
@@ -924,3 +1092,88 @@ async def twilio_status_webhook(
         log.error("twilio_status_processing_failed", exc_type=type(exc).__name__)
 
     return _twiml_empty()
+
+
+# ---------------------------------------------------------------------------
+# POST /webhooks/twilio/voice (#108) — TwiML callback for the emergency call
+# ---------------------------------------------------------------------------
+
+
+@router.post("/voice")
+async def twilio_voice_webhook(request: Request) -> Response:
+    """POST /webhooks/twilio/voice — TwiML callback for the emergency call
+    (``Digits=1`` → acknowledge). See module docstring for the two request
+    shapes this single endpoint answers.
+
+    Deliberately takes no ``session`` dependency of its own: every DB
+    access this handler needs goes through
+    ``app.agent.emergency_chain``'s own admin-session helpers
+    (``acknowledge_notification`` / the context lookup baked into
+    rendering the initial TwiML) — this file stays allowlisted for
+    ``get_admin_session`` via its OWN direct dependency on ``/sms``/
+    ``/status`` above, not because of anything this handler does directly.
+
+    Always 200 with valid TwiML — never a bare error status. A missing or
+    malformed ``notification_id`` query parameter (should never happen: it
+    is generated by our own ``emergency_chain.render_voice_action_url``,
+    never client-supplied) is a loud, metadata-only log line plus a
+    generic spoken apology, never a 4xx/5xx (Twilio has no useful retry
+    story for a voice callback — unlike ``/sms``, retrying would just
+    replay the exact same malformed URL).
+    """
+    params = await _extract_and_verify(request)
+
+    notification_id_raw = request.query_params.get("notification_id")
+    if not notification_id_raw:
+        log.error("twilio_voice_missing_notification_id")
+        return _twiml_response(emergency_chain.build_error_twiml())
+
+    try:
+        notification_id = UUID(notification_id_raw)
+    except ValueError:
+        log.error("twilio_voice_malformed_notification_id")
+        return _twiml_response(emergency_chain.build_error_twiml())
+
+    digits = params.get("Digits")
+    if digits == "1":
+        await emergency_chain.acknowledge_notification(
+            notification_id, actor="system", channel="voice_keypress"
+        )
+        return _twiml_response(emergency_chain.build_ack_confirmation_twiml())
+
+    if digits is not None:
+        # A digit was gathered but it wasn't "1" — no acknowledgment; the
+        # chain's own schedule (not a retry within this same call) tries
+        # again later.
+        return _twiml_response(emergency_chain.build_error_twiml())
+
+    # Initial TwiML fetch (no Digits yet) — render the spoken summary +
+    # Gather. Context comes straight off the emergency_call row's own
+    # durable state (message_id/property_id/categories), never re-derived
+    # from this request.
+    async with _isolated_session() as session:
+        row = (
+            (
+                await session.execute(
+                    _SELECT_NOTIFICATION_FOR_VOICE_SQL, {"id": str(notification_id)}
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+
+    if row is None:
+        log.error("twilio_voice_unknown_notification_id")
+        return _twiml_response(emergency_chain.build_error_twiml())
+
+    payload = row["payload"] or {}
+    categories = list(payload.get("categories") or [])
+    property_label = row["property_label"] or "the property"
+    primary_category = emergency_chain.choose_primary_category(categories)
+
+    twiml = emergency_chain.build_voice_twiml(
+        property_label=property_label,
+        category_label=emergency_chain.category_short_label(primary_category),
+        action_url=emergency_chain.render_voice_action_url(notification_id),
+    )
+    return _twiml_response(twiml)

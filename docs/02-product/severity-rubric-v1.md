@@ -29,6 +29,16 @@ These six decisions were explicitly reviewed and approved:
    never engages substance, flags for the landlord as ROUTINE unless paired
    with a maintenance issue.
 
+**Clarification (copy-guardian + founder ruling, 2026-07-12 — #108 safety
+review, copy finding C2):** judgment call 1's "911 first" governs *when*
+Stoop tells the tenant to call 911 relative to Stoop's own handling
+(immediately, never held back for landlord approval or further triage) —
+it does not mean "call 911" must be the literal first word of a safety
+instruction. The emergency safety-SMS templates (`app/agent/emergency_chain.py`)
+order their numbered steps by physical safety first where a physical
+action exists (e.g. fire: get out, *then* call 911 once outside) — this is
+the correct application of the rule, not an exception to it.
+
 ---
 
 ## The rubric (verbatim, v1.0)

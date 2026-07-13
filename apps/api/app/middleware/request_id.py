@@ -16,6 +16,20 @@ contain enough context to grep/filter without touching request headers
 (which must never be logged because they contain Authorization / JWTs).
 
 Safety: we never bind or log ``request.headers``.
+
+Ack-route path scrubbing (safety review, 2026-07-12, finding 6, MEDIUM)
+--------------------------------------------------------------------------
+``GET``/``POST /ack/{token}`` carry the ack token directly in the path.
+Binding ``request.url.path`` verbatim (as every other route safely does —
+none of them carry a capability token in the path) would put that token
+into ``request_id``/every log line's bound context for the DURATION of
+the request, including lines emitted deep inside the handler. This
+middleware runs BEFORE routing resolves, so the matched route's PATTERN
+(e.g. the literal string ``/ack/{token}``) isn't available yet — rather
+than reconstructing Starlette's full route-matching logic here, a narrow,
+targeted substitution (:data:`_ACK_PATH_RE`) replaces exactly an
+``/ack/<anything>`` path with the literal pattern string before binding,
+for this one route shape. Every other path is bound unchanged.
 """
 
 from __future__ import annotations
@@ -40,10 +54,25 @@ from starlette.types import ASGIApp
 # chars = 36) as well as reasonable client-supplied correlation ids.
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
+# Matches exactly `/ack/{anything}` (no further path segments) -- the ONE
+# route shape in this app whose path parameter is a capability token, not
+# an opaque/harmless id. See module docstring "Ack-route path scrubbing".
+_ACK_PATH_RE = re.compile(r"^/ack/[^/]+$")
+_ACK_PATH_PATTERN = "/ack/{token}"
+
 
 def _generate_request_id() -> str:
     """A fresh server-generated id: ``req_`` + 32 lowercase hex chars."""
     return f"req_{uuid.uuid4().hex}"
+
+
+def _safe_request_path(path: str) -> str:
+    """Return *path* unchanged, EXCEPT an ``/ack/{token}`` path is replaced
+    with the literal pattern string — see module docstring "Ack-route path
+    scrubbing"."""
+    if _ACK_PATH_RE.match(path):
+        return _ACK_PATH_PATTERN
+    return path
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -82,9 +111,12 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         )
 
         # Step 3 — bind to contextvars (NOT headers — headers contain JWTs).
+        # request_path is scrubbed for the one route shape that carries a
+        # capability token in its path -- see module docstring "Ack-route
+        # path scrubbing".
         structlog.contextvars.bind_contextvars(
             request_id=request_id,
-            request_path=request.url.path,
+            request_path=_safe_request_path(request.url.path),
             request_method=request.method,
         )
 

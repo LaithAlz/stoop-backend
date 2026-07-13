@@ -25,6 +25,31 @@ if TYPE_CHECKING:
     from sentry_sdk.types import Event, Hint
 
 
+class _SuppressAckPathFilter(logging.Filter):
+    """Drops uvicorn access-log records for any ``/ack/...`` path.
+
+    Safety review, 2026-07-12 (finding 6, MEDIUM — defense in depth): the
+    tokenized ack link (``GET``/``POST /ack/{token}``) carries the ack
+    token directly in the URL path. uvicorn's OWN access logger renders
+    the raw request path verbatim (independent of anything structlog
+    does), which would otherwise print that token to stdout on every
+    single request — not a JWT/phone number/message body (rule #5's
+    literal scope), but the same "don't put a capability token in a log
+    stream nobody needs it in" discipline applies. The token itself
+    carries no auth beyond "can acknowledge this one already-firing
+    emergency" (see ``app/routers/notifications.py``), so this is
+    defense-in-depth, not a critical fix on its own.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # pragma: no cover — defensive: never let a
+            # logging filter itself raise and break logging.
+            return True
+        return "/ack/" not in message
+
+
 def configure_logging() -> None:
     """Configure structlog for JSON output to stdout.
 
@@ -39,6 +64,15 @@ def configure_logging() -> None:
     Also configures the stdlib ``logging`` root logger so that any library
     using stdlib logging (e.g. uvicorn, SQLAlchemy) is captured by structlog
     at the configured level.
+
+    Two library-specific pins (safety review, 2026-07-12, finding 6):
+    - ``uvicorn.access`` gets ``_SuppressAckPathFilter`` — see that class's
+      own docstring.
+    - ``twilio`` (the SDK's own internal logger) is pinned to ``WARNING`` —
+      its INFO-level logs have, in other integrations, been observed to
+      include request/response detail; nothing this app needs at INFO,
+      and defense-in-depth against a future SDK version logging more than
+      today's does.
     """
     log_level = getattr(logging, settings.log_level, logging.INFO)
 
@@ -49,6 +83,9 @@ def configure_logging() -> None:
         stream=sys.stdout,
         level=log_level,
     )
+
+    logging.getLogger("uvicorn.access").addFilter(_SuppressAckPathFilter())
+    logging.getLogger("twilio").setLevel(logging.WARNING)
 
     structlog.configure(
         processors=[

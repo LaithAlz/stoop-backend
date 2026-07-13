@@ -16,11 +16,17 @@ IMPORTANT: Never log or print the ``settings`` object — it carries secrets.
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Twilio Account SIDs are always "AC" + 32 lowercase-hex characters (34
+# chars total) -- production-only shape gate, see
+# Settings._require_valid_twilio_account_sid_format_in_production below.
+_TWILIO_ACCOUNT_SID_RE = re.compile(r"^AC[0-9a-fA-F]{32}$")
 
 
 class Settings(BaseSettings):
@@ -118,6 +124,19 @@ class Settings(BaseSettings):
             "account/number already exists for this project (see .env); "
             "unlike app_database_url this has no safe fallback because "
             "there is no way to verify a webhook signature without it."
+        ),
+    )
+
+    twilio_account_sid: str = Field(
+        ...,
+        description=(
+            "Twilio Account SID — paired with twilio_auth_token to construct "
+            "the outbound REST client (app/integrations/twilio_send.py, #108). "
+            "Used ONLY by the emergency escalation chain today (the other "
+            "sanctioned sender, the approve-flow draft sender, is #44, "
+            "unbuilt). NEVER logged, NEVER included in any error message. "
+            "Required — the same real Twilio account referenced by "
+            "twilio_auth_token already has this SID (see .env)."
         ),
     )
 
@@ -294,6 +313,64 @@ class Settings(BaseSettings):
                 "verification must not depend on trusting proxy headers in "
                 "production; set PUBLIC_BASE_URL to the public HTTPS origin "
                 "Twilio is configured to POST webhooks to."
+            )
+        return self
+
+    # ------------------------------------------------------------------
+    # Production boot gate (#108 safety review, 2026-07-12, finding 7) --
+    # mirrors _require_public_base_url_in_production's PATTERN: a strict
+    # SHAPE check gated to production only, so dev/test placeholder values
+    # (which need not look like a real Twilio SID) keep working unchanged.
+    # ------------------------------------------------------------------
+
+    @field_validator("twilio_account_sid", mode="after")
+    @classmethod
+    def _normalize_twilio_account_sid(cls, v: str) -> str:
+        """Reject a blank/whitespace-only value in EVERY environment (this
+        field has no safe "unset" fallback the way ``app_database_url``/
+        ``public_base_url`` do -- there is no code path that works without
+        a real Account SID once the outbound Twilio client is ever
+        constructed), while still allowing loosely-shaped dev/test
+        placeholders through -- the STRICT shape check below is
+        production-only. Mirrors ``_normalize_app_database_url``/
+        ``_normalize_public_base_url``'s "a blank Fly secret must not
+        silently sail past validation" rationale.
+        """
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(
+                "TWILIO_ACCOUNT_SID must not be blank -- required to construct "
+                "the outbound Twilio client (app/integrations/twilio_send.py, #108)."
+            )
+        return stripped
+
+    @model_validator(mode="after")
+    def _require_valid_twilio_account_sid_format_in_production(self) -> Settings:
+        """Refuse to boot in production unless ``twilio_account_sid`` is
+        non-empty AND shaped like a real Twilio Account SID (``AC`` +
+        32 hex characters, 34 characters total) — safety review, 2026-07-12,
+        finding 7. A misconfigured/placeholder value (e.g. copy-pasted from
+        ``.env.example``, or truncated) would otherwise sail past startup
+        and only surface as a confusing 401 from Twilio's API the first
+        time the emergency chain tries to place a real call or send a real
+        SMS — precisely the worst moment to discover a config typo. Dev/
+        test keep using loosely-shaped placeholders unchanged (this check
+        is production-only, mirroring
+        ``_require_public_base_url_in_production``'s exact gating pattern).
+        No secrets in this message — the SID itself is not secret (it is
+        Twilio's public account identifier, always sent in the clear as
+        part of the REST URL/Basic-Auth username), but is still never
+        echoed here on principle (same discipline as every other boot-gate
+        message in this class).
+        """
+        if self.environment != "production":
+            return self
+        sid = self.twilio_account_sid
+        if not _TWILIO_ACCOUNT_SID_RE.match(sid):
+            raise ValueError(
+                "TWILIO_ACCOUNT_SID does not look like a real Twilio Account SID "
+                "(expected 'AC' followed by 32 hex characters) -- refusing to boot "
+                "in production with what looks like a placeholder or typo'd value."
             )
         return self
 

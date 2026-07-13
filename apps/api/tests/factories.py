@@ -48,12 +48,16 @@ async def insert_landlord(
     *,
     voice_profile: dict[str, Any] | None = None,
     full_name: str | None = None,
+    phone: str | None = None,
 ) -> str:
+    """``phone`` added for #108 (the emergency escalation chain calls/texts
+    ``landlords.phone``) — defaults ``None``, matching the schema's own
+    nullable column and every EXISTING caller's prior behavior unchanged."""
     landlord_id = str(uuid.uuid4())
     await session.execute(
         text(
-            "INSERT INTO landlords (id, auth_user_id, email, voice_profile, full_name) "
-            "VALUES (:id, :auth_id, :email, CAST(:voice_profile AS jsonb), :full_name)"
+            "INSERT INTO landlords (id, auth_user_id, email, voice_profile, full_name, phone) "
+            "VALUES (:id, :auth_id, :email, CAST(:voice_profile AS jsonb), :full_name, :phone)"
         ),
         {
             "id": landlord_id,
@@ -61,6 +65,7 @@ async def insert_landlord(
             "email": f"{landlord_id}@example.com",
             "voice_profile": json.dumps(voice_profile) if voice_profile is not None else None,
             "full_name": full_name,
+            "phone": phone,
         },
     )
     await session.commit()
@@ -74,14 +79,21 @@ async def insert_property(
     house_rules: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
+    twilio_number: str | None = None,
+    backup_contact: dict[str, Any] | None = None,
 ) -> str:
+    """``twilio_number``/``backup_contact`` added for #108 (the emergency
+    escalation chain needs a per-property outbound caller-id number and an
+    optional backup contact) — both default ``None``, matching the schema's
+    own nullable columns and every EXISTING caller's prior behavior
+    unchanged."""
     property_id = str(uuid.uuid4())
     await session.execute(
         text(
             "INSERT INTO properties (id, landlord_id, label, address_line1, city, house_rules, "
-            "lat, lon) "
+            "lat, lon, twilio_number, backup_contact) "
             "VALUES (:id, :landlord_id, 'Test Property', '123 Test St', 'Toronto', :house_rules, "
-            ":lat, :lon)"
+            ":lat, :lon, :twilio_number, CAST(:backup_contact AS jsonb))"
         ),
         {
             "id": property_id,
@@ -89,6 +101,8 @@ async def insert_property(
             "house_rules": house_rules,
             "lat": lat,
             "lon": lon,
+            "twilio_number": twilio_number,
+            "backup_contact": json.dumps(backup_contact) if backup_contact is not None else None,
         },
     )
     await session.commit()
