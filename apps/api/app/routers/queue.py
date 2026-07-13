@@ -26,25 +26,32 @@ above) — they never reach this predicate at all. ``open``/``reopened``
 cases (no ready draft yet — still mid-graph or blocked in degraded mode)
 and ``resolved`` cases are excluded the same way.
 
-Where severity/reasoning/``why`` come from — NOT ``cases.severity``
----------------------------------------------------------------------
-``cases.severity`` is a real column, but no code path in this codebase
-ever writes it (grep confirms — ``classify_severity.py``'s own module
-docstring explains why the canonical classification record is the
-``audit_log`` ``'classified'`` row instead, not a ``cases``/``messages``
-column). Sourcing the queue card's severity from ``cases.severity`` would
-therefore return ``null`` for every real card today. This endpoint instead
-reads the LATEST ``audit_log`` row with ``action='classified'`` for each
-case (a case can be reclassified more than once via the stale-draft
-re-run, so "latest" matters) and takes ``severity``, ``rules_fired``
-(→ the card's ``reasoning`` array), ``refusal_flags``, and — schema-v1
-v1.7, #183 — ``summary`` (→ ``why``, ``null`` for pre-v1.7 rows that
-predate the key) all from that ONE row, matching
+Where severity/reasoning/``why`` come from — STILL NOT ``cases.severity``
+---------------------------------------------------------------------------
+**#197 update:** ``classify_severity.py`` now writes the post-clamp
+severity to ``cases.severity`` (never downgrading a case away from
+``'emergency'`` — see that module's own docstring). This endpoint
+deliberately keeps sourcing severity from the ``audit_log`` row anyway,
+NOT switched to ``cases.severity`` in that same change: the card also
+needs ``rules_fired`` (→ ``reasoning``), ``refusal_flags``, and — schema-v1
+v1.7, #183 — ``summary`` (→ ``why``), none of which live on ``cases`` at
+all, only on the classified audit payload. Reading severity from a SECOND
+place (``cases.severity``) while every other field on the same card still
+comes from the audit row would risk the two disagreeing on some future
+edge case (e.g. a reclassification race) for zero benefit — one row, one
+source of truth, for this endpoint. This endpoint instead reads the LATEST
+``audit_log`` row with ``action='classified'`` for each case (a case can be
+reclassified more than once via the stale-draft re-run, so "latest"
+matters) and takes ``severity``, ``rules_fired``, ``refusal_flags``, and
+``summary`` all from that ONE row, matching
 ``docs/03-engineering/api-contracts.md``'s own note that ``reasoning`` and
-``why`` "serve different surfaces... from the same payload." This is a
-pre-existing gap in the codebase (``cases.severity``/``cases.title`` are
-write-once-never columns today), not something this issue's scope covers
-fixing — flagged here rather than silently working around it.
+``why`` "serve different surfaces... from the same payload." Revisiting
+this (reading ``cases.severity`` directly, now that it's populated, and
+dropping the per-card audit lookup) is a plausible FOLLOW-UP, not done here
+— out of #197's scope (that issue's own recommended shape explicitly keeps
+the read side unchanged) and not needed to unblock #60's trust ladder,
+which reads ``trust_metrics``, not this endpoint. ``cases.title`` remains
+unwritten (deferred, same as before #197).
 
 ``tenant_message``/``received_at``
 -----------------------------------

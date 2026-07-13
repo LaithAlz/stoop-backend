@@ -258,6 +258,14 @@ async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
     await session.execute(
         text("DELETE FROM audit_log WHERE landlord_id = :lid"), {"lid": landlord_id}
     )
+    await session.execute(
+        # #197: classify_severity now writes cases.severity, so a full
+        # graph -> approve -> scheduler-tick run can genuinely populate
+        # trust_metrics (previously always skipped -- nothing to clean up
+        # here before this issue).
+        text("DELETE FROM trust_metrics WHERE landlord_id = :lid"),
+        {"lid": landlord_id},
+    )
     await session.execute(text("DELETE FROM drafts WHERE landlord_id = :lid"), {"lid": landlord_id})
     await session.execute(
         text("DELETE FROM messages WHERE landlord_id = :lid"), {"lid": landlord_id}

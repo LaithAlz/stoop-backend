@@ -130,6 +130,68 @@ Cost accounting: ``Severity.db_value`` is used for the audit payload's
 ``severity`` field (lowercase, matching ``cases.severity``'s CHECK) per
 schema-v1.md rule #6 — never ``.value`` directly.
 
+``cases.severity`` — now written, post-clamp only (#197)
+----------------------------------------------------------
+schema-v1.md's implementer notes (v1.6 amendments era) long flagged that
+``cases.severity`` was a real, documented column no code path ever wrote —
+``GET /v1/queue``/``GET /v1/cases`` worked around it by sourcing severity
+from the latest ``classified`` audit row instead (and keep doing so; that
+read-side sourcing is UNCHANGED by this issue — see ``routers/queue.py``'s
+own module docstring). #197 closes the write side: immediately after the
+``audit_log`` INSERT above, in the SAME admin-session transaction (one
+commit, or neither write survives a crash between them), this node also
+``UPDATE``s ``cases.severity`` to the exact same post-clamp
+``severity_result.severity.db_value`` the audit row just recorded — never
+a second, independently-derived value; the two can never disagree because
+they're the same read of the same in-memory result. Skipped entirely when
+``case_context.case_id`` is ``None`` (the unknown-sender fallback thread —
+there is no case row to update). ``cases`` is NOT append-only (schema-v1.md
+never-break rule #2 only covers ``messages``/``audit_log``) — an ``UPDATE``
+here is legitimate, ordinary application state, not a violation of that
+rule.
+
+**Never downgrade a case away from ``'emergency'``** — the CASE-LEVEL
+mirror of the Tier-0 clamp above. A case already sitting at
+``severity='emergency'`` (set by an earlier message on the same case, Tier
+-0-clamped or not) must never be overwritten by a LATER message's own
+classification, even a wholly legitimate ``ROUTINE``/``URGENT`` result for
+that later message — e.g. a tenant's own "did you get my message about the
+gas smell?" follow-up, classified on its own textual merits as routine,
+must never erase the case's standing EMERGENCY. This is the same
+never-break invariant the Tier-0 clamp already enforces within one
+classification call ("the agent may escalate past a Tier-0 miss, it may
+never de-escalate a Tier-0 fire"), extended across calls: RECLASSIFICATION
+of the same case may only ever escalate or hold, never downgrade FROM
+emergency. Enforced at the SQL level, not by reading-then-branching in
+Python (a read-then-write in application code would race against a
+concurrent classification of the same case; the UPDATE's own ``WHERE``
+clause makes the guard atomic and race-free):
+``UPDATE cases SET severity = :severity, updated_at = now() WHERE id =
+:case_id AND severity IS DISTINCT FROM 'emergency'`` — when the current row
+already reads ``'emergency'``, this ``WHERE`` clause excludes it and the
+``UPDATE`` matches zero rows (a silent, correct no-op); every other current
+value (``NULL``, ``'urgent'``, ``'routine'``) is eligible and gets the new
+post-clamp value unconditionally. Note this guard is intentionally
+narrower than a full monotonic (never-decrease) clamp: an existing
+``'urgent'`` case CAN be overwritten by a later ``'routine'``
+classification — only ``'emergency'`` is sticky, mirroring the Tier-0
+clamp's own scope (it only ever protects the EMERGENCY level, never
+URGENT-vs-ROUTINE ordering).
+
+Scope of the "persistence-only" claim (safety-review LOW, #197): what is
+byte-identical is THIS node's LLM interaction — the severity prompt
+(``_build_user_content`` never includes ``open_cases``), the rubric, the
+tool call, and the returned state. The write itself does feed one other
+prompt indirectly: ``load_context`` loads ``cases.severity`` into
+``open_cases`` and ``classify_intent`` renders it (``severity: {...}``),
+so on a returning tenant's second-or-later message the intent prompt now
+shows a real value where it previously always said ``unclassified``.
+Harmless today — nothing consumes ``state["intent"]`` yet, and the value
+can only add context, never reach or de-escalate severity — but this is a
+TRIPWIRE: if ``classify_intent``'s output ever gains a consumer, that
+change must re-examine this feedback loop (and the eval gate applies to
+that work on its own terms).
+
 DB access
 ---------
 Admin engine (background/graph context), same pattern as the other #30/
@@ -172,6 +234,11 @@ _SELECT_MESSAGE_SQL = text("SELECT body, prefilter FROM messages WHERE id = :mes
 _INSERT_CLASSIFIED_AUDIT_SQL = text(
     "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
     "VALUES (:landlord_id, :case_id, 'agent', 'classified', CAST(:payload AS jsonb))"
+)
+
+_UPDATE_CASE_SEVERITY_SQL = text(
+    "UPDATE cases SET severity = :severity, updated_at = now() "
+    "WHERE id = :case_id AND severity IS DISTINCT FROM 'emergency'"
 )
 
 
@@ -297,6 +364,19 @@ async def _insert_classified_audit(
                 "payload": json.dumps(payload),
             },
         )
+        # #197: write the post-clamp severity onto cases.severity, in the
+        # SAME transaction as the audit INSERT above (one commit on this
+        # session's clean exit -- see get_admin_session's own "commits on
+        # clean exit" contract). Skipped when there is no case to update
+        # (the unknown-sender fallback thread). Never-downgrade-from-
+        # -emergency is enforced by the UPDATE's own WHERE clause -- see
+        # this module's docstring "cases.severity -- now written,
+        # post-clamp only (#197)".
+        if case_id is not None:
+            await session.execute(
+                _UPDATE_CASE_SEVERITY_SQL,
+                {"case_id": str(case_id), "severity": severity_result.severity.db_value},
+            )
 
 
 async def classify_severity(state: AgentState) -> dict[str, Any]:

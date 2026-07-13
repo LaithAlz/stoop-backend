@@ -400,8 +400,26 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
                     "edited_inc": edited_inc,
                 },
             )
-        else:  # pragma: no cover — defensive; draft_response never leaves severity unset
+        else:
+            # #197: cases.severity is now written by classify_severity (post
+            # -clamp) for every case that has ever been through the graph,
+            # so a NULL here is no longer the 100%-of-sends noise it used to
+            # be before that write existed -- it now means either a case
+            # created before #197 shipped (no backfill migration; NULL
+            # stays legal, schema-v1.md) or a genuine anomaly (e.g. a case
+            # whose classify_severity run somehow never reached the case-
+            # -update, or the unknown-sender fallback thread producing a
+            # case some other way). Either way trust_metrics silently loses
+            # a data point for the trust ladder (#60) this table exists to
+            # feed -- worth a page, not just a log line, same as every other
+            # anomaly branch in this module.
             log.error("draft_sender_missing_severity_for_trust_metrics", case_id=str(case_id))
+            sentry_sdk.capture_message(
+                "draft_sender: cases.severity is NULL on send -- trust_metrics not "
+                "incremented for this send",
+                level="error",
+                extras={"case_id": str(case_id), "draft_id": str(draft_id)},
+            )
 
         await session.execute(
             _INSERT_SENT_AUDIT_SQL,

@@ -19,15 +19,22 @@ import sys
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import pytest_asyncio
+import sentry_sdk
+from anthropic.types import ToolUseBlock
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 import app.db.session as db_mod
 from app.agent.draft_sender import run_sender_loop, sender_tick
+from app.agent.nodes.classify_severity import classify_severity
+from app.agent.schemas import CaseContext, PrefilterResult
+from app.agent.state import AgentState
+from app.integrations import anthropic as anthropic_mod
 from app.integrations.sms_sender import SmsSender
 from tests import factories
 
@@ -124,7 +131,7 @@ async def _seed_approved_draft(
     due_in_seconds: float = -1.0,
     edited: bool = False,
     final_body: str | None = None,
-    severity: str = "urgent",
+    severity: str | None = "urgent",
     provision_twilio_number: bool = True,
 ) -> tuple[str, str, str]:
     """Returns ``(landlord_id, case_id, draft_id)`` — a draft already
@@ -134,7 +141,9 @@ async def _seed_approved_draft(
     column is ``UNIQUE`` — never a fixed literal across calls) so every
     existing test exercises the realistic case: a property that already
     has a provisioned outbound number. Pass ``False`` for the "not yet
-    provisioned" guard test."""
+    provisioned" guard test. ``severity=None`` seeds a case the way every
+    real case looked before #197 (or any legacy case that predates it) —
+    used by the missing-severity anomaly test below."""
     landlord_id = await factories.insert_landlord(session)
     twilio_number = factories.fresh_phone() if provision_twilio_number else None
     property_id = await factories.insert_property(session, landlord_id, twilio_number=twilio_number)
@@ -596,6 +605,179 @@ async def test_sender_tick_stops_claiming_after_deadline_then_resumes_next_tick(
     finally:
         await _cleanup(db_session, landlord_id_a)
         await _cleanup(db_session, landlord_id_b)
+
+
+# ---------------------------------------------------------------------------
+# #197 -- cases.severity is now written by classify_severity, so the
+# missing-severity branch below is a genuine anomaly (ERROR + Sentry), and
+# trust_metrics genuinely accumulates end-to-end via the real write path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_sender_tick_missing_case_severity_pages_sentry_and_skips_trust_metrics(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A case with ``severity IS NULL`` (a legacy pre-#197 case; no
+    backfill migration) skips the ``trust_metrics`` upsert -- and now that
+    this is no longer expected on 100% of sends, it must page (ERROR log +
+    Sentry), not just log quietly."""
+    landlord_id, case_id, _draft_id = await _seed_approved_draft(db_session, severity=None)
+    sender = _FakeSmsSender()
+
+    captured: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        "capture_message",
+        lambda message, **kwargs: captured.append({"message": message, **kwargs}),
+    )
+
+    try:
+        claimed = await sender_tick(sender=sender)
+        assert claimed == 1
+        assert len(sender.calls) == 1  # the send itself still happens
+
+        trust_row = (
+            (
+                await db_session.execute(
+                    text("SELECT 1 FROM trust_metrics WHERE landlord_id = :lid"),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        assert trust_row is None  # no severity -> no (property, severity) key to upsert
+
+        assert len(captured) == 1
+        assert captured[0]["level"] == "error"
+        assert case_id in str(captured[0]["extras"])
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_severity_written_by_classify_severity_flows_into_trust_metrics_via_sender(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end #197 regression pin: ``classify_severity`` (the REAL
+    production write path, not a test-factory shortcut) writes
+    ``cases.severity``; the sender then reads that same column and
+    ``trust_metrics`` accumulates -- closing the exact gap the #50 e2e
+    rehearsal found (``draft_sender_missing_severity_for_trust_metrics``
+    firing on every approved send)."""
+    landlord_id = await factories.insert_landlord(db_session)
+    twilio_number = factories.fresh_phone()
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number=twilio_number
+    )
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await factories.insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="awaiting_approval",
+        severity=None,  # never classified yet -- exactly like a real new case
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the kitchen tap won't stop dripping",
+        prefilter=PrefilterResult(hard_hit=False).model_dump_json(),
+    )
+
+    def _fake_message(*, tool_input: dict[str, Any]) -> SimpleNamespace:
+        block = ToolUseBlock(
+            id="toolu_test", input=tool_input, name="classify_severity", type="tool_use"
+        )
+        usage = SimpleNamespace(input_tokens=100, output_tokens=40)
+        return SimpleNamespace(content=[block], usage=usage, model="claude-sonnet-5")
+
+    class _FakeMessages:
+        async def create(self, **kwargs: Any) -> Any:
+            return _fake_message(
+                tool_input={
+                    "severity": "ROUTINE",
+                    "rules_fired": [],
+                    "modifier": None,
+                    "refusal_flags": [],
+                    "reasoning": ["A dripping tap can wait for a scheduled visit."],
+                }
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.messages = _FakeMessages()
+
+    monkeypatch.setattr(anthropic_mod, "get_client", lambda: _FakeClient())
+
+    try:
+        # 1. The real classify_severity node writes cases.severity.
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "reasoning_log": [],
+        }
+        update = await classify_severity(state)
+        assert update["classification_failed"] is False
+
+        case_severity_row = (
+            (
+                await db_session.execute(
+                    text("SELECT severity FROM cases WHERE id = :id"), {"id": case_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert case_severity_row["severity"] == "routine"
+
+        # 2. An approved draft on that SAME case, drained by the sender.
+        draft_id = await factories.insert_draft(
+            db_session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            status="approved",
+            scheduled_send_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        sender = _FakeSmsSender()
+        claimed = await sender_tick(sender=sender)
+        assert claimed == 1
+        assert len(sender.calls) == 1
+
+        trust_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT severity, clean_approvals, edited_approvals FROM trust_metrics "
+                        "WHERE landlord_id = :lid"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert trust_row["severity"] == "routine"
+        assert trust_row["clean_approvals"] == 1
+        assert trust_row["edited_approvals"] == 0
+
+        draft_status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+        assert draft_status == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
 
 
 def test_sms_sender_protocol_is_a_runtime_checkable_shape() -> None:

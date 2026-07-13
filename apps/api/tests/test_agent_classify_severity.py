@@ -141,25 +141,42 @@ async def _insert_tenant(session: AsyncSession, landlord_id: str, property_id: s
 
 
 async def _insert_case(
-    session: AsyncSession, *, landlord_id: str, property_id: str, tenant_id: str
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    property_id: str,
+    tenant_id: str,
+    severity: str | None = None,
 ) -> str:
     case_id = str(uuid.uuid4())
     await session.execute(
         text(
             "INSERT INTO cases (id, landlord_id, property_id, tenant_id, status, "
-            "langgraph_thread_id) "
-            "VALUES (:id, :landlord_id, :property_id, :tenant_id, 'open', :thread_id)"
+            "severity, langgraph_thread_id) "
+            "VALUES (:id, :landlord_id, :property_id, :tenant_id, 'open', :severity, "
+            ":thread_id)"
         ),
         {
             "id": case_id,
             "landlord_id": landlord_id,
             "property_id": property_id,
             "tenant_id": tenant_id,
+            "severity": severity,
             "thread_id": str(uuid.uuid4()),
         },
     )
     await session.commit()
     return case_id
+
+
+async def _get_case_severity(session: AsyncSession, case_id: str) -> str | None:
+    row = (
+        (await session.execute(text("SELECT severity FROM cases WHERE id = :id"), {"id": case_id}))
+        .mappings()
+        .one()
+    )
+    severity: str | None = row["severity"]
+    return severity
 
 
 async def _insert_message(
@@ -840,5 +857,308 @@ async def test_classify_severity_summary_falls_back_to_generic_line_when_reasoni
         )
         assert audit_row["payload"]["summary"] == "I'm treating this as routine."
         assert audit_row["payload"]["summary"] in update["reasoning_log"]
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #197 -- cases.severity is now written, post-clamp, never downgraded away
+# from 'emergency'.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_classify_severity_writes_severity_onto_case_row(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain, un-clamped classification writes the SAME severity onto
+    ``cases.severity`` that the audit row records -- the case starts with
+    ``severity IS NULL`` (never classified before), matching every real
+    case before its first classification run."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="fridge just completely died, got a week of groceries in there",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                tool_input={
+                    "severity": "URGENT",
+                    "rules_fired": ["Refrigerator dead — spoilage clock is running"],
+                    "modifier": None,
+                    "refusal_flags": [],
+                    "reasoning": ["The fridge is completely dead and groceries will spoil."],
+                }
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        assert await _get_case_severity(db_session, case_id) is None
+
+        state = _base_state(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+        )
+        await classify_severity(state)
+
+        assert await _get_case_severity(db_session, case_id) == "urgent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_severity_tier0_clamp_writes_emergency_onto_case_row(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The value written to ``cases.severity`` is the POST-clamp severity --
+    the LLM said ROUTINE, Tier-0 hard-fired, so the row gets 'emergency',
+    never the model's own pre-clamp value."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="there is a fire in the hallway",
+        prefilter=PrefilterResult(hard_hit=True, categories=["fire"]),
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                tool_input={
+                    "severity": "ROUTINE",
+                    "rules_fired": [],
+                    "modifier": None,
+                    "refusal_flags": [],
+                    "reasoning": ["Seems minor."],
+                }
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state = _base_state(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+        )
+        update = await classify_severity(state)
+
+        assert update["severity"].severity.value == "EMERGENCY"
+        assert await _get_case_severity(db_session, case_id) == "emergency"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_severity_reclassification_updates_case_severity(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later message on the SAME case re-runs classification (e.g. the
+    stale-draft re-run) and the case's severity moves to the new post-clamp
+    value -- reclassification is a genuine update, not a write-once."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        severity="routine",
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="actually the leak has gotten a lot worse since this morning",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                tool_input={
+                    "severity": "URGENT",
+                    "rules_fired": ["Active water leak worsening"],
+                    "modifier": None,
+                    "refusal_flags": [],
+                    "reasoning": ["The leak has escalated since the last message."],
+                }
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        assert await _get_case_severity(db_session, case_id) == "routine"
+
+        state = _base_state(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+        )
+        await classify_severity(state)
+
+        assert await _get_case_severity(db_session, case_id) == "urgent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_severity_never_downgrades_case_from_emergency(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case-level mirror of the Tier-0 clamp: a case already at 'emergency'
+    (set by an earlier message) must never be overwritten by a LATER
+    message's own, wholly legitimate ROUTINE classification -- no Tier-0
+    hard hit on THIS message, so nothing clamps update['severity'] itself
+    to EMERGENCY, but the case row must stay 'emergency' regardless."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        severity="emergency",
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="did you get my message about the gas smell?",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                tool_input={
+                    "severity": "ROUTINE",
+                    "rules_fired": [],
+                    "modifier": None,
+                    "refusal_flags": [],
+                    "reasoning": ["Just a follow-up question, nothing new."],
+                }
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state = _base_state(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+        )
+        update = await classify_severity(state)
+
+        # The returned state/audit trail reflect the model's OWN, honest
+        # ROUTINE call for this message -- the never-downgrade rule is a
+        # CASE-level pointer guard, not a rewrite of this call's own result.
+        assert update["severity"].severity.value == "ROUTINE"
+        audit_row = (
+            (
+                await db_session.execute(
+                    text("SELECT payload FROM audit_log WHERE case_id = :cid"), {"cid": case_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"]["severity"] == "routine"
+
+        # But the CASE row itself never moves off 'emergency'.
+        assert await _get_case_severity(db_session, case_id) == "emergency"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_severity_skips_case_update_when_no_case_yet(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unknown-sender fallback thread has no case to attach to
+    (``case_context.case_id is None``) -- the audit row is still written
+    (with a NULL ``case_id``), but there is no ``cases`` row to update and
+    this node must not raise trying."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="hello is this the right number for maintenance",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                tool_input={
+                    "severity": "ROUTINE",
+                    "rules_fired": [],
+                    "modifier": None,
+                    "refusal_flags": [],
+                    "reasoning": [],
+                }
+            )
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state = _base_state(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            case_id=None,
+        )
+        update = await classify_severity(state)
+
+        assert update["classification_failed"] is False
+        audit_row = (
+            (
+                await db_session.execute(
+                    text("SELECT payload FROM audit_log WHERE payload ->> 'message_id' = :mid"),
+                    {"mid": message_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"]["case_id"] is None
     finally:
         await _cleanup(db_session, landlord_id)

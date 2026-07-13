@@ -381,6 +381,50 @@
 >    in `payload`, untouched) — it only means token lookups fall back to a
 >    sequential scan until the migration is re-applied, a performance
 >    regression, never a correctness one.
+>
+> **v1.10 amendment (2026-07-13)** — no migration required (#197); the
+> column already exists (this doc, since v1.0) but no code path ever wrote
+> it — flagged during #56's implementation (queue.py's own module
+> docstring) and escalated after the #50 e2e rehearsal found it hard
+> -blocking #60's trust ladder (`trust_metrics` never accumulated because
+> nothing populated `cases.severity`):
+> 1. `app/agent/nodes/classify_severity.py` now writes `cases.severity`,
+>    in the SAME admin-session transaction as its `audit_log` `'classified'`
+>    INSERT (v1.6 above) — the value is the exact post-clamp
+>    `severity_result.severity.db_value` that INSERT already records, never
+>    a second, independently-derived value; the two can never disagree.
+>    Skipped when the message has no case yet (the unknown-sender fallback
+>    thread — nothing to update).
+> 2. **Never downgrade a case away from `'emergency'`** — the CASE-LEVEL
+>    mirror of the Tier-0 clamp's own "escalate past a miss, never
+>    de-escalate a fire" invariant, extended across separate classification
+>    calls on the same case: a case already at `'emergency'` stays
+>    `'emergency'` even if a later message on that case classifies as
+>    `'urgent'`/`'routine'` on its own textual merits. Enforced by the
+>    `UPDATE`'s own `WHERE severity IS DISTINCT FROM 'emergency'` clause
+>    (atomic, race-free — no read-then-branch in application code). This
+>    guard is narrower than a full monotonic clamp: an `'urgent'` case CAN
+>    still be overwritten by a later `'routine'` classification — only
+>    `'emergency'` is sticky, matching the Tier-0 clamp's own scope.
+> 3. **The `audit_log` `'classified'` row remains the canonical,
+>    historical classification record** (v1.6 above, unchanged) —
+>    `cases.severity` is a mutable "current state" pointer derived from it,
+>    not a replacement for it. `GET /v1/queue` and `GET /v1/cases`(`/{id}`)
+>    read-side sourcing is UNCHANGED by this amendment: `queue.py` still
+>    reads the latest classified audit row (it also needs `rules_fired`/
+>    `summary`, which don't live on `cases` at all — see that router's own
+>    module docstring); `cases.py` already read `cases.severity` directly
+>    (returning `null` for every real case until this amendment), so its
+>    responses start reflecting real data with no code change. Switching
+>    `queue.py` to read `cases.severity` instead is a plausible follow-up,
+>    not done here.
+> 4. **No backfill.** Cases created before this amendment keep
+>    `severity IS NULL` forever unless/until a later message on that same
+>    case triggers a fresh classification — exactly the same "no backfill,
+>    NULL stays legal" precedent `pending_resolved_at` set in the v1.5
+>    amendments above.
+> 5. `cases.title` remains unwritten — explicitly deferred, out of this
+>    amendment's scope (tracked separately).
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
@@ -479,6 +523,12 @@ CREATE TABLE cases (
                       CHECK (resolved_reason IN ('landlord','tenant_confirmed','auto_stale')),
   severity            text
                       CHECK (severity IN ('emergency','urgent','routine')),
+                                                        -- v1.10: written by classify_severity,
+                                                        --  post-clamp, never downgraded away
+                                                        --  from 'emergency'; audit_log
+                                                        --  'classified' stays the historical
+                                                        --  record. NULL = never classified
+                                                        --  (pre-v1.10 cases; no backfill).
   intent              text,                          -- maintenance|admin|question|other
   title               text,                          -- short agent-written summary
   langgraph_thread_id text UNIQUE NOT NULL,
