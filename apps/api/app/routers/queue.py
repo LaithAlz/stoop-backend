@@ -99,7 +99,6 @@ from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
-import structlog
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -108,8 +107,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.case_lifecycle import STATUS_AWAITING_APPROVAL, STATUS_AWAITING_TENANT
 from app.deps import Landlord, require_landlord
-
-log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["queue"])
 
