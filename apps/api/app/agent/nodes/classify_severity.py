@@ -178,6 +178,20 @@ classification — only ``'emergency'`` is sticky, mirroring the Tier-0
 clamp's own scope (it only ever protects the EMERGENCY level, never
 URGENT-vs-ROUTINE ordering).
 
+Scope of the "persistence-only" claim (safety-review LOW, #197): what is
+byte-identical is THIS node's LLM interaction — the severity prompt
+(``_build_user_content`` never includes ``open_cases``), the rubric, the
+tool call, and the returned state. The write itself does feed one other
+prompt indirectly: ``load_context`` loads ``cases.severity`` into
+``open_cases`` and ``classify_intent`` renders it (``severity: {...}``),
+so on a returning tenant's second-or-later message the intent prompt now
+shows a real value where it previously always said ``unclassified``.
+Harmless today — nothing consumes ``state["intent"]`` yet, and the value
+can only add context, never reach or de-escalate severity — but this is a
+TRIPWIRE: if ``classify_intent``'s output ever gains a consumer, that
+change must re-examine this feedback loop (and the eval gate applies to
+that work on its own terms).
+
 DB access
 ---------
 Admin engine (background/graph context), same pattern as the other #30/
