@@ -157,6 +157,42 @@ class Settings(BaseSettings):
         ),
     )
 
+    twilio_messaging_service_sid: str | None = Field(
+        default=None,
+        description=(
+            "Optional Twilio Messaging Service SID for automatic A2P 10DLC/"
+            "CASL campaign association on newly-provisioned property numbers "
+            "(app/property_provisioning.py, #53). Unset today -- A2P "
+            "registration is still pending externally (architecture.md: "
+            "'a milestone-1 task, not an afterthought'). When unset, "
+            "POST /v1/properties still provisions a fully working number, "
+            "just without the campaign association -- logged and skipped "
+            "gracefully, never failing provisioning on it. Set this the day "
+            "a real Messaging Service + campaign exists to start associating "
+            "every NEWLY provisioned number automatically; it has no effect "
+            "on numbers provisioned before it was set (no retroactive "
+            "backfill)."
+        ),
+    )
+
+    max_properties_per_landlord: int = Field(
+        default=25,
+        description=(
+            "Hard cap on how many properties (and therefore live, "
+            "real-money Twilio numbers) a single landlord can provision "
+            "(app/routers/properties.py, #53 safety review finding H1). "
+            "Checked BEFORE any Twilio call, purely as a guard against "
+            "unbounded spend from a buggy or malicious client hammering "
+            "POST /v1/properties -- this is NOT an entitlement/paywall "
+            "gate (never-break rule #1: the emergency line is never "
+            "paywalled or throttled) -- every landlord, free or paid, "
+            "gets the identical cap. 25 is a generous ceiling for a v1 "
+            "self-serve landlord; raise the default here (never via a "
+            "feature flag -- this is a cost/safety guard, not a rollout "
+            "knob or pricing cohort) if a real landlord ever needs more."
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Anthropic (agent — #26/#9+; sensitive — no default)
     # ------------------------------------------------------------------

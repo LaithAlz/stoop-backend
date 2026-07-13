@@ -184,6 +184,7 @@ from uuid import UUID
 import sentry_sdk
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response
+from fastapi.routing import APIRoute
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1177,3 +1178,29 @@ async def twilio_voice_webhook(request: Request) -> Response:
         action_url=emergency_chain.render_voice_action_url(notification_id),
     )
     return _twiml_response(twiml)
+
+
+# ---------------------------------------------------------------------------
+# Registered-path constants — read by app/property_provisioning.py (#53
+# safety review, finding L3) to configure a newly-purchased number's inbound
+# webhooks. Derived from the ACTUAL registered route table below (never a
+# hand-duplicated literal), so a future rename of either endpoint above is
+# structurally impossible to silently drift out of sync with what a
+# freshly-provisioned number gets pointed at — this module is executed
+# top-to-bottom exactly once at import, so every route above is already
+# registered on ``router.routes`` by the time this runs.
+# ---------------------------------------------------------------------------
+
+
+def _registered_path(endpoint_name: str) -> str:
+    """Return the full path (this router's own ``/webhooks/twilio`` prefix
+    already baked in by FastAPI's ``add_api_route``) for the endpoint
+    function named *endpoint_name*."""
+    for route in router.routes:
+        if isinstance(route, APIRoute) and route.name == endpoint_name:
+            return route.path
+    raise RuntimeError(f"no registered route named {endpoint_name!r}")  # pragma: no cover
+
+
+SMS_WEBHOOK_PATH = _registered_path("twilio_sms_webhook")
+VOICE_WEBHOOK_PATH = _registered_path("twilio_voice_webhook")

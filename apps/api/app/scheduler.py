@@ -1,7 +1,7 @@
-"""In-process 60-second scheduler ticker (#108/#109) — FastAPI
+"""In-process 60-second scheduler ticker (#108/#109/#53) — FastAPI
 lifespan-managed, drives the emergency escalation chain sweep, the SMS
-drain sweep, the degraded-mode retry sweep, and the approve-flow draft
-sender:
+drain sweep, the degraded-mode retry sweep, the approve-flow draft
+sender, and the deprovisioning number-release sweep:
 - ``app/agent/emergency_chain.py::run_emergency_chain_sweep``
 - ``app/agent/emergency_chain.py::run_sms_drain_sweep`` (safety review,
   2026-07-12, spec finding S1 / safety finding 3 — drains
@@ -19,6 +19,12 @@ sender:
   when within that window approval happened); the worst case is a due
   send waiting up to just under 60s for the next tick, matching this
   ticker's existing coarse-grained cadence for every other sweep it drives.
+- ``app/property_provisioning.py::sweep_pending_number_releases`` (#53 —
+  releases a deleted property's Twilio number once its 24h grace period
+  has elapsed; same "the timer only decides WHEN TO LOOK, never WHAT'S
+  DUE" doctrine as every other sweep here). Runs LAST, after the draft
+  sender: a release tolerates hours of delay by design (the grace period
+  is 24h), so it must never sit ahead of anything time-sensitive.
 
 Design choice (the campaign's "sender design menu" — (a) in-process
 asyncio periodic task, RECOMMENDED for v1; matches
@@ -114,6 +120,7 @@ from app.agent.degraded_mode_sweep import sweep_degraded_mode_retries
 from app.agent.draft_sender import sender_tick
 from app.agent.emergency_chain import run_emergency_chain_sweep, run_sms_drain_sweep
 from app.integrations.sms_sender import get_default_sms_sender
+from app.property_provisioning import sweep_pending_number_releases
 
 log = structlog.get_logger(__name__)
 
@@ -177,6 +184,15 @@ async def _run_one_tick_body() -> None:
         _safe_report(
             "scheduler_draft_sender_tick_failed",
             "scheduler: draft sender tick raised",
+            exc,
+        )
+
+    try:
+        await sweep_pending_number_releases()
+    except Exception as exc:
+        _safe_report(
+            "scheduler_number_release_sweep_failed",
+            "scheduler: number-release sweep tick raised",
             exc,
         )
 

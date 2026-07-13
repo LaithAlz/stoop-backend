@@ -1,12 +1,14 @@
-"""Unit tests for ``app/scheduler.py`` (#108/#109) — the 60-second
-lifespan-managed ticker driving the emergency chain sweep, the SMS drain
-sweep, the degraded-mode retry sweep, and (#44/#45's integration commit)
-the approve-flow draft sender.
+"""Unit tests for ``app/scheduler.py`` (#108/#109/#44/#45/#53) — the
+60-second lifespan-managed ticker driving FIVE periodic jobs: the
+emergency chain sweep, the SMS drain sweep, the degraded-mode retry
+sweep, the approve-flow draft sender tick, and the deprovisioning
+number-release sweep (LAST — a release tolerates hours of delay by
+design, so it must never sit ahead of anything time-sensitive).
 
 No DB, no real sleep: ``_run_one_tick`` (the per-tick body) is tested
-directly with all four sweep/tick functions mocked — the ticker LOOP
-itself (``asyncio.sleep`` + repeat) is intentionally not exercised
-end-to-end here (that would mean a real-time test); ``start_scheduler``/
+directly with all five jobs mocked — the ticker LOOP itself
+(``asyncio.sleep`` + repeat) is intentionally not exercised end-to-end
+here (that would mean a real-time test); ``start_scheduler``/
 ``stop_scheduler`` are tested for their task-lifecycle mechanics only.
 ``sender_tick`` (not ``get_default_sms_sender``) is what's mocked in every
 test below — the real ``get_default_sms_sender()`` still runs underneath
@@ -25,16 +27,18 @@ import app.scheduler as scheduler_mod
 
 
 @pytest.mark.unit
-async def test_run_one_tick_calls_all_four_sweeps() -> None:
+async def test_run_one_tick_calls_all_five_jobs() -> None:
     fake_emergency = AsyncMock()
     fake_sms_drain = AsyncMock()
     fake_degraded = AsyncMock()
     fake_sender_tick = AsyncMock()
+    fake_number_release = AsyncMock()
     with (
         patch("app.scheduler.run_emergency_chain_sweep", new=fake_emergency),
         patch("app.scheduler.run_sms_drain_sweep", new=fake_sms_drain),
         patch("app.scheduler.sweep_degraded_mode_retries", new=fake_degraded),
         patch("app.scheduler.sender_tick", new=fake_sender_tick),
+        patch("app.scheduler.sweep_pending_number_releases", new=fake_number_release),
     ):
         await scheduler_mod._run_one_tick()  # noqa: SLF001
 
@@ -42,6 +46,46 @@ async def test_run_one_tick_calls_all_four_sweeps() -> None:
     fake_sms_drain.assert_awaited_once()
     fake_degraded.assert_awaited_once()
     fake_sender_tick.assert_awaited_once()
+    fake_number_release.assert_awaited_once()
+
+
+@pytest.mark.unit
+async def test_run_one_tick_sweep_order_is_fixed() -> None:
+    """Safety review, 2026-07-13 (spec MINOR-4): a single shared recorder
+    (mirrors ``test_lifespan_starts_scheduler_after_checkpointer_and_stops_
+    before_close``'s own ``order: list[str]`` pattern below) proves the
+    FIVE jobs run in a fixed order every tick — emergency chain always
+    first, number-release always last — so a future refactor can never
+    silently reorder a lower-priority job ahead of a more time-sensitive
+    one."""
+    order: list[str] = []
+
+    async def _fake_emergency() -> None:
+        order.append("emergency")
+
+    async def _fake_sms_drain() -> None:
+        order.append("sms_drain")
+
+    async def _fake_degraded() -> None:
+        order.append("degraded")
+
+    async def _fake_sender_tick(*, sender: object) -> None:
+        order.append("sender_tick")
+
+    async def _fake_number_release() -> list[str]:
+        order.append("number_release")
+        return []
+
+    with (
+        patch("app.scheduler.run_emergency_chain_sweep", new=_fake_emergency),
+        patch("app.scheduler.run_sms_drain_sweep", new=_fake_sms_drain),
+        patch("app.scheduler.sweep_degraded_mode_retries", new=_fake_degraded),
+        patch("app.scheduler.sender_tick", new=_fake_sender_tick),
+        patch("app.scheduler.sweep_pending_number_releases", new=_fake_number_release),
+    ):
+        await scheduler_mod._run_one_tick()  # noqa: SLF001
+
+    assert order == ["emergency", "sms_drain", "degraded", "sender_tick", "number_release"]
 
 
 @pytest.mark.unit
@@ -50,11 +94,13 @@ async def test_run_one_tick_emergency_failure_does_not_prevent_other_sweeps() ->
     fake_sms_drain = AsyncMock()
     fake_degraded = AsyncMock()
     fake_sender_tick = AsyncMock()
+    fake_number_release = AsyncMock()
     with (
         patch("app.scheduler.run_emergency_chain_sweep", new=fake_emergency),
         patch("app.scheduler.run_sms_drain_sweep", new=fake_sms_drain),
         patch("app.scheduler.sweep_degraded_mode_retries", new=fake_degraded),
         patch("app.scheduler.sender_tick", new=fake_sender_tick),
+        patch("app.scheduler.sweep_pending_number_releases", new=fake_number_release),
         patch("app.scheduler.sentry_sdk") as mock_sentry,
     ):
         await scheduler_mod._run_one_tick()  # noqa: SLF001
@@ -62,6 +108,7 @@ async def test_run_one_tick_emergency_failure_does_not_prevent_other_sweeps() ->
     fake_sms_drain.assert_awaited_once()
     fake_degraded.assert_awaited_once()
     fake_sender_tick.assert_awaited_once()
+    fake_number_release.assert_awaited_once()
     mock_sentry.capture_message.assert_called_once()
 
 
@@ -71,11 +118,13 @@ async def test_run_one_tick_sms_drain_failure_does_not_prevent_other_sweeps() ->
     fake_sms_drain = AsyncMock(side_effect=RuntimeError("sms drain boom"))
     fake_degraded = AsyncMock()
     fake_sender_tick = AsyncMock()
+    fake_number_release = AsyncMock()
     with (
         patch("app.scheduler.run_emergency_chain_sweep", new=fake_emergency),
         patch("app.scheduler.run_sms_drain_sweep", new=fake_sms_drain),
         patch("app.scheduler.sweep_degraded_mode_retries", new=fake_degraded),
         patch("app.scheduler.sender_tick", new=fake_sender_tick),
+        patch("app.scheduler.sweep_pending_number_releases", new=fake_number_release),
         patch("app.scheduler.sentry_sdk") as mock_sentry,
     ):
         await scheduler_mod._run_one_tick()  # noqa: SLF001
@@ -83,6 +132,7 @@ async def test_run_one_tick_sms_drain_failure_does_not_prevent_other_sweeps() ->
     fake_emergency.assert_awaited_once()
     fake_degraded.assert_awaited_once()
     fake_sender_tick.assert_awaited_once()
+    fake_number_release.assert_awaited_once()
     mock_sentry.capture_message.assert_called_once()
 
 
@@ -92,11 +142,13 @@ async def test_run_one_tick_degraded_failure_is_isolated_from_other_sweeps() -> 
     fake_sms_drain = AsyncMock()
     fake_degraded = AsyncMock(side_effect=RuntimeError("degraded sweep boom"))
     fake_sender_tick = AsyncMock()
+    fake_number_release = AsyncMock()
     with (
         patch("app.scheduler.run_emergency_chain_sweep", new=fake_emergency),
         patch("app.scheduler.run_sms_drain_sweep", new=fake_sms_drain),
         patch("app.scheduler.sweep_degraded_mode_retries", new=fake_degraded),
         patch("app.scheduler.sender_tick", new=fake_sender_tick),
+        patch("app.scheduler.sweep_pending_number_releases", new=fake_number_release),
         patch("app.scheduler.sentry_sdk") as mock_sentry,
     ):
         await scheduler_mod._run_one_tick()  # noqa: SLF001
@@ -104,23 +156,26 @@ async def test_run_one_tick_degraded_failure_is_isolated_from_other_sweeps() -> 
     fake_emergency.assert_awaited_once()
     fake_sms_drain.assert_awaited_once()
     fake_sender_tick.assert_awaited_once()
+    fake_number_release.assert_awaited_once()
     mock_sentry.capture_message.assert_called_once()
 
 
 @pytest.mark.unit
 async def test_run_one_tick_draft_sender_failure_does_not_prevent_other_sweeps() -> None:
-    """Symmetry with the three tests above (#44/#45 integration commit):
-    the draft sender is the FOURTH sweep sharing this tick, so its own
-    failure must be just as isolated as any other sweep's."""
+    """Symmetry with the other isolation tests (#44/#45 integration
+    commit): the draft sender is one of five jobs sharing this tick, so
+    its own failure must be just as isolated as any other job's."""
     fake_emergency = AsyncMock()
     fake_sms_drain = AsyncMock()
     fake_degraded = AsyncMock()
     fake_sender_tick = AsyncMock(side_effect=RuntimeError("draft sender tick boom"))
+    fake_number_release = AsyncMock()
     with (
         patch("app.scheduler.run_emergency_chain_sweep", new=fake_emergency),
         patch("app.scheduler.run_sms_drain_sweep", new=fake_sms_drain),
         patch("app.scheduler.sweep_degraded_mode_retries", new=fake_degraded),
         patch("app.scheduler.sender_tick", new=fake_sender_tick),
+        patch("app.scheduler.sweep_pending_number_releases", new=fake_number_release),
         patch("app.scheduler.sentry_sdk") as mock_sentry,
     ):
         await scheduler_mod._run_one_tick()  # noqa: SLF001
@@ -128,6 +183,31 @@ async def test_run_one_tick_draft_sender_failure_does_not_prevent_other_sweeps()
     fake_emergency.assert_awaited_once()
     fake_sms_drain.assert_awaited_once()
     fake_degraded.assert_awaited_once()
+    fake_number_release.assert_awaited_once()
+    mock_sentry.capture_message.assert_called_once()
+
+
+@pytest.mark.unit
+async def test_run_one_tick_number_release_failure_is_isolated_from_other_sweeps() -> None:
+    fake_emergency = AsyncMock()
+    fake_sms_drain = AsyncMock()
+    fake_degraded = AsyncMock()
+    fake_sender_tick = AsyncMock()
+    fake_number_release = AsyncMock(side_effect=RuntimeError("number release sweep boom"))
+    with (
+        patch("app.scheduler.run_emergency_chain_sweep", new=fake_emergency),
+        patch("app.scheduler.run_sms_drain_sweep", new=fake_sms_drain),
+        patch("app.scheduler.sweep_degraded_mode_retries", new=fake_degraded),
+        patch("app.scheduler.sender_tick", new=fake_sender_tick),
+        patch("app.scheduler.sweep_pending_number_releases", new=fake_number_release),
+        patch("app.scheduler.sentry_sdk") as mock_sentry,
+    ):
+        await scheduler_mod._run_one_tick()  # noqa: SLF001
+
+    fake_emergency.assert_awaited_once()
+    fake_sms_drain.assert_awaited_once()
+    fake_degraded.assert_awaited_once()
+    fake_sender_tick.assert_awaited_once()
     mock_sentry.capture_message.assert_called_once()
 
 
@@ -143,6 +223,7 @@ async def test_run_one_tick_survives_a_raising_sentry_transport(
     fake_sms_drain = AsyncMock()
     fake_degraded = AsyncMock()
     fake_sender_tick = AsyncMock()
+    fake_number_release = AsyncMock()
 
     def _raising_capture_message(*args: object, **kwargs: object) -> None:
         raise RuntimeError("sentry transport is down")
@@ -152,6 +233,7 @@ async def test_run_one_tick_survives_a_raising_sentry_transport(
         patch("app.scheduler.run_sms_drain_sweep", new=fake_sms_drain),
         patch("app.scheduler.sweep_degraded_mode_retries", new=fake_degraded),
         patch("app.scheduler.sender_tick", new=fake_sender_tick),
+        patch("app.scheduler.sweep_pending_number_releases", new=fake_number_release),
         patch("app.scheduler.sentry_sdk.capture_message", side_effect=_raising_capture_message),
     ):
         # Must not raise -- this is the whole point of the test.
@@ -160,6 +242,7 @@ async def test_run_one_tick_survives_a_raising_sentry_transport(
     fake_sms_drain.assert_awaited_once()
     fake_degraded.assert_awaited_once()
     fake_sender_tick.assert_awaited_once()
+    fake_number_release.assert_awaited_once()
 
 
 @pytest.mark.unit
@@ -169,12 +252,14 @@ async def test_run_one_tick_survives_a_raising_logger(monkeypatch: pytest.Monkey
     fake_sms_drain = AsyncMock()
     fake_degraded = AsyncMock()
     fake_sender_tick = AsyncMock()
+    fake_number_release = AsyncMock()
 
     with (
         patch("app.scheduler.run_emergency_chain_sweep", new=fake_emergency),
         patch("app.scheduler.run_sms_drain_sweep", new=fake_sms_drain),
         patch("app.scheduler.sweep_degraded_mode_retries", new=fake_degraded),
         patch("app.scheduler.sender_tick", new=fake_sender_tick),
+        patch("app.scheduler.sweep_pending_number_releases", new=fake_number_release),
         patch("app.scheduler.log") as mock_log,
     ):
         mock_log.error.side_effect = RuntimeError("logging pipe is broken")
@@ -183,6 +268,7 @@ async def test_run_one_tick_survives_a_raising_logger(monkeypatch: pytest.Monkey
     fake_sms_drain.assert_awaited_once()
     fake_degraded.assert_awaited_once()
     fake_sender_tick.assert_awaited_once()
+    fake_number_release.assert_awaited_once()
 
 
 @pytest.mark.unit

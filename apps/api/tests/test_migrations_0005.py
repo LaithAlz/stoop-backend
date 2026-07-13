@@ -547,6 +547,14 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # sweep_cases / degraded_mode_sweep above — see its own docstring
         # "Wiring (deliberately deferred)").
         "app/agent/draft_sender.py",
+        # #53: the deprovisioning number-release sweep
+        # (sweep_pending_number_releases, scheduled by app/scheduler.py) —
+        # same pre-identity background/scheduler context as
+        # run_emergency_chain_sweep/run_sms_drain_sweep above; there is no
+        # HTTP request/landlord JWT for a scheduled tick to resolve a GUC
+        # from, and by the time it runs the property row (and its
+        # landlord-scoped session) is long gone anyway.
+        "app/property_provisioning.py",
     }
 )
 

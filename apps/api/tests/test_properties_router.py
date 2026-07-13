@@ -29,15 +29,17 @@ import re
 import subprocess
 import sys
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
+from app.config import settings
 from app.deps import Landlord
 from app.errors import AppError
+from app.integrations import twilio_provision
 from app.pagination import decode_cursor
 from app.routers.properties import (
     PropertyCreateRequest,
@@ -51,6 +53,68 @@ from app.routers.properties import (
 from tests import factories
 
 _DB_URL_DEFAULT = "postgresql+asyncpg://stoop:stoop@localhost:5432/stoop"
+
+
+class _FakeProvisioner:
+    """Fake (#53) for router-level WIRING tests only — the full
+    search/purchase/compensation MATRIX lives in
+    ``tests/test_property_provisioning.py``. Always succeeds by default,
+    giving every property a distinct, syntactically-plausible E.164
+    number/SID pair; ``always_empty_search``/``fail_purchase`` let a
+    handful of router-level tests exercise the NoNumbersAvailableError/
+    ProvisioningFailedError -> HTTP-code mapping (spec MAJOR-2) without
+    duplicating the full cascade/compensation matrix here."""
+
+    def __init__(self) -> None:
+        self.purchased: list[str] = []
+        self.released: list[str] = []
+        self.always_empty_search = False
+        self.fail_purchase = False
+        self.fixed_phone_number: str | None = None
+        self._counter = 0
+
+    async def search_available_numbers(
+        self, *, area_code: str | None = None, region: str | None = None
+    ) -> list[str]:
+        if self.always_empty_search:
+            return []
+        if self.fixed_phone_number is not None:
+            return [self.fixed_phone_number]
+        self._counter += 1
+        return [f"+1416555{self._counter:04d}"]
+
+    async def purchase_number(self, *, phone_number: str) -> str:
+        if self.fail_purchase:
+            raise RuntimeError("fake purchase failure")
+        sid = f"PN{uuid.uuid4().hex}"
+        self.purchased.append(sid)
+        return sid
+
+    async def configure_webhooks(self, *, twilio_sid: str, sms_url: str, voice_url: str) -> None:
+        return None
+
+    async def associate_messaging_service(
+        self, *, twilio_sid: str, messaging_service_sid: str
+    ) -> None:
+        return None
+
+    async def release_number(self, *, twilio_sid: str) -> None:
+        self.released.append(twilio_sid)
+
+
+@pytest.fixture(autouse=True)
+def _fake_twilio_provisioner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[_FakeProvisioner]:
+    """Every test in this module that calls ``create_property`` now
+    provisions (#53) — inject a fake so none of them need Twilio
+    credentials or the network, and set ``public_base_url`` so the
+    webhook-url config gate never fires here."""
+    monkeypatch.setattr(settings, "public_base_url", "https://api.stoop.test")
+    fake = _FakeProvisioner()
+    twilio_provision.set_twilio_provisioner_for_tests(fake)
+    yield fake
+    twilio_provision.set_twilio_provisioner_for_tests(None)
 
 
 def _get_db_url() -> str:
@@ -102,7 +166,18 @@ async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
         ),
         params,
     )
-    for table in ("audit_log", "drafts", "messages", "cases", "tenants", "properties"):
+    for table in (
+        "audit_log",
+        "drafts",
+        "messages",
+        "cases",
+        "tenants",
+        "properties",
+        # #53: deprovisioning writes a `notifications` row keyed on
+        # landlord_id (ON DELETE RESTRICT) — must be gone before the
+        # landlords DELETE below or that statement itself raises.
+        "notifications",
+    ):
         await session.execute(text(f"DELETE FROM {table} WHERE landlord_id = :lid"), params)  # noqa: S608
     await session.execute(text("DELETE FROM landlords WHERE id = :lid"), params)
     await session.commit()
@@ -124,7 +199,7 @@ async def test_create_and_get_property_roundtrip(session: AsyncSession) -> None:
         )
         assert created.label == "41 Palmerston"
         assert created.province == "ON"  # DB default applied via COALESCE
-        assert created.twilio_number is None  # #53 provisioning is out of scope
+        assert created.twilio_number is not None  # #53: now actually provisioned
         assert created.open_case_count == 0
         assert created.quiet_hours == {"start": "21:00", "end": "08:00"}
 
@@ -174,7 +249,7 @@ async def test_cross_tenant_property_access_returns_404(session: AsyncSession) -
         assert update_exc.value.code == "property_not_found"
 
         with pytest.raises(AppError) as delete_exc:
-            await delete_property(prop.id, (landlord_b, session))
+            await delete_property(prop.id, (landlord_b, session), confirm=True)
         assert delete_exc.value.status_code == 404
         assert delete_exc.value.code == "property_not_found"
 
@@ -367,7 +442,7 @@ async def test_delete_blocked_by_open_case_returns_409(session: AsyncSession) ->
         )
 
         with pytest.raises(AppError) as exc_info:
-            await delete_property(prop.id, (landlord, session))
+            await delete_property(prop.id, (landlord, session), confirm=True)
         assert exc_info.value.status_code == 409
         assert exc_info.value.code == "has_open_cases"
     finally:
@@ -388,7 +463,7 @@ async def test_delete_blocked_by_dependents_returns_409(session: AsyncSession) -
         await factories.insert_tenant(session, landlord_id, str(prop.id))
 
         with pytest.raises(AppError) as exc_info:
-            await delete_property(prop.id, (landlord, session))
+            await delete_property(prop.id, (landlord, session), confirm=True)
         assert exc_info.value.status_code == 409
         assert exc_info.value.code == "has_dependents"
     finally:
@@ -404,10 +479,305 @@ async def test_delete_property_success(session: AsyncSession) -> None:
             PropertyCreateRequest(label="Deletable", address_line1="1 Gone St", city="Toronto"),
             (landlord, session),
         )
-        await delete_property(prop.id, (landlord, session))
+        await delete_property(prop.id, (landlord, session), confirm=True)
 
         with pytest.raises(AppError) as exc_info:
             await get_property(prop.id, (landlord, session))
         assert exc_info.value.code == "property_not_found"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_delete_without_confirm_returns_400(session: AsyncSession) -> None:
+    """#53: deleting a property with a live phone number is irreversible for
+    that number — an explicit ?confirm=true is required, checked before
+    the open-cases/dependents business checks."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(
+                label="Needs confirm", address_line1="1 Confirm St", city="Toronto"
+            ),
+            (landlord, session),
+        )
+        with pytest.raises(AppError) as exc_info:
+            await delete_property(prop.id, (landlord, session))
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == "confirmation_required"
+
+        # Never actually deleted.
+        still_there = await get_property(prop.id, (landlord, session))
+        assert still_there.id == prop.id
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_provisions_twilio_number(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    """#53: POST /v1/properties actually provisions — the fake purchased
+    exactly one number and never released it (happy path)."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        created = await create_property(
+            PropertyCreateRequest(
+                label="Provisioned", address_line1="1 Provision St", city="Toronto"
+            ),
+            (landlord, session),
+        )
+        assert created.twilio_number is not None
+        assert len(_fake_twilio_provisioner.purchased) == 1
+        assert _fake_twilio_provisioner.released == []
+
+        row = (
+            (
+                await session.execute(
+                    text("SELECT twilio_sid FROM properties WHERE id = :id"),
+                    {"id": str(created.id)},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["twilio_sid"] == _fake_twilio_provisioner.purchased[0]
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_delete_schedules_number_release_with_grace_period(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    """#53: deprovisioning does NOT call Twilio synchronously — it writes a
+    durable, sweep-visible `number_release` row with a ~24h next_attempt_at,
+    and never released the number (that's the sweeper's job)."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(label="Grace period", address_line1="1 Grace St", city="Toronto"),
+            (landlord, session),
+        )
+        twilio_sid = _fake_twilio_provisioner.purchased[0]
+
+        await delete_property(prop.id, (landlord, session), confirm=True)
+        assert _fake_twilio_provisioner.released == []  # not released synchronously
+
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT type, channel, status, payload, next_attempt_at, created_at "
+                        "FROM notifications WHERE landlord_id = :lid AND type = 'number_release'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["channel"] == "push"
+        assert row["status"] == "pending"
+        assert row["payload"]["twilio_sid"] == twilio_sid
+        assert row["payload"]["property_id"] == str(prop.id)
+        assert row["payload"]["landlord_id"] == landlord_id
+        delta = row["next_attempt_at"] - row["created_at"]
+        assert 23 * 3600 < delta.total_seconds() < 25 * 3600
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# H1 (safety review, 2026-07-13) — pre-Twilio-call money guards.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_cap_returns_409_before_any_purchase(
+    session: AsyncSession,
+    _fake_twilio_provisioner: _FakeProvisioner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "max_properties_per_landlord", 2)
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        await create_property(
+            PropertyCreateRequest(label="One", address_line1="1 Cap St", city="Toronto"),
+            (landlord, session),
+        )
+        await create_property(
+            PropertyCreateRequest(label="Two", address_line1="2 Cap St", city="Toronto"),
+            (landlord, session),
+        )
+        purchased_before = len(_fake_twilio_provisioner.purchased)
+        assert purchased_before == 2
+
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(label="Three", address_line1="3 Cap St", city="Toronto"),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "property_limit_reached"
+        # The cap check runs BEFORE any Twilio call -- no purchase attempted.
+        assert len(_fake_twilio_provisioner.purchased) == purchased_before
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_duplicate_address_retry_buys_zero_numbers(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    """H1: a client retrying the SAME create (e.g. after a timeout) must
+    hit the dedupe check instead of buying a second number for what is,
+    from the landlord's perspective, the same property."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        await create_property(
+            PropertyCreateRequest(
+                label="Original", address_line1="41 Palmerston Ave", city="Toronto", province="ON"
+            ),
+            (landlord, session),
+        )
+        assert len(_fake_twilio_provisioner.purchased) == 1
+
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                # Different label + casing/whitespace -- SAME normalized address.
+                PropertyCreateRequest(
+                    label="Retry",
+                    address_line1="  41 palmerston ave  ",
+                    city="TORONTO",
+                    province="on",
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "duplicate_property"
+        assert len(_fake_twilio_provisioner.purchased) == 1  # zero additional purchases
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Spec MAJOR-1 — DB-insert-failure compensation, end-to-end.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_db_insert_failure_after_purchase_compensates_and_releases(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    """Force the property INSERT to fail (a UNIQUE-constraint collision on
+    twilio_number) after a successful fake purchase, and prove the full
+    compensation contract: 502 provisioning_failed, the purchased SID gets
+    released, and ZERO new properties rows persist."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        conflicting_number = "+14165559876"
+        await factories.insert_property(session, landlord_id, twilio_number=conflicting_number)
+        _fake_twilio_provisioner.fixed_phone_number = conflicting_number
+
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Conflict test", address_line1="1 Conflict St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.code == "provisioning_failed"
+        await session.rollback()  # clear the aborted transaction from the UNIQUE violation
+
+        assert _fake_twilio_provisioner.purchased  # the purchase DID happen
+        purchased_sid = _fake_twilio_provisioner.purchased[-1]
+        assert _fake_twilio_provisioner.released == [purchased_sid]  # released as compensation
+
+        count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM properties WHERE landlord_id = :lid "
+                    "AND label = 'Conflict test'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert count == 0  # zero new properties rows persisted
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Spec MAJOR-2 — each provisioning exception maps to its own contract code.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_public_base_url_unconfigured_returns_500(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "public_base_url", None)
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="No base url", address_line1="1 Unconfigured St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.code == "public_base_url_unconfigured"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_no_numbers_available_returns_503(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    _fake_twilio_provisioner.always_empty_search = True
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="No numbers", address_line1="1 Empty St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.code == "no_numbers_available"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_purchase_failure_returns_502(
+    session: AsyncSession, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    _fake_twilio_provisioner.fail_purchase = True
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Purchase fails", address_line1="1 Fail St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.code == "provisioning_failed"
     finally:
         await _cleanup(session, landlord_id)

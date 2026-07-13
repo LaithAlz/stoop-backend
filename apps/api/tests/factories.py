@@ -86,20 +86,22 @@ async def insert_property(
     lat: float | None = None,
     lon: float | None = None,
     twilio_number: str | None = None,
+    twilio_sid: str | None = None,
     backup_contact: dict[str, Any] | None = None,
 ) -> str:
     """``twilio_number``/``backup_contact`` added for #108 (the emergency
     escalation chain needs a per-property outbound caller-id number and an
     optional backup contact) — both default ``None``, matching the schema's
     own nullable columns and every EXISTING caller's prior behavior
-    unchanged."""
+    unchanged. ``twilio_sid`` added for #53 (deprovisioning tests need a
+    SID to schedule a release for) — also defaults ``None``."""
     property_id = str(uuid.uuid4())
     await session.execute(
         text(
             "INSERT INTO properties (id, landlord_id, label, address_line1, city, house_rules, "
-            "lat, lon, twilio_number, backup_contact) "
+            "lat, lon, twilio_number, twilio_sid, backup_contact) "
             "VALUES (:id, :landlord_id, 'Test Property', '123 Test St', 'Toronto', :house_rules, "
-            ":lat, :lon, :twilio_number, CAST(:backup_contact AS jsonb))"
+            ":lat, :lon, :twilio_number, :twilio_sid, CAST(:backup_contact AS jsonb))"
         ),
         {
             "id": property_id,
@@ -108,6 +110,7 @@ async def insert_property(
             "lat": lat,
             "lon": lon,
             "twilio_number": twilio_number,
+            "twilio_sid": twilio_sid,
             "backup_contact": json.dumps(backup_contact) if backup_contact is not None else None,
         },
     )

@@ -113,6 +113,16 @@ def _reset_twilio_sender() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_twilio_provisioner() -> Iterator[None]:
+    """Drop any injected fake Twilio provisioner between tests (#53) —
+    same cross-test-leakage rationale as ``_reset_twilio_sender`` above."""
+    import app.integrations.twilio_provision as twilio_provision_mod
+
+    twilio_provision_mod.set_twilio_provisioner_for_tests(None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_ack_rate_limiter() -> Iterator[None]:
     """Clear the ack-surface rate limiter's in-memory state between tests
     — same cross-test-leakage rationale as the other resets in this file:

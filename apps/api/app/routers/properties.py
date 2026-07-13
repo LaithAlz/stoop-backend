@@ -13,12 +13,73 @@ Shapes match ``docs/03-engineering/api-contracts.md``'s "Properties"
 section exactly. Column names are ``schema-v1.md``'s ``properties`` table,
 verbatim.
 
-Twilio provisioning (the doc's "Provisions a Twilio number (#53)" note) is
-issue #53's job, not this one's — #53 is a separate, not-yet-implemented
-issue, and ``app/integrations/twilio*.py`` is out of scope for this PR.
-``POST /v1/properties`` here creates the row with ``twilio_number`` left
-``NULL`` (schema-v1.md: "E.164; null until provisioned" — the column is
-already nullable for exactly this reason).
+Twilio provisioning (#53, ``app/property_provisioning.py`` +
+``app/integrations/twilio_provision.py``): ``POST /v1/properties``
+provisions a real Twilio number BEFORE inserting the row — search (area
+code → province → any CA number) → purchase → configure webhooks →
+best-effort A2P association — and only inserts the row once that succeeds,
+with ``twilio_number``/``twilio_sid`` populated from the start (never a
+row with them ``NULL`` on success; schema-v1.md's "null until provisioned"
+comment describes the failure/pending state, not the success path). Any
+failure releases a just-purchased number as compensation before surfacing
+a clean error — see ``property_provisioning.py``'s own docstring and
+api-contracts.md's v1.12 amendment for the full failure-code contract.
+
+**Pre-Twilio-call money guards (safety review, 2026-07-13, finding H1)** —
+TWO cheap DB reads run BEFORE ``provision_number`` is ever called (before
+any real-money Twilio call), neither an entitlement/paywall gate (rule #1:
+the emergency line is never paywalled — these apply identically to every
+landlord, free or paid):
+
+1. **Property cap** — 409 ``property_limit_reached`` once a landlord
+   already has ``settings.max_properties_per_landlord`` properties. A pure
+   spend/abuse guard against a buggy or malicious client hammering this
+   endpoint, not a plan limit.
+2. **Duplicate-address dedupe** — 409 ``duplicate_property`` if the SAME
+   landlord already has a property at the same normalized address
+   (``address_line1``/``city``/``province``, case/whitespace-insensitive —
+   see ``_DUPLICATE_PROPERTY_SQL``). This is what makes a client's
+   timeout-and-retry hit the dedupe check instead of buying a SECOND
+   number for what is, from the landlord's perspective, the same property.
+   Mirrors the existing ``duplicate_phone`` convention
+   (tenants/vendors) in spirit, but is a pre-check here rather than a
+   ``UNIQUE``-constraint conversion — ``properties`` has no such
+   constraint (schema-v1.md), and closing the DB-level race for two
+   genuinely concurrent creates of the same address is accepted as a
+   follow-up, not this issue's job (the pre-check already closes the
+   money-costing case: a serial retry).
+
+**Connection-pinning tradeoff (safety review finding M4) — read before
+touching this handler.** ``create_property`` holds its
+``require_landlord`` session/transaction (and therefore the pooled DB
+connection and the RLS GUC) open across up to ~40s of real Twilio HTTP
+calls (three REQUIRED sequential requests at up to 10s each — search,
+purchase, configure — plus a 4th best-effort A2P call, also up to 10s).
+This is a genuine tradeoff,
+not an oversight: ``require_landlord``'s own module docstring already
+forbids a mid-handler ``session.commit()`` (``SET LOCAL`` — the GUC —
+dies with the transaction), so there is no cheap way to release the
+connection mid-request without a structural redesign (a durable
+"provisioning intent" row + background worker, matching the notifications
+-sweep pattern this same module already uses for deprovisioning) — that
+redesign is explicitly a follow-up issue, not this PR's scope. Mitigated
+today by: (a) running the cap/dedupe pre-checks (cheap reads) BEFORE any
+Twilio call, so a request that's going to be rejected never holds the
+connection through a Twilio round trip at all; (b) the property cap itself
+also bounds the WORST CASE (a single landlord can only ever hold this
+pattern open `max_properties_per_landlord` times in a row before hitting
+the cap); (c) each Twilio call already has its own 10s timeout
+(``twilio_provision.py``). Flagged here explicitly for senior review to
+adjudicate whether this tradeoff is acceptable at current traffic, or
+whether the structural fix should be pulled forward.
+
+``DELETE`` deprovisions: requires ``?confirm=true`` (400
+``confirmation_required`` otherwise, checked before the existing
+``has_open_cases``/``has_dependents`` checks below), then — for a property
+that had a live number — schedules a 24h-grace-period release rather than
+calling Twilio synchronously (``property_provisioning.schedule_number_
+release``; the actual release is swept by ``app/scheduler.py``). See
+api-contracts.md's v1.12 amendment.
 
 ``DELETE`` is a genuine hard delete (``properties`` has no ``deleted_at``
 column, unlike ``tenants``/``vendors``' ``active`` flag) — the documented
@@ -50,15 +111,18 @@ from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import property_provisioning
 from app.agent.case_lifecycle import OPEN_STATUSES
 from app.audit import record_audit_log
+from app.config import settings
 from app.deps import Landlord, require_landlord
 from app.errors import AppError
 from app.pagination import (
@@ -69,6 +133,8 @@ from app.pagination import (
     paginate_rows,
 )
 from app.validation import reject_explicit_null
+
+log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["properties"])
 
@@ -102,6 +168,12 @@ class PropertyListResponse(BaseModel):
 
 
 class PropertyCreateRequest(BaseModel):
+    """See api-contracts.md's Properties section. ``area_code`` (#53) is a
+    TRANSIENT Twilio-provisioning hint only — never persisted (no
+    ``properties`` column for it, per that section's v1.12 amendment): a
+    3-digit NANP area code biasing the number search; falls back to the
+    property's own ``province``, then any available Canadian number."""
+
     label: str
     address_line1: str
     city: str
@@ -109,6 +181,7 @@ class PropertyCreateRequest(BaseModel):
     postal_code: str | None = None
     house_rules: str | None = None
     backup_contact: dict[str, Any] | None = None
+    area_code: str | None = Field(default=None, pattern=r"^\d{3}$")
 
 
 class PropertyUpdateRequest(BaseModel):
@@ -127,9 +200,12 @@ class PropertyUpdateRequest(BaseModel):
 # SQL
 # ---------------------------------------------------------------------------
 
+# p.twilio_sid rides along for delete_property's deprovisioning step (#53)
+# — never surfaced in PropertyResponse (_row_to_property doesn't reference
+# it), same as any other internal-only column would be.
 _PROPERTY_COLUMNS = (
     "p.id, p.label, p.address_line1, p.city, p.province, p.postal_code, "
-    "p.twilio_number, p.house_rules, p.quiet_hours, p.heating_season, "
+    "p.twilio_number, p.twilio_sid, p.house_rules, p.quiet_hours, p.heating_season, "
     "p.backup_contact, p.created_at, COALESCE(oc.open_case_count, 0) AS open_case_count"
 )
 
@@ -153,10 +229,33 @@ _SELECT_ONE_SQL = text(
 _INSERT_SQL = text(
     """
     INSERT INTO properties (landlord_id, label, address_line1, city, province,
-                             postal_code, house_rules, backup_contact)
+                             postal_code, house_rules, backup_contact,
+                             twilio_number, twilio_sid)
     VALUES (:landlord_id, :label, :address_line1, :city, COALESCE(:province, 'ON'),
-            :postal_code, :house_rules, CAST(:backup_contact AS jsonb))
+            :postal_code, :house_rules, CAST(:backup_contact AS jsonb),
+            :twilio_number, :twilio_sid)
     RETURNING id
+    """
+)
+
+# #53 safety review H1 — both pre-checks below run BEFORE any Twilio call.
+_COUNT_LANDLORD_PROPERTIES_SQL = text(
+    "SELECT COUNT(*) FROM properties WHERE landlord_id = :landlord_id"
+)
+
+# Natural key for "the same property" (module docstring, "Duplicate-address
+# dedupe"): landlord_id + case/whitespace-insensitive address_line1/city
+# /province. postal_code is deliberately EXCLUDED (nullable/optional — a
+# retry that omits it the second time must still be recognized as the same
+# duplicate address).
+_DUPLICATE_PROPERTY_SQL = text(
+    """
+    SELECT id FROM properties
+    WHERE landlord_id = :landlord_id
+      AND LOWER(TRIM(address_line1)) = LOWER(TRIM(:address_line1))
+      AND LOWER(TRIM(city)) = LOWER(TRIM(:city))
+      AND LOWER(TRIM(province)) = LOWER(TRIM(:province))
+    LIMIT 1
     """
 )
 
@@ -261,25 +360,112 @@ async def create_property(
     landlord_and_session: Annotated[tuple[Landlord, AsyncSession], Depends(require_landlord)],
 ) -> PropertyResponse:
     landlord, session = landlord_and_session
+    landlord_id = str(landlord.id)
+    effective_province = body.province or "ON"
 
-    result = await session.execute(
-        _INSERT_SQL,
-        {
-            "landlord_id": str(landlord.id),
-            "label": body.label,
-            "address_line1": body.address_line1,
-            "city": body.city,
-            "province": body.province,
-            "postal_code": body.postal_code,
-            "house_rules": body.house_rules,
-            "backup_contact": json.dumps(body.backup_contact)
-            if body.backup_contact is not None
-            else None,
-        },
+    # #53 safety review H1 — cheap pre-checks BEFORE any Twilio call (see
+    # module docstring "Pre-Twilio-call money guards").
+    existing_count = (
+        await session.execute(_COUNT_LANDLORD_PROPERTIES_SQL, {"landlord_id": landlord_id})
+    ).scalar_one()
+    if existing_count >= settings.max_properties_per_landlord:
+        raise AppError(
+            status_code=409,
+            code="property_limit_reached",
+            message="You've reached the maximum number of properties.",
+        )
+
+    duplicate_row = (
+        (
+            await session.execute(
+                _DUPLICATE_PROPERTY_SQL,
+                {
+                    "landlord_id": landlord_id,
+                    "address_line1": body.address_line1,
+                    "city": body.city,
+                    "province": effective_province,
+                },
+            )
+        )
+        .mappings()
+        .one_or_none()
     )
-    new_id = result.scalar_one()
+    if duplicate_row is not None:
+        raise AppError(
+            status_code=409,
+            code="duplicate_property",
+            message="You already have a property at this address.",
+        )
 
-    row = await _get_property_or_404(session, landlord_id=str(landlord.id), property_id=str(new_id))
+    try:
+        provision_result = await property_provisioning.provision_number(
+            area_code=body.area_code, province=effective_province
+        )
+    except property_provisioning.PublicBaseUrlUnconfiguredError as exc:
+        raise AppError(
+            status_code=500,
+            code="public_base_url_unconfigured",
+            message="Server is not configured for phone provisioning yet.",
+        ) from exc
+    except property_provisioning.NoNumbersAvailableError as exc:
+        raise AppError(
+            status_code=503,
+            code="no_numbers_available",
+            message="No phone numbers are available for that area right now.",
+        ) from exc
+    except property_provisioning.ProvisioningFailedError as exc:
+        raise AppError(
+            status_code=502,
+            code="provisioning_failed",
+            message="Could not provision a phone number right now.",
+        ) from exc
+
+    try:
+        result = await session.execute(
+            _INSERT_SQL,
+            {
+                "landlord_id": landlord_id,
+                "label": body.label,
+                "address_line1": body.address_line1,
+                "city": body.city,
+                "province": body.province,
+                "postal_code": body.postal_code,
+                "house_rules": body.house_rules,
+                "backup_contact": json.dumps(body.backup_contact)
+                if body.backup_contact is not None
+                else None,
+                "twilio_number": provision_result.phone_number,
+                "twilio_sid": provision_result.twilio_sid,
+            },
+        )
+        new_id = result.scalar_one()
+        # Read-back is INSIDE this try too (safety review finding M3) — a
+        # purchased number must never go silently unrecorded even if this
+        # structurally-shouldn't-fail lookup somehow does.
+        row = await _get_property_or_404(session, landlord_id=landlord_id, property_id=str(new_id))
+    except Exception as exc:
+        # DB write (or its read-back) failed AFTER a successful purchase --
+        # compensate rather than leave a purchased-but-orphaned number
+        # (never-break: no half-provisioned row, and no unreferenced live
+        # Twilio number either). See property_provisioning.py's module
+        # docstring. ALWAYS pages (M3) regardless of whether the
+        # compensating release itself succeeds -- release_number_best_effort
+        # has its own, separate alert for a release that itself fails.
+        property_provisioning.alert_purchased_but_unrecorded(provision_result.twilio_sid)
+        await property_provisioning.release_number_best_effort(provision_result.twilio_sid)
+        raise AppError(
+            status_code=502,
+            code="provisioning_failed",
+            message="Could not provision a phone number right now.",
+        ) from exc
+
+    log.info(
+        "property_provisioned",
+        landlord_id=landlord_id,
+        property_id=str(new_id),
+        twilio_sid=provision_result.twilio_sid,
+        a2p_status=provision_result.a2p_status,
+    )
     return _row_to_property(row)
 
 
@@ -365,12 +551,25 @@ async def update_property(
 async def delete_property(
     property_id: UUID,
     landlord_and_session: Annotated[tuple[Landlord, AsyncSession], Depends(require_landlord)],
+    confirm: bool = False,
 ) -> None:
     landlord, session = landlord_and_session
     landlord_id = str(landlord.id)
     prop_id = str(property_id)
 
-    await _get_property_or_404(session, landlord_id=landlord_id, property_id=prop_id)
+    existing = await _get_property_or_404(session, landlord_id=landlord_id, property_id=prop_id)
+
+    # #53: deleting a property with a live phone number is irreversible for
+    # that number (deprovisioning below only delays the release, it never
+    # undoes this delete) — require an explicit ?confirm=true before doing
+    # anything else. Checked before the open-cases/dependents business
+    # checks below (api-contracts.md's v1.12 amendment).
+    if not confirm:
+        raise AppError(
+            status_code=400,
+            code="confirmation_required",
+            message="Pass ?confirm=true to delete this property.",
+        )
 
     open_count = (
         await session.execute(
@@ -395,3 +594,13 @@ async def delete_property(
             code="has_dependents",
             message="This property has related records and cannot be deleted.",
         ) from exc
+
+    twilio_sid = existing["twilio_sid"]
+    if twilio_sid:
+        # Deprovisioning (#53): the property row is already gone (hard
+        # delete, unchanged) — schedule the actual Twilio release for
+        # after the grace period rather than calling Twilio synchronously
+        # here. See property_provisioning.py's module docstring.
+        await property_provisioning.schedule_number_release(
+            session, landlord_id=landlord_id, property_id=prop_id, twilio_sid=twilio_sid
+        )
