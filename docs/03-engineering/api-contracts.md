@@ -113,6 +113,71 @@ two are indistinguishable by design — never leak cross-tenant existence).
 satisfied via `PATCH /v1/me` (below), not this endpoint; noted here so the
 two don't look like an unaddressed gap.
 
+**v1.11 amendment (2026-07-13 — #53 implementation):** this doc was
+previously silent on the provisioning request/response shape; the contract
+below is the minimal one this implementation follows (flagged for spec
+review — no issue-spec doc exists for #53, unlike #1-#15).
+
+- **`POST /v1/properties` request gains one new, OPTIONAL field:
+  `area_code`** (a 3-digit NANP area code string, e.g. `"416"`) —
+  transient provisioning input only, never persisted (no `properties`
+  column for it; schema-v1.md's `twilio_number`/`twilio_sid` are the only
+  Twilio-related columns and neither needed changing). Search order for
+  the number to purchase: (1) `area_code` if given; (2) the property's own
+  `province` (already a request field, defaults `'ON'`) as the "nearest"
+  fallback the issue's AC asks for — there is no `lat`/`lon` on the
+  request body to search by proximity, and those columns are `NULL` on
+  every property at creation time regardless (#30's weather lookup is the
+  only current writer of them, and only after creation); (3) any
+  available Canadian local number, unfiltered. `twilio_number` in the
+  response `Property` is populated on success (previously always `null`,
+  per #54's own note "#53 provisioning is out of scope").
+- **New `POST /v1/properties` failure codes**, standard error envelope:
+  - 503 `no_numbers_available` — every step of the search order above came
+    back empty. No property row is created.
+  - 502 `provisioning_failed` — any other Twilio-side failure (search
+    error, purchase error, webhook-configuration error) or a DB failure
+    immediately after a successful purchase. In every case where a number
+    was actually purchased before the failure, it is released back to
+    Twilio as compensation before the error is returned — never a
+    half-provisioned row (no property row with a `twilio_number` Twilio
+    itself doesn't also have record of, and never a purchased-but-orphaned
+    number with no property row referencing it).
+  - 500 `public_base_url_unconfigured` — `PUBLIC_BASE_URL` (already an
+    existing, optional-in-dev setting; see the Webhooks section) is unset,
+    so there is no URL to hand Twilio for the inbound webhook. A
+    deployment-configuration error, not a per-request one; the only way
+    this fires in production is `app/config.py`'s own boot gate having
+    somehow been bypassed.
+- **A2P/CASL campaign association** is attempted automatically when a
+  Twilio Messaging Service SID is configured
+  (`settings.twilio_messaging_service_sid`, unset today — A2P registration
+  is still pending externally, `architecture.md`: "a milestone-1 task, not
+  an afterthought"). Unconfigured → skipped gracefully. Configured but the
+  association call itself fails → also skipped gracefully (logged as a
+  warning, uuid/SID-level only) — **never fails provisioning either way**;
+  a working, webhook-configured number is a strictly better outcome than
+  none at all, and unregistered traffic degrades to carrier filtering, not
+  an outright send failure. Recorded only in structured logs (uuid/SID
+  only, rule #5), not in the `Property` response or `audit_log` — this
+  doesn't change agent behavior the way #54's audit-trail note describes,
+  and there is no `properties` column to persist the outcome on.
+- **`DELETE /v1/properties/{id}` gains a required `confirm=true` query
+  parameter** — absent or `false` → 400 `confirmation_required`, checked
+  BEFORE the existing `has_open_cases`/`has_dependents` checks (deleting a
+  property with a live phone number is irreversible for that number, even
+  though the checks below are unchanged). Once confirmed and the property
+  actually deletes: if it had a `twilio_number`, the number is **not**
+  released synchronously — it enters a 24-hour grace period (a durable
+  `notifications` row, `type='number_release'`, swept by the existing
+  `app/scheduler.py` 60s ticker; schema-v1.md's v1.10 amendment) before
+  the release actually happens, a "windows are data, not sleeps" design
+  mirroring the approve-flow's undo window. This is NOT an undo for the
+  deleted `properties` row itself (that delete is immediate and permanent,
+  unchanged) — only the external Twilio side effect is delayed, so an
+  operator has a same-day window to notice/intervene before the number is
+  gone for good.
+
 ## Tenants & Vendors
 
 `GET/POST /v1/properties/{id}/tenants` · `PATCH/DELETE /v1/tenants/{id}`

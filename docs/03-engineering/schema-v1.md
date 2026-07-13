@@ -426,6 +426,46 @@
 > 5. `cases.title` remains unwritten — explicitly deferred, out of this
 >    amendment's scope (tracked separately).
 
+> **v1.10 amendment (2026-07-13)** — migration 0011 implements this (#53,
+> property provisioning). No new column or table on `properties` —
+> `twilio_number`/`twilio_sid` already existed for exactly this — but
+> deprovisioning's grace period needs one new durable, sweep-visible
+> artifact, and `properties` has no `deleted_at`/status column to hang it
+> off (`DELETE /v1/properties/{id}` is a genuine hard delete, unchanged).
+> Same evolution path as v1.3/v1.8 above (adding a `notifications.type`
+> CHECK value, not a new column/table):
+> 1. **`number_release`** (`channel='push'`, same "internal marker, never
+>    actually delivered to a person" convention `degraded_retry` already
+>    established) — the durable record of "release this Twilio number back
+>    to the pool," written by `DELETE /v1/properties/{id}` at the moment a
+>    property (with a live `twilio_number`) is deleted, since the actual
+>    external release is deliberately NOT synchronous with the request
+>    (`apps/api/CLAUDE.md`'s "windows are data, not sleeps" — mirrors the
+>    approve-flow's `scheduled_send_at` undo window). `payload` carries
+>    `twilio_sid`/`property_id`/`landlord_id` only (uuids/SIDs — rule #5);
+>    the property row itself is already gone by the time this is written,
+>    so this row is the ONLY remaining record of which Twilio number needs
+>    releasing. `next_attempt_at` is set to `now() + 24h` at creation (the
+>    grace period itself — a same-day window during which the number still
+>    physically exists in the Twilio account even though the `properties`
+>    row does not) and the EXISTING `idx_notifications_sweep (status,
+>    next_attempt_at)` index already serves it — no new index needed here,
+>    unlike v1.3/v1.8's per-type dedupe indexes. `status` lifecycle:
+>    `pending` → `sent` (released) or, after
+>    `app/property_provisioning.py`'s bounded retry count is exhausted,
+>    `exhausted` (same terminal-vs-transient convention the v1.8 amendments
+>    already established for `tenant_ack`/`degraded_retry`).
+> 2. **`uq_notifications_number_release_dedupe`** — `CREATE UNIQUE INDEX
+>    ... ON notifications ((payload ->> 'twilio_sid')) WHERE type =
+>    'number_release'`, same NULL-safe partial-unique pattern as every
+>    other dedupe index in this file. Guards a genuine (if narrow) race: two
+>    concurrent `DELETE` requests for the same property could both read the
+>    row's `twilio_sid` before either commits the delete; this makes
+>    scheduling the release idempotent regardless.
+> 3. `DELETE /v1/properties/{id}` itself gains a required `confirm=true`
+>    query parameter (contract-level only, no schema change) — see
+>    `api-contracts.md`'s Properties section.
+
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
 CREATE TABLE landlords (
@@ -696,8 +736,10 @@ CREATE TABLE notifications (
   landlord_id     uuid NOT NULL REFERENCES landlords(id) ON DELETE RESTRICT,
   case_id         uuid REFERENCES cases(id),
   type            text NOT NULL CHECK (type IN ('emergency_call','emergency_sms',
-                    'needs_eyes','draft_ready','recap','tenant_ack','degraded_retry')),
+                    'needs_eyes','draft_ready','recap','tenant_ack','degraded_retry',
+                    'number_release')),
                                                      -- 'tenant_ack'/'degraded_retry' added v1.8 (#109)
+                                                     -- 'number_release' added v1.10 (#53)
   channel         text NOT NULL CHECK (channel IN ('voice','sms','push','email')),
   status          text NOT NULL DEFAULT 'pending'
                   CHECK (status IN ('pending','sent','acknowledged','failed','exhausted')),
@@ -726,6 +768,15 @@ CREATE UNIQUE INDEX uq_notifications_tenant_ack_dedupe
 CREATE UNIQUE INDEX uq_notifications_degraded_retry_dedupe
   ON notifications ((payload ->> 'message_id'))
   WHERE type = 'degraded_retry';
+
+-- v1.10 (migration 0011, #53): deprovisioning's grace-period release --
+-- see the v1.10 amendments note above. Reuses idx_notifications_sweep
+-- (status, next_attempt_at) above for the sweep itself; this index is only
+-- for idempotency, keyed on twilio_sid rather than message_id (this type
+-- has no message_id at all).
+CREATE UNIQUE INDEX uq_notifications_number_release_dedupe
+  ON notifications ((payload ->> 'twilio_sid'))
+  WHERE type = 'number_release';
 
 -- ───────────────────────── push_tokens ───────────────────────
 CREATE TABLE push_tokens (
