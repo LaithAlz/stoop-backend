@@ -110,11 +110,11 @@ class _FakeSmsSender:
         self.calls: list[dict[str, Any]] = []
         self.fail_next = False
 
-    async def send_sms(self, *, to_e164: str, body: str) -> str:
+    async def send_sms(self, *, to_e164: str, from_e164: str, body: str) -> str:
         if self.fail_next:
             self.fail_next = False
             raise RuntimeError("simulated provider failure")
-        self.calls.append({"to_e164": to_e164, "body": body})
+        self.calls.append({"to_e164": to_e164, "from_e164": from_e164, "body": body})
         return f"SM{uuid.uuid4().hex}"
 
 
@@ -125,12 +125,19 @@ async def _seed_approved_draft(
     edited: bool = False,
     final_body: str | None = None,
     severity: str = "urgent",
+    provision_twilio_number: bool = True,
 ) -> tuple[str, str, str]:
     """Returns ``(landlord_id, case_id, draft_id)`` — a draft already
     ``'approved'`` with ``scheduled_send_at`` *due_in_seconds* from now
-    (negative = already due)."""
+    (negative = already due). ``provision_twilio_number=True`` (default)
+    gives the property a fresh, collision-free ``twilio_number`` (the
+    column is ``UNIQUE`` — never a fixed literal across calls) so every
+    existing test exercises the realistic case: a property that already
+    has a provisioned outbound number. Pass ``False`` for the "not yet
+    provisioned" guard test."""
     landlord_id = await factories.insert_landlord(session)
-    property_id = await factories.insert_property(session, landlord_id)
+    twilio_number = factories.fresh_phone() if provision_twilio_number else None
+    property_id = await factories.insert_property(session, landlord_id, twilio_number=twilio_number)
     tenant_id = await factories.insert_tenant(session, landlord_id, property_id)
     case_id = await factories.insert_case(
         session,
@@ -197,6 +204,10 @@ async def test_sender_tick_sends_due_draft_and_writes_every_durable_side_effect(
         assert message_row["twilio_sid"] is not None
         assert message_row["twilio_sid"].startswith("SM")
         assert message_row["body"] == sender.calls[0]["body"]
+        # The send goes out from the CASE's OWN property's twilio_number,
+        # never a fabricated/omitted "from" (app/integrations/sms_sender.py's
+        # module docstring "Why from_e164 is required").
+        assert sender.calls[0]["from_e164"] is not None
 
         case_row = (
             (
@@ -455,12 +466,51 @@ async def test_edited_draft_with_empty_final_body_never_sends_original_text(
         await _cleanup(db_session, landlord_id)
 
 
+# ---------------------------------------------------------------------------
+# 6. No twilio_number provisioned yet -- refuse to send, never misroute.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_no_property_twilio_number_refuses_to_send(db_session: AsyncSession) -> None:
+    """A property with no ``twilio_number`` provisioned yet must never send
+    from a DIFFERENT property's number or a fabricated placeholder —
+    mirrors ``app/agent/emergency_chain.py``'s own ``"no_twilio_number"``
+    skip reason. Refused loudly, row left stuck ``'sending'`` (same
+    stuck-row semantics as any other send failure), no message row
+    fabricated."""
+    landlord_id, case_id, draft_id = await _seed_approved_draft(
+        db_session, provision_twilio_number=False
+    )
+    sender = _FakeSmsSender()
+    try:
+        claimed = await sender_tick(sender=sender)
+        assert claimed == 1  # claimed the row -- refused before ever calling send_sms
+        assert sender.calls == []
+
+        status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+        assert status == "sending"  # stuck, visible -- never silently re-attempted
+
+        message_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM messages WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert message_count == 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 def test_sms_sender_protocol_is_a_runtime_checkable_shape() -> None:
     """Cheap unit-level pin: SmsSender is the ONE seam the ticker depends
     on — a fake implementing just `send_sms` satisfies it structurally."""
 
     class _Impl:
-        async def send_sms(self, *, to_e164: str, body: str) -> str:
+        async def send_sms(self, *, to_e164: str, from_e164: str, body: str) -> str:
             return "sid"
 
     sender: SmsSender = _Impl()

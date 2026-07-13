@@ -41,11 +41,14 @@ from httpx import ASGITransport
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
+import app.agent.nodes.finalize_draft_decision as finalize_draft_decision_mod
 import app.db.session as db_mod
 import app.integrations.supabase_auth as auth_mod
+import app.scheduler as scheduler_mod
 from app.agent.checkpointer import close_checkpointer, setup_checkpointer
 from app.agent.graph import run_graph
 from app.integrations import anthropic as anthropic_mod
+from app.integrations.twilio_send import set_twilio_sender_for_tests
 from app.main import app
 from tests import factories
 
@@ -355,6 +358,69 @@ def _mocked_jwks(jwks_payload: dict[str, Any]) -> respx.MockRouter:
 
 def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+class _FakeTwilioSender:
+    """Records every call; never touches a network or real Twilio
+    credentials (there are none in this test suite). Injected via
+    ``app.integrations.twilio_send.set_twilio_sender_for_tests`` — the SAME
+    sanctioned seam ``tests/test_agent_emergency_chain.py``'s own
+    ``FakeTwilioSender`` uses for the emergency safety path. Proves the
+    FULL live chain: ``get_default_sms_sender()`` ->
+    ``TwilioBackedSmsSender`` -> ``get_twilio_sender()`` -> this fake —
+    never a real ``twilio.rest.Client``."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def send_sms(self, *, to: str, from_: str, body: str) -> str:
+        self.calls.append({"to": to, "from_": from_, "body": body})
+        return f"SM{uuid.uuid4().hex}"
+
+    async def create_call(self, *, to: str, from_: str, twiml_url: str) -> str:
+        raise AssertionError("the draft flow never places a voice call")
+
+
+async def _tenant_phone_for_case(session: AsyncSession, *, case_id: str) -> str:
+    """The case's tenant's phone — used by the live-wiring tests below to
+    scope ``_FakeTwilioSender.calls`` assertions to THIS test's own send,
+    never a raw global count (the fake is a process-wide singleton also
+    used by ``app/agent/emergency_chain.py``'s own sweeps, which
+    ``app.scheduler._run_one_tick()`` runs alongside the draft sender;
+    scoping by phone keeps these assertions correct regardless of
+    whatever else that same tick call touches)."""
+    row = (
+        (
+            await session.execute(
+                text(
+                    "SELECT t.phone FROM tenants t JOIN cases c ON c.tenant_id = t.id "
+                    "WHERE c.id = :case_id"
+                ),
+                {"case_id": case_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return str(row["phone"])
+
+
+async def _provision_twilio_number(session: AsyncSession, *, case_id: str) -> None:
+    """``_seed_pending_draft_via_graph``/``_seed_pending_draft_direct`` seed
+    a property with NO ``twilio_number`` (matching every OTHER test in this
+    module, which never drives an actual send). The live-wiring tests below
+    are the only ones that need a real "from" number to get past
+    ``app/agent/draft_sender.py``'s own guard — see
+    ``app/integrations/sms_sender.py``'s module docstring "Why from_e164
+    is required"."""
+    await session.execute(
+        text(
+            "UPDATE properties SET twilio_number = :num WHERE id = "
+            "(SELECT property_id FROM cases WHERE id = :case_id)"
+        ),
+        {"num": factories.fresh_phone(), "case_id": case_id},
+    )
+    await session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -997,5 +1063,224 @@ async def test_reject_conflict_reconciliation_when_concurrent_approve_won_return
             )
         assert exc_info.value.code == "already_sent"
         assert exc_info.value.status_code == 409
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 6. Live wiring (#44/#45 integration commit) — approve genuinely drives an
+#    outbound send through app/scheduler.py's real 60s-tick body, via a FAKE
+#    Twilio sender injected at the SAME seam the emergency chain uses
+#    (app.integrations.twilio_send.set_twilio_sender_for_tests). No real
+#    Twilio credentials exist in this test suite; nothing here ever reaches
+#    the network.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_approve_drives_exactly_one_send_via_scheduler_tick(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The FULL live chain, end to end: POST .../approve -> (once due) ->
+    app.scheduler._run_one_tick() -> app.agent.draft_sender.sender_tick ->
+    app.integrations.sms_sender.get_default_sms_sender() ->
+    TwilioBackedSmsSender -> app.integrations.twilio_send.get_twilio_sender()
+    -> this test's fake. Exactly ONE send recorded; every durable side
+    effect of a real send is written."""
+    monkeypatch.setattr(finalize_draft_decision_mod, "UNDO_WINDOW", timedelta(seconds=0))
+    fake_sender = _FakeTwilioSender()
+    set_twilio_sender_for_tests(fake_sender)
+
+    sub = str(uuid.uuid4())
+    landlord_id, case_id, draft_id = await _seed_pending_draft_via_graph(
+        db_session, monkeypatch, auth_user_id=sub
+    )
+    await _provision_twilio_number(db_session, case_id=case_id)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
+    token = _mint_token(private_key, sub=sub)
+
+    try:
+        async with _mocked_jwks(jwks_payload):
+            async with _client() as client:
+                approve_response = await client.post(
+                    f"/v1/drafts/{draft_id}/approve", headers={"Authorization": f"Bearer {token}"}
+                )
+        assert approve_response.status_code == 200, approve_response.text
+
+        # The scheduler's own per-tick body -- not a bespoke test loop, and
+        # not app.agent.draft_sender.sender_tick called directly -- drives
+        # the actual send.
+        await scheduler_mod._run_one_tick()  # noqa: SLF001
+
+        # Scoped to THIS test's own tenant phone (never a raw global count
+        # on the shared fake -- see _tenant_phone_for_case's docstring):
+        # exactly one send for THIS draft.
+        own_calls = [c for c in fake_sender.calls if c["to"] == tenant_phone]
+        assert len(own_calls) == 1
+
+        draft_row = (
+            (
+                await db_session.execute(
+                    text("SELECT status, sent_message_id FROM drafts WHERE id = :id"),
+                    {"id": draft_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert draft_row["status"] == "sent"
+        assert draft_row["sent_message_id"] is not None
+
+        message_row = (
+            (
+                await db_session.execute(
+                    text("SELECT direction, party, twilio_sid, body FROM messages WHERE id = :id"),
+                    {"id": str(draft_row["sent_message_id"])},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert message_row["direction"] == "outbound"
+        assert message_row["twilio_sid"] is not None
+        assert message_row["twilio_sid"].startswith("SM")
+        assert message_row["body"] == own_calls[0]["body"]
+        # Went out from the property's OWN provisioned number, never a
+        # fabricated/omitted "from" (app/integrations/sms_sender.py's
+        # module docstring "Why from_e164 is required").
+        assert own_calls[0]["from_"] is not None
+
+        audit_actions = (
+            (
+                await db_session.execute(
+                    text("SELECT action FROM audit_log WHERE case_id = :cid ORDER BY id"),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        action_sequence = [row["action"] for row in audit_actions]
+        # approved -> ... -> sent, in that relative order (approved must
+        # precede sent; other actions -- classified, drafted -- may appear
+        # earlier from the graph run itself).
+        assert "approved" in action_sequence
+        assert "sent" in action_sequence
+        assert action_sequence.index("approved") < action_sequence.index("sent")
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_undo_within_window_results_in_zero_sends(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Undo BEFORE a scheduler tick ever runs must leave the draft
+    'pending' -- the claim SQL only ever matches ``status = 'approved'``,
+    so a subsequent tick is a genuine no-op, never a send."""
+    fake_sender = _FakeTwilioSender()
+    set_twilio_sender_for_tests(fake_sender)
+
+    sub = str(uuid.uuid4())
+    landlord_id, case_id, draft_id = await _seed_pending_draft_via_graph(
+        db_session, monkeypatch, auth_user_id=sub
+    )
+    await _provision_twilio_number(db_session, case_id=case_id)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
+    token = _mint_token(private_key, sub=sub)
+
+    try:
+        async with _mocked_jwks(jwks_payload):
+            async with _client() as client:
+                approve_response = await client.post(
+                    f"/v1/drafts/{draft_id}/approve", headers={"Authorization": f"Bearer {token}"}
+                )
+                assert approve_response.status_code == 200
+
+                undo_response = await client.delete(
+                    f"/v1/drafts/{draft_id}/approve", headers={"Authorization": f"Bearer {token}"}
+                )
+                assert undo_response.status_code == 200, undo_response.text
+
+        await scheduler_mod._run_one_tick()  # noqa: SLF001
+
+        own_calls = [c for c in fake_sender.calls if c["to"] == tenant_phone]
+        assert own_calls == []
+
+        status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+        assert status == "pending"
+
+        message_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM messages WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert message_count == 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_double_approve_then_scheduler_tick_sends_exactly_once(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Approving the SAME draft twice (idempotent -- one scheduled_send_at,
+    one audit row, per test_approve_idempotent_on_repeat above) must still
+    result in exactly ONE real send once due, never two."""
+    monkeypatch.setattr(finalize_draft_decision_mod, "UNDO_WINDOW", timedelta(seconds=0))
+    fake_sender = _FakeTwilioSender()
+    set_twilio_sender_for_tests(fake_sender)
+
+    sub = str(uuid.uuid4())
+    landlord_id, case_id, draft_id = await _seed_pending_draft_via_graph(
+        db_session, monkeypatch, auth_user_id=sub
+    )
+    await _provision_twilio_number(db_session, case_id=case_id)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
+    token = _mint_token(private_key, sub=sub)
+
+    try:
+        async with _mocked_jwks(jwks_payload):
+            async with _client() as client:
+                r1 = await client.post(
+                    f"/v1/drafts/{draft_id}/approve", headers={"Authorization": f"Bearer {token}"}
+                )
+                r2 = await client.post(
+                    f"/v1/drafts/{draft_id}/approve", headers={"Authorization": f"Bearer {token}"}
+                )
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+
+        await scheduler_mod._run_one_tick()  # noqa: SLF001
+
+        own_calls = [c for c in fake_sender.calls if c["to"] == tenant_phone]
+        assert len(own_calls) == 1
+
+        status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+        assert status == "sent"
+
+        message_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM messages WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert message_count == 1
     finally:
         await _cleanup(db_session, landlord_id)

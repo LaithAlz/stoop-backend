@@ -70,19 +70,19 @@ short transaction) -> read recipient/case context (own short transaction)
 final durable state (one more short transaction). A slow/hanging Twilio
 call therefore never pins a pooled connection.
 
-Wiring (deliberately deferred — do not start this from app/main.py in
-THIS issue)
+Wiring (#108 integration, landed)
 ------------------------------------------------------------------------
-:func:`run_sender_loop` is a fully-built, independently testable callable
-seam — NOT invoked anywhere in ``app/main.py``'s lifespan by this PR. #108
-is landing its own ``app/main.py``/scheduler changes in parallel on a
-different branch; wiring this loop into the SAME file here risks a merge
-collision neither branch can resolve safely. A follow-up ONE-COMMIT
-integration (after #108 merges) adds the few lines that start this loop
-(and swap :func:`app.integrations.sms_sender.get_default_sms_sender`'s
-``None`` for #108's real Twilio-backed adapter) alongside whatever
-scheduler seam #108 introduces for its own escalation-chain sweeper — see
-that module's own docstring for the exact pattern to match.
+:func:`sender_tick` — one tick, not the standalone infinite loop below —
+is called from ``app/scheduler.py``'s existing 60s ticker, alongside the
+emergency escalation chain sweep and the degraded-mode retry sweep, using
+:func:`app.integrations.sms_sender.get_default_sms_sender`'s real
+Twilio-backed adapter. One scheduler owns all periodic work; this module
+never starts its own competing lifespan task. :func:`run_sender_loop`
+(the standalone, independently-tickable loop with its own interval/
+stop-event) remains as a fully-built, independently testable seam — kept
+for its own test coverage and as a documented alternative wiring, but is
+NOT invoked from ``app/main.py`` or ``app/scheduler.py``; the scheduler
+calls :func:`sender_tick` directly instead.
 """
 
 from __future__ import annotations
@@ -129,7 +129,9 @@ _CLAIM_DRAFT_SQL = text(
 )
 
 _SELECT_CASE_FOR_SEND_SQL = text(
-    "SELECT property_id, severity, tenant_id, vendor_id FROM cases WHERE id = :case_id"
+    "SELECT c.property_id, c.severity, c.tenant_id, c.vendor_id, p.twilio_number "
+    "FROM cases c JOIN properties p ON p.id = c.property_id "
+    "WHERE c.id = :case_id"
 )
 
 _SELECT_TENANT_PHONE_SQL = text("SELECT phone FROM tenants WHERE id = :tenant_id")
@@ -180,11 +182,17 @@ async def _claim_draft(session: AsyncSession, draft_id: UUID) -> dict[str, Any] 
 
 async def _load_recipient_context(
     session: AsyncSession, *, case_id: UUID, recipient: str
-) -> tuple[UUID, str | None, UUID | None, UUID | None, str | None]:
-    """Returns ``(property_id, severity, tenant_id, vendor_id, to_e164)`` —
-    *to_e164* is ``None`` when the recipient's phone can't be resolved
-    (defensive; structurally shouldn't happen given the schema's FK/NOT
-    NULL shape, but this module never assumes it away)."""
+) -> tuple[UUID, str | None, UUID | None, UUID | None, str | None, str | None]:
+    """Returns ``(property_id, severity, tenant_id, vendor_id, to_e164,
+    from_e164)`` — *to_e164* is ``None`` when the recipient's phone can't
+    be resolved (defensive; structurally shouldn't happen given the
+    schema's FK/NOT NULL shape, but this module never assumes it away).
+    *from_e164* is the case's own property's ``twilio_number`` — ``None``
+    until that property has one provisioned (schema-v1.md: nullable);
+    see ``app/integrations/sms_sender.py``'s module docstring "Why
+    ``from_e164`` is required" for why this must be the SENDING
+    property's number, never any other property's or a landlord-wide
+    default."""
     case_row = (
         (await session.execute(_SELECT_CASE_FOR_SEND_SQL, {"case_id": str(case_id)}))
         .mappings()
@@ -194,6 +202,7 @@ async def _load_recipient_context(
     severity: str | None = case_row["severity"]
     tenant_id: UUID | None = case_row["tenant_id"]
     vendor_id: UUID | None = case_row["vendor_id"]
+    from_e164: str | None = case_row["twilio_number"]
 
     to_e164: str | None = None
     if recipient == "tenant" and tenant_id is not None:
@@ -211,7 +220,7 @@ async def _load_recipient_context(
         )
         to_e164 = vrow["phone"] if vrow is not None else None
 
-    return property_id, severity, tenant_id, vendor_id, to_e164
+    return property_id, severity, tenant_id, vendor_id, to_e164, from_e164
 
 
 async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> None:
@@ -248,9 +257,14 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
     body: str = claimed["final_body"] if edited else claimed["body"]
 
     async with asynccontextmanager(get_admin_session)() as session:
-        property_id, severity, tenant_id, vendor_id, to_e164 = await _load_recipient_context(
-            session, case_id=case_id, recipient=recipient
-        )
+        (
+            property_id,
+            severity,
+            tenant_id,
+            vendor_id,
+            to_e164,
+            from_e164,
+        ) = await _load_recipient_context(session, case_id=case_id, recipient=recipient)
 
     if to_e164 is None:
         log.error(
@@ -261,8 +275,21 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
         )
         return
 
+    if from_e164 is None:
+        # Mirrors app/agent/emergency_chain.py's own "no_twilio_number"
+        # skip reason: a property with no twilio_number provisioned yet
+        # must never send from a DIFFERENT property's number or a
+        # fabricated placeholder — see app/integrations/sms_sender.py's
+        # module docstring "Why from_e164 is required".
+        log.error(
+            "draft_sender_no_property_twilio_number",
+            draft_id=str(draft_id),
+            case_id=str(case_id),
+        )
+        return
+
     try:
-        twilio_sid = await sender.send_sms(to_e164=to_e164, body=body)
+        twilio_sid = await sender.send_sms(to_e164=to_e164, from_e164=from_e164, body=body)
     except Exception as exc:
         log.error(
             "draft_sender_send_failed",
@@ -370,10 +397,11 @@ async def run_sender_loop(
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
     stop_event: asyncio.Event | None = None,
 ) -> None:
-    """The in-process periodic task (skill doc Phase 3, option (a) —
-    RECOMMENDED for v1; no new infra). See module docstring "Wiring
-    (deliberately deferred)" — NOT invoked from ``app/main.py`` by this
-    issue.
+    """The in-process periodic task (skill doc Phase 3, option (a)). See
+    module docstring "Wiring (#108 integration, landed)" — NOT invoked
+    from ``app/main.py`` or ``app/scheduler.py`` today; the scheduler calls
+    :func:`sender_tick` directly instead. Kept as a fully-built,
+    independently testable/usable alternative wiring.
 
     Ticks :func:`sender_tick` every *interval_seconds* until *stop_event*
     is set (runs forever if no *stop_event* is supplied — a caller that
@@ -381,11 +409,14 @@ async def run_sender_loop(
     application shutdown).
 
     Deployment gating (matches #109's own pattern — see
-    ``app/integrations/sms_sender.py``'s module docstring "The deployment
-    -gating pattern"): if *sender* is ``None``, this loop refuses to run at
-    all — logs ONE loud error and returns immediately, rather than looping
-    forever doing nothing or (worse) ever reaching a call site that could
-    invoke :class:`app.integrations.sms_sender.NotImplementedSmsSender`.
+    ``app/integrations/sms_sender.py``'s module docstring): if *sender* is
+    ``None``, this loop refuses to run at all — logs ONE loud error and
+    returns immediately, rather than looping forever doing nothing or
+    (worse) ever reaching a call site that could invoke
+    :class:`app.integrations.sms_sender.NotImplementedSmsSender`. No
+    production caller passes ``None`` today (``get_default_sms_sender``
+    always returns a real binding), but this contract stays enforced for
+    any future caller that does.
     """
     if sender is None:
         log.error(

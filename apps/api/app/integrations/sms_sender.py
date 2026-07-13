@@ -3,37 +3,51 @@ ticker depends on. This is the SECOND of the two sanctioned outbound-send
 call sites (``apps/api/CLAUDE.md``: "Send to tenant/vendor happens only
 through the draft flow or the emergency safety path").
 
-Scope boundary (2026-07)
-------------------------
-Issue #108 (parallel branch, ``feat/emergency-executor``) owns
-``app/integrations/twilio.py`` and ``app/agent/emergency*.py`` — the real
-Twilio client and the emergency-call/safety-SMS execution seam. This
-module is deliberately a SEPARATE file: the draft sender must depend only
-on this Protocol, never import ``app.integrations.twilio`` directly, so
-the two branches cannot collide on the same file. A follow-up, one-commit
-integration (after #108 merges) wires a real Twilio-backed implementation
-of :class:`SmsSender` into :func:`get_default_sms_sender` — until then this
-returns ``None`` on purpose (see that function's own docstring).
+Real binding (#108 integration, landed)
+----------------------------------------
+Issue #108 (``feat/emergency-executor``, merged as PR #196) built
+``app/integrations/twilio_send.py`` — the real Twilio client
+(``TwilioSender``/``TwilioRestSender``, an ``AsyncTwilioHttpClient`` with a
+10s timeout) and its sole prior caller, the emergency escalation chain.
+This module stays a SEPARATE file on purpose (draft_sender.py must never
+import ``app.integrations.twilio_send`` directly, and nothing outside
+``twilio_send.py`` may construct a real Twilio REST client at all — see
+``tests/test_twilio_send_allowlist.py``): :class:`TwilioBackedSmsSender`
+below is a thin adapter that delegates every real send to
+``twilio_send.py``'s own ``get_twilio_sender()`` singleton — the SAME
+client/timeout/credentials the emergency safety path uses, never a second
+Twilio client stack. ``app/integrations/sms_sender.py`` is now itself
+allowlisted in ``tests/test_twilio_send_allowlist.py`` as the sanctioned
+draft-flow call site (the second of exactly two).
 
-The deployment-gating pattern (matches #109's own)
-----------------------------------------------------
-There are two, deliberately layered defenses against ever silently
-"sending" nothing while believing it succeeded:
+Why ``from_e164`` is required
+------------------------------
+Each ``properties`` row owns its own ``twilio_number`` (nullable until
+provisioned, schema-v1.md) — inbound webhook routing keys strictly off the
+Twilio "To" number to resolve which property a message belongs to
+(``app/routers/webhooks/twilio.py``). A reply must go out from that SAME
+number or a tenant's next inbound message would arrive at (or appear to
+come from) the wrong property. ``app/agent/draft_sender.py`` resolves the
+case's property's ``twilio_number`` and passes it through as
+``from_e164`` — mirrors ``app/agent/emergency_chain.py``'s own
+``ctx.twilio_number`` convention exactly. A property with no
+``twilio_number`` yet provisioned is refused the same way
+``emergency_chain.py`` refuses one (``reason="no_twilio_number"``) —
+never a send from some other property's number, and never a fabricated
+placeholder number.
 
-1. :class:`NotImplementedSmsSender` — the documented placeholder for the
-   eventual real binding. If its ``send_sms`` is EVER actually invoked
-   (which the current wiring below prevents — see point 2), it raises
-   ``NotImplementedError`` loudly rather than silently no-opping or
-   fabricating a fake provider sid.
-2. :func:`get_default_sms_sender` returns ``None`` (not an instance of
-   (1)) until the real binding lands. ``app/agent/draft_sender.py``'s
-   ``run_sender_loop`` treats a ``None`` sender as "the worker is
-   disabled" and refuses to start its ticking loop AT ALL, logging a loud,
-   one-time warning instead — so (1)'s ``NotImplementedError`` is dead
-   code in every deployment that exists today, on purpose: the loop simply
-   never reaches a call site that could trigger it. Once #108 lands and a
-   real adapter is wired in here, the loop starts normally and (1) is
-   never constructed at all.
+The deployment-gating pattern this module used to rely on
+------------------------------------------------------------------------
+Before this integration, :func:`get_default_sms_sender` returned ``None``
+and ``app/agent/draft_sender.py``'s ``run_sender_loop`` treated that as
+"the worker is disabled." That gate is no longer needed for the real
+binding below (``twilio_account_sid``/``twilio_auth_token`` are required,
+non-optional settings — see ``app/config.py`` — so constructing a real
+sender never depends on an absent credential the way it hypothetically
+could have). :class:`NotImplementedSmsSender` is kept, unused, as a
+documented, loudly-failing placeholder contract for any FUTURE binding
+that bypasses :func:`get_default_sms_sender` by mistake — never
+constructed by this module today.
 """
 
 from __future__ import annotations
@@ -41,6 +55,8 @@ from __future__ import annotations
 from typing import Protocol
 
 import structlog
+
+from app.integrations.twilio_send import get_twilio_sender
 
 log = structlog.get_logger(__name__)
 
@@ -50,40 +66,57 @@ class SmsSender(Protocol):
     the provider's message sid (a plain string — never assumed to be a
     Twilio-specific shape) on success; raises on failure (the ticker
     itself decides what "failure" means for its own claim/retry bookkeeping
-    — see that module's docstring)."""
+    — see that module's docstring). ``from_e164`` is the sending
+    property's own ``twilio_number`` (see module docstring "Why
+    ``from_e164`` is required") — never a landlord- or account-wide
+    default number."""
 
-    async def send_sms(self, *, to_e164: str, body: str) -> str: ...
+    async def send_sms(self, *, to_e164: str, from_e164: str, body: str) -> str: ...
 
 
 class NotImplementedSmsSender:
-    """The documented placeholder production binding — see module
-    docstring "The deployment-gating pattern". Never constructed by
-    :func:`get_default_sms_sender` today; exists so the eventual real
-    binding has an unambiguous contract to satisfy, and so any FUTURE
-    caller that bypasses the loop's own ``None``-gating (a mistake, not a
-    sanctioned path) fails loudly instead of pretending to succeed."""
+    """Documented, loudly-failing placeholder — see module docstring "The
+    deployment-gating pattern this module used to rely on". Never
+    constructed by :func:`get_default_sms_sender`; exists only so a future
+    caller that bypasses the sanctioned binding by mistake fails loudly
+    instead of pretending to succeed."""
 
-    async def send_sms(self, *, to_e164: str, body: str) -> str:
+    async def send_sms(self, *, to_e164: str, from_e164: str, body: str) -> str:
         raise NotImplementedError(
-            "No real SmsSender is wired in yet -- #108's integration commit provides the "
-            "Twilio-backed binding (see app/integrations/sms_sender.py's module docstring). "
-            "This placeholder must never be reachable in a live deployment; "
-            "get_default_sms_sender() returning None is what keeps the sender worker "
-            "disabled until that binding exists."
+            "No real SmsSender is wired in yet -- get_default_sms_sender() "
+            "(app/integrations/sms_sender.py) is the sanctioned way to obtain one."
         )
 
 
-def get_default_sms_sender() -> SmsSender | None:
-    """Returns ``None`` until #108's integration commit provides a real
-    Twilio-backed binding — see module docstring. Deliberately NOT
-    :class:`NotImplementedSmsSender`: ``None`` is what
-    ``app/agent/draft_sender.py``'s ``run_sender_loop`` checks to decide
-    "the worker is disabled" (logged loudly, once, at start-up) BEFORE ever
-    reaching a call site that could invoke ``send_sms`` — the
-    ``NotImplementedError`` above is therefore unreachable dead code in
-    every deployment today, by construction, not by convention alone.
+class TwilioBackedSmsSender:
+    """The real production binding for :class:`SmsSender` (#108
+    integration commit). Delegates every send to ``app.integrations.
+    twilio_send``'s already-reviewed ``get_twilio_sender()`` singleton —
+    never constructs its own real Twilio REST client or duplicates any
+    HTTP setup (``tests/test_twilio_send_allowlist.py`` machine-enforces
+    both the call-site allowlist and the direct-construction import ban).
+    Holds no state of its own; cheap to construct per call."""
+
+    async def send_sms(self, *, to_e164: str, from_e164: str, body: str) -> str:
+        sender = get_twilio_sender()  # sanctioned draft-flow call site (allowlisted)
+        return await sender.send_sms(to=to_e164, from_=from_e164, body=body)
+
+
+def get_default_sms_sender() -> SmsSender:
+    """Returns the real Twilio-backed :class:`SmsSender` binding (#108's
+    integration commit) — ``app/scheduler.py``'s 60s ticker calls this
+    once per tick before draining due drafts via ``app.agent.draft_sender.
+    sender_tick``. Always returns a working instance: ``twilio_account_sid``
+    /``twilio_auth_token`` are required (non-optional) settings, so there is
+    no "unconfigured" state to gate on here the way there was before this
+    binding existed.
     """
-    return None
+    return TwilioBackedSmsSender()
 
 
-__all__: list[str] = ["NotImplementedSmsSender", "SmsSender", "get_default_sms_sender"]
+__all__: list[str] = [
+    "NotImplementedSmsSender",
+    "SmsSender",
+    "TwilioBackedSmsSender",
+    "get_default_sms_sender",
+]
