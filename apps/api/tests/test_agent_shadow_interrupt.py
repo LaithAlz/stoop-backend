@@ -75,6 +75,7 @@ from app.agent.graph import (
     run_graph,
 )
 from app.agent.graph_entry import enqueue_classification
+from app.agent.nodes.finalize_draft_decision import ACTION_APPROVE
 from app.integrations import anthropic as anthropic_mod
 from tests import factories
 
@@ -375,12 +376,24 @@ async def test_pause_is_durable_across_restart_then_resumable(
 
         # Resumable post-restart via the #44/#45 seam.
         result = await resume_case_thread(
-            case_id=uuid.UUID(case["id"]), draft_id=draft_id, resume_value={"action": "approved"}
+            case_id=uuid.UUID(case["id"]),
+            draft_id=draft_id,
+            resume_value={"action": ACTION_APPROVE},
         )
         assert "__interrupt__" not in result
 
         final_snapshot = await fresh_case_graph.aget_state(config)
         assert final_snapshot.next == ()
+
+        # The dispatch path this test's own name claims actually ran (#44/#45
+        # safety review, MINOR: the pre-existing "approved" placeholder never
+        # dispatched to any real node — this proves finalize_approval did).
+        draft_status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :did"), {"did": str(draft_id)}
+            )
+        ).scalar_one()
+        assert draft_status == "approved"
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -538,7 +551,7 @@ async def test_resume_after_superseded_by_stale_draft_rejects_safely(
             await resume_case_thread(
                 case_id=uuid.UUID(case["id"]),
                 draft_id=first_draft_id,
-                resume_value={"action": "approved"},
+                resume_value={"action": ACTION_APPROVE},
             )
         assert exc_info.value.fresh_draft_id == second_draft_id
         assert exc_info.value.draft_id == first_draft_id
@@ -560,11 +573,18 @@ async def test_resume_after_superseded_by_stale_draft_rejects_safely(
         result = await resume_case_thread(
             case_id=uuid.UUID(case["id"]),
             draft_id=second_draft_id,
-            resume_value={"action": "approved"},
+            resume_value={"action": ACTION_APPROVE},
         )
         assert "__interrupt__" not in result
         final_snapshot = await case_graph.aget_state(config)
         assert final_snapshot.next == ()
+
+        draft_status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :did"), {"did": str(second_draft_id)}
+            )
+        ).scalar_one()
+        assert draft_status == "approved"
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -757,7 +777,7 @@ async def test_resume_case_thread_rejects_when_no_pending_draft_at_all(
             await resume_case_thread(
                 case_id=uuid.UUID(case["id"]),
                 draft_id=bogus_draft_id,
-                resume_value={"action": "approved"},
+                resume_value={"action": ACTION_APPROVE},
             )
         real_draft_id = await _pending_draft_id(db_session, case_id=case["id"])
         assert exc_info.value.fresh_draft_id == real_draft_id
@@ -795,7 +815,7 @@ async def test_resume_case_thread_rejects_when_draft_pending_but_never_paused(
             await resume_case_thread(
                 case_id=uuid.UUID(case["id"]),
                 draft_id=draft_id,
-                resume_value={"action": "approved"},
+                resume_value={"action": ACTION_APPROVE},
             )
     finally:
         await _cleanup(db_session, landlord_id)
@@ -981,7 +1001,7 @@ async def test_second_message_crash_on_already_awaiting_approval_case_heals_on_r
             await resume_case_thread(
                 case_id=uuid.UUID(case["id"]),
                 draft_id=second_draft_id,
-                resume_value={"action": "approved"},
+                resume_value={"action": ACTION_APPROVE},
             )
 
         # "Process restarts" -- mark_awaiting_approval works again.
@@ -1020,9 +1040,16 @@ async def test_second_message_crash_on_already_awaiting_approval_case_heals_on_r
         result = await resume_case_thread(
             case_id=uuid.UUID(case["id"]),
             draft_id=third_draft_id,
-            resume_value={"action": "approved"},
+            resume_value={"action": ACTION_APPROVE},
         )
         assert "__interrupt__" not in result
+
+        draft_status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :did"), {"did": str(third_draft_id)}
+            )
+        ).scalar_one()
+        assert draft_status == "approved"
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -1181,7 +1208,23 @@ async def test_concurrent_double_resume_exactly_one_proceeds(
     case + draft_id + resume_value -- the per-case advisory lock must
     serialize them so exactly one actually resumes the thread; the other
     must observe (after waiting for the lock) that there is no longer a
-    live interrupt to resume."""
+    live interrupt to resume.
+
+    With a REAL, recognized ``ACTION_APPROVE`` resume value (#44/#45
+    safety review, MINOR — the ORIGINAL "approved" placeholder never
+    actually dispatched to any node, so this test's own concurrency
+    guarantee was proven against a no-op write, not the real one): the
+    WINNER's ``finalize_approval`` node actually writes ``drafts.status =
+    'approved'`` before the lock releases, so the LOSER's OWN staleness
+    re-check (inside its own later lock acquisition) now correctly finds
+    the draft no longer ``'pending'`` and raises :class:`DraftStaleError`
+    -- not :class:`CaseNotAwaitingApprovalError` as it did against the
+    unrecognized placeholder (which never touched ``drafts.status`` at
+    all, leaving it perpetually ``'pending'`` for both racers to observe).
+    This is the CORRECT, more precise outcome now that a real write
+    exists: the loser is told the draft is no longer pending (which it
+    genuinely isn't), not merely "no interrupt to resume."
+    """
     landlord_id = await factories.insert_landlord(db_session)
     property_id = await factories.insert_property(db_session, landlord_id)
     tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
@@ -1203,12 +1246,12 @@ async def test_concurrent_double_resume_exactly_one_proceeds(
             resume_case_thread(
                 case_id=uuid.UUID(case["id"]),
                 draft_id=draft_id,
-                resume_value={"action": "approved"},
+                resume_value={"action": ACTION_APPROVE},
             ),
             resume_case_thread(
                 case_id=uuid.UUID(case["id"]),
                 draft_id=draft_id,
-                resume_value={"action": "approved"},
+                resume_value={"action": ACTION_APPROVE},
             ),
             return_exceptions=True,
         )
@@ -1217,15 +1260,22 @@ async def test_concurrent_double_resume_exactly_one_proceeds(
         failures = [r for r in results if isinstance(r, BaseException)]
         assert len(successes) == 1, results
         assert len(failures) == 1, results
-        assert isinstance(failures[0], CaseNotAwaitingApprovalError), failures[0]
+        assert isinstance(failures[0], DraftStaleError), failures[0]
 
         # The thread genuinely only resumed once -- fully completed, no
-        # interrupt left over.
+        # interrupt left over -- AND the real write actually happened.
         case_graph = compile_case_graph()
         config = {"configurable": {"thread_id": case["langgraph_thread_id"]}}
         snapshot = await case_graph.aget_state(config)
         assert snapshot.next == ()
         assert snapshot.interrupts == ()
+
+        draft_status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :did"), {"did": str(draft_id)}
+            )
+        ).scalar_one()
+        assert draft_status == "approved"
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -1288,7 +1338,7 @@ async def test_concurrent_resume_racing_new_inbound_rerun_staleness_wins(
             resume_case_thread(
                 case_id=uuid.UUID(case["id"]),
                 draft_id=first_draft_id,
-                resume_value={"action": "approved"},
+                resume_value={"action": ACTION_APPROVE},
             )
         )
 

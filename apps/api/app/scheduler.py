@@ -1,11 +1,24 @@
 """In-process 60-second scheduler ticker (#108/#109) — FastAPI
 lifespan-managed, drives the emergency escalation chain sweep, the SMS
-drain sweep, and the degraded-mode retry sweep:
+drain sweep, the degraded-mode retry sweep, and the approve-flow draft
+sender:
 - ``app/agent/emergency_chain.py::run_emergency_chain_sweep``
 - ``app/agent/emergency_chain.py::run_sms_drain_sweep`` (safety review,
   2026-07-12, spec finding S1 / safety finding 3 — drains
   ``tenant_ack``/``emergency_sms`` rows)
 - ``app/agent/degraded_mode_sweep.py::sweep_degraded_mode_retries``
+- ``app/agent/draft_sender.py::sender_tick`` (#44/#45 integration commit —
+  the ONLY other sanctioned outbound-send call site besides the emergency
+  chain above; see ``apps/api/CLAUDE.md``'s "Send to tenant/vendor happens
+  only through the draft flow or the emergency safety path"). This reuses
+  the SAME 60s cadence as the other three sweeps rather than draft_sender.
+  py's own faster standalone loop (``run_sender_loop``) — one scheduler
+  owns all periodic work, never a second competing lifespan task. A
+  landlord's undo window is unaffected in the COMMON case (the window is
+  measured from approval, and a tick already runs every 60s regardless of
+  when within that window approval happened); the worst case is a due
+  send waiting up to just under 60s for the next tick, matching this
+  ticker's existing coarse-grained cadence for every other sweep it drives.
 
 Design choice (the campaign's "sender design menu" — (a) in-process
 asyncio periodic task, RECOMMENDED for v1; matches
@@ -14,18 +27,40 @@ asyncio periodic task, RECOMMENDED for v1; matches
 emergencies every 60 s is sufficient at pilot scale"). No new
 infrastructure — started/stopped in ``app/main.py``'s lifespan, the SAME
 lifespan that already manages the LangGraph checkpointer's connection
-pool. Combining all three sweeps into ONE ticker (rather than independent
+pool. Combining all four sweeps into ONE ticker (rather than independent
 loops) stayed clean enough to keep in this single small module — see this
-file for the entire scheduler surface; if a FOURTH sweep ever needs
+file for the entire scheduler surface; if a FIFTH sweep ever needs
 combining here and this file starts to sprawl, split it back out rather
 than let it bloat.
+
+Bounding sender_tick's own worst-case duration (safety review, MEDIUM)
+------------------------------------------------------------------------
+``sender_tick`` shares this SAME single ticker task with the three sweeps
+above — a slow tick here is a slow tick for the emergency chain sweep's
+NEXT run too. Up to ``DEFAULT_BATCH_SIZE`` (25) candidate drafts, each
+risking a 10s Twilio timeout (``app/integrations/twilio_send.py``'s
+``AsyncTwilioHttpClient``), could otherwise stretch one tick to ~250s in
+the worst case. ``app/agent/draft_sender.py::sender_tick`` bounds this
+with its own wall-clock deadline (``DEFAULT_TICK_DEADLINE_SECONDS``, 25s
+by default, computed from the injectable time source at tick start): once
+exceeded it stops claiming NEW drafts for the rest of that tick (a draft
+already claimed always finishes; leftover due candidates simply wait,
+unclaimed and still ``'approved'``, for the very next tick — nothing is
+lost). This bounds sender_tick's own contribution to a single tick's
+duration to roughly ``DEFAULT_TICK_DEADLINE_SECONDS`` plus one in-flight
+send's tail latency, so the other three sweeps' own cadence is never
+starved by an unbounded draft-sending backlog. The emergency chain sweep
+still runs FIRST in ``_run_one_tick_body`` (unchanged) — this deadline is
+additive insurance for the LAST sweep in the tick, not a reordering.
 
 Crash-safety
 ------------
 The ticker itself carries NO schedule state — it only wakes every
 :data:`TICK_INTERVAL_SECONDS` and asks each sweep function "what's due
-right now?", which reads directly from the ``notifications`` table. A
-process restart loses only the in-memory tick loop, never the schedule:
+right now?", which reads directly from the ``notifications`` table (the
+first three sweeps) or the ``drafts`` table (``sender_tick`` — "the undo
+window is data, not a sleep", ``app/agent/draft_sender.py``'s own phrase).
+A process restart loses only the in-memory tick loop, never the schedule:
 every due row is still due (or becomes due) after restart, and the very
 next tick catches up — the literal meaning of the task's "retries/chain
 state = data ... never in-process timers for the SCHEDULE" constraint:
@@ -36,11 +71,12 @@ IN the failure-reporting itself (safety review, 2026-07-12, finding 4,
 MEDIUM)
 --------------------------------------------------------------------------
 Each sweep call is wrapped in its OWN try/except, reported via
-:func:`_safe_report`. Both sweep functions already have their own internal
-per-candidate exception handling (see their module docstrings) — an
-exception escaping either one here represents an unexpected failure in
-the sweep's own outer bookkeeping (e.g. the initial due-rows SELECT
-itself), not a per-candidate failure.
+:func:`_safe_report`. Every sweep function already has its own internal
+per-candidate exception handling (see their module docstrings —
+``sender_tick``'s per-draft handling lives in ``_process_claimed_draft``,
+which never raises) — an exception escaping any one of them here
+represents an unexpected failure in that sweep's own outer bookkeeping
+(e.g. the initial due-rows SELECT itself), not a per-candidate failure.
 
 An EARLIER revision's per-sweep ``except Exception: log.error(...);
 sentry_sdk.capture_message(...)`` had a real gap: if the ``log.error``/
@@ -75,7 +111,9 @@ import sentry_sdk
 import structlog
 
 from app.agent.degraded_mode_sweep import sweep_degraded_mode_retries
+from app.agent.draft_sender import sender_tick
 from app.agent.emergency_chain import run_emergency_chain_sweep, run_sms_drain_sweep
+from app.integrations.sms_sender import get_default_sms_sender
 
 log = structlog.get_logger(__name__)
 
@@ -130,6 +168,15 @@ async def _run_one_tick_body() -> None:
         _safe_report(
             "scheduler_degraded_mode_sweep_failed",
             "scheduler: degraded-mode sweep tick raised",
+            exc,
+        )
+
+    try:
+        await sender_tick(sender=get_default_sms_sender())
+    except Exception as exc:
+        _safe_report(
+            "scheduler_draft_sender_tick_failed",
+            "scheduler: draft sender tick raised",
             exc,
         )
 

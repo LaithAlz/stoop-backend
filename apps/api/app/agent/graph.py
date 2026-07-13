@@ -5,7 +5,8 @@ entry point ``app/agent/graph_entry.py`` invokes per inbound message.
 
 Node order (issue #34's AC / ``apps/api/CLAUDE.md``'s ``agent/nodes/``
 layout; #43 added ``mark_awaiting_approval``/``await_approval``, see
-"Shadow mode (#43)" below)::
+"Shadow mode (#43)" below; #44/#45 added ``finalize_approval``/
+``finalize_rejection``, see "The resume seam for #44/#45" below)::
 
     identify_property -> load_context -> identify_case -> classify_intent
       -> classify_severity -> [classification_failed?] -> degraded_mode
@@ -14,6 +15,13 @@ layout; #43 added ``mark_awaiting_approval``/``await_approval``, see
                                       -> degraded_mode
                                       -> mark_awaiting_approval -> await_approval
                                                                      -> interrupt()
+                                                                     -> [resume action?]
+                                                                          -> finalize_approval
+                                                                             -> END
+                                                                          -> finalize_rejection
+                                                                             -> END
+                                                                          -> END (unrecognized
+                                                                             /no resume)
 
 LINEAR pipeline, no fan-out (founder directive, 2026-07-06): every edge
 above is a plain or conditional edge between exactly one predecessor and
@@ -230,10 +238,12 @@ inputs (above). The drain step was accordingly REMOVED entirely — it was
 dead code (the test suite already passed identically without it, because
 the natural re-invocation already does the right thing).
 
-The resume seam for #44/#45 (implemented here, no HTTP endpoint — #43 scope)
+The resume seam for #44/#45 (implemented here; routers/drafts.py is the
+HTTP surface)
 ------------------------------------------------------------------------
-:func:`resume_case_thread` is the documented entry point #44 (approve) and
-#45 (reject/edit-and-send) will call once those endpoints exist. Per
+:func:`resume_case_thread` is the documented, UNCHANGED-from-#43 entry
+point: given a live LangGraph interrupt, re-verify staleness under the
+per-case lock, then ``Command(resume=resume_value)`` it. Per
 conversation-model.md's "staleness wins" edge case ("the approve action
 carries the draft id; if that id is already stale, the send is rejected"):
 it re-checks, at call time, that ``draft_id`` is STILL the case's one
@@ -244,6 +254,89 @@ it ``stale`` and produced a fresh pending draft), this raises
 left completely untouched — a stale resume must never resolve the WRONG
 (current, fresh) interrupt with a value meant for an old one. Only when
 the id still matches does it call ``Command(resume=...)`` on the thread.
+
+``resume_value`` is ``{"action": "approve" | "reject" | "edit_and_send",
+...}`` — see ``app/agent/nodes/finalize_draft_decision.py`` for the exact
+vocabulary and the two new nodes (:func:`app.agent.nodes.
+finalize_draft_decision.finalize_approval` /
+``...finalize_rejection``) that :func:`_route_after_await_approval` (below)
+dispatches to once ``await_approval`` returns a resume value. This
+function's OWN behavior (staleness check, lock, exception types) is
+UNCHANGED from #43 — every #43 test against it still holds — #44/#45 only
+add what happens ONCE the resume actually reaches a live interrupt.
+
+**The #44-pinned open design question, decided**: ``draft_response``'s
+degraded-mode exit (EMERGENCY / ``draft_guard_failed``) still inserts a
+``pending`` draft but routes to ``degraded_mode`` instead of
+``mark_awaiting_approval`` — so ``cases.status`` never becomes
+``'awaiting_approval'`` and no live interrupt is ever created for that
+draft (:class:`CaseNotAwaitingApprovalError`'s own docstring, cause 1).
+**Decision (this issue): these drafts ARE approvable/rejectable/editable
+from the dashboard, via the SAME four endpoints** — a landlord must not
+lose the ability to act on a safe-fallback or EMERGENCY-drafted reply just
+because the interim degraded-mode routing never paused it. Implemented as
+a SANCTIONED SECOND PATH, never by loosening ``resume_case_thread`` itself
+(which would risk the exact double-resume hazard its own concurrency
+tests pin): :func:`resolve_draft_decision` is the actual entry point
+routers/drafts.py calls. It picks between two structurally distinct,
+mutually exclusive paths by reading ``cases.status`` (a plain, unlocked
+peek — see :func:`_finalize_never_paused_draft`'s own docstring for why an
+unlocked peek is safe here: both paths independently re-verify staleness
+under their OWN per-case lock before writing anything; the peek only ever
+picks WHICH lock-protected path runs):
+
+- ``cases.status == 'awaiting_approval'`` — the NORMAL path: a live
+  interrupt genuinely exists, so this calls :func:`resume_case_thread`
+  unchanged.
+- any other status — the degraded-path draft was never paused, so there
+  is nothing to ``Command(resume=...)``; :func:`_finalize_never_paused_draft`
+  performs the IDENTICAL state transition (:func:`app.agent.nodes.
+  finalize_draft_decision.apply_approve_or_edit` /
+  ``...apply_rejection`` — the SAME functions the graph nodes call) directly
+  under the per-case lock, WITHOUT ever touching the LangGraph thread.
+
+Both paths raise :class:`DraftStaleError` under the identical condition
+(``draft_id`` is no longer the case's pending draft) — routers/drafts.py
+handles that (and a same-shape re-check after ``CaseNotAwaitingApprovalError``)
+uniformly, re-reading the draft's CURRENT status to distinguish "a
+concurrent caller already approved/rejected this exact draft" (idempotent
+200) from "a newer tenant message truly superseded it" (409
+``draft_stale``) — see that router's own docstring.
+
+**The trap, closed (safety review, this round, MEDIUM — a genuinely
+unsendable draft, not just a mislabeled error)**: the ``cases.status ==
+'awaiting_approval'`` peek above is necessary but NOT sufficient proof
+that a live interrupt exists. Reachable sequence: msg1 pauses normally
+(``mark_awaiting_approval`` sets ``cases.status = 'awaiting_approval'``,
+draft D1 pending, live interrupt). msg2 lands on the SAME case — the
+stale-draft re-run (module docstring "Stale-draft re-run") restarts the
+SAME thread from ``START``: ``draft_response`` stales D1 and inserts a
+fresh D2 (its OWN stale-then-insert logic, unconditional), but msg2
+classifies EMERGENCY (or its own draft guard fails) — ``_route_after_
+draft_response`` routes straight to ``degraded_mode -> END``, draining the
+live interrupt WITHOUT ever reaching ``mark_awaiting_approval`` again.
+Net effect: ``cases.status`` is STILL ``'awaiting_approval'`` (msg1's own
+write, never revisited), D2 is ``'pending'``, and the thread has NO live
+interrupt — this is :class:`CaseNotAwaitingApprovalError`'s cause 3 below,
+distinct from cause 1 (case status is NOT ``'awaiting_approval'`` there)
+and cause 2 (the draft is NOT still pending there — the concurrent
+winner already resolved it). Naively re-raising on cause 3 the way cause 2
+correctly does would 409 ``draft_stale`` with ``fresh_draft_id == draft_id``
+— the landlord is told to "review the fresh draft," which IS the one they
+just tried, forever. **Fixed**: when :func:`resume_case_thread` raises
+:class:`CaseNotAwaitingApprovalError`, :func:`resolve_draft_decision`
+re-checks whether *draft_id* is STILL the case's pending draft. If yes
+(cause 1 or cause 3 — genuinely never paused, whether from the start or
+drained mid-flight), fall through to :func:`_finalize_never_paused_draft`
+— the identical non-graph write path degraded-path drafts already use,
+correct here for the same reason. If no (cause 2 — a concurrent caller
+already fully resolved this exact draft), re-raise unchanged so the
+router's OWN idempotency reconciliation (``_reconcile_concurrent_
+conflict``/``_reconcile_reject_conflict``) sees the now-actioned draft and
+responds correctly (200 idempotent, or the accurate not-actionable code) —
+never re-derived here. See ``tests/test_agent_finalize_draft_decision.py::
+test_trap_awaiting_approval_case_drained_interrupt_still_approvable`` for
+the exact msg1-paused/msg2-degraded scenario end-to-end.
 
 Per-case serialization — closing the TOCTOU between a resume and a
 concurrent new-inbound re-run (safety review, this issue's own review
@@ -295,6 +388,15 @@ from app.agent.nodes.classify_intent import classify_intent
 from app.agent.nodes.classify_severity import classify_severity
 from app.agent.nodes.degraded_mode import degraded_mode
 from app.agent.nodes.draft_response import draft_response
+from app.agent.nodes.finalize_draft_decision import (
+    ACTION_APPROVE,
+    ACTION_EDIT_AND_SEND,
+    ACTION_REJECT,
+    apply_approve_or_edit,
+    apply_rejection,
+    finalize_approval,
+    finalize_rejection,
+)
 from app.agent.nodes.identify_case import identify_case
 from app.agent.nodes.identify_property import identify_property
 from app.agent.nodes.load_context import load_context
@@ -318,6 +420,8 @@ NODE_DRAFT_RESPONSE = "draft_response"
 NODE_DEGRADED_MODE = "degraded_mode"
 NODE_MARK_AWAITING_APPROVAL = "mark_awaiting_approval"
 NODE_AWAIT_APPROVAL = "await_approval"
+NODE_FINALIZE_APPROVAL = "finalize_approval"
+NODE_FINALIZE_REJECTION = "finalize_rejection"
 
 _UNKNOWN_SENDER_THREAD_PREFIX = "message:"
 """Fallback checkpoint thread for a message that never attaches to a case
@@ -364,6 +468,35 @@ def _route_after_draft_response(state: AgentState) -> str:
     return NODE_MARK_AWAITING_APPROVAL
 
 
+def _route_after_await_approval(state: AgentState) -> str:
+    """#44/#45 — dispatches on whatever ``interrupt()`` returned this
+    resume (``state["approval_resume"]``, set by ``await_approval`` itself
+    — see that node's own docstring "#44/#45 implementation of the
+    above"). Structurally the ONLY place a resume value is ever inspected;
+    every actual DB write lives in the two nodes this routes to.
+
+    "Drain-sentinel-class values and rejections route to END, never send"
+    (this issue's own scope note): a missing/malformed ``approval_resume``
+    (the ``case_id is None`` / ``draft_id is None`` skip-the-pause paths in
+    ``await_approval``, which never call ``interrupt()`` at all and so
+    never set this key) is silently routed to ``END`` — not an anomaly,
+    just "nothing to dispatch". A PRESENT but unrecognized ``action`` (a
+    genuine resume value someone actually passed to
+    ``Command(resume=...)`` that doesn't match this module's vocabulary)
+    IS logged as an anomaly before routing to ``END`` — never silently
+    dropped, but also never allowed anywhere near a send."""
+    resume = state.get("approval_resume")
+    if not isinstance(resume, dict):
+        return END
+    action = resume.get("action")
+    if action in (ACTION_APPROVE, ACTION_EDIT_AND_SEND):
+        return NODE_FINALIZE_APPROVAL
+    if action == ACTION_REJECT:
+        return NODE_FINALIZE_REJECTION
+    log.error("resume_case_thread_unrecognized_action", action=action)
+    return END
+
+
 # ---------------------------------------------------------------------------
 # Graph builders
 # ---------------------------------------------------------------------------
@@ -403,6 +536,8 @@ def build_case_graph() -> StateGraph[AgentState, None, AgentState, AgentState]:
     graph.add_node(NODE_DEGRADED_MODE, degraded_mode)
     graph.add_node(NODE_MARK_AWAITING_APPROVAL, mark_awaiting_approval)
     graph.add_node(NODE_AWAIT_APPROVAL, await_approval)
+    graph.add_node(NODE_FINALIZE_APPROVAL, finalize_approval)
+    graph.add_node(NODE_FINALIZE_REJECTION, finalize_rejection)
 
     graph.add_edge(START, NODE_CLASSIFY_INTENT)
     graph.add_edge(NODE_CLASSIFY_INTENT, NODE_CLASSIFY_SEVERITY)
@@ -421,7 +556,21 @@ def build_case_graph() -> StateGraph[AgentState, None, AgentState, AgentState]:
     )
     graph.add_edge(NODE_MARK_AWAITING_APPROVAL, NODE_AWAIT_APPROVAL)
     graph.add_edge(NODE_DEGRADED_MODE, END)
-    graph.add_edge(NODE_AWAIT_APPROVAL, END)
+    # #44/#45 — the send-adjacent dispatch. See _route_after_await_approval's
+    # own docstring: a live resume routes to exactly one of the two finalize
+    # nodes; anything else (no resume at all, or an unrecognized resume
+    # value) goes straight to END, never a send.
+    graph.add_conditional_edges(
+        NODE_AWAIT_APPROVAL,
+        _route_after_await_approval,
+        {
+            NODE_FINALIZE_APPROVAL: NODE_FINALIZE_APPROVAL,
+            NODE_FINALIZE_REJECTION: NODE_FINALIZE_REJECTION,
+            END: END,
+        },
+    )
+    graph.add_edge(NODE_FINALIZE_APPROVAL, END)
+    graph.add_edge(NODE_FINALIZE_REJECTION, END)
     return graph
 
 
@@ -568,26 +717,53 @@ class DraftStaleError(RuntimeError):
 class CaseNotAwaitingApprovalError(RuntimeError):
     """Raised by :func:`resume_case_thread` when *draft_id* IS the case's
     current pending draft, but the case's thread has no live interrupt to
-    resume at all. TWO known causes collapse into this same exception
-    (both mean "there is nothing paused to resume right now", the caller's
-    remedy is the same either way — refresh and look again):
+    resume at all. THREE known causes collapse into this same exception
+    (all mean "there is nothing paused to resume right now on THIS call" —
+    but #44's own safety review split their REMEDIES: see
+    :func:`resolve_draft_decision`'s "The trap, closed" for exactly how
+    causes 1/3 vs. cause 2 are now handled differently by that seam):
 
-    1. A KNOWN, discovered gap (not fixed here, out of #43's scope):
+    1. A KNOWN, discovered gap (#43's own scope note, unfixed there):
        ``draft_response``'s degraded-mode exit (EMERGENCY /
        ``draft_guard_failed``) still inserts a ``pending`` draft, but
        routes to ``degraded_mode`` instead of ``mark_awaiting_approval``
        (module docstring "Shadow mode (#43)"), so that draft is never
-       actually paused behind an interrupt.
+       actually paused behind an interrupt. ``cases.status`` is NOT
+       ``'awaiting_approval'`` here — :func:`resolve_draft_decision`'s own
+       ``cases.status`` peek already routes this case away from
+       :func:`resume_case_thread` entirely (straight to
+       :func:`_finalize_never_paused_draft`), so in practice this cause is
+       caught before ever reaching this function — reachable only via a
+       DIRECT call to :func:`resume_case_thread` bypassing the seam (as
+       this codebase's own tests do, deliberately, to exercise the
+       function in isolation).
     2. A genuine concurrent-resume race (safety review, "Per-case
        serialization"): under :func:`_case_lock`, a SECOND concurrent
        ``resume_case_thread`` call for the same draft blocks until the
        FIRST one finishes; by the time it acquires the lock, the FIRST
        call has already resumed the thread to completion (no interrupt
-       left), so it correctly lands here rather than double-resuming.
+       left), so it correctly lands here rather than double-resuming. The
+       draft is NO LONGER pending by this point (the winner's finalize
+       node already wrote ``'approved'``/``'rejected'``) — the
+       distinguishing fact :func:`resolve_draft_decision` uses to tell
+       this cause apart from cause 3 below.
+    3. **THE TRAP (safety review finding, this round)**: ``cases.status
+       IS 'awaiting_approval'`` (set by an EARLIER message's
+       ``mark_awaiting_approval``), yet a LATER message's fresh re-run on
+       the SAME thread drained the live interrupt via its OWN
+       degraded-mode exit (cause 1's mechanism) WITHOUT ever revisiting
+       ``cases.status`` — leaving a genuinely never-paused, STILL-PENDING
+       draft behind on a case that superficially looks like the normal
+       "awaiting_approval, must have a live interrupt" case.
+       :func:`resolve_draft_decision`'s ``cases.status`` peek is fooled
+       (this case DOES read ``'awaiting_approval'``), so it tries
+       :func:`resume_case_thread` first, which correctly lands here — the
+       draft IS still pending, distinguishing this from cause 2.
 
     Distinct from :class:`DraftStaleError`: the draft id is CORRECT here,
     there is simply nothing paused to approve (whether because it never
-    was, or because someone else just resumed it)."""
+    was, or because someone else just resumed it, or because a later
+    message's own degraded-mode exit drained it)."""
 
     def __init__(self, *, case_id: UUID, draft_id: UUID) -> None:
         self.case_id = case_id
@@ -648,6 +824,164 @@ async def resume_case_thread(*, case_id: UUID, draft_id: UUID, resume_value: Any
 
 
 # ---------------------------------------------------------------------------
+# The #44/#45 public entry point — see module docstring "The resume seam
+# for #44/#45" / "The #44-pinned open design question, decided" for the
+# full rationale. routers/drafts.py calls ONLY resolve_draft_decision,
+# never resume_case_thread directly.
+# ---------------------------------------------------------------------------
+
+_SELECT_CASE_STATUS_AND_LANDLORD_SQL = text(
+    "SELECT status, landlord_id FROM cases WHERE id = :case_id"
+)
+
+_ENSURE_CASE_AWAITING_APPROVAL_SQL = text(
+    "UPDATE cases SET status = 'awaiting_approval', updated_at = now() "
+    "WHERE id = :case_id AND status != 'awaiting_approval'"
+)
+
+
+async def _peek_case_status(case_id: UUID) -> str | None:
+    """A plain, UNLOCKED read of ``cases.status`` — used ONLY to pick which
+    of :func:`resume_case_thread` / :func:`_finalize_never_paused_draft`
+    :func:`resolve_draft_decision` calls. Never a safety boundary by
+    itself (see that function's own docstring for why an unlocked peek is
+    safe here regardless of which way it races). Returns ``None`` if
+    *case_id* does not exist at all."""
+    async with asynccontextmanager(get_admin_session)() as session:
+        row = (
+            (await session.execute(_SELECT_CASE_STATUS_AND_LANDLORD_SQL, {"case_id": str(case_id)}))
+            .mappings()
+            .one_or_none()
+        )
+    return row["status"] if row is not None else None
+
+
+async def _peek_pending_draft_id(case_id: UUID) -> UUID | None:
+    """A plain, UNLOCKED read of the case's current pending draft id —
+    used ONLY by :func:`resolve_draft_decision` to distinguish
+    :class:`CaseNotAwaitingApprovalError`'s cause 3 (the trap: still
+    pending) from cause 2 (a concurrent caller already resolved it: no
+    longer pending) after :func:`resume_case_thread` has ALREADY raised.
+    By that point the lock :func:`resume_case_thread` held has already
+    released (the exception propagated out of its own ``async with
+    _case_lock(...)`` block), so this is a fresh, independent read — the
+    SUBSEQUENT call this decides between (:func:`_finalize_never_paused_
+    draft`, on the trap path) re-verifies staleness again under its OWN
+    lock before writing anything, so a narrow race in the window between
+    this peek and that lock acquisition is still safe, never silently
+    wrong (see that function's own re-check)."""
+    async with asynccontextmanager(get_admin_session)() as session:
+        row = (
+            (await session.execute(_SELECT_PENDING_DRAFT_ID_SQL, {"case_id": str(case_id)}))
+            .mappings()
+            .one_or_none()
+        )
+    return row["id"] if row is not None else None
+
+
+async def _finalize_never_paused_draft(
+    *, case_id: UUID, draft_id: UUID, resume_value: dict[str, Any]
+) -> None:
+    """The sanctioned second path for a pending draft that was inserted by
+    the EMERGENCY/``draft_guard_failed`` degraded-mode exit and never
+    actually paused behind a live interrupt at all (:class:`
+    CaseNotAwaitingApprovalError`'s own docstring, cause 1; module
+    docstring "The #44-pinned open design question, decided"). Never
+    touches the LangGraph thread — there is nothing there to resume.
+
+    Runs the IDENTICAL staleness re-check as :func:`resume_case_thread`,
+    under the SAME per-case advisory lock, then applies the SAME
+    ``app.agent.nodes.finalize_draft_decision`` helpers the graph nodes
+    themselves call — one write path, two entry points. Raises
+    :class:`DraftStaleError` under the identical condition
+    :func:`resume_case_thread` does (*draft_id* is no longer the case's
+    pending draft) — callers (routers/drafts.py) handle both paths'
+    exceptions uniformly.
+    """
+    action = resume_value.get("action")
+    async with _case_lock(case_id) as session:
+        pending_row = (
+            (await session.execute(_SELECT_PENDING_DRAFT_ID_SQL, {"case_id": str(case_id)}))
+            .mappings()
+            .one_or_none()
+        )
+        fresh_draft_id: UUID | None = pending_row["id"] if pending_row is not None else None
+        if fresh_draft_id != draft_id:
+            raise DraftStaleError(case_id=case_id, draft_id=draft_id, fresh_draft_id=fresh_draft_id)
+
+        case_row = (
+            (await session.execute(_SELECT_CASE_STATUS_AND_LANDLORD_SQL, {"case_id": str(case_id)}))
+            .mappings()
+            .one()
+        )
+        landlord_id: UUID = case_row["landlord_id"]
+
+        if action in (ACTION_APPROVE, ACTION_EDIT_AND_SEND):
+            # Mirrors mark_awaiting_approval's own transition — this draft
+            # never went through it, so this is the just-in-time
+            # equivalent, still under the same lock as the write below.
+            await session.execute(_ENSURE_CASE_AWAITING_APPROVAL_SQL, {"case_id": str(case_id)})
+            edited_body = resume_value.get("body") if action == ACTION_EDIT_AND_SEND else None
+            scheduled_send_at = await apply_approve_or_edit(
+                session,
+                landlord_id=landlord_id,
+                case_id=case_id,
+                draft_id=draft_id,
+                action=action,
+                edited_body=edited_body,
+            )
+            if scheduled_send_at is None:  # pragma: no cover — see apply_approve_or_edit docstring
+                raise CaseNotAwaitingApprovalError(case_id=case_id, draft_id=draft_id)
+        elif action == ACTION_REJECT:
+            note = resume_value.get("note")
+            applied = await apply_rejection(
+                session, landlord_id=landlord_id, case_id=case_id, draft_id=draft_id, note=note
+            )
+            if not applied:  # pragma: no cover — see apply_rejection docstring
+                raise CaseNotAwaitingApprovalError(case_id=case_id, draft_id=draft_id)
+        else:
+            raise ValueError(f"unrecognized resume action {action!r}")
+
+
+async def resolve_draft_decision(
+    *, case_id: UUID, draft_id: UUID, resume_value: dict[str, Any]
+) -> None:
+    """The #44/#45 entry point routers/drafts.py calls for approve/reject/
+    edit-and-send — see module docstring "The #44-pinned open design
+    question, decided" AND "The trap, closed" for the full rationale.
+    Returns ``None`` either way; callers re-read the draft's row fresh for
+    their HTTP response rather than relying on any return value here.
+
+    Raises :class:`ValueError` if *case_id* does not exist,
+    :class:`DraftStaleError` if *draft_id* is no longer the case's pending
+    draft (either path), or :class:`CaseNotAwaitingApprovalError` ONLY for
+    a genuine concurrent-resume loss (cause 2) — cause 3 (the trap) is
+    caught here and falls through to :func:`_finalize_never_paused_draft`
+    instead of ever propagating.
+    """
+    status = await _peek_case_status(case_id)
+    if status is None:
+        raise ValueError(f"case {case_id} does not exist")
+
+    if status == "awaiting_approval":
+        try:
+            await resume_case_thread(case_id=case_id, draft_id=draft_id, resume_value=resume_value)
+            return
+        except CaseNotAwaitingApprovalError:
+            # See module docstring "The trap, closed" — distinguish cause
+            # 3 (still pending -- genuinely never paused, fall through)
+            # from cause 2 (no longer pending -- a concurrent caller
+            # already resolved it, re-raise so the router's own
+            # idempotency reconciliation handles it).
+            if await _peek_pending_draft_id(case_id) != draft_id:
+                raise
+
+    await _finalize_never_paused_draft(
+        case_id=case_id, draft_id=draft_id, resume_value=resume_value
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level entry point — the one function app/agent/graph_entry.py calls.
 # ---------------------------------------------------------------------------
 
@@ -682,7 +1016,17 @@ async def run_graph(message_id: UUID) -> AgentState:
     one with the "never raise outward" contract, and owns catching this.
     """
     pre_routing_graph = compile_pre_routing_graph()
-    initial_state: AgentState = {"message_id": message_id, "reasoning_log": []}
+    # `approval_resume` is seeded `None` explicitly (belt-and-braces on top
+    # of `await_approval`'s own skip-branch clears — see that module's
+    # docstring "Hardening") — a brand-new thread's very first invocation
+    # has no prior resume to carry forward anyway, but stating it here
+    # keeps the invariant self-evident rather than relying on `.get()`'s
+    # implicit "absent key reads as None" behavior.
+    initial_state: AgentState = {
+        "message_id": message_id,
+        "reasoning_log": [],
+        "approval_resume": None,
+    }
     pre_routing_result = await pre_routing_graph.ainvoke(initial_state)
     pre_routing_state = cast("AgentState", pre_routing_result)
 
@@ -727,6 +1071,8 @@ __all__: list[str] = [
     "NODE_CLASSIFY_SEVERITY",
     "NODE_DEGRADED_MODE",
     "NODE_DRAFT_RESPONSE",
+    "NODE_FINALIZE_APPROVAL",
+    "NODE_FINALIZE_REJECTION",
     "NODE_IDENTIFY_CASE",
     "NODE_IDENTIFY_PROPERTY",
     "NODE_LOAD_CONTEXT",
@@ -737,6 +1083,7 @@ __all__: list[str] = [
     "build_pre_routing_graph",
     "compile_case_graph",
     "compile_pre_routing_graph",
+    "resolve_draft_decision",
     "resume_case_thread",
     "run_graph",
 ]

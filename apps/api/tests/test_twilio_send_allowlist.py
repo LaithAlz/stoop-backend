@@ -7,12 +7,15 @@ Mirrors ``tests/test_migrations_0005.py``'s
 same rationale, different capability. ``apps/api/CLAUDE.md``: "Send to
 tenant/vendor happens only through the draft flow or the emergency safety
 path. There is no other code path that calls ``twilio.send``. Keep it that
-way." Today the draft flow's sender doesn't exist yet (#44/#45 unbuilt) —
-so this allowlist has exactly TWO entries: the seam's own definition and
-its sole caller, the emergency escalation chain. Red-fails the instant a
-new file references ``get_twilio_sender`` without this allowlist being
-updated to match, forcing that update to be a deliberate, reviewed diff —
-exactly the protection this repo's send-call-site discipline depends on.
+way." This allowlist has exactly THREE entries: the seam's own definition,
+its first caller (the emergency escalation chain), and its second and
+FINAL sanctioned caller — ``app/integrations/sms_sender.py``, the
+approve-flow draft sender's real Twilio binding (#44/#45's integration
+commit, deliberately added below, never a silent new call site). Red-fails
+the instant a new file references ``get_twilio_sender`` without this
+allowlist being updated to match, forcing that update to be a deliberate,
+reviewed diff — exactly the protection this repo's send-call-site
+discipline depends on.
 """
 
 from __future__ import annotations
@@ -24,15 +27,20 @@ import pytest
 _APP_DIR = Path(__file__).resolve().parent.parent / "app"
 
 # Files allowed to reference get_twilio_sender: its definition
-# (app/integrations/twilio_send.py) and its sole caller
-# (app/agent/emergency_chain.py, #108). EXTEND THIS DELIBERATELY, not by
-# loosening the grep — e.g. the day #44's draft sender needs its own SMS
-# -sending seam, it gets its OWN reviewed addition here (or its own
-# separate seam entirely), never a silent new call site.
+# (app/integrations/twilio_send.py), its first caller
+# (app/agent/emergency_chain.py, #108), and its second, sanctioned caller
+# (app/integrations/sms_sender.py, #44/#45 — the draft flow's OWN real
+# Twilio binding, added deliberately, not a silent new call site: it
+# delegates through get_twilio_sender() rather than constructing a second
+# twilio.rest.Client stack). EXTEND THIS DELIBERATELY, not by loosening
+# the grep, if a THIRD sanctioned sender ever needs to reference it.
 _TWILIO_SEND_ALLOWLIST: frozenset[str] = frozenset(
     {
         "app/integrations/twilio_send.py",
         "app/agent/emergency_chain.py",
+        # Sanctioned draft flow (#44/#45): the ONLY other place allowed to
+        # obtain a real Twilio sender, alongside the emergency chain above.
+        "app/integrations/sms_sender.py",
     }
 )
 
