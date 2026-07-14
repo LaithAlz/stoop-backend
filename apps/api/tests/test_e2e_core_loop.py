@@ -74,7 +74,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -851,6 +851,208 @@ async def test_variant2_emergency_hard_keyword_no_approval_wait(
         ]
         assert len(landlord_calls_after) == 1
         assert len(tenant_sms_calls_after) == 1
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Issue #61 AC #4 — the case-history ("LTB artifact") query: GET
+# /v1/cases/{id}'s timeline must be a complete, ordered, human-readable
+# account of one case's ENTIRE lifecycle, answerable by that ONE endpoint.
+# Drives the real webhook -> graph (mocked Anthropic) -> approve -> send ->
+# resolve path — never hand-seeded rows (unlike tests/test_cases_router.py's
+# own timeline-shape regression test, which seeds directly).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_case_timeline_complete_ordered_full_lifecycle(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #61 AC #4: webhook -> classify -> draft -> approve -> send ->
+    resolve, then ``GET /v1/cases/{id}`` returns every expected
+    ``audit``/``message``/``draft`` timeline entry, oldest-first,
+    human-readable.
+
+    The "resolve" leg drives ``app.agent.case_lifecycle.sweep_cases`` (the
+    auto-stale leg) directly, the same way ``tests/test_agent_nodes.py``'s
+    own ``test_sweep_cases_auto_stales_inactive_case_in_the_real_database``
+    already does — there is no ``POST /v1/cases/{id}/resolve`` endpoint in
+    this codebase yet. ``api-contracts.md`` documents the shape, but issue
+    #55 explicitly scoped it out ("write endpoint, not part of #55's
+    read-only scope") and no other issue has built it since (verified at
+    #61 implementation time via a repo-wide grep — reported separately,
+    not built here: a new REST endpoint is out of #61's own scope, "audit
+    log writes", not "add a new endpoint"). The tenant-confirmed and
+    auto-stale legs are the only two ``case_resolved`` writers that
+    actually exist to drive end-to-end today.
+    """
+    monkeypatch.setattr(finalize_draft_decision_mod, "UNDO_WINDOW", timedelta(seconds=0))
+    fake_sender = _FakeTwilioSender()
+    set_twilio_sender_for_tests(fake_sender)
+    _patch_client(monkeypatch, _happy_path_fake_messages(body="I'll send someone out today."))
+
+    sub = str(uuid.uuid4())
+    landlord_id = await _seed_landlord_with_auth(db_session, auth_user_id=sub)
+    to_number = factories.fresh_phone()
+    property_id = await factories.insert_property(db_session, landlord_id, twilio_number=to_number)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id, name="Riley")
+    tenant_phone = await _tenant_phone(db_session, tenant_id)
+    token = _mint_token(private_key, sub=sub)
+
+    tenant_body = "the heat has been out since this morning"
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid, from_number=tenant_phone, to_number=to_number, body=tenant_body
+    )
+
+    try:
+        # --- signed POST to the Twilio SMS webhook ---
+        webhook_response = await _post_sms(params)
+        assert webhook_response.status_code == 200
+        assert webhook_response.text == "<Response/>"
+
+        # --- the background graph ran (mocked Anthropic): classified +
+        # drafted, draft parks pending ---
+        case_draft_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT c.id AS case_id, d.id AS draft_id, d.body AS draft_body "
+                        "FROM cases c JOIN drafts d ON d.case_id = c.id "
+                        "WHERE c.landlord_id = :lid"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        case_id = str(case_draft_row["case_id"])
+        draft_id = str(case_draft_row["draft_id"])
+        draft_body = case_draft_row["draft_body"]
+
+        async with _mocked_jwks(jwks_payload):
+            async with _client() as client:
+                # --- POST /v1/drafts/{id}/approve (real endpoint) ---
+                approve_response = await client.post(
+                    f"/v1/drafts/{draft_id}/approve",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert approve_response.status_code == 200, approve_response.text
+
+        # --- drive app.scheduler._run_one_tick() past scheduled_send_at
+        # (UNDO_WINDOW patched to 0s above) — the real send ---
+        await scheduler_mod._run_one_tick()  # noqa: SLF001
+
+        sent_message_row = (
+            (
+                await db_session.execute(
+                    text("SELECT sent_message_id FROM drafts WHERE id = :id"), {"id": draft_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert sent_message_row["sent_message_id"] is not None
+
+        # --- resolve: the auto-stale sweep leg, far enough in the future
+        # that this case's real (unmodified) last_activity_at clears the
+        # 14-day threshold — see this test's own docstring for why this,
+        # not a landlord-direct-resolve endpoint call, drives the leg. ---
+        from app.agent.case_lifecycle import sweep_cases
+
+        far_future = datetime.now(UTC) + timedelta(days=15)
+        swept = await sweep_cases(now=far_future)
+        assert case_id in {str(action.case_id) for action in swept}
+
+        # --- the ONE query: GET /v1/cases/{id} ---
+        async with _mocked_jwks(jwks_payload):
+            async with _client() as client:
+                detail_response = await client.get(
+                    f"/v1/cases/{case_id}", headers={"Authorization": f"Bearer {token}"}
+                )
+        assert detail_response.status_code == 200, detail_response.text
+        detail = detail_response.json()
+
+        assert detail["status"] == "resolved"
+        assert detail["resolved_at"] is not None
+
+        timeline = detail["timeline"]
+        ats = [entry["at"] for entry in timeline]
+        assert ats == sorted(ats), "timeline must be strictly oldest-first"
+
+        # --- complete: the full, ordered action_log action sequence,
+        # extending the same golden sequence
+        # test_variant1_routine_urgent_loop_webhook_to_send already proves
+        # (webhook -> send) with the resolve leg appended. ---
+        audit_actions = [entry["action"] for entry in timeline if entry["kind"] == "audit"]
+        assert audit_actions == [
+            "message_received",
+            "case_opened",
+            "classified",
+            "classified",
+            "drafted",
+            "approved",
+            "sent",
+            "case_resolved",
+        ], f"complete ordered action sequence expected, got {audit_actions}"
+
+        # --- the two `classified` rows share an action name, so the list
+        # above cannot detect THEIR relative order regressing — which is the
+        # exact tied-timestamp case cases.py's `ORDER BY a.created_at, a.id`
+        # tie-break exists to pin (intent classification runs, and is
+        # INSERTed, before severity classification). Assert it by payload
+        # shape, not action name. ---
+        classified_entries = [
+            entry
+            for entry in timeline
+            if entry["kind"] == "audit" and entry["action"] == "classified"
+        ]
+        assert classified_entries[0]["payload"].get("kind") == "intent", (
+            "intent-classified row must sort before severity-classified "
+            f"(tie-break regression): {classified_entries[0]['payload']}"
+        )
+        assert "severity" in classified_entries[1]["payload"], (
+            f"second classified row must be the severity one: {classified_entries[1]['payload']}"
+        )
+
+        # --- human-readable: the tenant's own words and the landlord's
+        # actual reply both appear as real message bodies, in order. ---
+        message_entries = [entry for entry in timeline if entry["kind"] == "message"]
+        assert [m["body"] for m in message_entries] == [tenant_body, draft_body]
+        assert message_entries[0]["direction"] == "inbound"
+        assert message_entries[1]["direction"] == "outbound"
+
+        # --- the one draft row, now `sent`. ---
+        draft_entries = [entry for entry in timeline if entry["kind"] == "draft"]
+        assert len(draft_entries) == 1
+        assert draft_entries[0]["status"] == "sent"
+        assert draft_entries[0]["body"] == draft_body
+
+        # --- human-readable: the severity classification's margin-note
+        # summary (schema-v1 v1.7) is present, not just the bare enum. ---
+        severity_entry = next(
+            entry
+            for entry in timeline
+            if entry["kind"] == "audit"
+            and entry["action"] == "classified"
+            and "severity" in entry["payload"]
+        )
+        assert severity_entry["payload"]["severity"] == "urgent"
+        assert severity_entry["payload"]["summary"]
+        assert severity_entry["payload"]["rules_fired"]
+
+        # --- human-readable: the resolution carries WHY it resolved. ---
+        resolved_entry = next(
+            entry
+            for entry in timeline
+            if entry["kind"] == "audit" and entry["action"] == "case_resolved"
+        )
+        assert resolved_entry["payload"]["reason"] == "auto_stale"
     finally:
         await _cleanup(db_session, landlord_id)
 
