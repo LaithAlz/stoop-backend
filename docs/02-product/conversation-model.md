@@ -39,7 +39,7 @@ holds the *primary* case for the common single-issue path.
    │            └── approve/send ─────┘                │
    │                                                    │
    └── landlord resolves directly ─────────────────────┘
-   └── auto-send (trust ladder, #60) ──────────────────►┘
+   └── auto-send (trust ladder, #60) ──►AWAITING_TENANT
                                   auto-stale (14 d inactivity) ──► RESOLVED(auto)
 ```
 
@@ -115,6 +115,16 @@ The 5-second undo window absorbs most of this race in practice.
 a message arriving after approval but before send does not supersede
 the approved draft. How the sender handles that gap is an open design
 point tracked on #122.)
+
+Auto-sent drafts (#60) get the OPPOSITE treatment from that
+landlord-approved gap: an auto-approved draft that has not yet been
+delivered IS superseded by a newer tenant message — cancelled
+(`send_cancelled` audit row, `reason: superseded_by_newer_message`) and
+replaced by a fresh draft for the full history, both when the new
+message's re-run drafts the replacement and, belt-and-braces, at the
+sender's claim step. The asymmetry is deliberate: a landlord's approval
+is a human decision the system never reverses on its own; an auto-send
+was never human-touched, so the freshest reply always wins.
 
 ## Approval queue ordering
 

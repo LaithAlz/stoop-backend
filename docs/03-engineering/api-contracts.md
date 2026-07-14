@@ -464,6 +464,16 @@ behavior; this is the minimal shape this implementation follows):**
   shape (server-side only), noted here so a future contract reader isn't
   surprised the number can change without a version bump to THIS doc (a
   behavior-affecting settings change, not a shape change).
+- **Daily auto-send cap is FOUNDER-PROVISIONAL** (same class as the
+  graduation threshold above): `app/config.py`'s
+  `auto_send_daily_case_cap`, default `5`. At routing time the graph
+  counts the case's `auto_sent` `audit_log` rows over the trailing 24
+  hours; at or over the cap, the draft falls back to the normal approval
+  card instead of auto-sending (same fail-closed edge as a trust-lookup
+  failure). Superseded-then-cancelled auto-sends still count toward the
+  cap — a chatty case reaches human approval sooner, never later.
+  Server-side only, no request/response shape; flagged for founder
+  ratification before launch.
 - **R1 eval variant** ("asserts auto_send when LV2 unlocked", #60's own
   AC) is explicitly OUT OF SCOPE for this amendment — touching `evals/`
   triggers the founder-gated paid eval run; it rides with the #66-70
