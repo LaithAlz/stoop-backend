@@ -37,9 +37,24 @@ holds the *primary* case for the common single-issue path.
  OPEN ──► AWAITING_APPROVAL ──► AWAITING_TENANT ──► RESOLVED ──► (REOPENED→OPEN)
    │            │                     │                ▲
    │            └── approve/send ─────┘                │
+   │                                                    │
    └── landlord resolves directly ─────────────────────┘
+   └── auto-send (trust ladder, #60) ──────────────────►┘
                                   auto-stale (14 d inactivity) ──► RESOLVED(auto)
 ```
+
+**Trust-ladder bypass (#60):** a `routine` case on a property whose
+`(property, 'routine')` `trust_metrics` row has graduated
+(`autonomy_unlocked = true`, `revoked_at IS NULL`) skips
+`AWAITING_APPROVAL` entirely — `cases.status` goes straight
+`OPEN → AWAITING_TENANT` once the sender actually delivers the
+auto-approved reply (never a separate "auto-approved" status; the case
+looks, mid-flight, exactly like it's still waiting on a draft, then jumps
+to awaiting-tenant). This is the ONLY path in the whole lifecycle that
+skips the landlord's own approval step — see `api-contracts.md`'s Drafts
+section (v1.13 amendment) for the exact auto-send/undo/revoke mechanics
+and CLAUDE.md rule 3 for why it exists at all (routine severity only,
+per property, earned by a clean-approval streak).
 
 - **Open:** when the agent's `identify_case` step (see routing below)
   decides an inbound message starts a new issue.

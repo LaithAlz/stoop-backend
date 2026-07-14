@@ -283,11 +283,18 @@ needs; PR #181 review):**
   oldest-first per severity tier — an exception to the newest-first +
   cursor convention above, because the queue is bounded by open cases,
   not message volume (`conversation-model.md`, "queue ordering").
-- **Auto-handled feed: deferred, slot reserved.** The dashboard's
-  "I handled this myself" note requires the trust ladder (#60); nothing
-  auto-sends today (rule 3). Endpoint to be specified WITH #60
-  (working name `GET /v1/activity?kind=auto_sent`) — until then the
-  dashboard renders no handled note from live data.
+- **Auto-handled feed: still deferred — NOT specified by #60.** #60
+  (implemented — see the Drafts section's v1.13 amendment) landed
+  auto-send itself (`auto_sent` audit rows, `drafts.auto_send`), but a
+  dedicated READ endpoint for the dashboard's "I handled this myself" note
+  (the `GET /v1/activity?kind=auto_sent` working name floated when this
+  bullet was written) was explicitly NOT part of #60's scope — this
+  endpoint remains unspecified, deferred to the #66-70 dashboard-surfacing
+  arc. Until it lands, an auto-sent case is visible only via `GET
+  /v1/cases`/`GET /v1/cases/{id}` (its audit trail carries `auto_sent`);
+  `GET /v1/queue` does not surface it (that endpoint's own module
+  docstring, unchanged by #60) and the dashboard renders no dedicated
+  handled note from live data yet.
 
 ## Cases
 
