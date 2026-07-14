@@ -1001,6 +1001,25 @@ async def test_case_timeline_complete_ordered_full_lifecycle(
             "case_resolved",
         ], f"complete ordered action sequence expected, got {audit_actions}"
 
+        # --- the two `classified` rows share an action name, so the list
+        # above cannot detect THEIR relative order regressing — which is the
+        # exact tied-timestamp case cases.py's `ORDER BY a.created_at, a.id`
+        # tie-break exists to pin (intent classification runs, and is
+        # INSERTed, before severity classification). Assert it by payload
+        # shape, not action name. ---
+        classified_entries = [
+            entry
+            for entry in timeline
+            if entry["kind"] == "audit" and entry["action"] == "classified"
+        ]
+        assert classified_entries[0]["payload"].get("kind") == "intent", (
+            "intent-classified row must sort before severity-classified "
+            f"(tie-break regression): {classified_entries[0]['payload']}"
+        )
+        assert "severity" in classified_entries[1]["payload"], (
+            f"second classified row must be the severity one: {classified_entries[1]['payload']}"
+        )
+
         # --- human-readable: the tenant's own words and the landlord's
         # actual reply both appear as real message bodies, in order. ---
         message_entries = [entry for entry in timeline if entry["kind"] == "message"]
