@@ -303,14 +303,18 @@ async def insert_draft(
     scheduled_send_at: Any = None,
     edited: bool = False,
     final_body: str | None = None,
+    auto_send: bool = False,
 ) -> str:
+    """``auto_send`` added for #60's trust-ladder tests (default ``False``,
+    matching the schema's own default and every existing caller's prior
+    behavior unchanged)."""
     draft_id = str(uuid.uuid4())
     await session.execute(
         text(
             "INSERT INTO drafts (id, landlord_id, case_id, recipient, body, prompt_version, "
-            "status, scheduled_send_at, edited, final_body) "
+            "status, scheduled_send_at, edited, final_body, auto_send) "
             "VALUES (:id, :landlord_id, :case_id, :recipient, :body, 'v1', :status, "
-            ":scheduled_send_at, :edited, :final_body)"
+            ":scheduled_send_at, :edited, :final_body, :auto_send)"
         ),
         {
             "id": draft_id,
@@ -322,6 +326,7 @@ async def insert_draft(
             "scheduled_send_at": scheduled_send_at,
             "edited": edited,
             "final_body": final_body,
+            "auto_send": auto_send,
         },
     )
     await session.commit()

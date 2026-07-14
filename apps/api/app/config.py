@@ -195,6 +195,7 @@ class Settings(BaseSettings):
 
     trust_graduation_threshold: int = Field(
         default=10,
+        ge=3,
         description=(
             "FOUNDER-PROVISIONAL (#60) -- number of CONSECUTIVE clean "
             "(unedited) sends on a (property, 'routine') trust_metrics row "
@@ -212,7 +213,32 @@ class Settings(BaseSettings):
             "value (schema-v1.md's own trust_metrics.autonomy_unlocked "
             "comment: 'only ever true for routine in v1'; CLAUDE.md rule "
             "3). This is a product/safety threshold, never a feature flag "
-            "(rule 7 forbids flag reads anywhere near auto-send)."
+            "(rule 7 forbids flag reads anywhere near auto-send). "
+            "`ge=3` (safety review, LOW-3): a 0/1/negative env value would "
+            "collapse the ladder to 'graduate on the first or second send' "
+            "-- refuse to boot with a value that low rather than silently "
+            "accept a near-instant-trust misconfiguration."
+        ),
+    )
+
+    auto_send_daily_case_cap: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "FOUNDER-PROVISIONAL (#60 safety review MEDIUM-2) -- hard cap "
+            "on how many auto_sent replies a single CASE may receive "
+            "within a trailing 24h window before auto-send falls back to "
+            "the normal landlord-approval interrupt (the SAME fail-closed "
+            "edge app/agent/graph.py's _route_after_draft_response already "
+            "uses for a trust-lookup failure). Counted directly off "
+            "audit_log 'auto_sent' rows (append-only INSERT-count -- the "
+            "honest source, never a separate mutable counter that could "
+            "drift from the audit trail). Exists because auto-send is the "
+            "ONLY human-free send path in this codebase (besides the "
+            "emergency safety path) -- a runaway back-and-forth or a "
+            "misclassified conversation must not be able to fire an "
+            "unbounded number of unattended sends on one case. Never a "
+            "feature flag (rule 7) -- change the default here only."
         ),
     )
 

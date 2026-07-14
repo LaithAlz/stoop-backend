@@ -37,6 +37,22 @@ graduation query's own ``severity = 'routine'`` predicate is a hardcoded
 SQL literal, not a bound parameter, per #60's PR #202 senior-review note:
 "treat the emergency/urgent rows as inert counters").
 
+Supersession belt-and-braces for auto-sent drafts (#60 safety review
+MEDIUM-1)
+------------------------------------------------------------------------
+``app/agent/nodes/draft_response.py``'s own stale-then-insert logic is the
+PRIMARY fix: it cancels a still-unsent ``auto_send=true`` draft the moment
+a newer tenant message triggers a fresh one, under the per-case advisory
+lock. This module carries a SECOND, independent layer for the same
+invariant, in case that primary path is ever bypassed: :data:`_CLAIM_
+DRAFT_SQL` itself refuses to claim (and therefore send) an ``auto_send =
+true`` draft if a newer inbound message has landed on its case since it
+was drafted (never a landlord-approved draft — that predicate only ever
+looks at ``auto_send = true`` rows); :func:`_claim_draft` then cancels
+that refused draft (:data:`_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL`) and
+records a ``send_cancelled`` audit row, so it never sits stuck
+``'approved'`` re-appearing as a "due" candidate forever.
+
 The undo window is data, not a sleep (schema-v1.md's own phrase) — this
 module never sleeps waiting for a specific draft; it only ever asks
 "which approved rows are due right now" and claims exactly those.
@@ -172,10 +188,58 @@ _SELECT_DUE_DRAFT_IDS_SQL = text(
     "ORDER BY scheduled_send_at LIMIT :limit"
 )
 
+# #60 safety review MEDIUM-1 (belt-and-braces) — an `auto_send=true` draft
+# is a NEVER-human-reviewed row (unlike a landlord-approved one), so the
+# claim itself must not dispatch it if a NEWER tenant inbound message has
+# arrived for its case since it was drafted. `app/agent/nodes/
+# draft_response.py`'s own `_cancel_superseded_auto_send_drafts` is the
+# PRIMARY fix (cancels immediately when the newer message triggers a fresh
+# draft, under the per-case advisory lock) — this predicate is the SECOND,
+# independent layer in case that primary path is ever bypassed. The
+# `EXISTS` sub-select correlates "does a newer inbound message belong to
+# this draft's case" the SAME way every other cross-table message/case
+# correlation in this codebase does (`app/routers/queue.py`'s own LATERAL
+# subquery, `app/routers/cases.py`'s `_SELECT_MESSAGES_SQL`):
+# `messages.case_id` is always NULL in production (the webhook, the sole
+# writer, inserts before case identity is known), so a direct
+# `m.case_id = drafts.case_id` match alone would never fire there — the
+# `message_cases` join is REQUIRED, not optional, to actually catch this
+# in production. `drafts.case_id`/`drafts.created_at` are referenced
+# directly (no alias needed — Postgres allows an UPDATE's own WHERE/
+# sub-selects to correlate against the target table by name).
+_NEWER_INBOUND_EXISTS_SQL = (
+    "EXISTS ("
+    "  SELECT 1 FROM messages m "
+    "  WHERE m.direction = 'inbound' AND m.created_at > drafts.created_at "
+    "    AND (m.case_id = drafts.case_id OR EXISTS ("
+    "      SELECT 1 FROM message_cases mc "
+    "      WHERE mc.message_id = m.id AND mc.case_id = drafts.case_id"
+    "    ))"
+    ")"
+)
+
 _CLAIM_DRAFT_SQL = text(
-    "UPDATE drafts SET status = 'sending', updated_at = now() "
+    "UPDATE drafts SET status = 'sending', updated_at = now() "  # noqa: S608 -- static const interpolated below, no user input
     "WHERE id = :draft_id AND status = 'approved' AND scheduled_send_at <= now() "
+    f"AND (auto_send = false OR NOT {_NEWER_INBOUND_EXISTS_SQL}) "
     "RETURNING id, case_id, recipient, body, final_body, edited, landlord_id"
+)
+
+# The claim above deliberately refuses a superseded auto_send draft (never
+# a landlord-approved one, gated by `auto_send = true` here too) — this is
+# the companion write that actually cancels it, so it doesn't sit stuck
+# 'approved' forever re-appearing as a "due" candidate on every future
+# tick. Same atomic-`UPDATE`-decides-everything shape as the claim itself.
+_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL = text(
+    "UPDATE drafts SET status = 'cancelled', updated_at = now() "  # noqa: S608 -- static const interpolated below, no user input
+    "WHERE id = :draft_id AND status = 'approved' AND auto_send = true "
+    f"AND {_NEWER_INBOUND_EXISTS_SQL} "
+    "RETURNING id, case_id, landlord_id"
+)
+
+_INSERT_AUTO_SEND_SUPERSEDED_AUDIT_SQL = text(
+    "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+    "VALUES (:landlord_id, :case_id, 'agent', 'send_cancelled', CAST(:payload AS jsonb))"
 )
 
 _SELECT_CASE_FOR_SEND_SQL = text(
@@ -257,12 +321,48 @@ def _default_time_source() -> float:
 
 
 async def _claim_draft(session: AsyncSession, draft_id: UUID) -> dict[str, Any] | None:
+    """Claim *draft_id* for sending, or ``None`` if it can't be claimed
+    right now — three DISTINCT reasons collapse into that same ``None``:
+    lost the claim race (another tick/process already claimed it), not
+    actually due yet, or (#60 safety review MEDIUM-1) a superseded
+    ``auto_send=true`` draft the claim's own guard refused. Only the THIRD
+    case does anything further here: :data:`_CANCEL_SUPERSEDED_AUTO_SEND_
+    DRAFT_SQL` cancels it (never a landlord-approved row — see that
+    query's own docstring) and records a ``send_cancelled`` audit row,
+    so it never sits stuck ``'approved'`` reappearing as "due" forever.
+    The first two cases fall through as a silent, correct no-op exactly
+    like before this fix.
+    """
     row = (
         (await session.execute(_CLAIM_DRAFT_SQL, {"draft_id": str(draft_id)}))
         .mappings()
         .one_or_none()
     )
-    return dict(row) if row is not None else None
+    if row is not None:
+        return dict(row)
+
+    cancelled_row = (
+        (await session.execute(_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL, {"draft_id": str(draft_id)}))
+        .mappings()
+        .one_or_none()
+    )
+    if cancelled_row is not None:
+        await session.execute(
+            _INSERT_AUTO_SEND_SUPERSEDED_AUDIT_SQL,
+            {
+                "landlord_id": str(cancelled_row["landlord_id"]),
+                "case_id": str(cancelled_row["case_id"]),
+                "payload": json.dumps(
+                    {"draft_id": str(draft_id), "reason": "superseded_by_newer_message"}
+                ),
+            },
+        )
+        log.info(
+            "draft_sender_auto_send_cancelled_superseded",
+            draft_id=str(draft_id),
+            case_id=str(cancelled_row["case_id"]),
+        )
+    return None
 
 
 async def _load_recipient_context(

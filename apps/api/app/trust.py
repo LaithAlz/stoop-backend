@@ -78,6 +78,32 @@ async def is_routine_autonomy_unlocked(session: AsyncSession, *, property_id: UU
 
 
 # ---------------------------------------------------------------------------
+# Daily rate cap (#60 safety review MEDIUM-2) — auto-send is the only
+# human-free send path in this codebase besides the emergency safety path;
+# this bounds how many auto-sends a single case can receive in a rolling
+# 24h window before falling back to the normal approval interrupt.
+# ---------------------------------------------------------------------------
+
+_SELECT_AUTO_SENT_COUNT_24H_SQL = text(
+    "SELECT COUNT(*) FROM audit_log WHERE case_id = :case_id AND action = 'auto_sent' "
+    "AND created_at > now() - interval '24 hours'"
+)
+
+
+async def auto_sent_count_last_24h(session: AsyncSession, *, case_id: UUID) -> int:
+    """Count of ``auto_sent`` ``audit_log`` rows for *case_id* in the
+    trailing 24h — the honest source for the daily cap (``audit_log`` is
+    append-only, rule #2; counting its own INSERTs can never drift the way
+    a separate mutable counter could). Callers gate auto-send on
+    ``count < settings.auto_send_daily_case_cap`` — see
+    ``app/agent/graph.py``'s ``_route_after_draft_response`` for the
+    actual fail-closed comparison.
+    """
+    result = await session.execute(_SELECT_AUTO_SENT_COUNT_24H_SQL, {"case_id": str(case_id)})
+    return int(result.scalar_one())
+
+
+# ---------------------------------------------------------------------------
 # Revocation — the landlord-facing hook (#60 AC-4) and the (currently
 # unwired, see app/agent/nodes/auto_send.py's own report note) global
 # misclassification hook (#60 AC-2's "any severity misclassification
@@ -208,6 +234,7 @@ async def revoke_all_autonomy(
 
 __all__: list[str] = [
     "GRADUATION_SEVERITY",
+    "auto_sent_count_last_24h",
     "is_routine_autonomy_unlocked",
     "revoke_all_autonomy",
     "revoke_property_autonomy",

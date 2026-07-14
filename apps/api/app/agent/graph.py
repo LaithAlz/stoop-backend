@@ -410,8 +410,9 @@ from app.agent.nodes.identify_property import identify_property
 from app.agent.nodes.load_context import load_context
 from app.agent.schemas import CaseContext, Severity
 from app.agent.state import AgentState
+from app.config import settings
 from app.db.session import get_admin_session
-from app.trust import is_routine_autonomy_unlocked
+from app.trust import auto_sent_count_last_24h, is_routine_autonomy_unlocked
 
 log = structlog.get_logger(__name__)
 
@@ -478,17 +479,33 @@ async def _route_after_draft_response(state: AgentState) -> str:
     :data:`NODE_AUTO_SEND_DRAFT` (CLAUDE.md rule 3: "only for `routine`") —
     URGENT falls straight through to the ordinary
     ``mark_awaiting_approval -> await_approval`` pause below, same as it
-    always has. When ROUTINE, this does a plain, unlocked
-    ``app.trust.is_routine_autonomy_unlocked`` read to decide whether the
-    case's property has EARNED auto-send. This is a CHEAP READ that only
-    picks the edge — :func:`app.agent.nodes.auto_send.apply_auto_send`
-    re-verifies the identical condition, hardcoded in SQL, before ever
-    writing anything (see that module's own docstring "Two-layer
-    eligibility check"). ANY exception during this read (a DB hiccup, a
-    missing property_id, anything) is treated as "not eligible" — fail
-    -closed to the SAME human-approval pause every ordinary draft goes
-    through, NEVER fail-open to auto-send. This is a `trust_metrics` DATA
-    read, never a feature-flag read (rule 7: flags never gate the approval
+    always has. When ROUTINE, this does TWO plain, unlocked reads to decide
+    whether the case's property has EARNED auto-send AND hasn't hit its
+    rate cap:
+
+    1. ``app.trust.is_routine_autonomy_unlocked`` — has this property
+       graduated?
+    2. ``app.trust.auto_sent_count_last_24h`` (#60 safety review MEDIUM-2)
+       — has this CASE already received
+       ``settings.auto_send_daily_case_cap`` auto-sends in the trailing
+       24h? At/over the cap, this falls back to the SAME
+       ``mark_awaiting_approval`` pause a trust-lookup failure does —
+       auto-send is the only human-free send path in this codebase besides
+       the emergency safety path, so a runaway back-and-forth (or a
+       misclassified conversation) must not be able to fire an unbounded
+       number of unattended sends on one case.
+
+    Both are CHEAP READS that only pick the edge —
+    :func:`app.agent.nodes.auto_send.apply_auto_send` re-verifies the
+    unlock condition, hardcoded in SQL, before ever writing anything (see
+    that module's own docstring "Two-layer eligibility check"; the cap is
+    a routing-time-only check, not re-verified at write time — a landlord
+    can always undo an individual auto-send within its window regardless).
+    ANY exception during either read (a DB hiccup, a missing property_id,
+    anything) is treated as "not eligible" — fail-closed to the SAME
+    human-approval pause every ordinary draft goes through, NEVER
+    fail-open to auto-send. This is `trust_metrics`/`audit_log` DATA, never
+    a feature-flag read (rule 7: flags never gate the approval
     requirement)."""
     if state.get("draft_guard_failed"):
         return NODE_DEGRADED_MODE
@@ -498,11 +515,21 @@ async def _route_after_draft_response(state: AgentState) -> str:
     if severity_result is not None and severity_result.severity is Severity.ROUTINE:
         case_context = state.get("case_context") or CaseContext()
         property_id = case_context.property_id
-        if property_id is not None:
-            unlocked = False
+        case_id = case_context.case_id
+        if property_id is not None and case_id is not None:
+            eligible = False
             try:
                 async with asynccontextmanager(get_admin_session)() as session:
                     unlocked = await is_routine_autonomy_unlocked(session, property_id=property_id)
+                    if unlocked:
+                        auto_sent_count = await auto_sent_count_last_24h(session, case_id=case_id)
+                        eligible = auto_sent_count < settings.auto_send_daily_case_cap
+                        if not eligible:
+                            log.info(
+                                "route_after_draft_response_auto_send_cap_reached",
+                                case_id=str(case_id),
+                                auto_sent_count=auto_sent_count,
+                            )
             except Exception:
                 # Fail-closed (module docstring above) — never let a lookup
                 # error skip landlord approval.
@@ -510,8 +537,8 @@ async def _route_after_draft_response(state: AgentState) -> str:
                     "route_after_draft_response_trust_lookup_failed",
                     property_id=str(property_id),
                 )
-                unlocked = False
-            if unlocked:
+                eligible = False
+            if eligible:
                 return NODE_AUTO_SEND_DRAFT
     return NODE_MARK_AWAITING_APPROVAL
 

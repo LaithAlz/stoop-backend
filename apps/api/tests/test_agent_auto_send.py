@@ -23,7 +23,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncGenerator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -565,5 +565,328 @@ async def test_emergency_severity_never_auto_sends_even_when_routine_unlocked(
 
         draft = await _draft_row(db_session, case_id=case_id)
         assert draft["status"] == "pending"  # degraded-path drafts stay pending, unsent
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 6. Safety review MEDIUM-1 (supersession) — a newer inbound message must
+#    cancel a still-unsent auto-sent draft, never let both go out.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_newer_inbound_cancels_unsent_auto_sent_draft_exactly_one_send(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact burst scenario (safety review MEDIUM-1): msg1 arrives and
+    auto-approves D1; msg2 arrives on the SAME case before any sender tick
+    runs; the tick that follows must send EXACTLY ONE reply (D2's content)
+    and D1 must be cancelled with a supersession-tagged audit row — never
+    two unattended sends for one burst."""
+    landlord_id, property_id, tenant_id = await _seed_landlord_property_tenant(db_session)
+    await factories.insert_trust_metrics(
+        db_session, landlord_id=landlord_id, property_id=property_id, autonomy_unlocked=True
+    )
+    first_message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the front door hinge squeaks a bit",
+    )
+    _patch_client(
+        monkeypatch, _happy_path_fake_messages(body="I'll take a look at that this week.")
+    )
+    try:
+        await run_graph(uuid.UUID(first_message_id))
+        case_id = await _find_case_id(db_session, landlord_id)
+        first_draft = await _draft_row(db_session, case_id=case_id)
+        assert first_draft["status"] == "approved"
+        assert first_draft["auto_send"] is True
+        first_draft_id = str(first_draft["id"])
+
+        # msg2 arrives BEFORE any sender tick — D1's undo window (+5s)
+        # hasn't elapsed, exactly the reviewer's scenario.
+        second_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="also the mailbox lid is loose",
+        )
+        _patch_client(monkeypatch, _happy_path_fake_messages(body="I'll fix the mailbox too."))
+        await run_graph(uuid.UUID(second_message_id))
+
+        # D1 must be cancelled -- never left dangling to also send.
+        first_draft_after = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE id = :id"), {"id": first_draft_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert first_draft_after["status"] == "cancelled"
+
+        cancel_audit = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT actor, payload FROM audit_log "
+                        "WHERE case_id = :cid AND action = 'send_cancelled'"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert cancel_audit["actor"] == "agent"
+        assert cancel_audit["payload"]["reason"] == "superseded_by_newer_message"
+        assert cancel_audit["payload"]["draft_id"] == first_draft_id
+
+        second_draft = await _draft_row(db_session, case_id=case_id)  # latest by created_at
+        assert second_draft["id"] != uuid.UUID(first_draft_id)
+        assert second_draft["status"] == "approved"
+        assert second_draft["auto_send"] is True
+
+        # Backdate for the tick (same convention as every other sender_tick
+        # test in this codebase -- never sleep for real seconds).
+        await db_session.execute(
+            text(
+                "UPDATE drafts SET scheduled_send_at = now() - interval '1 second' WHERE id = :id"
+            ),
+            {"id": str(second_draft["id"])},
+        )
+        await db_session.commit()
+
+        sender = _FakeSmsSender()
+        claimed = await sender_tick(sender=sender)
+        assert claimed == 1
+        assert len(sender.calls) == 1
+        assert sender.calls[0]["body"] == "I'll fix the mailbox too."
+
+        final_first = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE id = :id"), {"id": first_draft_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert final_first["status"] == "cancelled"  # never claimed/sent
+
+        second_final = await _draft_row(db_session, case_id=case_id)
+        assert second_final["status"] == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sender_cancels_auto_send_draft_when_newer_inbound_exists(
+    db_session: AsyncSession,
+) -> None:
+    """Belt-and-braces (safety review MEDIUM-1): even bypassing draft_
+    response's own primary fix entirely (seeded directly, no graph run),
+    the sender's OWN claim guard refuses to send a superseded auto_send
+    draft — cancelling it instead of claiming it. A landlord-approved
+    (``auto_send=false``) draft in the identical situation is UNTOUCHED."""
+    landlord_id, property_id, tenant_id = await _seed_landlord_property_tenant(db_session)
+    case_id = await factories.insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="open",
+        severity="routine",
+    )
+    auto_draft_id = await factories.insert_draft(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        status="approved",
+        scheduled_send_at=datetime.now(UTC) - timedelta(seconds=1),
+        auto_send=True,
+    )
+
+    # A landlord-approved draft on a DIFFERENT case, same shape otherwise --
+    # must be sent normally, never cancelled by this guard.
+    other_case_id = await factories.insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="open",
+        severity="routine",
+    )
+    landlord_draft_id = await factories.insert_draft(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=other_case_id,
+        status="approved",
+        scheduled_send_at=datetime.now(UTC) - timedelta(seconds=1),
+        auto_send=False,
+    )
+
+    try:
+        # A newer inbound message lands on the auto_send draft's OWN case,
+        # correlated via message_cases (messages.case_id stays NULL in
+        # production -- the same convention every other correlation in
+        # this codebase relies on).
+        newer_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="one more thing",
+        )
+        await factories.insert_message_case(
+            db_session, message_id=newer_message_id, case_id=case_id
+        )
+        # Same-shaped newer inbound on the OTHER case too, to prove a
+        # landlord-approved draft is sent regardless.
+        newer_message_id_2 = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="one more thing on the other case",
+        )
+        await factories.insert_message_case(
+            db_session, message_id=newer_message_id_2, case_id=other_case_id
+        )
+
+        sender = _FakeSmsSender()
+        claimed = await sender_tick(sender=sender)
+        assert claimed == 1  # only the landlord-approved draft
+        assert len(sender.calls) == 1
+
+        auto_draft_after = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE id = :id"), {"id": auto_draft_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert auto_draft_after["status"] == "cancelled"
+
+        cancel_audit = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT actor, payload FROM audit_log "
+                        "WHERE case_id = :cid AND action = 'send_cancelled'"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert cancel_audit["actor"] == "agent"
+        assert cancel_audit["payload"]["reason"] == "superseded_by_newer_message"
+
+        landlord_draft_after = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE id = :id"), {"id": landlord_draft_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert landlord_draft_after["status"] == "sent"  # untouched by the auto_send-only guard
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 7. Safety review MEDIUM-2 (rate cap) — a case cannot receive unlimited
+#    auto-sends; at/over the cap, auto-send falls back to the approval
+#    interrupt.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_auto_send_daily_case_cap_falls_back_to_approval(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """5 auto-sends (the default cap) then a 6th routine inbound on the
+    SAME case must produce a normal approval card, never a 6th send."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "auto_send_daily_case_cap", 5)
+
+    landlord_id, property_id, tenant_id = await _seed_landlord_property_tenant(db_session)
+    await factories.insert_trust_metrics(
+        db_session, landlord_id=landlord_id, property_id=property_id, autonomy_unlocked=True
+    )
+    # One open case, pre-seeded with 5 `auto_sent` audit rows -- seeded
+    # directly (cheap, deterministic) rather than 5 full graph runs; the
+    # router's own count read doesn't care how the rows got there, only
+    # that they exist within the trailing 24h.
+    case_id = await factories.insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="open",
+        severity="routine",
+    )
+    for _ in range(5):
+        await factories.insert_audit_log(
+            db_session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            actor="agent",
+            action="auto_sent",
+            payload={"draft_id": str(uuid.uuid4())},
+        )
+    try:
+        # The 6th routine message on the SAME conversation -- identify_case
+        # attaches it to the tenant's one open case (conversation-model.md's
+        # own routing rule: exactly one open case -> attach). Must land in
+        # the approval queue, never auto-send.
+        sixth_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="one more routine thing",
+        )
+        _patch_client(monkeypatch, _happy_path_fake_messages(body="Got it, I'll take a look."))
+
+        final_state = await run_graph(uuid.UUID(sixth_message_id))
+        assert "__interrupt__" in final_state  # approval card, not a send
+
+        case_after = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM cases WHERE id = :cid"), {"cid": case_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert case_after["status"] == "awaiting_approval"
+
+        draft = await _draft_row(db_session, case_id=case_id)
+        assert draft["status"] == "pending"
+        assert draft["auto_send"] is False
+
+        auto_sent_count = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE case_id = :cid AND action = 'auto_sent'"
+                ),
+                {"cid": case_id},
+            )
+        ).scalar_one()
+        assert auto_sent_count == 5  # unchanged -- the 6th never auto-sent
     finally:
         await _cleanup(db_session, landlord_id)

@@ -975,7 +975,10 @@ async def test_urgent_severity_never_graduates_even_at_10x_threshold(
     belt-and-braces enforcement even if that guard were bypassed."""
     from app.config import settings
 
-    monkeypatch.setattr(settings, "trust_graduation_threshold", 2)
+    # ge=3 (safety review LOW-3) is the floor a real deployment can ever
+    # boot with -- use the floor itself so this stays a realistic
+    # configuration, not a value production could never actually have.
+    monkeypatch.setattr(settings, "trust_graduation_threshold", 3)
 
     landlord_id = await factories.insert_landlord(db_session)
     property_id = await factories.insert_property(
@@ -984,7 +987,7 @@ async def test_urgent_severity_never_graduates_even_at_10x_threshold(
     tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
     sender = _FakeSmsSender()
     try:
-        for _ in range(20):  # 10x the threshold
+        for _ in range(30):  # 10x the threshold
             await _seed_approved_draft_for_property(
                 db_session,
                 landlord_id=landlord_id,
@@ -995,7 +998,7 @@ async def test_urgent_severity_never_graduates_even_at_10x_threshold(
             await sender_tick(sender=sender)
 
         row = await _trust_metrics_row(db_session, landlord_id=landlord_id, severity="urgent")
-        assert row["consecutive_clean"] == 20
+        assert row["consecutive_clean"] == 30
         assert row["autonomy_unlocked"] is False
         assert row["unlocked_at"] is None
     finally:
@@ -1043,6 +1046,62 @@ async def test_graduation_sql_predicate_never_matches_non_routine_severity(
             .one()
         )
         assert row["autonomy_unlocked"] is False
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_revoke_then_one_clean_send_does_not_re_unlock(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec review MINOR-2 / re-graduation semantics (app/trust.py's own
+    docstring): a revoke resets `consecutive_clean` to 0, so re-earning
+    autonomy after a revoke requires a FULL fresh streak, never just one
+    more clean send. Graduated -> revoked -> exactly ONE clean send must
+    still leave the property locked."""
+    from app.config import settings
+    from app.trust import revoke_property_autonomy
+
+    monkeypatch.setattr(settings, "trust_graduation_threshold", 3)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number=factories.fresh_phone()
+    )
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    sender = _FakeSmsSender()
+    try:
+        for _ in range(3):
+            await _seed_approved_draft_for_property(
+                db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+            )
+            await sender_tick(sender=sender)
+
+        graduated_row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+        assert graduated_row["autonomy_unlocked"] is True
+
+        revoked_count = await revoke_property_autonomy(
+            db_session,
+            landlord_id=uuid.UUID(landlord_id),
+            property_id=uuid.UUID(property_id),
+            actor="landlord",
+            reason="test",
+        )
+        assert revoked_count == 1
+
+        revoked_row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+        assert revoked_row["autonomy_unlocked"] is False
+        assert revoked_row["consecutive_clean"] == 0
+
+        # Exactly ONE clean send after the revoke -- not a full fresh streak.
+        await _seed_approved_draft_for_property(
+            db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+        )
+        await sender_tick(sender=sender)
+
+        after_one_send = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+        assert after_one_send["consecutive_clean"] == 1
+        assert after_one_send["autonomy_unlocked"] is False  # still locked -- needs 2 more
     finally:
         await _cleanup(db_session, landlord_id)
 

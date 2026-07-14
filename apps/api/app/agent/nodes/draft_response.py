@@ -350,6 +350,33 @@ audit writes too) and propagate out of the node. Fixed by
    graph invocation — "a concurrent duplicate must not error the whole
    graph run."
 
+A newer inbound message must also supersede an AUTO-SENT draft, not just
+a 'pending' one (#60 safety review MEDIUM-1)
+------------------------------------------------------------------------
+The stale-then-insert logic above only ever looks at ``status='pending'``
+drafts — by design, that was the ONLY status a not-yet-acted-on draft
+could ever be in before #60. Auto-send (``app/agent/nodes/auto_send.py``)
+changed that: a ROUTINE draft on a graduated property is marked
+``status='approved'``, ``auto_send=true`` IMMEDIATELY, in the SAME graph
+run that drafted it — no human ever looked at it. If a second tenant
+message then arrives before the sender ticker claims that row, the OLD
+stale-then-insert logic would leave it sitting there untouched (it is no
+longer ``'pending'``, so the SELECT above never finds it) while ALSO
+drafting (and, if the property is still unlocked, auto-sending) a SECOND,
+independently-drafted reply for the same conversation — a routine message
+burst could produce multiple unattended auto-sends with no human
+backstop at all. Fixed by :func:`_cancel_superseded_auto_send_drafts`,
+called once at the top of :func:`_stale_then_insert_draft`: any
+still-``'approved'``, ``auto_send=true`` draft on the case is cancelled
+(``status='cancelled'``, a ``send_cancelled`` audit row with
+``payload.reason='superseded_by_newer_message'``) before the fresh draft
+is ever inserted. A LANDLORD-approved draft (``auto_send=false``) is
+deliberately left completely untouched by this — their approval is a
+human decision this codebase never silently reverses; only
+``auto_send=true`` rows are ever in scope. ``app/agent/draft_sender.py``'s
+own claim guard carries a SECOND, independent belt-and-braces check for
+the same condition — see that module's own docstring.
+
 20 s END-TO-END budget / retry
 ----------------------------------
 Same shared-deadline arithmetic as ``classify_intent.py`` /
@@ -710,6 +737,25 @@ _INSERT_DRAFTED_AUDIT_SQL = text(
     "VALUES (:landlord_id, :case_id, 'agent', 'drafted', CAST(:payload AS jsonb))"
 )
 
+# #60 safety review MEDIUM-1 — an auto-approved (`auto_send=true`,
+# `status='approved'`) draft was NEVER reviewed by a human. Unlike a
+# landlord-approved draft (which this query deliberately never touches --
+# `auto_send = true` is the ONLY condition it matches on besides
+# `status='approved'`), it must be treated like a 'pending' draft for
+# supersession purposes: a newer inbound message on the SAME case cancels
+# it, exactly once, atomically. A single UPDATE (not a SELECT-then-UPDATE)
+# — safe against a concurrent sender claim racing this: whichever wins the
+# `status = 'approved'` predicate first, the other matches zero rows.
+_CANCEL_UNSENT_AUTO_SEND_DRAFTS_SQL = text(
+    "UPDATE drafts SET status = 'cancelled', updated_at = now() "
+    "WHERE case_id = :case_id AND status = 'approved' AND auto_send = true "
+    "RETURNING id"
+)
+_INSERT_AUTO_SEND_CANCELLED_AUDIT_SQL = text(
+    "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+    "VALUES (:landlord_id, :case_id, 'agent', 'send_cancelled', CAST(:payload AS jsonb))"
+)
+
 _MAX_DRAFT_INSERT_ATTEMPTS: int = 3
 """Bound on the stale-then-insert retry loop (see module docstring
 "Race-safety against a genuinely CONCURRENT insert") — high enough that a
@@ -724,6 +770,54 @@ class DraftInsertRaceExhaustedError(RuntimeError):
     the ``uq_drafts_one_pending`` race. Caught by :func:`draft_response`
     itself (never propagates out of the node) — see module docstring point
     3."""
+
+
+async def _cancel_superseded_auto_send_drafts(
+    session: AsyncSession, *, landlord_id: UUID, case_id: UUID, reasoning_log: list[str]
+) -> None:
+    """#60 safety review MEDIUM-1 — cancel any still-unsent auto-approved
+    (``auto_send=true``, ``status='approved'``) draft on *case_id* the
+    moment a NEWER inbound message triggers a fresh draft. Never touches a
+    landlord-approved draft (their approval is a human decision this
+    codebase never silently reverses — this query's own predicate only
+    ever matches ``auto_send = true`` rows).
+
+    Called ONCE, unconditionally, before the stale-then-insert retry loop
+    below — this is a single atomic ``UPDATE`` with no race to retry
+    against (see :data:`_CANCEL_UNSENT_AUTO_SEND_DRAFTS_SQL`'s own
+    docstring for why it's safe against a concurrently-racing sender
+    claim). In the ordinary case this matches at most one row (a case can
+    have at most one ``'approved'`` draft outstanding at a time — the next
+    auto-send only happens after a FRESH ``draft_response`` run, which
+    reaches this function again first); iterating defensively in case that
+    invariant is ever violated is cheap and never wrong.
+    """
+    cancelled_rows = (
+        (await session.execute(_CANCEL_UNSENT_AUTO_SEND_DRAFTS_SQL, {"case_id": str(case_id)}))
+        .mappings()
+        .all()
+    )
+    for row in cancelled_rows:
+        cancelled_draft_id = row["id"]
+        await session.execute(
+            _INSERT_AUTO_SEND_CANCELLED_AUDIT_SQL,
+            {
+                "landlord_id": str(landlord_id),
+                "case_id": str(case_id),
+                "payload": json.dumps(
+                    {"draft_id": str(cancelled_draft_id), "reason": "superseded_by_newer_message"}
+                ),
+            },
+        )
+        reasoning_log.append(
+            "A new message came in before the earlier automatic reply went out, so I "
+            "cancelled it and I'm writing a fresh one instead."
+        )
+        log.info(
+            "draft_response_auto_send_cancelled_superseded",
+            case_id=str(case_id),
+            draft_id=str(cancelled_draft_id),
+        )
 
 
 async def _stale_then_insert_draft(
@@ -746,7 +840,14 @@ async def _stale_then_insert_draft(
     if every attempt loses the race — the caller decides what to do next,
     this function never leaves two 'pending' rows coexisting and never
     lets a unique-violation escape as an unhandled ``IntegrityError``.
+
+    Also cancels any still-unsent AUTO-SENT draft on *case_id* (#60 safety
+    review MEDIUM-1 — see :func:`_cancel_superseded_auto_send_drafts`),
+    once, before the retry loop below.
     """
+    await _cancel_superseded_auto_send_drafts(
+        session, landlord_id=landlord_id, case_id=case_id, reasoning_log=reasoning_log
+    )
     for attempt in range(_MAX_DRAFT_INSERT_ATTEMPTS):
         pending_row = (
             (await session.execute(_SELECT_PENDING_DRAFT_SQL, {"case_id": str(case_id)}))

@@ -35,6 +35,13 @@ safety-review requirement)
    the race correctly: the ``UPDATE``'s ``EXISTS`` clause simply matches
    zero rows, :func:`apply_auto_send` returns ``None``, and this node falls
    back to the normal approval pause instead of ever writing anything.
+   The ``EXISTS`` also carries an explicit ``c.landlord_id = :landlord_id``
+   predicate (safety review LOW-4) — *landlord_id* is already in scope
+   here for the ``auto_sent`` audit row, so this send-fence writer never
+   relies on transitive scoping through ``case_id`` alone, matching this
+   codebase's "every multi-tenant query scoped by landlord_id" convention
+   (``apps/api/CLAUDE.md``) even in a query that would already be correct
+   without it.
 
 Fail-closed, never fail-open
 ------------------------------
@@ -111,7 +118,7 @@ _AUTO_SEND_DRAFT_SQL = text(
     "AND EXISTS ("
     "  SELECT 1 FROM cases c "
     "  JOIN trust_metrics tm ON tm.property_id = c.property_id AND tm.severity = 'routine' "
-    "  WHERE c.id = :case_id AND c.severity = 'routine' "
+    "  WHERE c.id = :case_id AND c.landlord_id = :landlord_id AND c.severity = 'routine' "
     "    AND tm.autonomy_unlocked = true AND tm.revoked_at IS NULL"
     ") "
     "RETURNING id"
@@ -155,6 +162,7 @@ async def apply_auto_send(
                 {
                     "draft_id": str(draft_id),
                     "case_id": str(case_id),
+                    "landlord_id": str(landlord_id),
                     "scheduled_send_at": scheduled_send_at,
                 },
             )
