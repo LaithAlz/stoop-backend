@@ -433,6 +433,61 @@ async def test_reject_archives_draft_and_reopens_case(
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
+async def test_reject_updates_trust_metrics_rejections_and_resets_streak(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#60 (AC-1): reject increments trust_metrics.rejections and resets
+    consecutive_clean to 0, in the SAME transaction as the rejection
+    write — proven here by pre-seeding a real streak on the case's own
+    (property, severity) pairing and observing it reset."""
+    landlord_id, case_id, draft_id = await _seed_paused_case(db_session, monkeypatch)
+    case_row = (
+        (
+            await db_session.execute(
+                text("SELECT property_id, severity FROM cases WHERE id = :cid"), {"cid": case_id}
+            )
+        )
+        .mappings()
+        .one()
+    )
+    property_id = str(case_row["property_id"])
+    severity = case_row["severity"]
+    await factories.insert_trust_metrics(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        severity=severity,
+        clean_approvals=4,
+        consecutive_clean=4,
+    )
+    try:
+        await resolve_draft_decision(
+            case_id=uuid.UUID(case_id),
+            draft_id=uuid.UUID(draft_id),
+            resume_value={"action": ACTION_REJECT, "note": "changed my mind"},
+        )
+
+        trust_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT rejections, consecutive_clean, clean_approvals FROM "
+                        "trust_metrics WHERE landlord_id = :lid AND severity = :severity"
+                    ),
+                    {"lid": landlord_id, "severity": severity},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert trust_row["rejections"] == 1
+        assert trust_row["consecutive_clean"] == 0
+        assert trust_row["clean_approvals"] == 4  # untouched by the reject
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 # ---------------------------------------------------------------------------
 # 4. Drain-sentinel-class / unrecognized resume values never send.
 # ---------------------------------------------------------------------------

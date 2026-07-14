@@ -303,14 +303,18 @@ async def insert_draft(
     scheduled_send_at: Any = None,
     edited: bool = False,
     final_body: str | None = None,
+    auto_send: bool = False,
 ) -> str:
+    """``auto_send`` added for #60's trust-ladder tests (default ``False``,
+    matching the schema's own default and every existing caller's prior
+    behavior unchanged)."""
     draft_id = str(uuid.uuid4())
     await session.execute(
         text(
             "INSERT INTO drafts (id, landlord_id, case_id, recipient, body, prompt_version, "
-            "status, scheduled_send_at, edited, final_body) "
+            "status, scheduled_send_at, edited, final_body, auto_send) "
             "VALUES (:id, :landlord_id, :case_id, :recipient, :body, 'v1', :status, "
-            ":scheduled_send_at, :edited, :final_body)"
+            ":scheduled_send_at, :edited, :final_body, :auto_send)"
         ),
         {
             "id": draft_id,
@@ -322,10 +326,58 @@ async def insert_draft(
             "scheduled_send_at": scheduled_send_at,
             "edited": edited,
             "final_body": final_body,
+            "auto_send": auto_send,
         },
     )
     await session.commit()
     return draft_id
+
+
+async def insert_trust_metrics(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    property_id: str,
+    severity: str = "routine",
+    clean_approvals: int = 0,
+    edited_approvals: int = 0,
+    rejections: int = 0,
+    consecutive_clean: int = 0,
+    autonomy_unlocked: bool = False,
+    unlocked_at: Any = None,
+    revoked_at: Any = None,
+) -> str:
+    """Seeds a ``trust_metrics`` row directly (bypassing the sender/
+    rejection upserts) — #60's own test modules exercise the auto-send
+    eligibility check/revoke endpoints against a KNOWN trust state, not
+    against whatever a real send/reject sequence would naturally
+    accumulate."""
+    trust_metrics_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO trust_metrics "
+            "(id, landlord_id, property_id, severity, clean_approvals, edited_approvals, "
+            "rejections, consecutive_clean, autonomy_unlocked, unlocked_at, revoked_at) "
+            "VALUES (:id, :landlord_id, :property_id, :severity, :clean_approvals, "
+            ":edited_approvals, :rejections, :consecutive_clean, :autonomy_unlocked, "
+            ":unlocked_at, :revoked_at)"
+        ),
+        {
+            "id": trust_metrics_id,
+            "landlord_id": landlord_id,
+            "property_id": property_id,
+            "severity": severity,
+            "clean_approvals": clean_approvals,
+            "edited_approvals": edited_approvals,
+            "rejections": rejections,
+            "consecutive_clean": consecutive_clean,
+            "autonomy_unlocked": autonomy_unlocked,
+            "unlocked_at": unlocked_at,
+            "revoked_at": revoked_at,
+        },
+    )
+    await session.commit()
+    return trust_metrics_id
 
 
 __all__: list[str] = [
@@ -338,5 +390,6 @@ __all__: list[str] = [
     "insert_message_case",
     "insert_property",
     "insert_tenant",
+    "insert_trust_metrics",
     "insert_vendor",
 ]

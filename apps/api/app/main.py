@@ -31,6 +31,7 @@ from app.routers import (
     properties,
     queue,
     tenants,
+    trust,
     vendors,
 )
 from app.routers.webhooks import twilio as webhooks_twilio
@@ -210,6 +211,7 @@ def create_app() -> fastapi.FastAPI:
     application.include_router(queue.router)
     application.include_router(drafts.router)
     application.include_router(notifications.router)
+    application.include_router(trust.router)
     application.include_router(webhooks_twilio.router)
 
     # auth-test: always registered so engineers can verify JWT plumbing with

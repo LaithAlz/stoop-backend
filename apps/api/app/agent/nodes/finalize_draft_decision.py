@@ -94,6 +94,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+import sentry_sdk
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -155,6 +156,25 @@ _REOPEN_CASE_TO_OPEN_SQL = text(
 _INSERT_REJECTED_AUDIT_SQL = text(
     "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
     "VALUES (:landlord_id, :case_id, 'landlord', 'rejected', CAST(:payload AS jsonb))"
+)
+
+# #60 (AC-1) — a rejection resets the SAME consecutive_clean streak an
+# edit resets (draft_sender.py's own upsert), and increments `rejections`.
+# Upserted (never select-then-insert) exactly like every other trust_metrics
+# writer in this codebase — a case can be rejected before any send has ever
+# happened for its (property, severity) pairing, so the row may not exist
+# yet.
+_SELECT_CASE_PROPERTY_SEVERITY_SQL = text(
+    "SELECT property_id, severity FROM cases WHERE id = :case_id"
+)
+
+_UPSERT_TRUST_METRICS_REJECTION_SQL = text(
+    "INSERT INTO trust_metrics (landlord_id, property_id, severity, rejections, consecutive_clean) "
+    "VALUES (:landlord_id, :property_id, :severity, 1, 0) "
+    "ON CONFLICT (property_id, severity) DO UPDATE SET "
+    "rejections = trust_metrics.rejections + 1, "
+    "consecutive_clean = 0, "
+    "updated_at = now()"
 )
 
 
@@ -230,7 +250,17 @@ async def apply_rejection(
     fallback. Returns ``True`` on success, ``False`` if *draft_id* was no
     longer ``'pending'`` (defensive — see :func:`apply_approve_or_edit`'s
     own docstring for why this is structurally unexpected, not assumed
-    impossible)."""
+    impossible).
+
+    #60 (AC-1): also updates ``trust_metrics`` in this SAME transaction —
+    ``rejections + 1``, ``consecutive_clean = 0`` — for the case's own
+    ``(property_id, severity)`` pairing, mirroring the SAME upsert
+    discipline ``app/agent/draft_sender.py``'s clean/edited path already
+    uses. Skipped (logged + paged, same pattern as that module's own
+    missing-severity branch) when ``cases.severity IS NULL`` — a legacy
+    pre-#197 case, or a genuine anomaly — there is no ``(property,
+    severity)`` key to upsert against.
+    """
     row = (
         (await session.execute(_REJECT_DRAFT_SQL, {"draft_id": str(draft_id)}))
         .mappings()
@@ -240,6 +270,32 @@ async def apply_rejection(
         return False
 
     await session.execute(_REOPEN_CASE_TO_OPEN_SQL, {"case_id": str(case_id)})
+
+    case_row = (
+        (await session.execute(_SELECT_CASE_PROPERTY_SEVERITY_SQL, {"case_id": str(case_id)}))
+        .mappings()
+        .one()
+    )
+    property_id: UUID = case_row["property_id"]
+    severity: str | None = case_row["severity"]
+    if severity is not None:
+        await session.execute(
+            _UPSERT_TRUST_METRICS_REJECTION_SQL,
+            {
+                "landlord_id": str(landlord_id),
+                "property_id": str(property_id),
+                "severity": severity,
+            },
+        )
+    else:
+        log.error("finalize_rejection_missing_severity_for_trust_metrics", case_id=str(case_id))
+        sentry_sdk.capture_message(
+            "finalize_rejection: cases.severity is NULL on reject -- trust_metrics not "
+            "updated for this rejection",
+            level="error",
+            extras={"case_id": str(case_id), "draft_id": str(draft_id)},
+        )
+
     await session.execute(
         _INSERT_REJECTED_AUDIT_SQL,
         {

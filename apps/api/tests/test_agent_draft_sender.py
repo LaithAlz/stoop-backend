@@ -780,6 +780,332 @@ async def test_severity_written_by_classify_severity_flows_into_trust_metrics_vi
         await _cleanup(db_session, landlord_id)
 
 
+# ---------------------------------------------------------------------------
+# #60 -- trust ladder graduation: consecutive_clean streak, boundary
+# graduation, edit resets, and the SQL-level belt-and-braces pinning that
+# a non-'routine' row can never graduate no matter its own streak.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_approved_draft_for_property(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    property_id: str,
+    tenant_id: str,
+    severity: str = "routine",
+    edited: bool = False,
+    final_body: str | None = None,
+    due_in_seconds: float = -1.0,
+) -> tuple[str, str]:
+    """Same shape as ``_seed_approved_draft`` but reuses an EXISTING
+    (landlord, property, tenant) — #60's graduation tests need several
+    consecutive sends to accumulate against the SAME (property, severity)
+    ``trust_metrics`` row, which ``_seed_approved_draft`` (a fresh
+    landlord/property every call) cannot exercise. Returns
+    ``(case_id, draft_id)``."""
+    case_id = await factories.insert_case(
+        session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="awaiting_approval",
+        severity=severity,
+    )
+    scheduled_send_at = datetime.now(UTC) + timedelta(seconds=due_in_seconds)
+    draft_id = await factories.insert_draft(
+        session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        status="approved",
+        scheduled_send_at=scheduled_send_at,
+        edited=edited,
+        final_body=final_body,
+    )
+    return case_id, draft_id
+
+
+async def _trust_metrics_row(
+    session: AsyncSession, *, landlord_id: str, severity: str = "routine"
+) -> dict[str, Any]:
+    row = (
+        (
+            await session.execute(
+                text(
+                    "SELECT consecutive_clean, autonomy_unlocked, unlocked_at, revoked_at, "
+                    "clean_approvals, edited_approvals FROM trust_metrics "
+                    "WHERE landlord_id = :lid AND severity = :severity"
+                ),
+                {"lid": landlord_id, "severity": severity},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return dict(row)
+
+
+@pytest.mark.integration
+async def test_graduation_fires_at_exactly_threshold_boundary_with_trust_unlocked_audit(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clean-approval streak -> unlock at EXACTLY N (boundary), never one
+    send early or late, with a `trust_unlocked` audit row."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "trust_graduation_threshold", 3)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number=factories.fresh_phone()
+    )
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    sender = _FakeSmsSender()
+    try:
+        for _ in range(2):
+            await _seed_approved_draft_for_property(
+                db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+            )
+            claimed = await sender_tick(sender=sender)
+            assert claimed == 1
+            row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+            assert row["autonomy_unlocked"] is False  # not yet -- below threshold
+
+        # The THIRD consecutive clean send crosses the threshold.
+        await _seed_approved_draft_for_property(
+            db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+        )
+        claimed = await sender_tick(sender=sender)
+        assert claimed == 1
+
+        row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+        assert row["consecutive_clean"] == 3
+        assert row["autonomy_unlocked"] is True
+        assert row["unlocked_at"] is not None
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT actor, payload FROM audit_log "
+                        "WHERE landlord_id = :lid AND action = 'trust_unlocked'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["actor"] == "system"
+        assert audit_row["payload"]["severity"] == "routine"
+        assert audit_row["payload"]["threshold"] == 3
+
+        # A FOURTH clean send does not re-fire graduation (no second
+        # trust_unlocked row) -- the WHERE autonomy_unlocked = false guard.
+        await _seed_approved_draft_for_property(
+            db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+        )
+        await sender_tick(sender=sender)
+        audit_count = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log "
+                    "WHERE landlord_id = :lid AND action = 'trust_unlocked'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert audit_count == 1
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_edit_resets_consecutive_clean_streak(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "trust_graduation_threshold", 5)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number=factories.fresh_phone()
+    )
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    sender = _FakeSmsSender()
+    try:
+        for _ in range(3):
+            await _seed_approved_draft_for_property(
+                db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+            )
+            await sender_tick(sender=sender)
+
+        row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+        assert row["consecutive_clean"] == 3
+
+        await _seed_approved_draft_for_property(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            edited=True,
+            final_body="Landlord-edited text.",
+        )
+        await sender_tick(sender=sender)
+
+        row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+        assert row["consecutive_clean"] == 0  # reset by the edit
+        assert row["clean_approvals"] == 3
+        assert row["edited_approvals"] == 1
+        assert row["autonomy_unlocked"] is False
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_urgent_severity_never_graduates_even_at_10x_threshold(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """'urgent'/'emergency' rows accumulate the SAME counters (PR #202
+    senior review: "treat the emergency/urgent rows as inert counters")
+    but can NEVER unlock, no matter how long the streak — the Python-level
+    `severity == GRADUATION_SEVERITY` guard skips the graduation query
+    entirely for these; see the DIRECT SQL-predicate test below for the
+    belt-and-braces enforcement even if that guard were bypassed."""
+    from app.config import settings
+
+    # ge=3 (safety review LOW-3) is the floor a real deployment can ever
+    # boot with -- use the floor itself so this stays a realistic
+    # configuration, not a value production could never actually have.
+    monkeypatch.setattr(settings, "trust_graduation_threshold", 3)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number=factories.fresh_phone()
+    )
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    sender = _FakeSmsSender()
+    try:
+        for _ in range(30):  # 10x the threshold
+            await _seed_approved_draft_for_property(
+                db_session,
+                landlord_id=landlord_id,
+                property_id=property_id,
+                tenant_id=tenant_id,
+                severity="urgent",
+            )
+            await sender_tick(sender=sender)
+
+        row = await _trust_metrics_row(db_session, landlord_id=landlord_id, severity="urgent")
+        assert row["consecutive_clean"] == 30
+        assert row["autonomy_unlocked"] is False
+        assert row["unlocked_at"] is None
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_graduation_sql_predicate_never_matches_non_routine_severity(
+    db_session: AsyncSession,
+) -> None:
+    """SQL-level belt-and-braces (#60): even calling the graduation UPDATE
+    DIRECTLY against a non-'routine' row with a streak far past any
+    threshold, the query's own hardcoded `severity = 'routine'` literal
+    refuses to match — never enforced by Python control flow alone."""
+    import app.agent.draft_sender as draft_sender_mod
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    await factories.insert_trust_metrics(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        severity="emergency",
+        consecutive_clean=999,
+        autonomy_unlocked=False,
+    )
+    try:
+        result = await db_session.execute(
+            draft_sender_mod._GRADUATE_ROUTINE_TRUST_SQL,
+            {"property_id": property_id, "threshold": 1},
+        )
+        assert result.mappings().one_or_none() is None  # never matches
+
+        row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT autonomy_unlocked FROM trust_metrics "
+                        "WHERE property_id = :pid AND severity = 'emergency'"
+                    ),
+                    {"pid": property_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["autonomy_unlocked"] is False
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_revoke_then_one_clean_send_does_not_re_unlock(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec review MINOR-2 / re-graduation semantics (app/trust.py's own
+    docstring): a revoke resets `consecutive_clean` to 0, so re-earning
+    autonomy after a revoke requires a FULL fresh streak, never just one
+    more clean send. Graduated -> revoked -> exactly ONE clean send must
+    still leave the property locked."""
+    from app.config import settings
+    from app.trust import revoke_property_autonomy
+
+    monkeypatch.setattr(settings, "trust_graduation_threshold", 3)
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number=factories.fresh_phone()
+    )
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    sender = _FakeSmsSender()
+    try:
+        for _ in range(3):
+            await _seed_approved_draft_for_property(
+                db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+            )
+            await sender_tick(sender=sender)
+
+        graduated_row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+        assert graduated_row["autonomy_unlocked"] is True
+
+        revoked_count = await revoke_property_autonomy(
+            db_session,
+            landlord_id=uuid.UUID(landlord_id),
+            property_id=uuid.UUID(property_id),
+            actor="landlord",
+            reason="test",
+        )
+        assert revoked_count == 1
+
+        revoked_row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+        assert revoked_row["autonomy_unlocked"] is False
+        assert revoked_row["consecutive_clean"] == 0
+
+        # Exactly ONE clean send after the revoke -- not a full fresh streak.
+        await _seed_approved_draft_for_property(
+            db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+        )
+        await sender_tick(sender=sender)
+
+        after_one_send = await _trust_metrics_row(db_session, landlord_id=landlord_id)
+        assert after_one_send["consecutive_clean"] == 1
+        assert after_one_send["autonomy_unlocked"] is False  # still locked -- needs 2 more
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 def test_sms_sender_protocol_is_a_runtime_checkable_shape() -> None:
     """Cheap unit-level pin: SmsSender is the ONE seam the ticker depends
     on — a fake implementing just `send_sms` satisfies it structurally."""

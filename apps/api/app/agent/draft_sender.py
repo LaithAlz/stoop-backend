@@ -13,7 +13,45 @@ drains them through an INJECTABLE :class:`app.integrations.sms_sender.
 SmsSender`, and writes every durable side effect of an actual send: the
 outbound ``messages`` row, ``drafts.sent_message_id`` + ``status='sent'``,
 ``cases.status='awaiting_tenant'``, the ``trust_metrics`` clean-vs-edited
-increment, and the ``audit_log`` ``'sent'`` row.
+increment (plus, #60: the ``consecutive_clean`` streak counter and the
+graduation write once a ``'routine'`` streak reaches
+``settings.trust_graduation_threshold`` — see "Trust ladder graduation
+(#60)" below), and the ``audit_log`` ``'sent'`` row.
+
+Trust ladder graduation (#60)
+------------------------------
+Every send through this ticker (regardless of whether a landlord approved
+it or the trust ladder auto-sent it — this module makes no distinction,
+it drains ANY due ``'approved'`` row) upserts the SAME ``trust_metrics``
+row this module already maintained: a clean (unedited) send increments
+``consecutive_clean``; an edited send resets it to 0. Immediately after
+that upsert, for a clean ``'routine'`` send ONLY, a second, atomic UPDATE
+(:data:`_GRADUATE_ROUTINE_TRUST_SQL`) checks whether the streak has
+reached :attr:`app.config.Settings.trust_graduation_threshold`
+(FOUNDER-PROVISIONAL — see that setting's own docstring) and, if so, flips
+``autonomy_unlocked = true`` + ``unlocked_at = now()`` (clearing any prior
+``revoked_at``) and appends a ``trust_unlocked`` ``audit_log`` row
+(``actor='system'``). ``'urgent'``/``'emergency'`` severities accumulate
+the SAME counters (an inert streak that can never graduate — the
+graduation query's own ``severity = 'routine'`` predicate is a hardcoded
+SQL literal, not a bound parameter, per #60's PR #202 senior-review note:
+"treat the emergency/urgent rows as inert counters").
+
+Supersession belt-and-braces for auto-sent drafts (#60 safety review
+MEDIUM-1)
+------------------------------------------------------------------------
+``app/agent/nodes/draft_response.py``'s own stale-then-insert logic is the
+PRIMARY fix: it cancels a still-unsent ``auto_send=true`` draft the moment
+a newer tenant message triggers a fresh one, under the per-case advisory
+lock. This module carries a SECOND, independent layer for the same
+invariant, in case that primary path is ever bypassed: :data:`_CLAIM_
+DRAFT_SQL` itself refuses to claim (and therefore send) an ``auto_send =
+true`` draft if a newer inbound message has landed on its case since it
+was drafted (never a landlord-approved draft — that predicate only ever
+looks at ``auto_send = true`` rows); :func:`_claim_draft` then cancels
+that refused draft (:data:`_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL`) and
+records a ``send_cancelled`` audit row, so it never sits stuck
+``'approved'`` re-appearing as a "due" candidate forever.
 
 The undo window is data, not a sleep (schema-v1.md's own phrase) — this
 module never sleeps waiting for a specific draft; it only ever asks
@@ -104,8 +142,10 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db.session import get_admin_session
 from app.integrations.sms_sender import SmsSender
+from app.trust import GRADUATION_SEVERITY
 
 log = structlog.get_logger(__name__)
 
@@ -148,10 +188,58 @@ _SELECT_DUE_DRAFT_IDS_SQL = text(
     "ORDER BY scheduled_send_at LIMIT :limit"
 )
 
+# #60 safety review MEDIUM-1 (belt-and-braces) — an `auto_send=true` draft
+# is a NEVER-human-reviewed row (unlike a landlord-approved one), so the
+# claim itself must not dispatch it if a NEWER tenant inbound message has
+# arrived for its case since it was drafted. `app/agent/nodes/
+# draft_response.py`'s own `_cancel_superseded_auto_send_drafts` is the
+# PRIMARY fix (cancels immediately when the newer message triggers a fresh
+# draft, under the per-case advisory lock) — this predicate is the SECOND,
+# independent layer in case that primary path is ever bypassed. The
+# `EXISTS` sub-select correlates "does a newer inbound message belong to
+# this draft's case" the SAME way every other cross-table message/case
+# correlation in this codebase does (`app/routers/queue.py`'s own LATERAL
+# subquery, `app/routers/cases.py`'s `_SELECT_MESSAGES_SQL`):
+# `messages.case_id` is always NULL in production (the webhook, the sole
+# writer, inserts before case identity is known), so a direct
+# `m.case_id = drafts.case_id` match alone would never fire there — the
+# `message_cases` join is REQUIRED, not optional, to actually catch this
+# in production. `drafts.case_id`/`drafts.created_at` are referenced
+# directly (no alias needed — Postgres allows an UPDATE's own WHERE/
+# sub-selects to correlate against the target table by name).
+_NEWER_INBOUND_EXISTS_SQL = (
+    "EXISTS ("
+    "  SELECT 1 FROM messages m "
+    "  WHERE m.direction = 'inbound' AND m.created_at > drafts.created_at "
+    "    AND (m.case_id = drafts.case_id OR EXISTS ("
+    "      SELECT 1 FROM message_cases mc "
+    "      WHERE mc.message_id = m.id AND mc.case_id = drafts.case_id"
+    "    ))"
+    ")"
+)
+
 _CLAIM_DRAFT_SQL = text(
-    "UPDATE drafts SET status = 'sending', updated_at = now() "
+    "UPDATE drafts SET status = 'sending', updated_at = now() "  # noqa: S608 -- static const interpolated below, no user input
     "WHERE id = :draft_id AND status = 'approved' AND scheduled_send_at <= now() "
+    f"AND (auto_send = false OR NOT {_NEWER_INBOUND_EXISTS_SQL}) "
     "RETURNING id, case_id, recipient, body, final_body, edited, landlord_id"
+)
+
+# The claim above deliberately refuses a superseded auto_send draft (never
+# a landlord-approved one, gated by `auto_send = true` here too) — this is
+# the companion write that actually cancels it, so it doesn't sit stuck
+# 'approved' forever re-appearing as a "due" candidate on every future
+# tick. Same atomic-`UPDATE`-decides-everything shape as the claim itself.
+_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL = text(
+    "UPDATE drafts SET status = 'cancelled', updated_at = now() "  # noqa: S608 -- static const interpolated below, no user input
+    "WHERE id = :draft_id AND status = 'approved' AND auto_send = true "
+    f"AND {_NEWER_INBOUND_EXISTS_SQL} "
+    "RETURNING id, case_id, landlord_id"
+)
+
+_INSERT_AUTO_SEND_SUPERSEDED_AUDIT_SQL = text(
+    "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+    "VALUES (:landlord_id, :case_id, 'agent', 'send_cancelled', CAST(:payload AS jsonb))"
 )
 
 _SELECT_CASE_FOR_SEND_SQL = text(
@@ -183,12 +271,37 @@ _MARK_CASE_AWAITING_TENANT_SQL = text(
 
 _UPSERT_TRUST_METRICS_SQL = text(
     "INSERT INTO trust_metrics "
-    "(landlord_id, property_id, severity, clean_approvals, edited_approvals) "
-    "VALUES (:landlord_id, :property_id, :severity, :clean_inc, :edited_inc) "
+    "(landlord_id, property_id, severity, clean_approvals, edited_approvals, consecutive_clean) "
+    "VALUES (:landlord_id, :property_id, :severity, :clean_inc, :edited_inc, "
+    "CASE WHEN :edited THEN 0 ELSE 1 END) "
     "ON CONFLICT (property_id, severity) DO UPDATE SET "
     "clean_approvals = trust_metrics.clean_approvals + EXCLUDED.clean_approvals, "
     "edited_approvals = trust_metrics.edited_approvals + EXCLUDED.edited_approvals, "
-    "updated_at = now()"
+    "consecutive_clean = CASE WHEN :edited THEN 0 ELSE trust_metrics.consecutive_clean + 1 END, "
+    "updated_at = now() "
+    "RETURNING consecutive_clean"
+)
+
+# #60 graduation — 'routine' is a LITERAL here, never a bound parameter
+# (belt-and-braces: CLAUDE.md rule 3, "only for routine" — schema-v1.md's
+# own trust_metrics.autonomy_unlocked comment, "only ever true for routine
+# in v1"). `autonomy_unlocked = false` in the WHERE clause makes this fire
+# AT MOST ONCE per graduation event — a row already unlocked never
+# re-matches, so this never re-inserts a duplicate `trust_unlocked` audit
+# row on every subsequent clean send. `revoked_at = NULL` clears any prior
+# revocation (#60's own re-graduation semantics — app/trust.py's module
+# docstring "Re-graduation semantics").
+_GRADUATE_ROUTINE_TRUST_SQL = text(
+    "UPDATE trust_metrics SET autonomy_unlocked = true, unlocked_at = now(), "
+    "revoked_at = NULL, updated_at = now() "
+    "WHERE property_id = :property_id AND severity = 'routine' "
+    "AND consecutive_clean >= :threshold AND autonomy_unlocked = false "
+    "RETURNING id"
+)
+
+_INSERT_TRUST_UNLOCKED_AUDIT_SQL = text(
+    "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+    "VALUES (:landlord_id, :case_id, 'system', 'trust_unlocked', CAST(:payload AS jsonb))"
 )
 
 _INSERT_SENT_AUDIT_SQL = text(
@@ -208,12 +321,48 @@ def _default_time_source() -> float:
 
 
 async def _claim_draft(session: AsyncSession, draft_id: UUID) -> dict[str, Any] | None:
+    """Claim *draft_id* for sending, or ``None`` if it can't be claimed
+    right now — three DISTINCT reasons collapse into that same ``None``:
+    lost the claim race (another tick/process already claimed it), not
+    actually due yet, or (#60 safety review MEDIUM-1) a superseded
+    ``auto_send=true`` draft the claim's own guard refused. Only the THIRD
+    case does anything further here: :data:`_CANCEL_SUPERSEDED_AUTO_SEND_
+    DRAFT_SQL` cancels it (never a landlord-approved row — see that
+    query's own docstring) and records a ``send_cancelled`` audit row,
+    so it never sits stuck ``'approved'`` reappearing as "due" forever.
+    The first two cases fall through as a silent, correct no-op exactly
+    like before this fix.
+    """
     row = (
         (await session.execute(_CLAIM_DRAFT_SQL, {"draft_id": str(draft_id)}))
         .mappings()
         .one_or_none()
     )
-    return dict(row) if row is not None else None
+    if row is not None:
+        return dict(row)
+
+    cancelled_row = (
+        (await session.execute(_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL, {"draft_id": str(draft_id)}))
+        .mappings()
+        .one_or_none()
+    )
+    if cancelled_row is not None:
+        await session.execute(
+            _INSERT_AUTO_SEND_SUPERSEDED_AUDIT_SQL,
+            {
+                "landlord_id": str(cancelled_row["landlord_id"]),
+                "case_id": str(cancelled_row["case_id"]),
+                "payload": json.dumps(
+                    {"draft_id": str(draft_id), "reason": "superseded_by_newer_message"}
+                ),
+            },
+        )
+        log.info(
+            "draft_sender_auto_send_cancelled_superseded",
+            draft_id=str(draft_id),
+            case_id=str(cancelled_row["case_id"]),
+        )
+    return None
 
 
 async def _load_recipient_context(
@@ -390,16 +539,63 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
 
         if severity is not None:
             clean_inc, edited_inc = (0, 1) if edited else (1, 0)
-            await session.execute(
-                _UPSERT_TRUST_METRICS_SQL,
-                {
-                    "landlord_id": str(landlord_id),
-                    "property_id": str(property_id),
-                    "severity": severity,
-                    "clean_inc": clean_inc,
-                    "edited_inc": edited_inc,
-                },
+            trust_row = (
+                (
+                    await session.execute(
+                        _UPSERT_TRUST_METRICS_SQL,
+                        {
+                            "landlord_id": str(landlord_id),
+                            "property_id": str(property_id),
+                            "severity": severity,
+                            "clean_inc": clean_inc,
+                            "edited_inc": edited_inc,
+                            "edited": edited,
+                        },
+                    )
+                )
+                .mappings()
+                .one()
             )
+
+            # #60 graduation — only ever attempted for 'routine' clean
+            # sends (an edit always resets consecutive_clean to 0 above,
+            # so it could never legitimately reach the threshold on the
+            # SAME transaction anyway; skipping the query entirely for
+            # edited/non-routine sends is a cheap belt-and-braces on top
+            # of _GRADUATE_ROUTINE_TRUST_SQL's own hardcoded predicate).
+            if severity == GRADUATION_SEVERITY and not edited:
+                threshold = settings.trust_graduation_threshold
+                graduated_row = (
+                    (
+                        await session.execute(
+                            _GRADUATE_ROUTINE_TRUST_SQL,
+                            {"property_id": str(property_id), "threshold": threshold},
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if graduated_row is not None:
+                    await session.execute(
+                        _INSERT_TRUST_UNLOCKED_AUDIT_SQL,
+                        {
+                            "landlord_id": str(landlord_id),
+                            "case_id": str(case_id),
+                            "payload": json.dumps(
+                                {
+                                    "property_id": str(property_id),
+                                    "severity": GRADUATION_SEVERITY,
+                                    "threshold": threshold,
+                                    "consecutive_clean": trust_row["consecutive_clean"],
+                                }
+                            ),
+                        },
+                    )
+                    log.info(
+                        "trust_ladder_graduated",
+                        property_id=str(property_id),
+                        case_id=str(case_id),
+                    )
         else:
             # #197: cases.severity is now written by classify_severity (post
             # -clamp) for every case that has ever been through the graph,
