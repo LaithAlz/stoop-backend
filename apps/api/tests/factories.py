@@ -328,6 +328,53 @@ async def insert_draft(
     return draft_id
 
 
+async def insert_trust_metrics(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    property_id: str,
+    severity: str = "routine",
+    clean_approvals: int = 0,
+    edited_approvals: int = 0,
+    rejections: int = 0,
+    consecutive_clean: int = 0,
+    autonomy_unlocked: bool = False,
+    unlocked_at: Any = None,
+    revoked_at: Any = None,
+) -> str:
+    """Seeds a ``trust_metrics`` row directly (bypassing the sender/
+    rejection upserts) — #60's own test modules exercise the auto-send
+    eligibility check/revoke endpoints against a KNOWN trust state, not
+    against whatever a real send/reject sequence would naturally
+    accumulate."""
+    trust_metrics_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO trust_metrics "
+            "(id, landlord_id, property_id, severity, clean_approvals, edited_approvals, "
+            "rejections, consecutive_clean, autonomy_unlocked, unlocked_at, revoked_at) "
+            "VALUES (:id, :landlord_id, :property_id, :severity, :clean_approvals, "
+            ":edited_approvals, :rejections, :consecutive_clean, :autonomy_unlocked, "
+            ":unlocked_at, :revoked_at)"
+        ),
+        {
+            "id": trust_metrics_id,
+            "landlord_id": landlord_id,
+            "property_id": property_id,
+            "severity": severity,
+            "clean_approvals": clean_approvals,
+            "edited_approvals": edited_approvals,
+            "rejections": rejections,
+            "consecutive_clean": consecutive_clean,
+            "autonomy_unlocked": autonomy_unlocked,
+            "unlocked_at": unlocked_at,
+            "revoked_at": revoked_at,
+        },
+    )
+    await session.commit()
+    return trust_metrics_id
+
+
 __all__: list[str] = [
     "fresh_phone",
     "insert_audit_log",
@@ -338,5 +385,6 @@ __all__: list[str] = [
     "insert_message_case",
     "insert_property",
     "insert_tenant",
+    "insert_trust_metrics",
     "insert_vendor",
 ]

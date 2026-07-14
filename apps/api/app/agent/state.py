@@ -170,6 +170,23 @@ class AgentState(TypedDict, total=False):
         replacement SMS text, already stored durably in ``drafts.
         final_body``, not something this key introduces a new home for.
 
+    auto_send_fallback:
+        Set by ``app.agent.nodes.auto_send.auto_send_draft`` (#60) — ``True``
+        when that node could not actually auto-send (its own belt-and
+        -braces write found the draft/trust condition no longer eligible,
+        or a defensive case-context/pending-draft anomaly), ``False`` when
+        it genuinely auto-sent. Consumed EXCLUSIVELY by ``app.agent.graph``'s
+        ``_route_after_auto_send_draft`` conditional edge, reached ONLY
+        immediately after that SAME node runs within the SAME invocation
+        (auto-send never pauses, so there is no cross-invocation/resume gap
+        for a stale value to survive across — unlike ``approval_resume``
+        above). ``auto_send_draft`` always sets this explicitly on EVERY
+        return path (never leaves it unset) precisely to avoid that same
+        class of "stale checkpoint value" hazard on principle, even though
+        it is not actually reachable here. ``None``/absent on every run
+        that never reaches ``auto_send_draft`` at all (the ordinary
+        degraded-mode or human-approval paths).
+
     reasoning_log:
         Append-only list of human-readable trace lines.  Every node MUST
         append at least one entry describing what it observed and decided.
@@ -210,4 +227,5 @@ class AgentState(TypedDict, total=False):
     draft_guard_failed: bool
     length_over_budget: bool
     approval_resume: dict[str, Any] | None
+    auto_send_fallback: bool
     reasoning_log: list[str]

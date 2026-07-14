@@ -6,13 +6,20 @@ entry point ``app/agent/graph_entry.py`` invokes per inbound message.
 Node order (issue #34's AC / ``apps/api/CLAUDE.md``'s ``agent/nodes/``
 layout; #43 added ``mark_awaiting_approval``/``await_approval``, see
 "Shadow mode (#43)" below; #44/#45 added ``finalize_approval``/
-``finalize_rejection``, see "The resume seam for #44/#45" below)::
+``finalize_rejection``, see "The resume seam for #44/#45" below; #60 added
+``auto_send_draft``, see "Auto-send (#60)" in ``_route_after_draft_
+response``'s own docstring)::
 
     identify_property -> load_context -> identify_case -> classify_intent
       -> classify_severity -> [classification_failed?] -> degraded_mode
                             -> draft_response
                                  -> [draft_guard_failed? OR severity==EMERGENCY?]
                                       -> degraded_mode
+                                      -> [severity==ROUTINE AND trust unlocked?]
+                                           -> auto_send_draft
+                                                -> [fallback?]
+                                                     -> mark_awaiting_approval (below)
+                                                     -> END (genuinely auto-sent)
                                       -> mark_awaiting_approval -> await_approval
                                                                      -> interrupt()
                                                                      -> [resume action?]
@@ -383,6 +390,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.checkpointer import get_checkpointer
+from app.agent.nodes.auto_send import auto_send_draft
 from app.agent.nodes.await_approval import await_approval, mark_awaiting_approval
 from app.agent.nodes.classify_intent import classify_intent
 from app.agent.nodes.classify_severity import classify_severity
@@ -403,6 +411,7 @@ from app.agent.nodes.load_context import load_context
 from app.agent.schemas import CaseContext, Severity
 from app.agent.state import AgentState
 from app.db.session import get_admin_session
+from app.trust import is_routine_autonomy_unlocked
 
 log = structlog.get_logger(__name__)
 
@@ -422,6 +431,7 @@ NODE_MARK_AWAITING_APPROVAL = "mark_awaiting_approval"
 NODE_AWAIT_APPROVAL = "await_approval"
 NODE_FINALIZE_APPROVAL = "finalize_approval"
 NODE_FINALIZE_REJECTION = "finalize_rejection"
+NODE_AUTO_SEND_DRAFT = "auto_send_draft"
 
 _UNKNOWN_SENDER_THREAD_PREFIX = "message:"
 """Fallback checkpoint thread for a message that never attaches to a case
@@ -442,7 +452,7 @@ def _route_after_classify_severity(state: AgentState) -> str:
     return NODE_DRAFT_RESPONSE
 
 
-def _route_after_draft_response(state: AgentState) -> str:
+async def _route_after_draft_response(state: AgentState) -> str:
     """Two INDEPENDENT triggers route to ``degraded_mode`` here, checked
     separately (never combined into one condition):
 
@@ -456,16 +466,71 @@ def _route_after_draft_response(state: AgentState) -> str:
       only decides whether a person ALSO gets durably notified.
 
     Either way this is IN ADDITION TO (not instead of) the draft that
-    ``draft_response`` already inserted. Checked FIRST, before the plain
-    ``mark_awaiting_approval -> await_approval`` exit below — #43's
-    approval pause never traps this interim emergency/degraded-mode path
-    (module docstring "Shadow mode (#43)")."""
+    ``draft_response`` already inserted. Checked FIRST, before either exit
+    below — #43's approval pause (and #60's auto-send) never trap this
+    interim emergency/degraded-mode path (module docstring "Shadow mode
+    (#43)").
+
+    Auto-send (#60) — a THIRD exit, ROUTINE-only, checked only once the two
+    triggers above have already ruled out EMERGENCY/guard-failed
+    ------------------------------------------------------------------------
+    ``severity == ROUTINE`` is the ONLY severity that may ever route to
+    :data:`NODE_AUTO_SEND_DRAFT` (CLAUDE.md rule 3: "only for `routine`") —
+    URGENT falls straight through to the ordinary
+    ``mark_awaiting_approval -> await_approval`` pause below, same as it
+    always has. When ROUTINE, this does a plain, unlocked
+    ``app.trust.is_routine_autonomy_unlocked`` read to decide whether the
+    case's property has EARNED auto-send. This is a CHEAP READ that only
+    picks the edge — :func:`app.agent.nodes.auto_send.apply_auto_send`
+    re-verifies the identical condition, hardcoded in SQL, before ever
+    writing anything (see that module's own docstring "Two-layer
+    eligibility check"). ANY exception during this read (a DB hiccup, a
+    missing property_id, anything) is treated as "not eligible" — fail
+    -closed to the SAME human-approval pause every ordinary draft goes
+    through, NEVER fail-open to auto-send. This is a `trust_metrics` DATA
+    read, never a feature-flag read (rule 7: flags never gate the approval
+    requirement)."""
     if state.get("draft_guard_failed"):
         return NODE_DEGRADED_MODE
     severity_result = state.get("severity")
     if severity_result is not None and severity_result.severity is Severity.EMERGENCY:
         return NODE_DEGRADED_MODE
+    if severity_result is not None and severity_result.severity is Severity.ROUTINE:
+        case_context = state.get("case_context") or CaseContext()
+        property_id = case_context.property_id
+        if property_id is not None:
+            unlocked = False
+            try:
+                async with asynccontextmanager(get_admin_session)() as session:
+                    unlocked = await is_routine_autonomy_unlocked(session, property_id=property_id)
+            except Exception:
+                # Fail-closed (module docstring above) — never let a lookup
+                # error skip landlord approval.
+                log.error(
+                    "route_after_draft_response_trust_lookup_failed",
+                    property_id=str(property_id),
+                )
+                unlocked = False
+            if unlocked:
+                return NODE_AUTO_SEND_DRAFT
     return NODE_MARK_AWAITING_APPROVAL
+
+
+def _route_after_auto_send_draft(state: AgentState) -> str:
+    """#60 — dispatches on whatever :func:`app.agent.nodes.auto_send.
+    auto_send_draft` set ``state["auto_send_fallback"]`` to (see that
+    node's own docstring and ``state.py``'s field docstring). ``True``
+    (the node's own belt-and-braces write found the draft/trust condition
+    no longer eligible, or hit a defensive anomaly) falls back to the SAME
+    ``mark_awaiting_approval -> await_approval`` pause every ordinary
+    routine/urgent draft goes through — fail-closed, never a stuck,
+    unapproved, un-sent draft. ``False`` (genuinely auto-sent) reaches
+    ``END`` directly — no pause, no landlord interrupt, matching the
+    approve/edit-and-send path's own ``-> END`` shape once a draft is
+    scheduled for send."""
+    if state.get("auto_send_fallback"):
+        return NODE_MARK_AWAITING_APPROVAL
+    return END
 
 
 def _route_after_await_approval(state: AgentState) -> str:
@@ -538,6 +603,7 @@ def build_case_graph() -> StateGraph[AgentState, None, AgentState, AgentState]:
     graph.add_node(NODE_AWAIT_APPROVAL, await_approval)
     graph.add_node(NODE_FINALIZE_APPROVAL, finalize_approval)
     graph.add_node(NODE_FINALIZE_REJECTION, finalize_rejection)
+    graph.add_node(NODE_AUTO_SEND_DRAFT, auto_send_draft)
 
     graph.add_edge(START, NODE_CLASSIFY_INTENT)
     graph.add_edge(NODE_CLASSIFY_INTENT, NODE_CLASSIFY_SEVERITY)
@@ -551,8 +617,18 @@ def build_case_graph() -> StateGraph[AgentState, None, AgentState, AgentState]:
         _route_after_draft_response,
         {
             NODE_DEGRADED_MODE: NODE_DEGRADED_MODE,
+            NODE_AUTO_SEND_DRAFT: NODE_AUTO_SEND_DRAFT,
             NODE_MARK_AWAITING_APPROVAL: NODE_MARK_AWAITING_APPROVAL,
         },
+    )
+    # #60 — auto_send_draft's OWN belt-and-braces write can still fall back
+    # (module docstring "Fail-closed, never fail-open"); this edge is what
+    # actually sends that fallback to the ordinary pause instead of just
+    # ending the run with nothing approved and nothing pending review.
+    graph.add_conditional_edges(
+        NODE_AUTO_SEND_DRAFT,
+        _route_after_auto_send_draft,
+        {NODE_MARK_AWAITING_APPROVAL: NODE_MARK_AWAITING_APPROVAL, END: END},
     )
     graph.add_edge(NODE_MARK_AWAITING_APPROVAL, NODE_AWAIT_APPROVAL)
     graph.add_edge(NODE_DEGRADED_MODE, END)
@@ -1066,6 +1142,7 @@ async def run_graph(message_id: UUID) -> AgentState:
 
 
 __all__: list[str] = [
+    "NODE_AUTO_SEND_DRAFT",
     "NODE_AWAIT_APPROVAL",
     "NODE_CLASSIFY_INTENT",
     "NODE_CLASSIFY_SEVERITY",

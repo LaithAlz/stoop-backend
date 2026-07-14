@@ -193,6 +193,29 @@ class Settings(BaseSettings):
         ),
     )
 
+    trust_graduation_threshold: int = Field(
+        default=10,
+        description=(
+            "FOUNDER-PROVISIONAL (#60) -- number of CONSECUTIVE clean "
+            "(unedited) sends on a (property, 'routine') trust_metrics row "
+            "before autonomy_unlocked flips true and that pairing starts "
+            "auto-sending routine drafts without landlord approval. No "
+            "founder ruling on this EXACT number exists yet (verified "
+            "against docs + issue history at implementation time) -- 10 is "
+            "a reasonable placeholder pending ratification, not a "
+            "considered product decision. The founder must ratify or "
+            "adjust this one number before launch. Change ONLY here -- "
+            "never hardcode a graduation count anywhere in app/agent or "
+            "app/routers (grep for this field name if you're tempted to). "
+            "Applies EXCLUSIVELY to severity='routine' rows -- "
+            "'urgent'/'emergency' rows never graduate regardless of this "
+            "value (schema-v1.md's own trust_metrics.autonomy_unlocked "
+            "comment: 'only ever true for routine in v1'; CLAUDE.md rule "
+            "3). This is a product/safety threshold, never a feature flag "
+            "(rule 7 forbids flag reads anywhere near auto-send)."
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Anthropic (agent — #26/#9+; sensitive — no default)
     # ------------------------------------------------------------------

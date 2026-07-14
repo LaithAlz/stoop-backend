@@ -13,7 +13,29 @@ drains them through an INJECTABLE :class:`app.integrations.sms_sender.
 SmsSender`, and writes every durable side effect of an actual send: the
 outbound ``messages`` row, ``drafts.sent_message_id`` + ``status='sent'``,
 ``cases.status='awaiting_tenant'``, the ``trust_metrics`` clean-vs-edited
-increment, and the ``audit_log`` ``'sent'`` row.
+increment (plus, #60: the ``consecutive_clean`` streak counter and the
+graduation write once a ``'routine'`` streak reaches
+``settings.trust_graduation_threshold`` — see "Trust ladder graduation
+(#60)" below), and the ``audit_log`` ``'sent'`` row.
+
+Trust ladder graduation (#60)
+------------------------------
+Every send through this ticker (regardless of whether a landlord approved
+it or the trust ladder auto-sent it — this module makes no distinction,
+it drains ANY due ``'approved'`` row) upserts the SAME ``trust_metrics``
+row this module already maintained: a clean (unedited) send increments
+``consecutive_clean``; an edited send resets it to 0. Immediately after
+that upsert, for a clean ``'routine'`` send ONLY, a second, atomic UPDATE
+(:data:`_GRADUATE_ROUTINE_TRUST_SQL`) checks whether the streak has
+reached :attr:`app.config.Settings.trust_graduation_threshold`
+(FOUNDER-PROVISIONAL — see that setting's own docstring) and, if so, flips
+``autonomy_unlocked = true`` + ``unlocked_at = now()`` (clearing any prior
+``revoked_at``) and appends a ``trust_unlocked`` ``audit_log`` row
+(``actor='system'``). ``'urgent'``/``'emergency'`` severities accumulate
+the SAME counters (an inert streak that can never graduate — the
+graduation query's own ``severity = 'routine'`` predicate is a hardcoded
+SQL literal, not a bound parameter, per #60's PR #202 senior-review note:
+"treat the emergency/urgent rows as inert counters").
 
 The undo window is data, not a sleep (schema-v1.md's own phrase) — this
 module never sleeps waiting for a specific draft; it only ever asks
@@ -104,8 +126,10 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db.session import get_admin_session
 from app.integrations.sms_sender import SmsSender
+from app.trust import GRADUATION_SEVERITY
 
 log = structlog.get_logger(__name__)
 
@@ -183,12 +207,37 @@ _MARK_CASE_AWAITING_TENANT_SQL = text(
 
 _UPSERT_TRUST_METRICS_SQL = text(
     "INSERT INTO trust_metrics "
-    "(landlord_id, property_id, severity, clean_approvals, edited_approvals) "
-    "VALUES (:landlord_id, :property_id, :severity, :clean_inc, :edited_inc) "
+    "(landlord_id, property_id, severity, clean_approvals, edited_approvals, consecutive_clean) "
+    "VALUES (:landlord_id, :property_id, :severity, :clean_inc, :edited_inc, "
+    "CASE WHEN :edited THEN 0 ELSE 1 END) "
     "ON CONFLICT (property_id, severity) DO UPDATE SET "
     "clean_approvals = trust_metrics.clean_approvals + EXCLUDED.clean_approvals, "
     "edited_approvals = trust_metrics.edited_approvals + EXCLUDED.edited_approvals, "
-    "updated_at = now()"
+    "consecutive_clean = CASE WHEN :edited THEN 0 ELSE trust_metrics.consecutive_clean + 1 END, "
+    "updated_at = now() "
+    "RETURNING consecutive_clean"
+)
+
+# #60 graduation — 'routine' is a LITERAL here, never a bound parameter
+# (belt-and-braces: CLAUDE.md rule 3, "only for routine" — schema-v1.md's
+# own trust_metrics.autonomy_unlocked comment, "only ever true for routine
+# in v1"). `autonomy_unlocked = false` in the WHERE clause makes this fire
+# AT MOST ONCE per graduation event — a row already unlocked never
+# re-matches, so this never re-inserts a duplicate `trust_unlocked` audit
+# row on every subsequent clean send. `revoked_at = NULL` clears any prior
+# revocation (#60's own re-graduation semantics — app/trust.py's module
+# docstring "Re-graduation semantics").
+_GRADUATE_ROUTINE_TRUST_SQL = text(
+    "UPDATE trust_metrics SET autonomy_unlocked = true, unlocked_at = now(), "
+    "revoked_at = NULL, updated_at = now() "
+    "WHERE property_id = :property_id AND severity = 'routine' "
+    "AND consecutive_clean >= :threshold AND autonomy_unlocked = false "
+    "RETURNING id"
+)
+
+_INSERT_TRUST_UNLOCKED_AUDIT_SQL = text(
+    "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+    "VALUES (:landlord_id, :case_id, 'system', 'trust_unlocked', CAST(:payload AS jsonb))"
 )
 
 _INSERT_SENT_AUDIT_SQL = text(
@@ -390,16 +439,63 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
 
         if severity is not None:
             clean_inc, edited_inc = (0, 1) if edited else (1, 0)
-            await session.execute(
-                _UPSERT_TRUST_METRICS_SQL,
-                {
-                    "landlord_id": str(landlord_id),
-                    "property_id": str(property_id),
-                    "severity": severity,
-                    "clean_inc": clean_inc,
-                    "edited_inc": edited_inc,
-                },
+            trust_row = (
+                (
+                    await session.execute(
+                        _UPSERT_TRUST_METRICS_SQL,
+                        {
+                            "landlord_id": str(landlord_id),
+                            "property_id": str(property_id),
+                            "severity": severity,
+                            "clean_inc": clean_inc,
+                            "edited_inc": edited_inc,
+                            "edited": edited,
+                        },
+                    )
+                )
+                .mappings()
+                .one()
             )
+
+            # #60 graduation — only ever attempted for 'routine' clean
+            # sends (an edit always resets consecutive_clean to 0 above,
+            # so it could never legitimately reach the threshold on the
+            # SAME transaction anyway; skipping the query entirely for
+            # edited/non-routine sends is a cheap belt-and-braces on top
+            # of _GRADUATE_ROUTINE_TRUST_SQL's own hardcoded predicate).
+            if severity == GRADUATION_SEVERITY and not edited:
+                threshold = settings.trust_graduation_threshold
+                graduated_row = (
+                    (
+                        await session.execute(
+                            _GRADUATE_ROUTINE_TRUST_SQL,
+                            {"property_id": str(property_id), "threshold": threshold},
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if graduated_row is not None:
+                    await session.execute(
+                        _INSERT_TRUST_UNLOCKED_AUDIT_SQL,
+                        {
+                            "landlord_id": str(landlord_id),
+                            "case_id": str(case_id),
+                            "payload": json.dumps(
+                                {
+                                    "property_id": str(property_id),
+                                    "severity": GRADUATION_SEVERITY,
+                                    "threshold": threshold,
+                                    "consecutive_clean": trust_row["consecutive_clean"],
+                                }
+                            ),
+                        },
+                    )
+                    log.info(
+                        "trust_ladder_graduated",
+                        property_id=str(property_id),
+                        case_id=str(case_id),
+                    )
         else:
             # #197: cases.severity is now written by classify_severity (post
             # -clamp) for every case that has ever been through the graph,

@@ -555,6 +555,16 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # from, and by the time it runs the property row (and its
         # landlord-scoped session) is long gone anyway.
         "app/property_provisioning.py",
+        # #60: the trust ladder's auto-send node (reached from
+        # app/agent/graph.py's _route_after_draft_response, BEFORE
+        # mark_awaiting_approval/await_approval ever run) — same
+        # background/graph context as every other node above, no HTTP
+        # request/JWT. app/trust.py (the shared trust_metrics helpers this
+        # node and app/routers/trust.py both call) deliberately does NOT
+        # appear here — it never calls get_admin_session itself, only ever
+        # receiving an already-open session, same "session-only helper"
+        # convention as app/audit.py (also absent from this list).
+        "app/agent/nodes/auto_send.py",
     }
 )
 
