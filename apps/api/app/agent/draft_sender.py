@@ -521,8 +521,19 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
     # from the Twilio response (Twilio's API doesn't return segment count).
     # Pure/no-I/O (app/integrations/sms_segments.py) -- never affects
     # whether/what was sent, only what gets recorded about it afterward.
-    segment_info = count_segments(body)
-    sms_cost_cents = estimate_sms_cost_cents(segment_info.segments)
+    # Guarded (safety review, #111): the SMS is already irreversibly out at
+    # this point, so a metering failure must NEVER cost the send record --
+    # the module's own never-raises invariant outranks a cost annotation.
+    segments: int | None
+    sms_cost_cents: float | None
+    try:
+        segment_info = count_segments(body)
+        segments = segment_info.segments
+        sms_cost_cents = estimate_sms_cost_cents(segment_info.segments)
+    except Exception:
+        log.error("draft_sender_segment_metering_failed", draft_id=str(draft_id))
+        segments = None
+        sms_cost_cents = None
 
     message_tenant_id = str(tenant_id) if recipient == "tenant" and tenant_id else None
     message_vendor_id = str(vendor_id) if recipient == "vendor" and vendor_id else None
@@ -646,7 +657,7 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
                         "edited": edited,
                         # #111 cost metering (schema-v1.md v1.12): segment
                         # count + estimated Twilio cost for THIS send.
-                        "segments": segment_info.segments,
+                        "segments": segments,
                         "sms_cost_cents": sms_cost_cents,
                     }
                 ),

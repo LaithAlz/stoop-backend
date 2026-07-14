@@ -499,12 +499,13 @@
 >    *after* the real Twilio send completes — so, unlike the v1.6 LLM
 >    columns (inserted *before* classification runs), populating
 >    `sms_cost_cents` at that same INSERT would NOT be an append-only
->    violation. This is a genuine doc gap this issue's report flags for the
->    founder/spec-guardian to resolve (either wire it up in a follow-up, or
->    mark it DEPRECATED alongside its siblings for consistency) — not
->    decided unilaterally here. Until resolved, point 1's `audit_log`
->    `'sent'` payload is the canonical SMS-cost record, mirroring the v1.6
->    LLM-cost pattern exactly.
+>    violation. RESOLVED by spec-guardian adjudication in this same
+>    amendment: writing it would create a second source of truth for a fact
+>    whose only reader (`app/cost_reporting.py`) deliberately reads
+>    `audit_log` alone — exactly the redundancy/drift risk v1.6 eliminated
+>    for LLM cost. The column is therefore marked **DEPRECATED v1.12**
+>    below, alongside its four v1.6 siblings; point 1's `audit_log`
+>    `'sent'` payload is the canonical SMS-cost record.
 > 4. New pure-function helper: `app/integrations/sms_segments.py` — GSM-7 vs
 >    UCS-2 segment counting (extended-table GSM-7 characters count double;
 >    any character outside the GSM-7 repertoire falls the WHOLE message back
@@ -522,12 +523,14 @@
 >    `'sent'`/`'emergency_call_attempt'` payloads for SMS cost; rows written
 >    before this amendment (missing the new keys) contribute `0`, never an
 >    error — every cast is guarded by a `payload ? 'key'` existence check
->    first.
-> 6. **Reconciliation note:** a sibling branch (`feat/audit-completeness`)
->    may independently claim the next version number here at the same time
->    as this amendment — if both land as "v1.12", reconcile the actual
->    ordering/number at rebase; this amendment's content does not depend on
->    which number it ends up with.
+>    first. Caveat (mirrored from `app/cost_reporting.py`'s docstring):
+>    per-CASE rollups structurally exclude emergency-chain SMS cost — the
+>    `emergency_call_attempt` row carries no `case_id` by design (it fires
+>    in the webhook before `identify_case` runs) — that cost appears in the
+>    per-property and per-month rollups instead.
+> 6. **Reconciliation note:** verified at review time — the sibling
+>    `feat/audit-completeness` branch (merged as PR #207) makes no schema
+>    changes, so v1.12 is uncontested.
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
@@ -695,7 +698,8 @@ CREATE TABLE messages (
                                                      --  `classification` above
   llm_cost_cents  numeric(10,4),                      -- DEPRECATED v1.6: never written; see
                                                      --  `classification` above
-  sms_cost_cents  numeric(10,4),
+  sms_cost_cents  numeric(10,4),                     -- DEPRECATED v1.12: never written; the
+                                                     --  audit_log 'sent' payload is canonical
   created_at      timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_messages_case    ON messages (case_id, created_at);
