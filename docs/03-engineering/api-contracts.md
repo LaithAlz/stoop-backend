@@ -408,6 +408,60 @@ a newer tenant message.
 empty or whitespace-only) → same response as approve. Records
 `edited: true` for trust metrics.
 
+**v1.13 amendment (2026-07-14 — #60 implementation, doc-first — no prior
+contract existed for the trust ladder's revoke surface or its auto-send
+behavior; this is the minimal shape this implementation follows):**
+
+- **Auto-send.** When a `routine` draft's `(property_id, 'routine')`
+  `trust_metrics` row has `autonomy_unlocked = true` AND `revoked_at IS
+  NULL`, the draft is approved AUTOMATICALLY (no landlord approval
+  interrupt) with the SAME `scheduled_send_at = now() + 5s` undo window
+  every landlord-approved draft gets — a landlord can still undo it within
+  that window via the EXISTING `DELETE /v1/drafts/{id}/approve`, unchanged.
+  `drafts.auto_send = true` on these rows (schema-v1.md, already present —
+  "true only via trust ladder (#60)"). The `audit_log` trail records
+  `auto_sent` (`actor='agent'`) instead of `approved` (`actor='landlord'`)
+  — surfaced wherever a case's audit trail is already read (`GET
+  /v1/cases/{id}`); no new read endpoint. `emergency`/`urgent` severities
+  NEVER auto-send, regardless of trust state (CLAUDE.md rule 3) — enforced
+  at the SQL predicate level, not just by which code path runs.
+  `GET /v1/queue` does NOT surface an auto-sent case (that endpoint's own
+  module docstring already flags an "auto-handled feed" as a deferred,
+  separate follow-up) — the case remains visible via `GET
+  /v1/cases`/`GET /v1/cases/{id}` throughout, informational.
+- **`POST /v1/properties/{id}/trust/revoke`** — body (optional):
+  `{ "scope?": "property" | "global", "reason?": "…" }` (`scope` defaults
+  `"property"`) → 200 `{ "scope": "property" | "global", "revoked_count":
+  0 | 1 | N }`.
+  - `scope: "property"` revokes ONLY that property's `'routine'` autonomy
+    (the one severity that can ever be unlocked).
+  - `scope: "global"` revokes EVERY currently-unlocked `(property,
+    severity)` row across the landlord's entire portfolio.
+  - Idempotent: calling this with nothing left to revoke still returns 200
+    `revoked_count: 0`, never an error. Always writes one `trust_revoked`
+    `audit_log` row (`actor='landlord'`), even when `revoked_count` is 0 —
+    the landlord's action is real and worth recording regardless of
+    effect.
+  - 404 `property_not_found` for a missing or cross-tenant `property_id`
+    (same non-disclosure convention as every other `/v1/properties/{id}`
+    endpoint), checked before either scope's write.
+  - **Re-graduation semantics:** a revoke also resets `consecutive_clean`
+    to 0 on every row it touches — earning auto-send back after a revoke
+    requires a full fresh streak of `trust_graduation_threshold`
+    consecutive clean sends, not a single next one.
+- **Graduation threshold is FOUNDER-PROVISIONAL.** The number of
+  consecutive clean sends required to graduate
+  (`app/config.py`'s `trust_graduation_threshold`, default `10`) has no
+  recorded founder ruling as of this implementation — flagged for
+  ratification before launch. Not itself part of any request/response
+  shape (server-side only), noted here so a future contract reader isn't
+  surprised the number can change without a version bump to THIS doc (a
+  behavior-affecting settings change, not a shape change).
+- **R1 eval variant** ("asserts auto_send when LV2 unlocked", #60's own
+  AC) is explicitly OUT OF SCOPE for this amendment — touching `evals/`
+  triggers the founder-gated paid eval run; it rides with the #66-70
+  batch, not this implementation.
+
 ## Notifications / emergencies
 
 `POST /v1/notifications/{id}/ack` → 200 `{ "acknowledged_at": "…" }` —
