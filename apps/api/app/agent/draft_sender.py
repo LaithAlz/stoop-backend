@@ -18,6 +18,15 @@ graduation write once a ``'routine'`` streak reaches
 ``settings.trust_graduation_threshold`` — see "Trust ladder graduation
 (#60)" below), and the ``audit_log`` ``'sent'`` row.
 
+Cost metering (#111, schema-v1.md v1.12)
+------------------------------------------
+The ``'sent'`` audit payload also carries ``segments``/``sms_cost_cents``,
+computed by the pure ``app/integrations/sms_segments.py`` helper from the
+SAME ``body`` this tick just sent (never from the Twilio response --
+Twilio's REST API doesn't return a segment count). ``app/cost_reporting.py``
+is the read side: cost-per-case/door/month, each answerable by one query
+over ``audit_log``.
+
 Trust ladder graduation (#60)
 ------------------------------
 Every send through this ticker (regardless of whether a landlord approved
@@ -144,6 +153,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.session import get_admin_session
+from app.integrations.sms_segments import count_segments, estimate_sms_cost_cents
 from app.integrations.sms_sender import SmsSender
 from app.trust import GRADUATION_SEVERITY
 
@@ -507,6 +517,24 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
         )
         return
 
+    # #111 cost metering -- computed from the SAME body just sent, never
+    # from the Twilio response (Twilio's API doesn't return segment count).
+    # Pure/no-I/O (app/integrations/sms_segments.py) -- never affects
+    # whether/what was sent, only what gets recorded about it afterward.
+    # Guarded (safety review, #111): the SMS is already irreversibly out at
+    # this point, so a metering failure must NEVER cost the send record --
+    # the module's own never-raises invariant outranks a cost annotation.
+    segments: int | None
+    sms_cost_cents: float | None
+    try:
+        segment_info = count_segments(body)
+        segments = segment_info.segments
+        sms_cost_cents = estimate_sms_cost_cents(segment_info.segments)
+    except Exception:
+        log.error("draft_sender_segment_metering_failed", draft_id=str(draft_id))
+        segments = None
+        sms_cost_cents = None
+
     message_tenant_id = str(tenant_id) if recipient == "tenant" and tenant_id else None
     message_vendor_id = str(vendor_id) if recipient == "vendor" and vendor_id else None
 
@@ -623,7 +651,15 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
                 "landlord_id": str(landlord_id),
                 "case_id": str(case_id),
                 "payload": json.dumps(
-                    {"draft_id": str(draft_id), "message_id": str(message_id), "edited": edited}
+                    {
+                        "draft_id": str(draft_id),
+                        "message_id": str(message_id),
+                        "edited": edited,
+                        # #111 cost metering (schema-v1.md v1.12): segment
+                        # count + estimated Twilio cost for THIS send.
+                        "segments": segments,
+                        "sms_cost_cents": sms_cost_cents,
+                    }
                 ),
             },
         )

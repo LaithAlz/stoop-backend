@@ -249,7 +249,7 @@ async def test_sender_tick_sends_due_draft_and_writes_every_durable_side_effect(
             (
                 await db_session.execute(
                     text(
-                        "SELECT actor, action FROM audit_log WHERE case_id = :cid "
+                        "SELECT actor, action, payload FROM audit_log WHERE case_id = :cid "
                         "AND action = 'sent'"
                     ),
                     {"cid": case_id},
@@ -258,6 +258,11 @@ async def test_sender_tick_sends_due_draft_and_writes_every_durable_side_effect(
             .mappings()
             .one()
         )
+        # #111 cost metering (schema-v1.md v1.12): the 'sent' audit payload
+        # carries the segment count + estimated Twilio cost for THIS send,
+        # computed from the same body the fake sender recorded above.
+        assert audit_row["payload"]["segments"] == 1
+        assert audit_row["payload"]["sms_cost_cents"] == pytest.approx(0.75)
         assert audit_row["actor"] == "system"
     finally:
         await _cleanup(db_session, landlord_id)

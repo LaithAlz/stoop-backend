@@ -467,6 +467,71 @@
 >    query parameter (contract-level only, no schema change) — see
 >    `api-contracts.md`'s Properties section.
 
+> **v1.12 amendment (2026-07-14)** — no migration required (#111, per-message
+> cost metering, `architecture.md` §9's "cost per door must be a query, not
+> a guess"). No new `action`/`type` CHECK value — `'sent'` and
+> `'emergency_call_attempt'` are already-legal `audit_log.action` values
+> (v1.0/v1.3), unchanged. Two existing payload shapes gain new keys, same
+> "doc-first, no migration" evolution path v1.7's `summary` key amendment
+> already used:
+> 1. The `'sent'` payload (`app/agent/draft_sender.py::_INSERT_SENT_AUDIT_SQL`
+>    — the only writer of this action) gains **`segments`** (integer — GSM-7/
+>    UCS-2 segment count of the sent body) and **`sms_cost_cents`** (numeric
+>    — estimated Twilio per-segment cost). Shape is now `{draft_id,
+>    message_id, edited, segments, sms_cost_cents}`. Computed from the
+>    already-in-scope `body`/`final_body` at the SAME `INSERT` that already
+>    writes `message_id` — never an `UPDATE`.
+> 2. The `'emergency_call_attempt'` payload (`app/agent/emergency_chain.py`)
+>    gains **`property_id`** (the candidate's own property — lets a cost
+>    rollup group by door without a second join through `notifications`)
+>    at the top level, and each entry of its existing `actions` array gains
+>    **`segments`**/**`sms_cost_cents`** for SMS-type actions only
+>    (`landlord_sms`, `backup_sms`, `tenant_safety_sms`, `tenant_status_sms`)
+>    — both `null` for voice-call actions (`landlord_call`/`backup_call`,
+>    priced per-minute by Twilio, out of this issue's scope) and for
+>    `skipped`/`failed` outcomes (no SMS actually went out).
+> 3. **Flagged, not resolved:** `messages.sms_cost_cents` (this table, still
+>    listed below, never marked DEPRECATED at v1.6 unlike its four LLM-cost
+>    siblings — `classification`/`tokens_in`/`tokens_out`/`model`/
+>    `llm_cost_cents`) is still not written by this amendment, even though
+>    the ONE outbound `messages` row this codebase ever inserts
+>    (`app/agent/draft_sender.py::_INSERT_OUTBOUND_MESSAGE_SQL`) is written
+>    *after* the real Twilio send completes — so, unlike the v1.6 LLM
+>    columns (inserted *before* classification runs), populating
+>    `sms_cost_cents` at that same INSERT would NOT be an append-only
+>    violation. RESOLVED by spec-guardian adjudication in this same
+>    amendment: writing it would create a second source of truth for a fact
+>    whose only reader (`app/cost_reporting.py`) deliberately reads
+>    `audit_log` alone — exactly the redundancy/drift risk v1.6 eliminated
+>    for LLM cost. The column is therefore marked **DEPRECATED v1.12**
+>    below, alongside its four v1.6 siblings; point 1's `audit_log`
+>    `'sent'` payload is the canonical SMS-cost record.
+> 4. New pure-function helper: `app/integrations/sms_segments.py` — GSM-7 vs
+>    UCS-2 segment counting (extended-table GSM-7 characters count double;
+>    any character outside the GSM-7 repertoire falls the WHOLE message back
+>    to UCS-2) plus a conservative, FOUNDER-PROVISIONAL per-segment price
+>    constant (Twilio's long-published CA outbound SMS rate, $0.0075
+>    USD/segment) — same "hardcoded, erring-high placeholder, reconcile
+>    against real billing later" pattern `app/integrations/anthropic.py`'s
+>    `estimate_cost_cents` already established for LLM cost.
+> 5. Cost-per-case / cost-per-door(property) / cost-per-month is answered by
+>    three plain parameterized queries over one shared `audit_log`-only CTE
+>    — `app/cost_reporting.py` — never a database VIEW or a migration (no
+>    new column or table needed here; a view would only add a migration to
+>    keep hand-in-sync with the same small query, not reduce complexity).
+>    Reads `'classified'`/`'drafted'` payloads for LLM cost and
+>    `'sent'`/`'emergency_call_attempt'` payloads for SMS cost; rows written
+>    before this amendment (missing the new keys) contribute `0`, never an
+>    error — every cast is guarded by a `payload ? 'key'` existence check
+>    first. Caveat (mirrored from `app/cost_reporting.py`'s docstring):
+>    per-CASE rollups structurally exclude emergency-chain SMS cost — the
+>    `emergency_call_attempt` row carries no `case_id` by design (it fires
+>    in the webhook before `identify_case` runs) — that cost appears in the
+>    per-property and per-month rollups instead.
+> 6. **Reconciliation note:** verified at review time — the sibling
+>    `feat/audit-completeness` branch (merged as PR #207) makes no schema
+>    changes, so v1.12 is uncontested.
+
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
 CREATE TABLE landlords (
@@ -633,7 +698,8 @@ CREATE TABLE messages (
                                                      --  `classification` above
   llm_cost_cents  numeric(10,4),                      -- DEPRECATED v1.6: never written; see
                                                      --  `classification` above
-  sms_cost_cents  numeric(10,4),
+  sms_cost_cents  numeric(10,4),                     -- DEPRECATED v1.12: never written; the
+                                                     --  audit_log 'sent' payload is canonical
   created_at      timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_messages_case    ON messages (case_id, created_at);

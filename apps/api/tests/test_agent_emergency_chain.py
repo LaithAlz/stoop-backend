@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 import app.db.session as db_mod
 from app.agent import emergency_chain
 from app.agent.schemas import PrefilterResult
+from app.integrations import sms_segments
 from app.integrations.twilio_send import set_twilio_sender_for_tests
 from tests import factories
 
@@ -532,6 +533,19 @@ async def test_handle_emergency_trigger_calls_landlord_and_texts_tenant(
         attempts = await _fetch_attempt_audit_rows(db_session, landlord_id)
         assert len(attempts) == 1
         assert attempts[0]["payload"]["step"] == 0
+        # #111 cost metering (schema-v1.md v1.12): property_id rides along
+        # at the top level (no case_id exists this early), and the SMS
+        # action -- never the voice-call action -- carries segments/cost.
+        assert attempts[0]["payload"]["property_id"] == property_id
+        actions = attempts[0]["payload"]["actions"]
+        call_action = next(a for a in actions if a["action"] == "landlord_call")
+        sms_action = next(a for a in actions if a["action"] == "tenant_safety_sms")
+        assert call_action["segments"] is None
+        assert call_action["sms_cost_cents"] is None
+        assert sms_action["segments"] >= 1
+        assert sms_action["sms_cost_cents"] == pytest.approx(
+            sms_action["segments"] * sms_segments.SEGMENT_PRICE_USD_CENTS
+        )
     finally:
         await _cleanup(db_session, landlord_id)
 
