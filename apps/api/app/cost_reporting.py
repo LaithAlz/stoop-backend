@@ -123,10 +123,15 @@ _SELECT_COST_PER_PROPERTY_SQL = text(
 
 _SELECT_COST_PER_MONTH_SQL = text(
     f"WITH cost_events AS ({_COST_EVENTS_CTE_SQL}) "  # noqa: S608
-    "SELECT date_trunc('month', created_at) AS month, kind, "
+    # UTC pinned explicitly (PR #209 senior review): date_trunc on a bare
+    # timestamptz truncates in the SESSION TimeZone GUC, which the app never
+    # sets -- a non-UTC Postgres would push boundary-adjacent events into the
+    # neighbouring month. AT TIME ZONE 'UTC' makes the bucket deployment-
+    # independent (and the returned key a naive-UTC timestamp).
+    "SELECT date_trunc('month', created_at AT TIME ZONE 'UTC') AS month, kind, "
     "COALESCE(SUM(cost_cents), 0) AS cost_cents FROM cost_events "
     "WHERE landlord_id = :landlord_id "
-    "GROUP BY date_trunc('month', created_at), kind ORDER BY month"
+    "GROUP BY date_trunc('month', created_at AT TIME ZONE 'UTC'), kind ORDER BY month"
 )
 
 
