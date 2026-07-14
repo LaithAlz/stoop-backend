@@ -168,6 +168,15 @@ as ``"skipped"`` (``reason="no_tenant_phone"``), never silently dropped
 with no trace. Left as a discovered gap for the spec to record, not solved
 unilaterally here.
 
+Cost metering (#111, schema-v1.md v1.12)
+------------------------------------------
+Every SMS-type action (never a voice call) that actually sends carries its
+segment count + estimated Twilio cost in its own ``ActionOutcome``, via the
+pure ``app/integrations/sms_segments.py`` helper — see
+:func:`_sms_sent_outcome`. These ride along in the SAME ``'emergency_call_
+attempt'`` audit row every attempt already writes (no new audit action, no
+schema change) — ``app/cost_reporting.py`` is the read side.
+
 DB access
 ---------
 Admin engine (pre-identity/background context — no landlord JWT exists for
@@ -196,6 +205,7 @@ from twilio.twiml.voice_response import Gather, VoiceResponse
 
 from app.config import settings
 from app.db.session import get_admin_session
+from app.integrations.sms_segments import count_segments, estimate_sms_cost_cents
 from app.integrations.twilio_send import TwilioSender, get_twilio_sender
 
 log = structlog.get_logger(__name__)
@@ -539,6 +549,16 @@ class ActionOutcome:
     sid: str | None = None
     exc_type: str | None = None
     reason: str | None = None  # set only when status == "skipped"
+    segments: int | None = None
+    """#111 cost metering (schema-v1.md v1.12) -- SMS segment count for a
+    ``"sent"`` SMS-type action ONLY (``landlord_sms``/``backup_sms``/
+    ``tenant_safety_sms``/``tenant_status_sms``). ``None`` for voice-call
+    actions (priced per-minute, out of this issue's scope) and for
+    ``skipped``/``failed`` outcomes (no SMS actually went out)."""
+    sms_cost_cents: float | None = None
+    """Estimated Twilio cost for :attr:`segments` -- see
+    ``app/integrations/sms_segments.py::estimate_sms_cost_cents``. Same
+    ``None``-for-non-SMS/non-sent scope as :attr:`segments`."""
 
 
 _SELECT_EMERGENCY_SMS_ROW_SQL = text(
@@ -599,6 +619,21 @@ async def _claim_emergency_sms_for_send(message_id: UUID) -> bool:
         return claimed is not None
 
 
+def _sms_sent_outcome(action: str, sid: str, body: str) -> ActionOutcome:
+    """#111 cost metering (schema-v1.md v1.12): every SMS-type action that
+    actually sent (never a voice call, never ``skipped``/``failed``) gets
+    its segment count + estimated cost recorded, computed from the SAME
+    *body* just sent (pure, no I/O — ``app/integrations/sms_segments.py``)."""
+    segment_info = count_segments(body)
+    return ActionOutcome(
+        action=action,
+        status="sent",
+        sid=sid,
+        segments=segment_info.segments,
+        sms_cost_cents=estimate_sms_cost_cents(segment_info.segments),
+    )
+
+
 async def _execute_action(
     sender: TwilioSender,
     action: str,
@@ -639,7 +674,7 @@ async def _execute_action(
                 ack_url=ack_url,
             )
             sid = await sender.send_sms(to=ctx.landlord_phone, from_=from_number, body=body)
-            return ActionOutcome(action=action, status="sent", sid=sid)
+            return _sms_sent_outcome(action, sid, body)
 
         if action in (_ACTION_BACKUP_CALL, _ACTION_BACKUP_SMS):
             backup_phone = _backup_phone(ctx.backup_contact)
@@ -649,16 +684,16 @@ async def _execute_action(
                 sid = await sender.create_call(
                     to=backup_phone, from_=from_number, twiml_url=action_url
                 )
-            else:
-                body = render_backup_alert_sms(
-                    property_label=ctx.property_label,
-                    category_label=category_label,
-                    landlord_label=landlord_label,
-                    tenant_label=tenant_label,
-                    ack_url=ack_url,
-                )
-                sid = await sender.send_sms(to=backup_phone, from_=from_number, body=body)
-            return ActionOutcome(action=action, status="sent", sid=sid)
+                return ActionOutcome(action=action, status="sent", sid=sid)
+            body = render_backup_alert_sms(
+                property_label=ctx.property_label,
+                category_label=category_label,
+                landlord_label=landlord_label,
+                tenant_label=tenant_label,
+                ack_url=ack_url,
+            )
+            sid = await sender.send_sms(to=backup_phone, from_=from_number, body=body)
+            return _sms_sent_outcome(action, sid, body)
 
         if action == _ACTION_TENANT_SAFETY_SMS:
             if not ctx.tenant_phone:
@@ -673,14 +708,14 @@ async def _execute_action(
                 )
             _, body = render_tenant_safety_sms(categories)
             sid = await sender.send_sms(to=ctx.tenant_phone, from_=from_number, body=body)
-            return ActionOutcome(action=action, status="sent", sid=sid)
+            return _sms_sent_outcome(action, sid, body)
 
         if action == _ACTION_TENANT_STATUS_SMS:
             if not ctx.tenant_phone:
                 return ActionOutcome(action=action, status="skipped", reason="no_tenant_phone")
             body = render_tenant_status_sms(landlord_label)
             sid = await sender.send_sms(to=ctx.tenant_phone, from_=from_number, body=body)
-            return ActionOutcome(action=action, status="sent", sid=sid)
+            return _sms_sent_outcome(action, sid, body)
 
         return ActionOutcome(  # pragma: no cover
             action=action, status="skipped", reason="unknown_action"
@@ -920,6 +955,10 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
                     {
                         "notification_id": str(candidate.notification_id),
                         "message_id": str(candidate.message_id),
+                        # #111 cost metering (schema-v1.md v1.12): lets a
+                        # cost rollup group emergency-chain SMS cost by
+                        # door without a second join through notifications.
+                        "property_id": str(candidate.property_id),
                         "step": step,
                         "actions": [asdict(outcome) for outcome in outcomes],
                     }
