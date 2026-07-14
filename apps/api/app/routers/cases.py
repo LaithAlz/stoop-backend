@@ -236,9 +236,23 @@ _SELECT_MESSAGES_SQL = text(
 # `message_received` (app/agent/graph_entry.py) and `emergency_triggered`
 # (app/routers/webhooks/twilio.py), both of which stash `message_id` in
 # their own payload instead.
+#
+# `ORDER BY ... a.id ASC` (#61 gap-fill): a single inbound message can
+# drive several `audit_log` INSERTs in quick succession across separate
+# short-lived admin-session transactions (message_received, case_opened,
+# two `classified` rows, drafted -- each its own node/transaction/`now()`
+# read) -- close enough in wall-clock time that `created_at` alone (a
+# timestamptz, not guaranteed sub-microsecond-unique) is not a reliable
+# total order. `a.id` is the table's own `GENERATED ALWAYS AS IDENTITY`
+# column (schema-v1.md) -- monotonic in INSERT order by construction --
+# so it is the correct, free tiebreaker for genuine ties, matching the
+# same table's own `ORDER BY id` convention already used elsewhere in this
+# codebase (e.g. tests/test_e2e_core_loop.py's audit-sequence assertion).
+# Never changes the order for two rows that already have distinct
+# `created_at` values.
 _SELECT_AUDIT_SQL = text(
     """
-    SELECT a.actor, a.action, a.payload, a.created_at
+    SELECT a.actor, a.action, a.payload, a.created_at, a.id
     FROM audit_log a
     WHERE a.landlord_id = :landlord_id
       AND (
@@ -249,7 +263,7 @@ _SELECT_AUDIT_SQL = text(
             AND mc.message_id::text = a.payload ->> 'message_id'
         )
       )
-    ORDER BY a.created_at ASC
+    ORDER BY a.created_at ASC, a.id ASC
     """
 )
 
