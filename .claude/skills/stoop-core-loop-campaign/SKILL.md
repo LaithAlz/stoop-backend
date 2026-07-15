@@ -52,9 +52,16 @@ in #199). Phase 5's fake-based #50 rehearsal MERGED — **PR #201**
 half). Also landed the same day: #56+#183 queue (**PR #200**), #197
 `cases.severity` write + trust_metrics unblock (**PR #202**), #53
 provisioning (**PR #204**, migration 0011). **Live Supabase at migration
-head 0011.** Still open: **#111** (metering), #50's staging half, #60
-(trust ladder — in flight). Treat every merged phase's section below as a
-contract to preserve, not work to do.
+head 0011.** 2026-07-14 additions: #60 trust ladder MERGED (**PR #205** —
+the SECOND sanctioned `status='approved'` writer, `apply_auto_send`;
+supersession + daily cap; FOUNDER-PROVISIONAL threshold=10 & cap=5 await
+ratification), #61 MERGED (**PR #207** — timeline a.id tie-break; #206
+tracks the unbuilt landlord-resolve endpoint), **#111 MERGED** (**PR
+#209** — segment metering never load-bearing; cost rollups UTC-pinned;
+`messages.sms_cost_cents` DEPRECATED v1.12; #208 tracks failed-call
+spend). THE CAMPAIGN'S CODE IS DONE — only #50's credential-gated staging
+half and the #66-70 eval-gated batch remain. Treat every merged phase's
+section below as a contract to preserve, not work to do.
 
 Definitions used throughout:
 - **Tier-0 prefilter** — deterministic regex emergency filter
