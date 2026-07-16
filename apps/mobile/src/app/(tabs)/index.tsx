@@ -1,21 +1,40 @@
 /**
- * Home — the approval queue, per mockup exhibit 01 ("Home — the queue,
- * needing you"). M0 ships the shell only: no data fetching yet (issue
- * #210 scope), so this renders the honest "nothing to show yet" state
- * rather than a fake "0 need you" count — there's no queue endpoint call
- * behind it to make that number true.
+ * Home — the real approval queue (issue #210 M1). Fetches `GET /v1/queue`
+ * (src/api/queue.ts) and layers the local approve/undo/skip state machine
+ * (src/features/queue/useDraftActions.ts + queueEntries.ts) on top — see
+ * queueEntries.ts's docstring for why a local overlay exists at all over a
+ * server that only ever lists cases still needing action.
  *
- * M1 TODO: fetch GET /v1/queue (docs/03-engineering/api-contracts.md),
- * render EmergencyBanner + DecisionCard + CountsStrip above this empty
- * state (port apps/web/src/components/clarity/{EmergencyBanner,
- * DecisionCard,CountsStrip}.tsx), and only fall back to this view once
- * the queue really is empty.
+ * M0's static "Nothing to show yet." shell is gone; the empty state below
+ * only ever renders once a real, successful fetch says the queue is
+ * actually empty (never a fake placeholder pretending to be live data).
  */
-import { StyleSheet, View } from "react-native";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, Alert, FlatList, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useRouter } from "expo-router";
 import { AppHeader } from "@/components/AppHeader";
 import { EmptyState } from "@/components/EmptyState";
-import { colors } from "@/theme/tokens";
+import { Button } from "@/components/Button";
+import { CountsStrip } from "@/components/clarity/CountsStrip";
+import { EmergencyBanner } from "@/components/clarity/EmergencyBanner";
+import { DecisionCard } from "@/components/clarity/DecisionCard";
+import { SkippedCard } from "@/components/clarity/SkippedCard";
+import { colors, spacing } from "@/theme/tokens";
+import { useQueue } from "@/api/queue";
+import { useMe } from "@/api/me";
+import { ApiError, toHouseApiError } from "@/api/errors";
+import type { QueueItem } from "@/api/types";
+import { firstName } from "@/lib/tenantName";
+import {
+  buildQueueView,
+  secondsRemaining,
+  totalUndoSeconds,
+  type QueueViewRow,
+} from "@/features/queue/queueEntries";
+import { useDraftActions } from "@/features/queue/useDraftActions";
+import { emergencyHeadline, emergencySubtext } from "@/features/emergency/emergencyBanner";
+import { EditDraftModal } from "@/features/queue/EditDraftModal";
 
 function timeOfDayGreeting(date: Date): string {
   const hour = date.getHours();
@@ -25,28 +44,197 @@ function timeOfDayGreeting(date: Date): string {
 }
 
 export default function HomeScreen() {
-  // The mockup greets by first name ("Good morning, Laith.") — but M0 has
-  // no /v1/me fetch yet, so there's no real display name to greet with. A
-  // name derived from the email local-part reads wrong ("Good morning,
-  // Allaithalzoubi2."), so until M1 wires /v1/me the greeting stands alone.
-  const greeting = `Good ${timeOfDayGreeting(new Date())}.`;
+  const router = useRouter();
+  const queueQuery = useQueue();
+  const meQuery = useMe();
+
+  const [skippedSnapshots, setSkippedSnapshots] = useState<Record<string, QueueItem>>({});
+
+  const onNotice = useCallback((message: string) => Alert.alert("Stoop", message), []);
+  const onSettled = useCallback(() => void queueQuery.refetch(), [queueQuery]);
+  const draftActions = useDraftActions({ onNotice, onSettled });
+  const { entries } = draftActions;
+
+  const openCase = useCallback(
+    (caseId: string) => {
+      router.push({ pathname: "/conversations/[id]", params: { id: caseId } });
+    },
+    [router],
+  );
+
+  // Once the server confirms a "sent" card is really gone from the queue,
+  // drop its local entry too — otherwise it just sits inert forever.
+  useEffect(() => {
+    if (!queueQuery.data) return;
+    const freshIds = new Set(queueQuery.data.items.map((item) => item.draft_id));
+    for (const [draftId, entry] of Object.entries(entries)) {
+      if (entry.status === "sent" && !freshIds.has(draftId)) {
+        draftActions.dispatch({ type: "cleared", draftId });
+      }
+    }
+    // draftActions.dispatch is stable (useReducer) — entries is the only
+    // real dependency here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queueQuery.data, entries]);
+
+  const items = useMemo(() => queueQuery.data?.items ?? [], [queueQuery.data]);
+  const emergencyItems = useMemo(
+    () => items.filter((item) => item.severity === "emergency"),
+    [items],
+  );
+  const decisionItems = useMemo(
+    () => items.filter((item) => item.severity !== "emergency"),
+    [items],
+  );
+  const rows = useMemo(
+    () => buildQueueView(decisionItems, entries, skippedSnapshots),
+    [decisionItems, entries, skippedSnapshots],
+  );
+
+  const name = meQuery.data ? firstName(meQuery.data.full_name) : null;
+  const greeting = name
+    ? `Good ${timeOfDayGreeting(new Date())}, ${name}.`
+    : `Good ${timeOfDayGreeting(new Date())}.`;
+
+  const needYou = queueQuery.data?.counts.total ?? 0;
+  const waitingOnTenants = queueQuery.data?.counts.awaiting_tenant ?? 0;
+
+  function handleSkip(item: QueueItem) {
+    setSkippedSnapshots((prev) => ({ ...prev, [item.draft_id]: item }));
+    draftActions.skip({
+      draftId: item.draft_id,
+      caseId: item.case_id,
+      tenantName: item.tenant_name,
+    });
+  }
+
+  function renderRow({ item: row }: { item: QueueViewRow }) {
+    const { item, entry } = row;
+
+    if (entry.status === "skipped") {
+      return (
+        <SkippedCard
+          tenantName={item.tenant_name}
+          propertyLabel={item.property_label}
+          timestamp={item.received_at}
+          onPress={() => openCase(item.case_id)}
+        />
+      );
+    }
+
+    const cardStatus =
+      entry.status === "sending" ? "sending" : entry.status === "sent" ? "sent" : "idle";
+    const secondsLeft = entry.status === "sending" ? secondsRemaining(entry.undoUntil) : 0;
+    const totalSeconds = entry.status === "sending" ? totalUndoSeconds(entry) : 5;
+    const ctx = { draftId: item.draft_id, caseId: item.case_id, tenantName: item.tenant_name };
+
+    return (
+      <DecisionCard
+        item={item}
+        status={cardStatus}
+        secondsLeft={secondsLeft}
+        totalSeconds={totalSeconds}
+        staleNotice={draftActions.staleNotices[item.case_id]}
+        onApprove={() => draftActions.approve(ctx)}
+        onEdit={() => draftActions.openEditor(ctx, item.draft_body)}
+        onSkip={() => handleSkip(item)}
+        onUndo={() => draftActions.undo(ctx)}
+        onOpen={() => openCase(item.case_id)}
+      />
+    );
+  }
+
+  const showAllClear = queueQuery.isSuccess && rows.length === 0 && emergencyItems.length === 0;
 
   return (
     <SafeAreaView style={styles.safeArea} edges={["top"]}>
       <AppHeader title={greeting} showLiveIndicator />
-      <View style={styles.body}>
-        <EmptyState
-          icon="home-outline"
-          title="Nothing to show yet."
-          message="This is where anything that needs you will show up — one decision at a time, never a table to scan."
-          note="Connect your first property to turn this on."
+
+      {queueQuery.isLoading ? (
+        <View style={styles.centered}>
+          <ActivityIndicator color={colors.brand} />
+        </View>
+      ) : queueQuery.isError ? (
+        <View style={styles.centered}>
+          <Text style={styles.errorText}>
+            {queueQuery.error instanceof ApiError
+              ? toHouseApiError(queueQuery.error)
+              : "Couldn't load your queue. Try again."}
+          </Text>
+          <Button
+            label="Try again"
+            onPress={() => void queueQuery.refetch()}
+            testID="queue-retry"
+          />
+        </View>
+      ) : (
+        <FlatList
+          data={rows}
+          keyExtractor={(row) => row.item.draft_id}
+          renderItem={renderRow}
+          contentContainerStyle={styles.listContent}
+          refreshing={queueQuery.isRefetching}
+          onRefresh={() => void queueQuery.refetch()}
+          ListHeaderComponent={
+            <View>
+              <CountsStrip needYou={needYou} waitingOnTenants={waitingOnTenants} />
+              {emergencyItems.map((item) => (
+                <EmergencyBanner
+                  key={item.case_id}
+                  headline={emergencyHeadline(item)}
+                  subtext={emergencySubtext(item)}
+                  onPress={() => openCase(item.case_id)}
+                />
+              ))}
+              {emergencyItems.length > 0 ? <View style={styles.headerGap} /> : null}
+            </View>
+          }
+          ListEmptyComponent={
+            showAllClear ? (
+              <EmptyState
+                icon="checkmark-circle-outline"
+                title="That's everything."
+                message="I'm watching your messages — go enjoy your day. I'll text you if anything needs you."
+              />
+            ) : null
+          }
         />
-      </View>
+      )}
+
+      <EditDraftModal
+        visible={draftActions.editingContext !== null}
+        tenantFirstName={
+          draftActions.editingContext ? firstName(draftActions.editingContext.tenantName) : ""
+        }
+        initialBody={draftActions.editingContext?.body ?? ""}
+        submitting={draftActions.isEditSubmitting}
+        onCancel={draftActions.cancelEditor}
+        onSend={draftActions.submitEdit}
+      />
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: colors.bg },
-  body: { flex: 1 },
+  listContent: {
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.base,
+    paddingBottom: spacing.xxl,
+    flexGrow: 1,
+  },
+  headerGap: {
+    height: spacing.sm,
+  },
+  centered: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: spacing.base,
+    paddingHorizontal: spacing.xl,
+  },
+  errorText: {
+    textAlign: "center",
+    color: colors.inkDim,
+  },
 });

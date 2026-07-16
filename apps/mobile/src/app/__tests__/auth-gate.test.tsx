@@ -78,8 +78,11 @@ describe("root layout auth gate (rendered)", () => {
 
     renderRouter("src/app", { initialUrl: "/" });
 
-    // Home tab's empty state renders -> we're inside (tabs), not sign-in.
-    expect(await screen.findByText("Nothing to show yet.")).toBeOnTheScreen();
+    // The tab bar's own labels only render inside (tabs) — unlike Home's
+    // content (M1: a real, data-dependent queue fetch), these are static
+    // regardless of network/query state, so they're a stable "we're inside
+    // (tabs), not sign-in" signal for this test.
+    expect(await screen.findByText("Conversations")).toBeOnTheScreen();
     expect(screen.queryByTestId("sign-in-submit")).toBeNull();
   });
 });
