@@ -66,6 +66,34 @@ The undo window is data, not a sleep (schema-v1.md's own phrase) — this
 module never sleeps waiting for a specific draft; it only ever asks
 "which approved rows are due right now" and claims exactly those.
 
+Resolved-case guard belt-and-braces (#206)
+------------------------------------------------------------------------
+``app/routers/cases.py``'s ``POST /v1/cases/{id}/resolve`` is the PRIMARY
+fix for "a draft must never send after its case is resolved": it cancels
+every still-``'pending'``/``'approved'`` draft on the case, in the SAME
+transaction as the case's own ``UPDATE``, the moment a landlord resolves
+directly. This module carries a SECOND, independent layer for the same
+invariant, in case that primary path is ever bypassed (the exact same
+"belt-and-braces" shape as the supersession guard above): :data:`_CLAIM_
+DRAFT_SQL` itself also refuses to claim ANY ``'approved'`` draft whose
+case has since become ``status = 'resolved'`` — never a landlord-approved
+row exception this time; a resolved case's draft is refused regardless of
+``auto_send``. Unlike the supersession guard, a draft refused ONLY for
+this reason is not actively cancelled here — it is simply never claimed,
+falling through :func:`_claim_draft` as a silent no-op (the row stays
+``'approved'`` forever, re-appearing as a due candidate on every future
+tick but never winning the claim). This is deliberate: the primary fix
+(``cases.py``) already cancels the common case immediately, so this guard
+almost never fires in practice; it exists purely to make "never sends
+after resolve" true even against a code path (present or future) this
+module's authors didn't anticipate — e.g. ``app/agent/case_lifecycle.py``'s
+own ``sweep_cases()`` tenant-confirmed leg, which (unlike its auto-stale
+leg) is NOT excluded from ``awaiting_approval`` and could in principle
+auto-resolve a case with a still-approved draft sitting on it. A stuck-
+forever-``'approved'``-but-never-sent row is a strictly SAFER failure mode
+than a send after resolve, and is a pre-existing, out-of-scope gap in
+``sweep_cases()`` itself (not fixed here — only insured against).
+
 Idempotent claim — single-flight per row (skill doc Phase 3's own
 obligation)
 ------------------------------------------------------------------------
@@ -228,10 +256,19 @@ _NEWER_INBOUND_EXISTS_SQL = (
     ")"
 )
 
+# #206 belt-and-braces — see module docstring "Resolved-case guard
+# belt-and-braces (#206)". Applies to EVERY draft (not gated on `auto_send`,
+# unlike the newer-inbound guard above): a landlord-approved draft is no
+# more safe to send after its case is resolved than an auto-sent one.
+_CASE_RESOLVED_EXISTS_SQL = (
+    "EXISTS (SELECT 1 FROM cases c WHERE c.id = drafts.case_id AND c.status = 'resolved')"
+)
+
 _CLAIM_DRAFT_SQL = text(
     "UPDATE drafts SET status = 'sending', updated_at = now() "  # noqa: S608 -- static const interpolated below, no user input
     "WHERE id = :draft_id AND status = 'approved' AND scheduled_send_at <= now() "
     f"AND (auto_send = false OR NOT {_NEWER_INBOUND_EXISTS_SQL}) "
+    f"AND NOT {_CASE_RESOLVED_EXISTS_SQL} "
     "RETURNING id, case_id, recipient, body, final_body, edited, landlord_id"
 )
 
@@ -332,16 +369,24 @@ def _default_time_source() -> float:
 
 async def _claim_draft(session: AsyncSession, draft_id: UUID) -> dict[str, Any] | None:
     """Claim *draft_id* for sending, or ``None`` if it can't be claimed
-    right now — three DISTINCT reasons collapse into that same ``None``:
+    right now — FOUR distinct reasons collapse into that same ``None``:
     lost the claim race (another tick/process already claimed it), not
-    actually due yet, or (#60 safety review MEDIUM-1) a superseded
-    ``auto_send=true`` draft the claim's own guard refused. Only the THIRD
-    case does anything further here: :data:`_CANCEL_SUPERSEDED_AUTO_SEND_
-    DRAFT_SQL` cancels it (never a landlord-approved row — see that
-    query's own docstring) and records a ``send_cancelled`` audit row,
-    so it never sits stuck ``'approved'`` reappearing as "due" forever.
-    The first two cases fall through as a silent, correct no-op exactly
-    like before this fix.
+    actually due yet, a superseded ``auto_send=true`` draft the claim's own
+    guard refused (#60 safety review MEDIUM-1), or (#206) its case has
+    since become ``resolved`` (see module docstring "Resolved-case guard
+    belt-and-braces (#206)"). Only the THIRD case does anything further
+    here: :data:`_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL` cancels it (never
+    a landlord-approved row — see that query's own docstring) and records
+    a ``send_cancelled`` audit row, so it never sits stuck ``'approved'``
+    reappearing as "due" forever. The FOURTH case (resolved-case refusal)
+    is NOT actively cancelled here on purpose — the primary fix
+    (``app/routers/cases.py``'s resolve endpoint) already cancels the
+    common case immediately; this guard is a pure safety net, so a draft
+    caught ONLY by it is left ``'approved'`` (never sent, never
+    cancelled) — see that section of the module docstring for why this is
+    an acceptable, strictly-safer-than-sending failure mode. The first two
+    cases fall through as a silent, correct no-op exactly like before this
+    fix.
     """
     row = (
         (await session.execute(_CLAIM_DRAFT_SQL, {"draft_id": str(draft_id)}))

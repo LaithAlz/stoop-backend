@@ -383,6 +383,55 @@ consistent position, just possibly not the one the client expected).
 `POST /v1/cases/{id}/ask-vendor` — body `{ "vendor_id": "…", "note?": "…" }`
 → 201 `{ "draft_id": "…" }` (vendor draft enters the same queue, #115).
 
+**v1.14 amendment (2026-07-16 — #206 implementation, doc-first —
+`POST /v1/cases/{id}/resolve` had a request body but no response shape or
+idempotency semantics documented anywhere, and `resolve_by_landlord()`
+(`app/agent/case_lifecycle.py`) already existed as a tested pure function
+with zero caller until this issue):**
+
+- **Response shape** (previously undocumented beyond "→ 200"):
+  `{ "status": "resolved", "resolved_at": "…" }` — mirrors
+  `POST /v1/drafts/{id}/approve`'s own `{"status": ..., ...}` convention.
+- **Idempotent 200, not 409.** Repeat-calling this on an already-resolved
+  case (however it got there — `landlord`, `tenant_confirmed`, or
+  `auto_stale`) returns the SAME shape with the case's real stored
+  `resolved_at`; no new `audit_log` row is written. This follows
+  `POST /v1/notifications/{id}/ack`'s and `POST /v1/drafts/{id}/approve`'s
+  repeat-call precedent (both idempotent-200 on a repeat that changes
+  nothing), not `POST /v1/drafts/{id}/reject`'s `already_sent` 409 —
+  reject's 409 exists because a concurrent approve is a MEANINGFULLY
+  DIFFERENT outcome than the one the caller asked for ("reject" vs. "it
+  already sent"); resolving an already-resolved case has no such
+  contradiction; the caller's requested end state ("this case is
+  resolved") is already true, so 200 is the honest response.
+- **404 `case_not_found`** for a missing or cross-tenant `case_id` — same
+  non-disclosure convention as every other `/v1/cases/{id}` endpoint.
+- **Draft safety (the reason this endpoint needed a real safety review,
+  not just a status flip):** every `drafts` row on the case in status
+  `pending` or `approved` with `sent_message_id IS NULL` is cancelled
+  (`status = 'cancelled'`) in the SAME transaction as the case `UPDATE` —
+  one `send_cancelled` `audit_log` row per cancelled draft
+  (`actor='landlord'`, payload `{"draft_id": "…", "reason":
+  "case_resolved"}`). A draft already claimed `'sending'` at the moment of
+  resolve is left alone — it is genuinely mid-flight (this codebase never
+  holds a transaction open across the Twilio network call, so there is no
+  atomic way to cancel it without either blocking the resolve request on
+  an in-flight send or racing a real SMS already past the point of no
+  return); it completes normally and its own `'sent'` audit row lands on
+  the case as usual. `app/agent/draft_sender.py`'s claim SQL additionally
+  refuses to claim (and therefore never sends) any `'approved'` draft
+  whose case has since become `resolved` — belt-and-braces for any OTHER
+  path that might resolve a case without going through this cancellation
+  (see that module's own docstring, "Resolved-case guard belt-and-braces
+  (#206)").
+- **The emergency chain is untouched.** `notifications` rows are
+  `case_id`-tagged only for landlord-facing display; the escalation sweep
+  (`app/agent/emergency_chain.py`) keys entirely off
+  `notifications.status`/`next_attempt_at`/`acknowledged_at`, never off
+  the referenced case's status (verified: no query in that module joins
+  `cases` at all). Resolving a case never acknowledges, cancels, or delays
+  an emergency call/SMS in flight.
+
 ## Drafts (the approve loop)
 
 `POST /v1/drafts/{id}/approve` → 200
