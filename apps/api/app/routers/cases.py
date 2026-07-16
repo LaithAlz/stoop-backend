@@ -9,7 +9,7 @@ below matches that shape verbatim.
 
 Out of scope for this issue (per the delegating task and
 ``docs/03-engineering/api-contracts.md``): ``GET /v1/queue`` (#56, depends
-on #183), ``POST /v1/cases/{id}/resolve``, ``POST /v1/cases/{id}/ask-vendor``
+on #183), ``POST /v1/cases/{id}/ask-vendor``
 (write endpoints, not part of #55's read-only scope), and
 ``GET /v1/messages`` (issue #55's own acceptance criteria mentions a
 "channel view per tenant" endpoint, but ``api-contracts.md`` defines no
@@ -19,6 +19,14 @@ hard rule "never invent a shape that isn't documented," this endpoint is
 NOT implemented here; flagged in the PR description as a gap needing a
 doc-first decision (either amend api-contracts.md with a real shape, or
 confirm the case timeline supersedes it and drop the AC bullet).
+
+``POST /v1/cases/{id}/resolve`` (#206) — landlord-direct resolve, added by
+this module below (was documented but had zero implementation and zero
+caller — ``app/agent/case_lifecycle.py::resolve_by_landlord`` existed as a
+tested pure function nothing ever invoked). See that endpoint's own
+docstring and ``docs/03-engineering/api-contracts.md``'s v1.14 amendment
+for the full contract (response shape, idempotency precedent, and the
+draft-cancellation safety edge).
 
 Timeline contract-gap follow-ups (PR #190 review) addressed here:
 - **draft entries need ids** — resolved: ``DraftTimelineEntry.id`` added
@@ -61,7 +69,8 @@ case already exists by the time they run) and needs no such join.
 
 from __future__ import annotations
 
-from datetime import datetime
+import json
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -70,6 +79,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.case_lifecycle import resolve_by_landlord
 from app.deps import Landlord, require_landlord
 from app.errors import AppError
 from app.pagination import (
@@ -177,6 +187,27 @@ class CaseDetailResponse(BaseModel):
     timeline: list[TimelineEntry]
 
 
+class ResolveCaseRequest(BaseModel):
+    """``docs/03-engineering/api-contracts.md``'s documented body —
+    ``reason`` is the only field, and ``"landlord"`` is the only legal
+    value on this endpoint (this is the LANDLORD-direct resolve path; the
+    other two ``cases.resolved_reason`` values, ``tenant_confirmed`` and
+    ``auto_stale``, are written exclusively by ``app/agent/case_lifecycle.
+    py``'s ``sweep_cases()`` — never by this router). Defaults to
+    ``"landlord"`` so an empty/omitted body still works, matching
+    ``app/routers/trust.py``'s ``RevokeTrustRequest`` "optional body"
+    convention for a single-field, single-legal-value request."""
+
+    reason: Literal["landlord"] = "landlord"
+
+
+class ResolveCaseResponse(BaseModel):
+    """v1.14 amendment — previously undocumented beyond "→ 200"."""
+
+    status: Literal["resolved"]
+    resolved_at: datetime
+
+
 # ---------------------------------------------------------------------------
 # SQL
 # ---------------------------------------------------------------------------
@@ -270,6 +301,66 @@ _SELECT_AUDIT_SQL = text(
 _SELECT_DRAFTS_SQL = text(
     "SELECT id, status, body, created_at FROM drafts "
     "WHERE case_id = :case_id AND landlord_id = :landlord_id ORDER BY created_at ASC"
+)
+
+# ---------------------------------------------------------------------------
+# POST /v1/cases/{id}/resolve SQL (#206)
+# ---------------------------------------------------------------------------
+
+# Self-guarding UPDATE — matches app/agent/case_lifecycle.py's own sweep
+# discipline ("the guarded UPDATE decides everything, gate side effects on
+# rowcount"): `status != 'resolved'` re-asserts, at UPDATE time, that this
+# call is the one actually performing the transition. A concurrent repeat
+# (double-tap, redelivered request) or a case some OTHER path (sweep_cases)
+# already resolved between this handler starting and this statement
+# running simply matches zero rows here — the idempotent-200 branch below
+# handles that by re-reading the row instead. `pending_resolved_at = NULL`
+# and `last_activity_at = :resolved_at` mirror case_lifecycle.py's own two
+# UPDATE statements for the SAME "case -> resolved" transition family (a
+# tenant-confirmed proposal pending on a case a landlord resolves directly
+# right now is moot; the resolve is itself the most recent activity).
+_RESOLVE_CASE_SQL = text(
+    "UPDATE cases SET status = :new_status, resolved_reason = :resolved_reason, "
+    "resolved_at = :resolved_at, pending_resolved_at = NULL, "
+    "last_activity_at = :resolved_at, updated_at = :resolved_at "
+    "WHERE id = :case_id AND landlord_id = :landlord_id AND status != 'resolved' "
+    "RETURNING id, resolved_at"
+)
+
+# Only reached when the guarded UPDATE above matched zero rows — distinguishes
+# "doesn't exist / cross-tenant" (404) from "already resolved" (idempotent 200).
+_SELECT_CASE_RESOLUTION_SQL = text(
+    "SELECT id, resolved_at FROM cases WHERE id = :case_id AND landlord_id = :landlord_id"
+)
+
+# THE SAFETY EDGE (#206 review): a draft this endpoint's own transaction
+# doesn't cancel here could still be claimed and sent by app/agent/
+# draft_sender.py's ticker after this case is resolved. `sent_message_id IS
+# NULL` is redundant with the status filter today (only a 'sent' row ever
+# gets one) but kept explicit as belt-and-braces matching the issue's own
+# wording. `status IN ('pending','approved')` deliberately excludes
+# 'sending' — see this router's resolve_case docstring "The 'sending' race"
+# for why a mid-flight claim is left alone rather than blocked on.
+_CANCEL_OPEN_DRAFTS_SQL = text(
+    "UPDATE drafts SET status = 'cancelled', updated_at = now() "
+    "WHERE case_id = :case_id AND landlord_id = :landlord_id "
+    "AND status IN ('pending', 'approved') AND sent_message_id IS NULL "
+    "RETURNING id"
+)
+
+_INSERT_CASE_RESOLVED_AUDIT_SQL = text(
+    "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+    "VALUES (:landlord_id, :case_id, 'landlord', :action, CAST(:payload AS jsonb))"
+)
+
+# actor='landlord' (not 'agent', unlike draft_sender.py's OWN superseded-
+# auto-send cancellation) — this cancellation is a direct, immediate
+# consequence of the landlord's own resolve action, exactly like
+# app/routers/drafts.py's undo endpoint recording its own send_cancelled
+# row as actor='landlord'.
+_INSERT_DRAFT_CANCELLED_AUDIT_SQL = text(
+    "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+    "VALUES (:landlord_id, :case_id, 'landlord', 'send_cancelled', CAST(:payload AS jsonb))"
 )
 
 
@@ -454,3 +545,201 @@ async def get_case(
         resolved_at=case_row["resolved_at"],
         timeline=[entry for _, _, entry in timeline],
     )
+
+
+@router.post("/cases/{case_id}/resolve", response_model=ResolveCaseResponse)
+async def resolve_case(
+    case_id: UUID,
+    landlord_and_session: Annotated[tuple[Landlord, AsyncSession], Depends(require_landlord)],
+    payload: ResolveCaseRequest | None = None,
+) -> ResolveCaseResponse:
+    """``POST /v1/cases/{id}/resolve`` (#206) — the landlord-direct resolve
+    path. ``docs/03-engineering/api-contracts.md``'s v1.14 amendment is the
+    canonical contract; this docstring covers the implementation decisions
+    that amendment summarizes.
+
+    Request body
+    ------------
+    ``ResolveCaseRequest.reason`` is accepted but never branched on:
+    ``"landlord"`` is the only legal value on THIS endpoint (the other two
+    ``cases.resolved_reason`` values are written exclusively by
+    ``app/agent/case_lifecycle.py``'s ``sweep_cases()``), so the field
+    exists only to match the documented request shape — this handler always
+    calls :func:`app.agent.case_lifecycle.resolve_by_landlord`, never forks
+    its semantics.
+
+    Scoping / not-found
+    --------------------
+    ``require_landlord`` scopes ``session``; every SQL statement below ALSO
+    carries an explicit ``landlord_id = :landlord_id`` predicate (belt-and-
+    braces, matching every other router in this package). A missing case
+    and a cross-tenant case are indistinguishable from the caller's point of
+    view — both 404 ``case_not_found``.
+
+    Idempotency precedent chosen: 200, not 409
+    -------------------------------------------
+    This codebase has TWO different precedents for "the caller repeated an
+    action that already happened": ``POST /v1/drafts/{id}/approve``
+    (and ``POST /v1/notifications/{id}/ack``) answer idempotent 200s,
+    while ``POST /v1/drafts/{id}/reject`` answers 409 ``already_sent`` when
+    a concurrent approve already won. The distinguishing question is
+    whether the repeat contradicts something that happened in between:
+    reject-after-approve is a genuine conflict (the draft went somewhere
+    the reject caller didn't intend). Resolve-after-resolve is not — the
+    caller's requested end state ("this case is resolved") is already
+    true, regardless of whether IT was the resolver or someone/something
+    else (a tenant confirmation, an auto-stale sweep) got there first. This
+    handler therefore follows the approve/ack precedent: 200, the case's
+    REAL stored ``resolved_at``, no new ``audit_log`` row, no attempt to
+    re-run draft cancellation (nothing new transitioned, so nothing new to
+    cancel — see ``_RESOLVE_CASE_SQL``'s own comment for the self-guarding
+    ``UPDATE ... WHERE status != 'resolved'`` that decides which branch this
+    call takes).
+
+    The safety edge — why a draft-only status flip was not enough
+    ------------------------------------------------------------------
+    A `pending` draft is never a risk on its own (only `approved` rows are
+    ever claimed by ``app/agent/draft_sender.py``'s ticker) — but a draft a
+    landlord already approved (or the trust ladder auto-approved,
+    ``drafts.auto_send = true``) sits `approved`, due, and CLAIMABLE for up
+    to ~60s (the sender's own tick cadence) after this endpoint returns,
+    unless something cancels it. ``_CANCEL_OPEN_DRAFTS_SQL`` cancels every
+    such draft (`status IN ('pending', 'approved')`, `sent_message_id IS
+    NULL`) in the SAME transaction as the case ``UPDATE`` above (this
+    router never calls ``session.commit()`` mid-handler — ``get_session``'s
+    single commit at request teardown is what makes this atomic: another
+    caller either sees the FULLY pre-resolve state or the FULLY
+    post-resolve-and-cancelled state, never a torn read). One
+    ``send_cancelled`` ``audit_log`` row (``actor='landlord'``, payload
+    ``{"draft_id": ..., "reason": "case_resolved"}``) is appended per
+    cancelled draft — mirrors ``app/agent/draft_sender.py``'s own
+    supersession-cancel payload shape (``{"draft_id": ..., "reason":
+    "superseded_by_newer_message"}``), not ``app/routers/drafts.py``'s
+    ``undo`` endpoint's ``send_cancelled`` row (that one carries only
+    ``draft_id``, no ``reason`` key at all) — ``reason`` is what
+    distinguishes every ``send_cancelled`` row in this codebase's audit
+    vocabulary from every other.
+
+    The 'sending' race — a documented, deliberate non-block
+    -----------------------------------------------------------
+    A draft the sender ticker has ALREADY claimed (`status = 'sending'`) at
+    the moment this transaction runs is left alone on purpose —
+    ``_CANCEL_OPEN_DRAFTS_SQL``'s `status IN ('pending', 'approved')` never
+    matches it. Two honest alternatives were considered and rejected:
+    blocking this request until the in-flight send finishes (this codebase
+    never holds a DB transaction open across a Twilio network call —
+    ``app/agent/draft_sender.py``'s own "Session discipline" section is
+    explicit about this — and there is no cheap way to await a send from
+    inside THIS request without re-introducing exactly that anti-pattern);
+    or racing to "cancel" a row that may already be an irreversible SMS in
+    the provider's hands (a false "cancelled" state would misrepresent a
+    message that actually went out). Standard Postgres row-lock semantics
+    make the actual outcome race-free regardless of which UPDATE reaches
+    the row first: if the sender's claim (`'approved' -> 'sending'`)
+    commits first, this cancel's own `WHERE status IN ('pending',
+    'approved')` simply no longer matches that row when THIS transaction's
+    UPDATE runs; if this cancel commits first, the sender's claim's own
+    `WHERE status = 'approved'` no longer matches either. Either way, the
+    draft's actual fate (sent, or cancelled) is unambiguous and durably
+    recorded — never lost, never double-counted. A claimed-and-completed
+    send on a since-resolved case still writes its normal outbound
+    ``messages`` row, ``drafts.sent_message_id``/``status='sent'``,
+    ``trust_metrics`` update, and ``'sent'`` audit row exactly as it always
+    does — none of that is rolled back or suppressed; this is a known,
+    accepted outcome, not a bug. The ONE thing that does NOT happen
+    anymore (safety review MEDIUM-1, reproduced empirically, fixed in
+    ``app/agent/draft_sender.py``): the completed send used to
+    UNCONDITIONALLY flip ``cases.status`` back to ``'awaiting_tenant'``,
+    dragging an already-``'resolved'`` case back out of resolution while
+    ``resolved_at``/``resolved_reason`` stayed populated — an inconsistent
+    row that silently overrode the landlord's own action. That ONE
+    statement (:data:`app.agent.draft_sender._MARK_CASE_AWAITING_TENANT_SQL`)
+    is now self-guarding (``AND status != 'resolved'``) — a case this
+    endpoint resolved stays ``'resolved'`` even when a draft that was
+    already ``'sending'`` at resolve time goes on to complete.
+
+    Belt-and-braces: ``app/agent/draft_sender.py``'s claim SQL additionally
+    refuses to claim ANY `'approved'` draft whose case has since become
+    `resolved` (see that module's own docstring, "Resolved-case guard
+    belt-and-braces (#206)") — a second, independent layer protecting
+    against any OTHER code path that might ever resolve a case without
+    running this endpoint's own cancellation (e.g. ``sweep_cases()``'s
+    tenant-confirmed leg, which is NOT excluded from ``awaiting_approval``
+    the way its auto-stale leg is — a pre-existing, out-of-scope gap this
+    guard also happens to close).
+
+    Emergency chain — untouched by construction
+    -----------------------------------------------
+    This handler never reads or writes ``notifications``. Verified: the
+    entire escalation sweep (``app/agent/emergency_chain.py``) keys off
+    ``notifications.status``/``next_attempt_at``/``acknowledged_at`` only —
+    no query in that module ever joins ``cases`` or reads ``cases.status``.
+    Resolving a case cannot acknowledge, cancel, or delay an emergency
+    call/SMS in flight, by construction, not by a special-case guard here.
+    """
+    landlord, session = landlord_and_session
+    landlord_id = str(landlord.id)
+    cid = str(case_id)
+
+    transition = resolve_by_landlord(datetime.now(UTC))
+
+    resolved_row = (
+        (
+            await session.execute(
+                _RESOLVE_CASE_SQL,
+                {
+                    "case_id": cid,
+                    "landlord_id": landlord_id,
+                    "new_status": transition.new_status,
+                    "resolved_reason": transition.resolved_reason,
+                    "resolved_at": transition.resolved_at,
+                },
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+    if resolved_row is None:
+        existing = (
+            (
+                await session.execute(
+                    _SELECT_CASE_RESOLUTION_SQL, {"case_id": cid, "landlord_id": landlord_id}
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if existing is None:
+            raise AppError(status_code=404, code="case_not_found", message="Case not found.")
+        # Idempotent repeat (see docstring "Idempotency precedent chosen") —
+        # no new writes, no re-attempted draft cancellation.
+        return ResolveCaseResponse(status="resolved", resolved_at=existing["resolved_at"])
+
+    await session.execute(
+        _INSERT_CASE_RESOLVED_AUDIT_SQL,
+        {
+            "landlord_id": landlord_id,
+            "case_id": cid,
+            "action": transition.audit_action,
+            "payload": json.dumps({"reason": transition.resolved_reason}),
+        },
+    )
+
+    cancel_params = {"case_id": cid, "landlord_id": landlord_id}
+    cancelled_draft_rows = (
+        (await session.execute(_CANCEL_OPEN_DRAFTS_SQL, cancel_params)).mappings().all()
+    )
+    for draft_row in cancelled_draft_rows:
+        await session.execute(
+            _INSERT_DRAFT_CANCELLED_AUDIT_SQL,
+            {
+                "landlord_id": landlord_id,
+                "case_id": cid,
+                "payload": json.dumps(
+                    {"draft_id": str(draft_row["id"]), "reason": "case_resolved"}
+                ),
+            },
+        )
+
+    return ResolveCaseResponse(status="resolved", resolved_at=resolved_row["resolved_at"])

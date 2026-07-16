@@ -30,7 +30,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 import app.db.session as db_mod
-from app.agent.draft_sender import run_sender_loop, sender_tick
+from app.agent.draft_sender import DEFAULT_BATCH_SIZE, run_sender_loop, sender_tick
 from app.agent.nodes.classify_severity import classify_severity
 from app.agent.schemas import CaseContext, PrefilterResult
 from app.agent.state import AgentState
@@ -1109,6 +1109,125 @@ async def test_revoke_then_one_clean_send_does_not_re_unlock(
         assert after_one_send["autonomy_unlocked"] is False  # still locked -- needs 2 more
     finally:
         await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# 7. Resolved-case guard belt-and-braces (#206) — see this module's own
+#    docstring "Resolved-case guard belt-and-braces (#206)". The PRIMARY
+#    fix (app/routers/cases.py's resolve endpoint cancelling the draft
+#    itself) is tested end-to-end in tests/test_cases_resolve_router.py;
+#    these two tests exercise the claim SQL's own independent guard in
+#    isolation, including the case that guard exists FOR (a case resolved
+#    by some OTHER path that never cancelled the draft).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_claim_refuses_draft_on_resolved_case_leaves_it_approved(
+    db_session: AsyncSession,
+) -> None:
+    """Simulates a case resolved by a path OTHER than app/routers/cases.py's
+    own resolve endpoint (which already cancels the draft itself) — e.g.
+    the pre-existing app/agent/case_lifecycle.py sweep_cases() gap this
+    guard's own docstring flags. Even with nothing having cancelled the
+    draft, the claim's own belt-and-braces predicate must still refuse to
+    send it."""
+    landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
+    await db_session.execute(
+        text(
+            "UPDATE cases SET status = 'resolved', resolved_reason = 'landlord', "
+            "resolved_at = now() WHERE id = :id"
+        ),
+        {"id": case_id},
+    )
+    await db_session.commit()
+    sender = _FakeSmsSender()
+    try:
+        claimed = await sender_tick(sender=sender)
+        assert claimed == 0
+        assert sender.calls == []
+
+        status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+        # Never sent -- and never actively cancelled by this guard either
+        # (see this module's own docstring for why that's an accepted,
+        # strictly-safer-than-sending trade-off).
+        assert status == "approved"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_claim_still_sends_normally_on_a_non_resolved_case(
+    db_session: AsyncSession,
+) -> None:
+    """Regression guard for the new predicate: an ordinary due draft on a
+    case that is NOT resolved must still send exactly as before."""
+    landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
+    sender = _FakeSmsSender()
+    try:
+        claimed = await sender_tick(sender=sender)
+        assert claimed == 1
+        assert len(sender.calls) == 1
+
+        status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+        assert status == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_resolved_case_zombie_does_not_starve_the_batch(
+    db_session: AsyncSession,
+) -> None:
+    """MEDIUM-2 (starvation half, #206 follow-up): a resolved-case "zombie"
+    draft is never claimable (see the claim SQL's own guard), but with the
+    OLDEST ``scheduled_send_at`` it would otherwise sort to the front of
+    every tick's candidate window (:data:`DEFAULT_BATCH_SIZE`-limited) and
+    permanently occupy one slot, starving a legitimate due draft out of
+    that batch forever. The candidate SELECT itself must exclude it, not
+    just the claim."""
+    zombie_landlord_id, zombie_case_id, zombie_draft_id = await _seed_approved_draft(
+        db_session,
+        due_in_seconds=-100_000.0,  # oldest by far -- sorts first
+    )
+    await db_session.execute(
+        text(
+            "UPDATE cases SET status = 'resolved', resolved_reason = 'landlord', "
+            "resolved_at = now() WHERE id = :id"
+        ),
+        {"id": zombie_case_id},
+    )
+    await db_session.commit()
+
+    legitimate_landlord_ids: list[str] = []
+    for _ in range(DEFAULT_BATCH_SIZE):
+        landlord_id, _case_id, _draft_id = await _seed_approved_draft(db_session)
+        legitimate_landlord_ids.append(landlord_id)
+
+    sender = _FakeSmsSender()
+    try:
+        claimed = await sender_tick(sender=sender, batch_size=DEFAULT_BATCH_SIZE)
+        assert claimed == DEFAULT_BATCH_SIZE
+        assert len(sender.calls) == DEFAULT_BATCH_SIZE
+
+        zombie_status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": zombie_draft_id}
+            )
+        ).scalar_one()
+        assert zombie_status == "approved"  # never claimed, never sent, never a batch slot
+    finally:
+        await _cleanup(db_session, zombie_landlord_id)
+        for landlord_id in legitimate_landlord_ids:
+            await _cleanup(db_session, landlord_id)
 
 
 def test_sms_sender_protocol_is_a_runtime_checkable_shape() -> None:
