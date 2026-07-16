@@ -24,6 +24,23 @@ interface AuthContextValue {
   signOut: () => Promise<void>;
 }
 
+// Customer-facing copy rule (CLAUDE.md rule 8 / copy-guardian, M0 review):
+// raw supabase-js error strings never reach the screen — every auth failure
+// maps to the house voice. Unknown errors get one honest generic line.
+function toHouseAuthError(error: { message: string }): string {
+  const message = error.message.toLowerCase();
+  if (message.includes("invalid login credentials")) {
+    return "Email or password didn't match.";
+  }
+  if (message.includes("email not confirmed")) {
+    return "This email hasn't been confirmed yet. Check your inbox for the confirmation link.";
+  }
+  if (message.includes("network") || message.includes("fetch")) {
+    return "Couldn't reach Stoop. Check your connection and try again.";
+  }
+  return "Sign-in didn't go through. Try again.";
+}
+
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -57,7 +74,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       initializing,
       signIn: async (email, password) => {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
-        return { error: error?.message ?? null };
+        return { error: error ? toHouseAuthError(error) : null };
       },
       signOut: async () => {
         await supabase.auth.signOut();

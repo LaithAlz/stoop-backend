@@ -26,12 +26,6 @@ export default function MeScreen() {
           <Text style={styles.email}>{session?.user.email ?? "Unknown account"}</Text>
         </View>
 
-        <View style={styles.card}>
-          <Text style={styles.settingsNote}>
-            Your profile, notification choices, and plan details will live here soon.
-          </Text>
-        </View>
-
         <Button label="Sign out" variant="ghost" onPress={() => void signOut()} testID="sign-out" />
       </View>
     </SafeAreaView>
