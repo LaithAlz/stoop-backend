@@ -6,8 +6,11 @@
  */
 export function planDisplayName(tier: string, cohort: string): string {
   if (tier === "full" && cohort === "early_access") {
-    return "Full Plan — $5/mo (early-access price, locked in)";
+    // Price-lock phrasing per the PR #142 audit remediation: never
+    // "locked for life" — "locked in for as long as you stay" is the
+    // house claim (mirrors apps/web/src/routes/plans.tsx).
+    return "Full Plan — $5/month early access, locked in for as long as you stay";
   }
-  if (tier === "full") return "Full Plan — $10/mo";
+  if (tier === "full") return "Full Plan — $10/month";
   return "Emergency Line — free";
 }
