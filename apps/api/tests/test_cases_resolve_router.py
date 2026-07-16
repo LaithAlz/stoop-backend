@@ -27,6 +27,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -37,7 +38,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 
 import app.db.session as db_mod
 from app.agent.case_lifecycle import STATUS_RESOLVED, CaseSnapshot, decide_reopen_or_new
-from app.agent.draft_sender import sender_tick
+from app.agent.draft_sender import _claim_draft, _process_claimed_draft, sender_tick
+from app.db.session import get_admin_session
 from app.deps import Landlord
 from app.errors import AppError
 from app.routers.cases import get_case, resolve_case
@@ -113,7 +115,18 @@ async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
     await session.rollback()
     params = {"lid": landlord_id}
     await session.execute(text("DELETE FROM notifications WHERE landlord_id = :lid"), params)
-    for table in ("audit_log", "drafts", "messages", "cases", "tenants", "vendors", "properties"):
+    # trust_metrics before properties (FK) -- a completed send (safety
+    # review MEDIUM-1's own regression test) upserts a trust_metrics row.
+    for table in (
+        "audit_log",
+        "drafts",
+        "messages",
+        "cases",
+        "trust_metrics",
+        "tenants",
+        "vendors",
+        "properties",
+    ):
         await session.execute(text(f"DELETE FROM {table} WHERE landlord_id = :lid"), params)  # noqa: S608
     await session.execute(text("DELETE FROM landlords WHERE id = :lid"), params)
     await session.commit()
@@ -495,5 +508,79 @@ async def test_resolve_then_reopen_decision_still_fires_within_window(
 
         past_window = decide_reopen_or_new(snapshot, response.resolved_at + timedelta(days=31))
         assert past_window.reopen is False
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Safety review MEDIUM-1 (reproduced empirically): a draft already claimed
+# ('sending') at the moment of resolve completes normally afterward -- its
+# own bookkeeping must land, but the case-status flip that completion does
+# must not drag an explicitly-resolved case back out of 'resolved'.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_resolve_case_then_in_flight_send_completes_without_reverting_status(
+    session: AsyncSession,
+) -> None:
+    """Sequence: landlord approves -> sender claims ('sending') -> landlord
+    resolves (correctly leaves the 'sending' row alone) -> the send
+    completes. The completed send's own durable bookkeeping (outbound
+    message, 'sent' audit, sent_message_id, trust_metrics) must still
+    land, but the case must stay 'resolved' -- not get dragged back to
+    'awaiting_tenant' by app/agent/draft_sender.py's own case-status
+    flip."""
+    landlord_id, _property_id, case_id = await _seed_case(
+        session, status="awaiting_approval", severity="urgent", provision_twilio_number=True
+    )
+    scheduled_send_at = datetime.now(UTC) - timedelta(seconds=1)
+    draft_id = await factories.insert_draft(
+        session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        status="approved",
+        scheduled_send_at=scheduled_send_at,
+    )
+    await session.commit()
+
+    # Drive a REAL claim ('approved' -> 'sending') through the actual claim
+    # SQL, exactly as sender_tick would -- BEFORE the case resolves.
+    async with asynccontextmanager(get_admin_session)() as claim_session:
+        claimed = await _claim_draft(claim_session, uuid.UUID(draft_id))
+    assert claimed is not None
+
+    draft_row = await _draft_row(session, draft_id)
+    assert draft_row["status"] == "sending"
+
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        response = await resolve_case(uuid.UUID(case_id), (landlord, session))
+        assert response.status == "resolved"
+        await session.commit()
+
+        # The 'sending' row was correctly left alone by the resolve.
+        draft_row_after_resolve = await _draft_row(session, draft_id)
+        assert draft_row_after_resolve["status"] == "sending"
+
+        # The tick's own per-claim completion step now runs (the send
+        # actually goes out -- it was already irreversibly claimed).
+        sender = _FakeSmsSender()
+        await _process_claimed_draft(sender, claimed)
+        assert len(sender.calls) == 1
+
+        draft_row_after_send = await _draft_row(session, draft_id)
+        assert draft_row_after_send["status"] == "sent"
+        assert draft_row_after_send["sent_message_id"] is not None
+
+        sent_audit = await _audit_rows(session, case_id=case_id, action="sent")
+        assert len(sent_audit) == 1
+
+        # THE fix: the case must stay resolved, never dragged back to
+        # 'awaiting_tenant' by the completed send's own bookkeeping.
+        case_row = await _case_row(session, case_id)
+        assert case_row["status"] == "resolved"
+        assert case_row["resolved_reason"] == "landlord"
+        assert case_row["resolved_at"] == response.resolved_at
     finally:
         await _cleanup(session, landlord_id)

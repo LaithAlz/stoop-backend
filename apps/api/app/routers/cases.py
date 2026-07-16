@@ -612,9 +612,13 @@ async def resolve_case(
     post-resolve-and-cancelled state, never a torn read). One
     ``send_cancelled`` ``audit_log`` row (``actor='landlord'``, payload
     ``{"draft_id": ..., "reason": "case_resolved"}``) is appended per
-    cancelled draft — mirrors ``app/routers/drafts.py``'s own ``undo``
-    endpoint's ``send_cancelled`` shape, distinguished only by the payload
-    ``reason``.
+    cancelled draft — mirrors ``app/agent/draft_sender.py``'s own
+    supersession-cancel payload shape (``{"draft_id": ..., "reason":
+    "superseded_by_newer_message"}``), not ``app/routers/drafts.py``'s
+    ``undo`` endpoint's ``send_cancelled`` row (that one carries only
+    ``draft_id``, no ``reason`` key at all) — ``reason`` is what
+    distinguishes every ``send_cancelled`` row in this codebase's audit
+    vocabulary from every other.
 
     The 'sending' race — a documented, deliberate non-block
     -----------------------------------------------------------
@@ -638,9 +642,21 @@ async def resolve_case(
     `WHERE status = 'approved'` no longer matches either. Either way, the
     draft's actual fate (sent, or cancelled) is unambiguous and durably
     recorded — never lost, never double-counted. A claimed-and-completed
-    send on a since-resolved case still writes its normal ``'sent'`` audit
-    row exactly as it always does; this is a known, accepted outcome, not
-    a bug.
+    send on a since-resolved case still writes its normal outbound
+    ``messages`` row, ``drafts.sent_message_id``/``status='sent'``,
+    ``trust_metrics`` update, and ``'sent'`` audit row exactly as it always
+    does — none of that is rolled back or suppressed; this is a known,
+    accepted outcome, not a bug. The ONE thing that does NOT happen
+    anymore (safety review MEDIUM-1, reproduced empirically, fixed in
+    ``app/agent/draft_sender.py``): the completed send used to
+    UNCONDITIONALLY flip ``cases.status`` back to ``'awaiting_tenant'``,
+    dragging an already-``'resolved'`` case back out of resolution while
+    ``resolved_at``/``resolved_reason`` stayed populated — an inconsistent
+    row that silently overrode the landlord's own action. That ONE
+    statement (:data:`app.agent.draft_sender._MARK_CASE_AWAITING_TENANT_SQL`)
+    is now self-guarding (``AND status != 'resolved'``) — a case this
+    endpoint resolved stays ``'resolved'`` even when a draft that was
+    already ``'sending'`` at resolve time goes on to complete.
 
     Belt-and-braces: ``app/agent/draft_sender.py``'s claim SQL additionally
     refuses to claim ANY `'approved'` draft whose case has since become
