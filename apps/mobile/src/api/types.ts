@@ -1,0 +1,334 @@
+/**
+ * Hand-written types mirroring docs/03-engineering/api-contracts.md.
+ * Every export below cites the doc section it mirrors — do NOT add a field
+ * that isn't shown there; an ambiguous/unpinned shape is called out in the
+ * comment above it instead of guessed at (see `CaseDetailTenant` /
+ * `CaseDetailVendor` below for the two cases where the doc genuinely never
+ * shows a GET response shape).
+ *
+ * Enum values (`Severity`, `CaseStatus`, `DraftStatus`, audit `actor`/
+ * `action`) are pinned against docs/03-engineering/schema-v1.md's CHECK
+ * constraints (CLAUDE.md rule 6 — schema names/values are canonical there),
+ * since api-contracts.md itself only shows illustrative examples, not the
+ * full vocabulary.
+ */
+
+// ---------------------------------------------------------------------------
+// Conventions (api-contracts.md "Conventions")
+// ---------------------------------------------------------------------------
+
+/** schema-v1.md `cases.severity` CHECK. */
+export type Severity = "emergency" | "urgent" | "routine";
+
+/** schema-v1.md `cases.status` CHECK. */
+export type CaseStatus = "open" | "awaiting_approval" | "awaiting_tenant" | "resolved" | "reopened";
+
+/** schema-v1.md `drafts.status` CHECK. */
+export type DraftStatus =
+  "pending" | "stale" | "approved" | "sending" | "sent" | "rejected" | "cancelled";
+
+/** schema-v1.md `drafts.recipient` CHECK. */
+export type DraftRecipient = "tenant" | "vendor";
+
+/** schema-v1.md `audit_log.actor` CHECK. */
+export type AuditActor = "agent" | "landlord" | "system" | "prefilter";
+
+/** schema-v1.md `audit_log.action` CHECK — the full vocabulary, so the
+ *  timeline renderer never has to fall back to an unhandled-string case for
+ *  a value this doc already promises won't occur. */
+export type AuditAction =
+  | "message_received"
+  | "classified"
+  | "case_opened"
+  | "case_reopened"
+  | "case_resolved"
+  | "drafted"
+  | "draft_stale"
+  | "approved"
+  | "edited"
+  | "rejected"
+  | "sent"
+  | "send_cancelled"
+  | "auto_sent"
+  | "emergency_triggered"
+  | "emergency_call_attempt"
+  | "acknowledged"
+  | "vendor_engaged"
+  | "degraded_mode"
+  | "trust_unlocked"
+  | "trust_revoked"
+  | "billing_changed"
+  | "settings_changed";
+
+/** messages.media jsonb shape, schema-v1.md `messages` table. */
+export interface MediaItem {
+  url: string;
+  content_type: string;
+}
+
+/**
+ * The error envelope ("Conventions" section) — every non-2xx response.
+ * Endpoint-specific extra fields (e.g. `fresh_draft_id` on `draft_stale`)
+ * are allowed alongside the three reserved keys; callers narrow via `code`.
+ */
+export interface ApiErrorBody {
+  code: string;
+  message: string;
+  request_id: string;
+  [extra: string]: unknown;
+}
+
+// ---------------------------------------------------------------------------
+// Me ("Me" section)
+// ---------------------------------------------------------------------------
+
+export interface VoiceProfile {
+  tone: string;
+  samples: string[];
+}
+
+/** GET /v1/me response. */
+export interface LandlordMe {
+  id: string;
+  email: string;
+  full_name: string;
+  timezone: string;
+  voice_profile: VoiceProfile;
+  price_cohort: string;
+  subscription_tier: string;
+  subscription_status: string;
+  created_at: string;
+}
+
+// ---------------------------------------------------------------------------
+// Properties ("Properties" section) — only referenced here because
+// `GET /v1/cases/{id}` embeds a `property` object (see the CaseDetail note
+// below); M1 does not otherwise fetch this endpoint (M2 scope).
+// ---------------------------------------------------------------------------
+
+export interface QuietHours {
+  start: string;
+  end: string;
+}
+
+export interface HeatingSeason {
+  start: string;
+  end: string;
+}
+
+export interface BackupContact {
+  name: string;
+  phone: string;
+}
+
+/** The full `Property` shape from the "Properties" section. */
+export interface Property {
+  id: string;
+  label: string;
+  address_line1: string;
+  city: string;
+  province: string;
+  postal_code: string;
+  twilio_number: string | null;
+  house_rules: string | null;
+  quiet_hours: QuietHours | null;
+  heating_season: HeatingSeason | null;
+  backup_contact: BackupContact | null;
+  open_case_count: number;
+  created_at: string;
+}
+
+// ---------------------------------------------------------------------------
+// Queue ("Queue (the dashboard's main read)" section, v1.1 amendments)
+// ---------------------------------------------------------------------------
+
+export interface QueueCounts {
+  total: number;
+  emergency: number;
+  urgent: number;
+  routine: number;
+  awaiting_tenant: number;
+}
+
+/**
+ * One card per case needing action. `case_id` drives navigation/full-view;
+ * `draft_id` drives approve/undo/reject/edit-and-send — the doc is explicit
+ * these must never be conflated.
+ *
+ * No notification id anywhere on this shape (checked against the doc's own
+ * JSON example and every v1.1 amendment bullet) — see the mobile M1 report
+ * for what that means for the emergency banner's acknowledge action.
+ */
+export interface QueueItem {
+  case_id: string;
+  draft_id: string;
+  severity: Severity;
+  /** Agent-written, per-case; null until #197's title work lands (per this
+   *  work's own brief) — never client-templated. */
+  title: string | null;
+  property_label: string;
+  tenant_name: string;
+  unit: string | null;
+  received_at: string;
+  tenant_message: string;
+  draft_body: string;
+  draft_recipient: DraftRecipient;
+  /** One warm plain-English sentence for the margin note; null for rows
+   *  classified before the `summary` audit key shipped. */
+  why: string | null;
+  /** Terse rule-fragment array — the expandable "reasoning" disclosure. */
+  reasoning: string[];
+  refusal_flags: string[];
+  has_media: boolean;
+  media_note: string | null;
+}
+
+/** GET /v1/queue response. Deliberately unpaginated (see the doc's own
+ *  "Ordering/pagination" bullet) — no `next_cursor` here, unlike every
+ *  other list endpoint. */
+export interface QueueResponse {
+  items: QueueItem[];
+  counts: QueueCounts;
+}
+
+// ---------------------------------------------------------------------------
+// Cases ("Cases" section)
+// ---------------------------------------------------------------------------
+
+/** GET /v1/cases list item ("pinned 2026-07-06" shape). */
+export interface CaseSummary {
+  id: string;
+  title: string | null;
+  status: CaseStatus;
+  severity: Severity | null;
+  tenant_name: string;
+  unit: string | null;
+  property_label: string;
+  last_activity_at: string;
+}
+
+export interface CasesResponse {
+  items: CaseSummary[];
+  next_cursor: string | null;
+}
+
+export interface TimelineMessageEntry {
+  kind: "message";
+  direction: "inbound" | "outbound";
+  party: "tenant" | "vendor" | "landlord";
+  body: string;
+  media: MediaItem[];
+  at: string;
+}
+
+/**
+ * The audit timeline entry's `payload` is specified as the FULL, opaque
+ * `audit_log.payload` jsonb column — implementations pass it through
+ * verbatim (v1.9 amendment), so it stays `Record<string, unknown>` here
+ * rather than a per-action union. `ClassifiedAuditPayload` below is a
+ * narrowing HELPER for the one action (`classified`) the UI actually reads
+ * from (the case-detail "why" plaque, since — unlike the queue — this
+ * endpoint has no top-level `why`/`reasoning` field; see the mobile M1
+ * report), not a claim that the server only ever sends these keys.
+ */
+export type AuditPayload = Record<string, unknown>;
+
+/** Narrowing helper for `action === "classified"` payloads — field names
+ *  from schema-v1.md's `audit_log` column comment and the queue section's
+ *  v1.1 amendment (`summary`/`rules_fired` are the same durable source the
+ *  queue's `why`/`reasoning` read from). Every field optional: this is a
+ *  read-time cast of an opaque jsonb blob, never a guaranteed shape. */
+export interface ClassifiedAuditPayload {
+  severity?: Severity;
+  summary?: string | null;
+  rules_fired?: string[];
+  modifier?: string;
+  refusal_flags?: string[];
+}
+
+export interface TimelineAuditEntry {
+  kind: "audit";
+  actor: AuditActor;
+  action: AuditAction;
+  payload: AuditPayload;
+  at: string;
+}
+
+export interface TimelineDraftEntry {
+  kind: "draft";
+  id: string;
+  status: DraftStatus;
+  body: string;
+  at: string;
+}
+
+export type TimelineEntry = TimelineMessageEntry | TimelineAuditEntry | TimelineDraftEntry;
+
+/**
+ * The nested `tenant`/`vendor` objects on `GET /v1/cases/{id}` are shown
+ * only as `{...}` in the doc — no GET response shape is pinned anywhere for
+ * either resource (the "Tenants & Vendors" section only specifies REQUEST
+ * bodies). These are a best-effort read of the fields the UI actually needs
+ * (name/phone/unit for the header line), flagged as a contract gap in the
+ * mobile M1 report rather than presented as verbatim-confirmed.
+ */
+export interface CaseDetailTenant {
+  id?: string;
+  name?: string | null;
+  phone?: string;
+  unit?: string | null;
+}
+
+export interface CaseDetailVendor {
+  id?: string;
+  name?: string;
+  trade?: string;
+  phone?: string;
+}
+
+/** GET /v1/cases/{id} response. `property` reuses the full `Property` shape
+ *  from the "Properties" section — the doc doesn't re-declare it here, but
+ *  gives no reason to think case-detail invents a different one. */
+export interface CaseDetail {
+  id: string;
+  status: CaseStatus;
+  severity: Severity | null;
+  title: string | null;
+  property: Property;
+  tenant: CaseDetailTenant;
+  vendor: CaseDetailVendor | null;
+  opened_at: string;
+  resolved_at: string | null;
+  timeline: TimelineEntry[];
+}
+
+// ---------------------------------------------------------------------------
+// Drafts ("Drafts (the approve loop)" section)
+// ---------------------------------------------------------------------------
+
+/** POST /v1/drafts/{id}/approve and .../edit-and-send both return this. */
+export interface ApproveDraftResponse {
+  status: "approved";
+  scheduled_send_at: string;
+  /** The undo window's own end time — countdowns derive from THIS, never a
+   *  client-local constant (the doc's own "the undo window is data"). */
+  undo_until: string;
+}
+
+/** DELETE /v1/drafts/{id}/approve response. */
+export interface UndoDraftResponse {
+  status: "pending";
+}
+
+/** POST /v1/drafts/{id}/reject response — 200, no documented body fields
+ *  beyond the implicit success; typed as unknown-but-present rather than
+ *  invented. */
+export type RejectDraftResponse = Record<string, never>;
+
+// ---------------------------------------------------------------------------
+// Notifications ("Notifications / emergencies" section)
+// ---------------------------------------------------------------------------
+
+export interface AckNotificationResponse {
+  acknowledged_at: string;
+}

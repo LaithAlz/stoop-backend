@@ -14,6 +14,7 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase";
+import { queryClient } from "@/api/queryClient";
 
 interface AuthContextValue {
   session: Session | null;
@@ -56,8 +57,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setInitializing(false);
     });
 
-    const { data: subscription } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+    const { data: subscription } = supabase.auth.onAuthStateChange((event, nextSession) => {
       if (!mounted) return;
+      // PII fence (M1 senior review, BLOCKING): the shared React Query
+      // cache holds tenant messages/names and the landlord's own account
+      // data. On sign-out it must be emptied immediately — otherwise a
+      // different landlord signing in on the same device within the
+      // cache's gc window would be served the previous account's data by
+      // stale-while-revalidate before the refetch lands.
+      if (event === "SIGNED_OUT") {
+        queryClient.clear();
+      }
       setSession(nextSession);
       setInitializing(false);
     });

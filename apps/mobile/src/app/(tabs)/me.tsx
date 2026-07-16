@@ -1,21 +1,23 @@
 /**
- * Me — account & settings. M0 ships the shell plus the one real control
- * this phase has: sign out. Shows the signed-in email (already visible to
- * the signed-in user — display only; never logged, CLAUDE.md rule 5).
- *
- * M2 TODO: profile editing via GET/PATCH /v1/me, notification preferences,
- * plan details. Plan copy must follow CLAUDE.md rule 8 (free Emergency
- * Line / $10 Full Plan / $5 early-access grandfathered).
+ * Me — account & settings. M1 (issue #210) wires the real `GET /v1/me`
+ * (name/email/plan display only — `PATCH /v1/me` profile editing is M2
+ * scope) alongside M0's sign-out. `GET /v1/me`'s `full_name` also feeds
+ * Home's dynamic greeting (src/app/(tabs)/index.tsx) — both screens read
+ * the same React Query cache key (src/api/me.ts's `useMe`).
  */
-import { StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useAuth } from "@/auth/AuthProvider";
 import { AppHeader } from "@/components/AppHeader";
 import { Button } from "@/components/Button";
 import { colors, radius, spacing, type } from "@/theme/tokens";
+import { useMe } from "@/api/me";
+import { ApiError, toHouseApiError } from "@/api/errors";
+import { planDisplayName } from "@/features/account/plan";
 
 export default function MeScreen() {
   const { session, signOut } = useAuth();
+  const meQuery = useMe();
 
   return (
     <SafeAreaView style={styles.safeArea} edges={["top"]}>
@@ -23,7 +25,29 @@ export default function MeScreen() {
       <View style={styles.body}>
         <View style={styles.card}>
           <Text style={styles.label}>Signed in as</Text>
-          <Text style={styles.email}>{session?.user.email ?? "Unknown account"}</Text>
+          <Text style={styles.email}>
+            {meQuery.data?.full_name || session?.user.email || "Unknown account"}
+          </Text>
+          {meQuery.data?.full_name ? (
+            <Text style={styles.subtext}>{meQuery.data.email}</Text>
+          ) : null}
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.label}>Plan</Text>
+          {meQuery.isSuccess ? (
+            <Text style={styles.email}>
+              {planDisplayName(meQuery.data.subscription_tier, meQuery.data.price_cohort)}
+            </Text>
+          ) : meQuery.isError ? (
+            <Text style={styles.subtext}>
+              {meQuery.error instanceof ApiError
+                ? toHouseApiError(meQuery.error)
+                : "Couldn't load your plan right now."}
+            </Text>
+          ) : (
+            <ActivityIndicator color={colors.brand} style={styles.planSpinner} />
+          )}
         </View>
 
         <Button label="Sign out" variant="ghost" onPress={() => void signOut()} testID="sign-out" />
@@ -55,9 +79,12 @@ const styles = StyleSheet.create({
     ...type.cardTitle,
     color: colors.ink,
   },
-  settingsNote: {
-    ...type.body,
-    fontSize: 14.5,
+  subtext: {
+    ...type.footnote,
     color: colors.inkDim,
+  },
+  planSpinner: {
+    alignSelf: "flex-start",
+    marginTop: spacing.xs,
   },
 });
