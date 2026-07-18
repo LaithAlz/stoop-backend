@@ -127,3 +127,24 @@ export function buildQueueView(
 export function draftStaleNotice(tenantFirstName: string): string {
   return `${tenantFirstName} replied — this draft just updated.`;
 }
+
+/**
+ * M1 senior advisory: drop any snapshot whose entry is no longer
+ * "skipped" — a skip that failed (its entry was `cleared` by the error
+ * handler) or otherwise resolved would leave its snapshot in Home's map
+ * forever, keeping a stale card resurrectable and tenant text pinned in
+ * memory past its purpose. Returns the SAME object when nothing needs
+ * pruning so a `setState` caller can bail without re-rendering.
+ */
+export function pruneSkippedSnapshots(
+  snapshots: Record<string, QueueItem>,
+  entries: QueueEntriesState,
+): Record<string, QueueItem> {
+  const staleIds = Object.keys(snapshots).filter(
+    (draftId) => entries[draftId]?.status !== "skipped",
+  );
+  if (staleIds.length === 0) return snapshots;
+  const next = { ...snapshots };
+  for (const draftId of staleIds) delete next[draftId];
+  return next;
+}
