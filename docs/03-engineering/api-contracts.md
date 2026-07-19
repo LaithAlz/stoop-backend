@@ -239,7 +239,8 @@ emergency-followup → urgent (oldest first) → routine (oldest first):
     "why": "No heat on a cold night with a baby in the unit can't wait, so I treated it as urgent.",
     "reasoning": ["no heat + overnight + infant present", "Ontario bylaw ≥21°C", "…"],
     "refusal_flags": [],
-    "has_media": false, "media_note": null
+    "has_media": false, "media_note": null,
+    "notification_id": null
   }],
   "counts": { "total": 3, "emergency": 0, "urgent": 1, "routine": 2,
               "awaiting_tenant": 1 } }
@@ -296,6 +297,70 @@ needs; PR #181 review):**
   docstring, unchanged by #60) and the dashboard renders no dedicated
   handled note from live data yet.
 
+**v1.15 amendment (2026-07-18 — #213 implementation, doc-first — mobile
+client contract gaps):**
+
+- **`notification_id`** (new field, always present, nullable uuid): wires
+  the dashboard/mobile "acknowledge" button directly from a queue card,
+  without a second round trip to find the right notification. Populated
+  ONLY when the card's case has an unacknowledged emergency notification —
+  `notifications.type = 'emergency_call' AND acknowledged_at IS NULL` —
+  scoped to the SAME landlord as the card itself (belt-and-braces,
+  explicit `landlord_id` predicate, matching this endpoint's existing
+  `tenant_message`/`classified`-payload LATERALs). `null` for every other
+  case: no emergency call was ever triggered for this case, one was but it
+  has already been acknowledged (via the dashboard, the SMS ack link, or
+  press-1 on the call itself), or the card's own severity isn't
+  emergency-related at all.
+  - **Correlation.** `notifications.case_id` is `NULL` at the moment the
+    webhook creates an `emergency_call` row (no case exists yet
+    pre-routing — `app/routers/webhooks/twilio.py`'s own note), but
+    `app/agent/nodes/identify_case.py` backfills it directly
+    (`UPDATE notifications SET case_id = …  WHERE payload ->> 'message_id'
+    = … AND case_id IS NULL`) the moment a case is assigned to that same
+    message — an ordinary, non-append-only column (schema-v1.md), unlike
+    `messages.case_id`/`audit_log.case_id`, which stay `NULL` forever for
+    their own pre-case rows. The read below matches on
+    `notifications.case_id` directly OR's in the same `message_cases`
+    correlation this doc's Cases section (v1.11, B1) already established
+    for the `audit_log` `emergency_triggered` row that shares the same
+    `payload ->> 'message_id'` — belt-and-braces for the narrow window
+    before that backfill runs, and honest regardless of whether it ever
+    does. In production, by the time a case has a queue card at all
+    (`awaiting_approval`), `identify_case` has already run for it, so the
+    direct `case_id` match is what actually resolves this in practice; the
+    `message_cases` fallback is defense-in-depth, not the primary path.
+  - **Latest wins.** A case can only ever have one notification of type
+    `emergency_call` in production (`uq_notifications_message_dedupe`,
+    schema-v1.md v1.3, keyed on `(payload ->> 'message_id', type)` — a
+    given inbound message triggers at most one), but a case CAN carry more
+    than one distinct Tier-0-triggering message across its lifetime (a
+    reopened case, or a second emergency report before the first is
+    acknowledged) — genuinely ambiguous if more than one is unacknowledged
+    at once. The most recently created unacknowledged row wins
+    (`ORDER BY created_at DESC LIMIT 1`) — the newest emergency is the one
+    most worth surfacing an ack button for.
+  - **Compatibility:** additive, nullable field — existing clients that
+    don't read it are unaffected; no version break.
+
+**Also pinning `GET /v1/notifications` here (v1.15, same implementation):**
+this doc has, since its original 2026-06-11 design, listed
+`GET /v1/notifications?type=emergency_call&status=pending` as the intended
+read for the dashboard's emergency banner (see the "Notifications /
+emergencies" section below) — but **no such endpoint exists in
+`app/routers/notifications.py` (or anywhere else in this codebase) as of
+this implementation.** That router implements exactly three routes —
+`POST /v1/notifications/{id}/ack`, `GET /ack/{token}`, `POST /ack/{token}`
+— and no list/query endpoint. A request to `GET /v1/notifications` 404s
+today (no matching route), not with any notification-shaped body. Flagged
+here rather than inventing a response shape for code that doesn't exist:
+either a future issue implements this endpoint doc-first (a real request/
+response shape added here first), or the "Notifications / emergencies"
+section's mention of it is corrected to point at this queue card's new
+`notification_id` (above) plus `POST /v1/notifications/{id}/ack` as the
+actual, currently-shipped path for the mobile emergency banner's
+acknowledge action.
+
 ## Cases
 
 `GET /v1/cases?status=&severity=&property_id=` → `{ items: [CaseSummary], next_cursor }`
@@ -311,7 +376,10 @@ all case lists read this shape):
 oldest-first):
 ```json
 { "id": "…", "status": "awaiting_approval", "severity": "urgent",
-  "title": "No heat — Unit 2", "property": {...}, "tenant": {...},
+  "title": "No heat — Unit 2",
+  "property": { "id": "…", "label": "41 Palmerston", "address_line1": "…", "city": "Toronto" },
+  "tenant": { "id": "…", "name": "Maria", "phone": "+1416…", "unit": "2",
+              "vulnerable_occupant": "infant" },
   "vendor": null, "opened_at": "…", "resolved_at": null,
   "timeline": [
     { "kind": "message", "direction": "inbound", "party": "tenant",
@@ -321,6 +389,8 @@ oldest-first):
     { "kind": "draft", "id": "…", "status": "pending", "body": "…", "at": "…" }
   ] }
 ```
+`vendor` (when the case has one) is
+`{ "id": "…", "name": "…", "trade": "…", "phone": "+1…" }`.
 404 with code `case_not_found` for a missing or cross-tenant id (same
 non-disclosure convention as `property_not_found`).
 
@@ -432,6 +502,32 @@ with zero caller until this issue):**
   `cases` at all). Resolving a case never acknowledges, cancels, or delays
   an emergency call/SMS in flight.
 
+**v1.16 amendment (2026-07-18 — #213 implementation, doc-first — pinning
+reality, no code change):** `property`/`tenant`/`vendor` above had been
+documented as bare `{...}` placeholders since this doc's original design —
+the mobile client typed best-effort partials against nothing. Pinned to
+what `app/routers/cases.py` (`PropertyRef`/`TenantRef`/`VendorRef`) has
+always actually returned:
+
+- **`property`**: `{ "id", "label", "address_line1", "city" }` — a
+  reference, not the full `Property` shape (Properties section above) —
+  deliberately narrower; `twilio_number`/`house_rules`/`quiet_hours`/
+  `heating_season`/`backup_contact`/`open_case_count` are NOT included
+  here (this endpoint has never returned them; not a new restriction).
+- **`tenant`**: `{ "id", "name", "phone", "unit", "vulnerable_occupant" }`
+  — `phone` is the tenant's real number, present here because this is the
+  landlord's OWN authenticated read of their OWN tenant's contact info (no
+  different from the tenant list endpoints, which return the same field) —
+  distinct from CLAUDE.md rule 5's app-log/error-message/Sentry
+  restriction, which this endpoint does not touch. `notes` (a write-only
+  field on `PATCH/POST /v1/tenants`) is NOT included — never has been.
+- **`vendor`**: `{ "id", "name", "trade", "phone" }` when the case has one,
+  else `null` — `notes`/`working_hours`/`active` are NOT included — never
+  have been.
+
+No field here was found to leak anything beyond what the endpoint has
+always returned; this amendment is a pure documentation catch-up.
+
 ## Drafts (the approve loop)
 
 `POST /v1/drafts/{id}/approve` → 200
@@ -456,10 +552,12 @@ with zero caller until this issue):**
   is `stale`/`rejected`/`cancelled` — distinct from `already_sent`: the
   draft never went out, "already gone out" would be a false statement for
   these three; there is simply nothing approved left to undo.
-`POST /v1/drafts/{id}/reject` — body `{ "note?": "…" }` → 200. 409
-`already_sent` if a concurrent approve already won (reject no longer
-applies); 409 `draft_stale` (+ `fresh_draft_id`) if genuinely superseded by
-a newer tenant message.
+`POST /v1/drafts/{id}/reject` — body `{ "note?": "…" }` → 200
+`{ "status": "rejected" }` (pinned 2026-07-18, v1.17 amendment below — the
+200 body previously had no documented shape). 409 `already_sent` if a
+concurrent approve already won (reject no longer applies); 409
+`draft_stale` (+ `fresh_draft_id`) if genuinely superseded by a newer
+tenant message.
 `POST /v1/drafts/{id}/edit-and-send` — body `{ "body": "…" }` (rejected if
 empty or whitespace-only) → same response as approve. Records
 `edited: true` for trust metrics.
@@ -528,12 +626,32 @@ behavior; this is the minimal shape this implementation follows):**
   triggers the founder-gated paid eval run; it rides with the #66-70
   batch, not this implementation.
 
+**v1.17 amendment (2026-07-18 — #213 implementation, doc-first — pinning
+reality, no code change):** `POST /v1/drafts/{id}/reject`'s 200 body had
+never been documented beyond "→ 200" (the mobile client typed it as an
+empty object). Pinned to what `app/routers/drafts.py`'s `RejectResponse`
+has always actually returned: `{ "status": "rejected" }` — no other keys.
+Same shape on every reachable path to a 200: a fresh reject, a repeat call
+on an already-`rejected` draft (idempotent), and the reconciled-conflict
+branch that lands on `rejected` after a resume-seam race.
+
 ## Notifications / emergencies
 
 `POST /v1/notifications/{id}/ack` → 200 `{ "acknowledged_at": "…" }` —
 landlord-authenticated (the dashboard "open the case" ack surface).
 `GET /v1/notifications?type=emergency_call&status=pending` for the
-dashboard's emergency banner.
+dashboard's emergency banner — **NOT IMPLEMENTED as of v1.15 (2026-07-18,
+#213): reality-check, no code change.** `app/routers/notifications.py`
+implements exactly `POST /v1/notifications/{id}/ack`, `GET /ack/{token}`,
+`POST /ack/{token}` — no list/query route exists anywhere in this
+codebase, so this line has been aspirational since the doc's original
+design and a request here 404s (no matching route), not with any
+notification-shaped body. The Queue section's own v1.15 amendment
+(`notification_id`) plus the ack endpoint above are the actual, currently
+-shipped path for the mobile/dashboard emergency banner's acknowledge
+action; either a future issue implements this endpoint doc-first (real
+shape added here first) or this line should be dropped. See that
+amendment for the full writeup.
 
 **v1.1 amendment (2026-07-12 — safety review finding 1, CRITICAL):** the
 tokenized SMS-link ack surface is now a **GET/POST pair**, not a single

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -86,7 +87,18 @@ async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
         ),
         params,
     )
-    for table in ("audit_log", "drafts", "messages", "cases", "tenants", "vendors", "properties"):
+    # notifications has FKs to both landlords (RESTRICT) and cases (no
+    # explicit ON DELETE -> NO ACTION) -- must go before "cases" below.
+    for table in (
+        "audit_log",
+        "drafts",
+        "notifications",
+        "messages",
+        "cases",
+        "tenants",
+        "vendors",
+        "properties",
+    ):
         await session.execute(text(f"DELETE FROM {table} WHERE landlord_id = :lid"), params)  # noqa: S608
     await session.execute(text("DELETE FROM landlords WHERE id = :lid"), params)
     await session.commit()
@@ -479,3 +491,234 @@ async def test_queue_scoped_by_landlord_cross_tenant_isolation(session: AsyncSes
     finally:
         await _cleanup(session, landlord_a_id)
         await _cleanup(session, landlord_b_id)
+
+
+# ---------------------------------------------------------------------------
+# notification_id (#213 -- wiring the emergency ack path for clients)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_queue_notification_id_null_when_no_notification_exists(
+    session: AsyncSession,
+) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        await _seed_awaiting_case(
+            session,
+            landlord_id=landlord_id,
+            classified_payload={"severity": "emergency", "rules_fired": [], "refusal_flags": []},
+        )
+
+        result = await get_queue((landlord, session))
+
+        assert len(result.items) == 1
+        assert result.items[0].notification_id is None
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_queue_notification_id_present_via_direct_case_id_backfill(
+    session: AsyncSession,
+) -> None:
+    """The steady-state production path: ``app/agent/nodes/identify_case.py``
+    has already backfilled ``notifications.case_id`` directly by the time a
+    case reaches ``awaiting_approval`` (a queue card always implies
+    ``identify_case`` already ran for it) -- no ``message_cases`` join
+    needed for this one."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        _p, _t, case_id = await _seed_awaiting_case(
+            session,
+            landlord_id=landlord_id,
+            classified_payload={"severity": "emergency", "rules_fired": [], "refusal_flags": []},
+        )
+        notification_id = await factories.insert_notification(
+            session, landlord_id=landlord_id, case_id=case_id, type_="emergency_call"
+        )
+
+        result = await get_queue((landlord, session))
+
+        assert len(result.items) == 1
+        assert str(result.items[0].notification_id) == notification_id
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_queue_notification_id_present_via_message_cases_correlation(
+    session: AsyncSession,
+) -> None:
+    """The narrow pre-backfill window: ``notifications.case_id`` is still
+    ``NULL`` (matching how the webhook actually inserts an ``emergency_call``
+    row, pre-routing) -- correlates via ``message_cases`` on the shared
+    ``payload ->> 'message_id'``, the same pattern ``app/routers/cases.py``'s
+    ``_SELECT_AUDIT_SQL`` uses for the sibling ``emergency_triggered`` audit
+    row."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        property_id = await factories.insert_property(session, landlord_id)
+        tenant_id = await factories.insert_tenant(session, landlord_id, property_id)
+        case_id = await factories.insert_case(
+            session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+        )
+        message_id = await factories.insert_message(
+            session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="there's smoke coming from the wall",
+        )
+        await factories.insert_message_case(session, message_id=message_id, case_id=case_id)
+        await factories.insert_audit_log(
+            session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            actor="agent",
+            action="classified",
+            payload={"severity": "emergency", "rules_fired": [], "refusal_flags": []},
+        )
+        await factories.insert_draft(session, landlord_id=landlord_id, case_id=case_id)
+        notification_id = await factories.insert_notification(
+            session,
+            landlord_id=landlord_id,
+            case_id=None,  # pre-backfill: notifications.case_id is NULL in production
+            type_="emergency_call",
+            payload={"message_id": message_id},
+        )
+
+        result = await get_queue((landlord, session))
+
+        assert len(result.items) == 1
+        assert str(result.items[0].notification_id) == notification_id
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_queue_notification_id_null_once_acknowledged(session: AsyncSession) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        _p, _t, case_id = await _seed_awaiting_case(
+            session,
+            landlord_id=landlord_id,
+            classified_payload={"severity": "emergency", "rules_fired": [], "refusal_flags": []},
+        )
+        await factories.insert_notification(
+            session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            type_="emergency_call",
+            acknowledged_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        result = await get_queue((landlord, session))
+
+        assert len(result.items) == 1
+        assert result.items[0].notification_id is None
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_queue_notification_id_null_for_non_emergency_call_type(
+    session: AsyncSession,
+) -> None:
+    """An unacknowledged ``needs_eyes`` notification on the same case must
+    never leak into ``notification_id`` -- only ``type = 'emergency_call'``
+    correlates."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        _p, _t, case_id = await _seed_awaiting_case(
+            session,
+            landlord_id=landlord_id,
+            classified_payload={"severity": "routine", "rules_fired": [], "refusal_flags": []},
+        )
+        await factories.insert_notification(
+            session, landlord_id=landlord_id, case_id=case_id, type_="needs_eyes", channel="push"
+        )
+
+        result = await get_queue((landlord, session))
+
+        assert len(result.items) == 1
+        assert result.items[0].notification_id is None
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_queue_notification_id_latest_wins_when_multiple_unacked(
+    session: AsyncSession,
+) -> None:
+    """Genuinely ambiguous case (a reopened case, or a second emergency
+    report before the first is acknowledged): more than one unacknowledged
+    ``emergency_call`` notification on the same case. The most recently
+    created one wins."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        _p, _t, case_id = await _seed_awaiting_case(
+            session,
+            landlord_id=landlord_id,
+            classified_payload={"severity": "emergency", "rules_fired": [], "refusal_flags": []},
+        )
+        await factories.insert_notification(
+            session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            type_="emergency_call",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        newest_notification_id = await factories.insert_notification(
+            session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            type_="emergency_call",
+            created_at=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+
+        result = await get_queue((landlord, session))
+
+        assert len(result.items) == 1
+        assert str(result.items[0].notification_id) == newest_notification_id
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_queue_notification_id_cross_tenant_isolation(session: AsyncSession) -> None:
+    """Landlord B's notification must never correlate to landlord A's queue
+    card, even when it carries landlord A's own real ``case_id`` (simulating
+    a hypothetical cross-linkage bug) -- the explicit
+    ``n.landlord_id = :landlord_id`` predicate is what protects this, not
+    the case-id correlation alone."""
+    landlord_a_id = await factories.insert_landlord(session)
+    landlord_b_id = await factories.insert_landlord(session)
+    landlord_a = Landlord(id=uuid.UUID(landlord_a_id))
+    try:
+        _p, _t, case_a = await _seed_awaiting_case(
+            session,
+            landlord_id=landlord_a_id,
+            classified_payload={"severity": "emergency", "rules_fired": [], "refusal_flags": []},
+        )
+        await factories.insert_notification(
+            session, landlord_id=landlord_b_id, case_id=case_a, type_="emergency_call"
+        )
+
+        result = await get_queue((landlord_a, session))
+
+        assert len(result.items) == 1
+        assert result.items[0].notification_id is None
+    finally:
+        # landlord_b's notification references landlord_a's case (case_a) --
+        # must be cleaned up BEFORE landlord_a's own cleanup deletes that
+        # case, or the FK (notifications.case_id, no ON DELETE action)
+        # blocks it.
+        await _cleanup(session, landlord_b_id)
+        await _cleanup(session, landlord_a_id)
