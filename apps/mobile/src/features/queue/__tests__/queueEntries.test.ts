@@ -8,6 +8,7 @@ import type { QueueItem } from "@/api/types";
 import {
   buildQueueView,
   draftStaleNotice,
+  pruneSkippedSnapshots,
   queueEntriesReducer,
   secondsRemaining,
   totalUndoSeconds,
@@ -112,6 +113,36 @@ describe("buildQueueView — skip keeps the card visible and muted", () => {
     const entries = queueEntriesReducer({}, { type: "skipped", draftId: "draft-1" });
     const rows = buildQueueView([], entries, {});
     expect(rows).toEqual([]);
+  });
+});
+
+describe("pruneSkippedSnapshots — M1 senior advisory (snapshots die with their skip)", () => {
+  it("drops a snapshot whose entry was cleared (e.g. the reject call failed)", () => {
+    const item = makeItem();
+    const skipped = queueEntriesReducer({}, { type: "skipped", draftId: item.draft_id });
+    const cleared = queueEntriesReducer(skipped, { type: "cleared", draftId: item.draft_id });
+
+    const pruned = pruneSkippedSnapshots({ [item.draft_id]: item }, cleared);
+
+    expect(pruned).toEqual({});
+  });
+
+  it("keeps the snapshot while the skip is still live", () => {
+    const item = makeItem();
+    const entries = queueEntriesReducer({}, { type: "skipped", draftId: item.draft_id });
+
+    const pruned = pruneSkippedSnapshots({ [item.draft_id]: item }, entries);
+
+    expect(pruned).toEqual({ [item.draft_id]: item });
+  });
+
+  it("returns the SAME object when nothing needs pruning — a setState caller must not re-render", () => {
+    const item = makeItem();
+    const entries = queueEntriesReducer({}, { type: "skipped", draftId: item.draft_id });
+    const snapshots = { [item.draft_id]: item };
+
+    expect(pruneSkippedSnapshots(snapshots, entries)).toBe(snapshots);
+    expect(pruneSkippedSnapshots({}, {})).toEqual({});
   });
 });
 

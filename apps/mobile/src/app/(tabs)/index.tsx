@@ -28,6 +28,7 @@ import type { QueueItem } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
 import {
   buildQueueView,
+  pruneSkippedSnapshots,
   secondsRemaining,
   totalUndoSeconds,
   type QueueViewRow,
@@ -100,7 +101,17 @@ export default function HomeScreen() {
   const waitingOnTenants = queueQuery.data?.counts.awaiting_tenant ?? 0;
 
   function handleSkip(item: QueueItem) {
-    setSkippedSnapshots((prev) => ({ ...prev, [item.draft_id]: item }));
+    // M1 senior advisory: snapshots whose skip has since cleared (e.g. the
+    // reject call failed and the error handler reset the card) are pruned
+    // at this write site — a snapshot with no live "skipped" entry is
+    // never rendered (buildQueueView ignores it), so cleaning on the next
+    // skip keeps the map bounded without an extra effect/render pass. The
+    // just-skipped item is added AFTER the prune (its entry only becomes
+    // "skipped" in the dispatch below).
+    setSkippedSnapshots((prev) => ({
+      ...pruneSkippedSnapshots(prev, entries),
+      [item.draft_id]: item,
+    }));
     draftActions.skip({
       draftId: item.draft_id,
       caseId: item.case_id,

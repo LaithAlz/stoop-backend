@@ -45,7 +45,7 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   const [editingContext, setEditingContext] = useState<(DraftContext & { body: string }) | null>(
     null,
   );
-  const [, forceTick] = useReducer((count: number) => count + 1, 0);
+  const [tick, forceTick] = useReducer((count: number) => count + 1, 0);
 
   const showStaleNotice = useCallback((caseId: string, tenantName: string) => {
     setStaleNotices((prev) => ({ ...prev, [caseId]: draftStaleNotice(firstName(tenantName)) }));
@@ -97,7 +97,21 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   const undoMutation = useMutation({
     mutationFn: (ctx: DraftContext) => undoDraftApprove(ctx.draftId),
     onSuccess: (_data, ctx) => dispatch({ type: "undone", draftId: ctx.draftId }),
-    onError: handleError,
+    onError: (error, ctx) => {
+      // M1 senior advisory: a 409 `already_sent` on undo means the reply
+      // genuinely went out — the honest card state is "sent", not a flash
+      // of the idle decision card (which would invite a second approve tap
+      // on a reply that already left) while the refetch catches up.
+      // `expired` only fires from "sending", which is the only state Undo
+      // is ever offered from.
+      if (error instanceof ApiError && error.code === "already_sent") {
+        dispatch({ type: "expired", draftId: ctx.draftId });
+        onNotice(toHouseApiError(error));
+        onSettled();
+        return;
+      }
+      handleError(error, ctx);
+    },
   });
 
   const skipMutation = useMutation({
@@ -131,13 +145,18 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
     return () => clearInterval(timer);
   }, [entries]);
 
+  // M1 senior advisory: this effect was missing its deps array (it ran on
+  // every render of the host screen, not just on countdown ticks). `tick`
+  // is a real dependency — the reducer above increments it once a second
+  // while anything is "sending", and wall-clock time (what
+  // `secondsRemaining` reads) only moves the outcome between ticks.
   useEffect(() => {
     for (const [draftId, entry] of Object.entries(entries)) {
       if (entry.status === "sending" && secondsRemaining(entry.undoUntil) <= 0) {
         dispatch({ type: "expired", draftId });
       }
     }
-  });
+  }, [entries, tick]);
 
   return {
     entries,

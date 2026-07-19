@@ -100,10 +100,26 @@ export interface LandlordMe {
   created_at: string;
 }
 
+/**
+ * PATCH /v1/me body — exactly the four documented fields ("Me" section +
+ * its v1.9 amendment: "any of `full_name`, `phone`, `timezone`,
+ * `voice_profile`"). Notification prefs / quiet-hours overrides are NOT
+ * here on purpose: the amendment explicitly records them as unimplemented
+ * pending a schema-doc-first decision, and "emergency notifications are
+ * not a settable preference" by construction. Note `phone` is settable but
+ * never returned by GET (the backend's MeResponse excludes it as
+ * internal-only) — a write-only field; flagged in the M2 report.
+ * Response: the full updated `LandlordMe` (mirrors GET).
+ */
+export interface UpdateMeInput {
+  full_name?: string;
+  phone?: string;
+  timezone?: string;
+  voice_profile?: VoiceProfile;
+}
+
 // ---------------------------------------------------------------------------
-// Properties ("Properties" section) — only referenced here because
-// `GET /v1/cases/{id}` embeds a `property` object (see the CaseDetail note
-// below); M1 does not otherwise fetch this endpoint (M2 scope).
+// Properties ("Properties" section + the v1.12 provisioning amendment)
 // ---------------------------------------------------------------------------
 
 export interface QuietHours {
@@ -121,14 +137,16 @@ export interface BackupContact {
   phone: string;
 }
 
-/** The full `Property` shape from the "Properties" section. */
+/** The full `Property` shape from the "Properties" section. `postal_code`
+ *  is nullable — it's optional on create (`postal_code?`) and the backend's
+ *  own `PropertyResponse` types it `str | None`. */
 export interface Property {
   id: string;
   label: string;
   address_line1: string;
   city: string;
   province: string;
-  postal_code: string;
+  postal_code: string | null;
   twilio_number: string | null;
   house_rules: string | null;
   quiet_hours: QuietHours | null;
@@ -136,6 +154,123 @@ export interface Property {
   backup_contact: BackupContact | null;
   open_case_count: number;
   created_at: string;
+}
+
+/** GET /v1/properties response — standard cursor pagination ("Conventions"
+ *  section; a malformed cursor 400s with `invalid_cursor`, v1.9). */
+export interface PropertiesResponse {
+  items: Property[];
+  next_cursor: string | null;
+}
+
+/**
+ * POST /v1/properties body — the documented create fields plus the v1.12
+ * amendment's optional `area_code` (a 3-digit NANP string; a transient
+ * provisioning hint, never persisted). Provisioning failure codes this call
+ * can 4xx/5xx with: 409 `property_limit_reached`, 409 `duplicate_property`,
+ * 503 `no_numbers_available`, 502 `provisioning_failed` — all mapped to
+ * house lines in src/api/errors.ts.
+ */
+export interface CreatePropertyInput {
+  label: string;
+  address_line1: string;
+  city: string;
+  province?: string;
+  postal_code?: string;
+  house_rules?: string;
+  backup_contact?: BackupContact;
+  area_code?: string;
+}
+
+/** PATCH /v1/properties/{id} body — "same fields + `quiet_hours`,
+ *  `heating_season`" per the Properties section. */
+export interface UpdatePropertyInput {
+  label?: string;
+  address_line1?: string;
+  city?: string;
+  province?: string;
+  postal_code?: string;
+  house_rules?: string;
+  backup_contact?: BackupContact;
+  quiet_hours?: QuietHours;
+  heating_season?: HeatingSeason;
+}
+
+// ---------------------------------------------------------------------------
+// Tenants ("Tenants & Vendors" section) — sub-resource routes:
+// GET/POST /v1/properties/{id}/tenants · PATCH/DELETE /v1/tenants/{id}.
+// The doc pins the request body ("name?, phone, unit?,
+// vulnerable_occupant?, notes?"); the GET/response row shape below is the
+// backend's own TenantResponse (schema-v1.md's `tenants` table verbatim:
+// + id, property_id, active, created_at). DELETE is a SOFT delete
+// (active=false, returns the updated row) per the v1.9 amendment.
+// ---------------------------------------------------------------------------
+
+/** schema-v1.md `tenants.vulnerable_occupant` CHECK; null = no one. */
+export type VulnerableOccupant = "infant" | "elderly" | "medical_device";
+
+export interface Tenant {
+  id: string;
+  property_id: string;
+  name: string | null;
+  phone: string;
+  unit: string | null;
+  vulnerable_occupant: VulnerableOccupant | null;
+  notes: string | null;
+  active: boolean;
+  created_at: string;
+}
+
+/** GET /v1/properties/{id}/tenants — unpaginated per the v1.9 amendment
+ *  ("per-property tenant counts are small"); `next_cursor` is always null
+ *  but the envelope keeps the standard list shape. */
+export interface TenantsResponse {
+  items: Tenant[];
+  next_cursor: string | null;
+}
+
+/** POST /v1/properties/{id}/tenants body. 409 `duplicate_phone` on a
+ *  `(property_id, phone)` collision (v1.10 amendment). */
+export interface CreateTenantInput {
+  phone: string;
+  name?: string;
+  unit?: string;
+  vulnerable_occupant?: VulnerableOccupant;
+  notes?: string;
+}
+
+/** PATCH /v1/tenants/{id} body — same optional fields. */
+export interface UpdateTenantInput {
+  phone?: string;
+  name?: string;
+  unit?: string;
+  vulnerable_occupant?: VulnerableOccupant | null;
+  notes?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Trust ("Drafts" section, v1.13 amendment) — WRITE-side only. There is no
+// read contract for trust state anywhere in api-contracts.md (the
+// `Property` shape carries no trust fields and no GET endpoint surfaces
+// `trust_metrics`), so the app can only offer the revoke ACTION, never
+// display unlock/streak state — flagged as a contract gap in the M2 report,
+// not invented here.
+// ---------------------------------------------------------------------------
+
+export type RevokeTrustScope = "property" | "global";
+
+/** POST /v1/properties/{id}/trust/revoke body (both fields optional
+ *  server-side; this client always sends `scope` explicitly). */
+export interface RevokeTrustInput {
+  scope: RevokeTrustScope;
+  reason?: string;
+}
+
+/** 200 response — idempotent; `revoked_count: 0` when nothing was
+ *  unlocked (still records the landlord's `trust_revoked` audit row). */
+export interface RevokeTrustResponse {
+  scope: RevokeTrustScope;
+  revoked_count: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +435,19 @@ export interface CaseDetail {
   opened_at: string;
   resolved_at: string | null;
   timeline: TimelineEntry[];
+}
+
+/**
+ * POST /v1/cases/{id}/resolve → 200 (v1.14 amendment). Idempotent: a
+ * repeat call on an already-resolved case returns the SAME shape with the
+ * stored `resolved_at` — never a 409. Resolving cancels every unsent
+ * pending/approved draft on the case in the same transaction (one
+ * `send_cancelled` audit row each); a draft already mid-send completes
+ * normally.
+ */
+export interface ResolveCaseResponse {
+  status: "resolved";
+  resolved_at: string;
 }
 
 // ---------------------------------------------------------------------------

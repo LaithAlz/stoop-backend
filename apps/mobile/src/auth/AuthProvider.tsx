@@ -15,6 +15,7 @@ import { createContext, useContext, useEffect, useMemo, useState, type ReactNode
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase";
 import { queryClient } from "@/api/queryClient";
+import { resetOnboardingOffer } from "@/features/onboarding/gate";
 
 interface AuthContextValue {
   session: Session | null;
@@ -67,6 +68,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // stale-while-revalidate before the refetch lands.
       if (event === "SIGNED_OUT") {
         queryClient.clear();
+        // The onboarding gate's once-per-session flag is per-LANDLORD in
+        // spirit — a different account signing in on this device gets its
+        // own zero-properties gate decision (M2).
+        resetOnboardingOffer();
       }
       setSession(nextSession);
       setInitializing(false);

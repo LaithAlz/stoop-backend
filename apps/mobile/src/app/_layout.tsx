@@ -53,6 +53,11 @@ function RootNavigator() {
     <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.bg } }}>
       <Stack.Protected guard={route === "tabs"}>
         <Stack.Screen name="(tabs)" />
+        {/* The M2 onboarding wizard — pushed OVER the tab shell by the
+            zero-properties gate (src/features/onboarding/gate.ts) or the
+            Properties empty state; signed-in only, never blocks the tabs
+            (back/Exit always returns to them). */}
+        <Stack.Screen name="onboarding" />
       </Stack.Protected>
       <Stack.Protected guard={route === "sign-in"}>
         <Stack.Screen name="sign-in" />
