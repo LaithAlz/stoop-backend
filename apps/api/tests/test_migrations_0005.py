@@ -76,7 +76,8 @@ _MIGRATION_PATH = (
 
 _APP_DIR = Path(__file__).resolve().parent.parent / "app"
 
-# Every table in schema-v1.md except alembic_version.
+# The 13 tables migration 0005 ITSELF put a policy on (every schema-v1.md
+# table that existed at the time it ran, except alembic_version).
 _ALL_RLS_TABLES: list[str] = [
     "landlords",
     "properties",
@@ -92,6 +93,15 @@ _ALL_RLS_TABLES: list[str] = [
     "push_tokens",
     "message_status_events",
 ]
+
+# Tables added by a LATER migration that also carry their own RLS policy —
+# migration 0012 (#210 M3) is the first migration since 0005 to add a
+# genuinely new table (push_outbox), following 0005's exact pattern (see
+# that migration's own module docstring). Tracked separately here, rather
+# than folded into _ALL_RLS_TABLES above, so these "state at head"
+# assertions stay accurate without conflating what migration 0005 itself
+# created with what a later migration independently added.
+_LATER_MIGRATION_RLS_TABLES: list[str] = ["push_outbox"]
 
 # Ordinary tables: full CRUD for app_role.
 _ORDINARY_TABLES: list[str] = [
@@ -237,8 +247,9 @@ async def test_exactly_one_policy_per_table(db: AsyncEngine) -> None:
     for table, policy in rows:
         by_table.setdefault(table, []).append(policy)
 
-    assert set(by_table) == set(_ALL_RLS_TABLES), (
-        f"policy coverage mismatch: {set(by_table)} != {set(_ALL_RLS_TABLES)}"
+    expected_tables = set(_ALL_RLS_TABLES) | set(_LATER_MIGRATION_RLS_TABLES)
+    assert set(by_table) == expected_tables, (
+        f"policy coverage mismatch: {set(by_table)} != {expected_tables}"
     )
     for table, policies in by_table.items():
         assert policies == [f"{table}_isolation"], (
@@ -565,6 +576,12 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # receiving an already-open session, same "session-only helper"
         # convention as app/audit.py (also absent from this list).
         "app/agent/nodes/auto_send.py",
+        # #210 M3: the push-outbox sweep (run_push_outbox_sweep, scheduled
+        # by app/scheduler.py) — same pre-identity background/scheduler
+        # context as sweep_pending_number_releases/run_emergency_chain_
+        # sweep above; there is no HTTP request/landlord JWT for a
+        # scheduled tick to resolve a GUC from.
+        "app/push_outbox.py",
     }
 )
 
@@ -662,8 +679,10 @@ async def test_reupgrade_restores_0005_state(db: AsyncEngine) -> None:
         assert row is not None
         assert row[1] is False
 
+        expected_table_count = len(_ALL_RLS_TABLES) + len(_LATER_MIGRATION_RLS_TABLES)
+
         policy_result = await connection.execute(text("SELECT count(*) FROM pg_policy"))
-        assert policy_result.scalar_one() == len(_ALL_RLS_TABLES)
+        assert policy_result.scalar_one() == expected_table_count
 
         rls_result = await connection.execute(
             text(
@@ -672,4 +691,4 @@ async def test_reupgrade_restores_0005_state(db: AsyncEngine) -> None:
                 "AND relrowsecurity AND NOT relforcerowsecurity"
             )
         )
-        assert rls_result.scalar_one() == len(_ALL_RLS_TABLES)
+        assert rls_result.scalar_one() == expected_table_count

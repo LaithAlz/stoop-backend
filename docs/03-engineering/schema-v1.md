@@ -532,6 +532,132 @@
 >    `feat/audit-completeness` branch (merged as PR #207) makes no schema
 >    changes, so v1.12 is uncontested.
 
+> **v1.13 amendment (2026-07-18)** — migration 0012 implements this (#210
+> M3, push-notifications backend surface). Push is for approvals/status
+> only — **push never carries the emergency path** (rule #1: voice + SMS
+> remain the only emergency channels; nothing here touches, delays, or
+> conditions the escalation chain in `notifications`/`emergency_chain.py`).
+> No feature-flag reads anywhere near this (rule #7).
+> 1. **Reused `push_tokens` — did NOT invent a `device_tokens` table.**
+>    This table has existed since v1.0/migration 0002 (RLS'd since
+>    migration 0005) but had no real writer until now. Per CLAUDE.md rule 6
+>    ("schema names come from schema-v1.md ... never invent a variant"),
+>    the M3 spec's working name (`device_tokens`/`expo_push_token`) is
+>    superseded by this existing table/column — `push_tokens.token` is
+>    exactly an Expo push token string (`ExponentPushToken[...]`) once a
+>    real writer exists; no rename needed. `platform`'s existing CHECK
+>    (`'ios','android','web'`) is left UNCHANGED (unnarrowed) — the mobile
+>    registration endpoint's own request model only ever sends
+>    `'ios'`/`'android'` (Expo has no `'web'` push-token concept), but
+>    narrowing the stored CHECK for a value nothing has ever written was
+>    judged not worth the churn against `tests/test_rls_isolation_matrix.py`
+>    's existing `'web'`-literal seed data, with zero functional benefit.
+> 2. **New nullable column `push_tokens.revoked_at timestamptz`** — set
+>    ONLY by the push sweep (`app/push_outbox.py::run_push_outbox_sweep`)
+>    when Expo's per-receipt response reports `DeviceNotRegistered` (the
+>    token is permanently dead — reinstalls/uninstalls issue a fresh one).
+>    `NULL` = active (the overwhelmingly common case; every existing row
+>    stays `NULL`, no backfill). The enqueue seam (`push_outbox` INSERT,
+>    below) only ever selects `revoked_at IS NULL` rows. This is a SOFT
+>    marker, deliberately distinct from `DELETE /v1/devices/{id}`'s HARD
+>    delete (api-contracts.md's Devices section) — an explicit landlord
+>    sign-out unregister means "this row should not exist," while a
+>    sweep-observed dead token is a passive delivery fact worth keeping
+>    for observability, not an explicit user action.
+> 3. **Token ownership model**: `token` stays `UNIQUE NOT NULL` (unchanged)
+>    — `POST /v1/devices` upserts `ON CONFLICT (token) DO UPDATE SET
+>    landlord_id = EXCLUDED.landlord_id, platform = EXCLUDED.platform,
+>    last_seen_at = now(), revoked_at = NULL`. A token belongs to whoever
+>    registered it LAST — the shared-device/sign-out-sign-in flow (landlord
+>    B signs into a phone landlord A was previously using) safely moves the
+>    row to landlord B, and the `revoked_at = NULL` reset on every upsert
+>    means a token Expo once reported dead is trusted again the instant
+>    a real registration call proves it live once more.
+> 4. **New table `push_outbox`** — the durable delivery queue, one row per
+>    `(device, event)` fan-out. Follows the `notifications` table's
+>    sweep-column pattern EXACTLY (`status`/`attempt`/`next_attempt_at`/
+>    `payload`/`updated_at`) — same CAS-claim discipline
+>    (`app/agent/emergency_chain.py`'s `_CLAIM_STEP_SQL` /
+>    `app/property_provisioning.py`'s `_CLAIM_NUMBER_RELEASE_SQL`) governs
+>    its sweep:
+>    ```sql
+>    CREATE TABLE push_outbox (
+>      id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+>      landlord_id     uuid NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
+>      device_token_id uuid NOT NULL REFERENCES push_tokens(id) ON DELETE CASCADE,
+>      kind            text NOT NULL CHECK (kind IN ('draft_awaiting_approval')),
+>      payload         jsonb NOT NULL DEFAULT '{}',
+>      status          text NOT NULL DEFAULT 'pending'
+>                      CHECK (status IN ('pending','sent','failed','exhausted')),
+>      attempt         integer NOT NULL DEFAULT 0,
+>      next_attempt_at timestamptz,
+>      created_at      timestamptz NOT NULL DEFAULT now(),
+>      updated_at      timestamptz NOT NULL DEFAULT now()
+>    );
+>    CREATE INDEX idx_push_outbox_sweep    ON push_outbox (status, next_attempt_at);
+>    CREATE INDEX idx_push_outbox_landlord ON push_outbox (landlord_id);
+>    CREATE INDEX idx_push_outbox_device   ON push_outbox (device_token_id);
+>    ```
+>    `payload` carries uuids/counts ONLY — `case_id`/`draft_id` for the v1
+>    `'draft_awaiting_approval'` kind — NEVER tenant names/phones/message
+>    bodies (rule #5-adjacent: push payloads transit Apple/Google servers).
+>    The push notification body the app renders is a FIXED, generic string
+>    ("A reply is waiting for your approval") never derived from `payload`.
+>    Both FKs `ON DELETE CASCADE` (matches `push_tokens`' own
+>    landlord-cascade convention above) — this table is best-effort
+>    delivery bookkeeping, not an audit trail; losing rows when their
+>    landlord/device is gone is correct, not a gap.
+> 5. **The enqueue seam**: `app/agent/nodes/await_approval.py::
+>    mark_awaiting_approval` — the SAME admin-session transaction that
+>    flips `cases.status = 'awaiting_approval'` also runs one
+>    `INSERT ... SELECT` fanning out to every one of that case's
+>    landlord's active (`revoked_at IS NULL`) `push_tokens` rows, joined
+>    through the case's own just-inserted pending draft. Zero devices or
+>    zero pending draft (the rare `draft_response` race-exhausted path —
+>    see that node's own docstring) both naturally yield zero rows via the
+>    `JOIN`s themselves — no branching needed, and a hard DB error rolls
+>    back both statements together (same transaction, by design — see
+>    that module's docstring for why this is acceptable). A `NOT EXISTS`
+>    guard on the same statement additionally makes a crash-then-redelivered
+>    run of this node a no-op for any `(device, draft)` pair already
+>    enqueued (`app/agent/graph_entry.py`'s own documented "Crash-window
+>    coherence with #43's mark_awaiting_approval" — this node CAN genuinely
+>    re-run for the same message) — no new unique index needed since
+>    `app/agent/graph.py`'s per-case advisory lock already rules out a true
+>    concurrent race here, only a sequential redelivery one.
+> 6. **The sweep** (`app/push_outbox.py::run_push_outbox_sweep`, wired
+>    into `app/scheduler.py`'s tick LAST, after `number_release`) claims a
+>    bounded batch via CAS, calls Expo's push API once per claimed row
+>    (raw `httpx`, no Expo SDK dependency — mirrors
+>    `app/integrations/twilio_send.py`'s client pattern), and applies:
+>    `DeviceNotRegistered` → `push_tokens.revoked_at` set + this row
+>    → `'failed'` (TERMINAL for this cause, unlike the `tenant_ack`/
+>    `emergency_sms` convention where `'failed'` is transient — see
+>    `app/push_outbox.py`'s own docstring); any other error (HTTP failure,
+>    Expo-reported transient ticket error) → the house bounded-retry
+>    backoff (`app/property_provisioning.py::sweep_pending_number_
+>    releases`'s shape: fixed interval, bounded attempt count) → `'sent'`
+>    on eventual success or `'exhausted'` once the bound is reached.
+>    **Deliberate divergence from every other sweep in this codebase:
+>    exhaustion here pages NO Sentry alert** — push is best-effort by
+>    design (a landlord who never registered a device, or whose push
+>    fails, loses nothing; the queue/SMS surfaces are the source of
+>    truth), so a log line is the only signal, never a page.
+> 7. **RLS + grants** — migration 0012 is the first migration since 0005
+>    to add a genuinely new table, so it independently reproduces 0005's
+>    exact pattern for `push_outbox` (no prior migration 0006-0011 added a
+>    table to mirror — all six were column/index/CHECK-only amendments):
+>    `ENABLE ROW LEVEL SECURITY` (no `FORCE`, same rationale as every other
+>    table), one `FOR ALL TO app_role` policy keyed on direct `landlord_id`
+>    match, and `GRANT SELECT, INSERT, UPDATE, DELETE ... TO app_role`.
+>    The anon/authenticated Data API closure needs no new statement here —
+>    migration 0005's `ALTER DEFAULT PRIVILEGES` already covers every
+>    table the SAME migrating role creates in `public` in the future,
+>    which includes this one. **Flagged for the live-dry-run rule**: this
+>    migration is RLS/role-grant-adjacent, so per that rule it must be
+>    dry-run against a real (non-local) Supabase-shaped database before
+>    merge, same as migration 0005 itself was.
+
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
 CREATE TABLE landlords (
@@ -849,11 +975,40 @@ CREATE UNIQUE INDEX uq_notifications_number_release_dedupe
 CREATE TABLE push_tokens (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   landlord_id  uuid NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
-  token        text NOT NULL UNIQUE,
+  token        text NOT NULL UNIQUE,          -- an Expo push token once a real writer
+                                               --  exists (v1.13); ON CONFLICT (token) is
+                                               --  the "last registration wins" upsert key
   platform     text NOT NULL CHECK (platform IN ('ios','android','web')),
   last_seen_at timestamptz NOT NULL DEFAULT now(),
+  revoked_at   timestamptz,                   -- v1.13 (migration 0012): set by the push
+                                               --  sweep on Expo's DeviceNotRegistered;
+                                               --  NULL = active. DELETE /v1/devices/{id}
+                                               --  hard-deletes the row instead (see v1.13
+                                               --  amendments above).
   created_at   timestamptz NOT NULL DEFAULT now()
 );
+
+-- ───────────────────────── push_outbox ───────────────────────
+-- Durable delivery queue for landlord-facing push notifications (#210 M3)
+-- -- approvals/status only, NEVER the emergency path (rule #1). See the
+-- v1.13 amendments block above for the enqueue seam and sweep design.
+CREATE TABLE push_outbox (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id     uuid NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
+  device_token_id uuid NOT NULL REFERENCES push_tokens(id) ON DELETE CASCADE,
+  kind            text NOT NULL CHECK (kind IN ('draft_awaiting_approval')),
+  payload         jsonb NOT NULL DEFAULT '{}', -- uuids/counts ONLY -- never tenant
+                                                --  names/phones/message bodies
+  status          text NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','sent','failed','exhausted')),
+  attempt         integer NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  updated_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_push_outbox_sweep    ON push_outbox (status, next_attempt_at);
+CREATE INDEX idx_push_outbox_landlord ON push_outbox (landlord_id);
+CREATE INDEX idx_push_outbox_device   ON push_outbox (device_token_id);
 
 -- LangGraph checkpoint tables: created by AsyncPostgresSaver.setup() (#24),
 -- service-role connection, thread_id = cases.langgraph_thread_id. They live

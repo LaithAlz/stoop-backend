@@ -443,6 +443,72 @@ async def insert_trust_metrics(
     return trust_metrics_id
 
 
+async def insert_push_token(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    platform: str = "ios",
+    revoked_at: Any = None,
+) -> str:
+    """Seeds a ``push_tokens`` row (#210 M3) — a fresh, collision-free
+    token string every call (mirrors ``fresh_phone``'s "never a real
+    value" convention)."""
+    push_token_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO push_tokens (id, landlord_id, token, platform, revoked_at) "
+            "VALUES (:id, :landlord_id, :token, :platform, :revoked_at)"
+        ),
+        {
+            "id": push_token_id,
+            "landlord_id": landlord_id,
+            "token": f"ExponentPushToken[{uuid.uuid4()}]",
+            "platform": platform,
+            "revoked_at": revoked_at,
+        },
+    )
+    await session.commit()
+    return push_token_id
+
+
+async def insert_push_outbox(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    device_token_id: str,
+    kind: str = "draft_awaiting_approval",
+    payload: dict[str, Any] | None = None,
+    status: str = "pending",
+    attempt: int = 0,
+    next_attempt_at: Any = None,
+) -> str:
+    """Seeds a ``push_outbox`` row (#210 M3) directly — #210's own test
+    modules exercise the sweep against a KNOWN outbox state, not against
+    whatever ``mark_awaiting_approval``'s enqueue seam would naturally
+    produce."""
+    push_outbox_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO push_outbox "
+            "(id, landlord_id, device_token_id, kind, payload, status, attempt, next_attempt_at) "
+            "VALUES (:id, :landlord_id, :device_token_id, :kind, CAST(:payload AS jsonb), "
+            ":status, :attempt, :next_attempt_at)"
+        ),
+        {
+            "id": push_outbox_id,
+            "landlord_id": landlord_id,
+            "device_token_id": device_token_id,
+            "kind": kind,
+            "payload": json.dumps(payload or {}),
+            "status": status,
+            "attempt": attempt,
+            "next_attempt_at": next_attempt_at,
+        },
+    )
+    await session.commit()
+    return push_outbox_id
+
+
 __all__: list[str] = [
     "fresh_phone",
     "insert_audit_log",
@@ -453,6 +519,8 @@ __all__: list[str] = [
     "insert_message_case",
     "insert_notification",
     "insert_property",
+    "insert_push_outbox",
+    "insert_push_token",
     "insert_tenant",
     "insert_trust_metrics",
     "insert_vendor",

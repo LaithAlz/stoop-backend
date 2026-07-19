@@ -3,14 +3,16 @@
 ``tests/test_rls_isolation.py`` (#22) proves the RLS enforcement
 *mechanism* once per scoping SHAPE (direct ``landlord_id``, ``id``-keyed,
 and both ``EXISTS``-join tables). This file proves the same enforcement
-EXHAUSTIVELY, for every one of the 13 tables in
-``docs/03-engineering/schema-v1.md`` (all but ``alembic_version``), across
-the full operations matrix (SELECT / UPDATE / DELETE / INSERT), plus the
-structural gates a senior review would ask for on top of that:
+EXHAUSTIVELY, for every one of the 14 tables in
+``docs/03-engineering/schema-v1.md`` (all but ``alembic_version`` —
+``push_outbox`` added #210 M3, migration 0012, the first migration since
+0005 to add a genuinely new table), across the full operations matrix
+(SELECT / UPDATE / DELETE / INSERT), plus the structural gates a senior
+review would ask for on top of that:
 
 1. **The full per-table operations matrix** (this file's main body) —
    generated PROGRAMMATICALLY from ``TABLE_DESCRIPTORS`` below, not
-   hand-duplicated per table. Adding a 14th table to a future migration
+   hand-duplicated per table. Adding a 15th table to a future migration
    without adding a matching ``TableDescriptor`` here fails
    ``test_descriptor_table_set_matches_public_schema_catalog`` (reads the
    live catalog, not a hardcoded list) — "a failing policy is impossible
@@ -162,7 +164,7 @@ async def db(_migrate_once: None) -> AsyncGenerator[AsyncEngine, None]:
 
 
 # ---------------------------------------------------------------------------
-# Seed — one row per landlord (A, B) in every one of the 13 tables.
+# Seed — one row per landlord (A, B) in every one of the 14 tables.
 # ---------------------------------------------------------------------------
 
 
@@ -190,6 +192,8 @@ class _MatrixSeed:
     notification_b: str
     push_token_a: str
     push_token_b: str
+    push_outbox_a: str
+    push_outbox_b: str
     message_status_event_a: int
     message_status_event_b: int
     # message_cases has no id of its own; identified by its (unique, in this
@@ -377,9 +381,21 @@ async def _insert_push_token(conn: AsyncConnection, landlord_id: str) -> str:
     return push_token_id
 
 
+async def _insert_push_outbox(conn: AsyncConnection, landlord_id: str, device_token_id: str) -> str:
+    push_outbox_id = str(uuid.uuid4())
+    await conn.execute(
+        text(
+            "INSERT INTO push_outbox (id, landlord_id, device_token_id, kind) "
+            "VALUES (:id, :landlord_id, :device_token_id, 'draft_awaiting_approval')"
+        ),
+        {"id": push_outbox_id, "landlord_id": landlord_id, "device_token_id": device_token_id},
+    )
+    return push_outbox_id
+
+
 @pytest_asyncio.fixture
 async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
-    """Two landlords, each with one row in every one of the 13 tables,
+    """Two landlords, each with one row in every one of the 14 tables,
     committed (not rolled back) so later, separate role-switched
     transactions can see them — same pattern as ``test_rls_isolation.py``'s
     ``seed`` fixture, extended to cover every table."""
@@ -411,6 +427,8 @@ async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
         notification_b = await _insert_notification(connection, landlord_b)
         push_token_a = await _insert_push_token(connection, landlord_a)
         push_token_b = await _insert_push_token(connection, landlord_b)
+        push_outbox_a = await _insert_push_outbox(connection, landlord_a, push_token_a)
+        push_outbox_b = await _insert_push_outbox(connection, landlord_b, push_token_b)
         await trans.commit()
 
     seeded = _MatrixSeed(
@@ -436,6 +454,8 @@ async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
         notification_b=notification_b,
         push_token_a=push_token_a,
         push_token_b=push_token_b,
+        push_outbox_a=push_outbox_a,
+        push_outbox_b=push_outbox_b,
         message_status_event_a=event_a,
         message_status_event_b=event_b,
         message_cases_case_a=case_a,
@@ -486,6 +506,9 @@ async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
                     text("DELETE FROM tenants WHERE landlord_id = :id"), {"id": landlord_id}
                 )
                 await connection.execute(
+                    text("DELETE FROM push_outbox WHERE landlord_id = :id"), {"id": landlord_id}
+                )
+                await connection.execute(
                     text("DELETE FROM push_tokens WHERE landlord_id = :id"), {"id": landlord_id}
                 )
                 await connection.execute(
@@ -506,9 +529,9 @@ async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
 # ---------------------------------------------------------------------------
 # Table descriptors — the programmatic matrix generator.
 #
-# Every one of the 13 schema-v1.md tables (all but alembic_version) gets
+# Every one of the 14 schema-v1.md tables (all but alembic_version) gets
 # exactly one ``TableDescriptor``. ``TABLE_DESCRIPTORS`` is asserted equal
-# to the live public-schema catalog below — a 14th table added to a future
+# to the live public-schema catalog below — a 15th table added to a future
 # migration without a matching descriptor here fails that assertion, which
 # is exactly the enforcement issue #23 asks for.
 # ---------------------------------------------------------------------------
@@ -770,18 +793,38 @@ TABLE_DESCRIPTORS: list[TableDescriptor] = [
             "token": f"token-{uuid.uuid4()}",
         },
     ),
+    TableDescriptor(
+        name="push_outbox",
+        scoping="direct_landlord_id",
+        append_only=False,
+        id_column="id",
+        row_a_id=lambda s: s.push_outbox_a,
+        row_b_id=lambda s: s.push_outbox_b,
+        update_sql="UPDATE push_outbox SET attempt = attempt WHERE id = :row_id",
+        delete_sql="DELETE FROM push_outbox WHERE id = :row_id",
+        insert_mismatch_sql=(
+            "INSERT INTO push_outbox (landlord_id, device_token_id, kind) "
+            "VALUES (:landlord_id, :device_token_id, 'draft_awaiting_approval')"
+        ),
+        insert_mismatch_params=lambda s: {
+            "landlord_id": s.landlord_b,
+            "device_token_id": s.push_token_b,
+        },
+    ),
 ]
 
 _DESCRIPTOR_IDS = [d.name for d in TABLE_DESCRIPTORS]
 
 
 @pytest.mark.unit
-def test_table_descriptors_cover_exactly_thirteen_tables() -> None:
-    """Cheap, DB-free sanity pin: schema-v1.md lists 13 tables besides
-    ``alembic_version`` (see the doc's v1.2 amendments block and migration
-    0005's module docstring, both of which enumerate exactly these 13)."""
-    assert len(TABLE_DESCRIPTORS) == 13
-    assert len({d.name for d in TABLE_DESCRIPTORS}) == 13, "descriptor names must be unique"
+def test_table_descriptors_cover_exactly_fourteen_tables() -> None:
+    """Cheap, DB-free sanity pin: schema-v1.md lists 14 tables besides
+    ``alembic_version`` (the original 13 enumerated by the doc's v1.2
+    amendments block and migration 0005's module docstring, plus
+    ``push_outbox`` — added by the v1.13 amendments block / migration
+    0012, #210 M3)."""
+    assert len(TABLE_DESCRIPTORS) == 14
+    assert len({d.name for d in TABLE_DESCRIPTORS}) == 14, "descriptor names must be unique"
 
 
 # ---------------------------------------------------------------------------
@@ -805,7 +848,7 @@ async def _public_tables_except_alembic_version(db: AsyncEngine) -> set[str]:
 async def test_descriptor_table_set_matches_public_schema_catalog(db: AsyncEngine) -> None:
     """``TABLE_DESCRIPTORS`` must exactly match every real table in
     ``public`` (except ``alembic_version``) — read from the live catalog,
-    not a hardcoded list. A migration that adds a 14th table without a
+    not a hardcoded list. A migration that adds a 15th table without a
     matching descriptor here, or a descriptor for a table that no longer
     exists, fails this test."""
     catalog_tables = await _public_tables_except_alembic_version(db)
@@ -891,7 +934,7 @@ async def test_no_tables_outside_descriptor_set_exist_in_public_schema(db: Async
 
 # ---------------------------------------------------------------------------
 # 3. The operations matrix — SELECT / UPDATE / DELETE / INSERT, generated
-# from TABLE_DESCRIPTORS. 13 tables x 4 operations = 52 parametrized cases.
+# from TABLE_DESCRIPTORS. 14 tables x 4 operations = 56 parametrized cases.
 # ---------------------------------------------------------------------------
 
 

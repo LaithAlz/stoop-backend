@@ -318,8 +318,9 @@ byte-identical to B". Anything that drifts silently, one innocent PR at a time.
   `tests/test_migrations_0005.py::test_get_admin_session_referenced_only_by_allowlisted_files`:
   enumerates every reference to `get_admin_session` (the RLS-bypassing engine) in the
   codebase; a new caller must be added to the allowlist deliberately, in review.
-- **RLS matrix** — `tests/test_rls_isolation_matrix.py`: pins exactly 13 tables
-  (`test_table_descriptors_cover_exactly_thirteen_tables`), proves the descriptor set
+- **RLS matrix** — `tests/test_rls_isolation_matrix.py`: pins exactly 14 tables (13 +
+  `push_outbox`, added #210 M3/migration 0012)
+  (`test_table_descriptors_cover_exactly_fourteen_tables`), proves the descriptor set
   equals the actual `public`-schema catalog
   (`test_descriptor_table_set_matches_public_schema_catalog`,
   `test_no_tables_outside_descriptor_set_exist_in_public_schema`), then runs
@@ -436,7 +437,7 @@ before relying on them (run from the repo root unless noted):
 | Gate-8 variance coercions compose in ONE before-validator (Pydantic reverse-order hazard) | `grep -n "REVERSE definition order" apps/api/app/agent/schemas.py; grep -n "wrapper_plus_gate8_variances_compose" apps/api/tests/test_agent_schemas.py` |
 | Rubric checksum tests | `cd apps/api && uv run pytest tests/test_rubric.py --collect-only -q` |
 | Admin-session allowlist test | `grep -n "test_get_admin_session_referenced_only_by_allowlisted_files" apps/api/tests/test_migrations_0005.py` |
-| RLS matrix pins 13 tables + catalog completeness | `grep -n "thirteen_tables\|matches_public_schema_catalog" apps/api/tests/test_rls_isolation_matrix.py` |
+| RLS matrix pins 14 tables + catalog completeness | `grep -n "fourteen_tables\|matches_public_schema_catalog" apps/api/tests/test_rls_isolation_matrix.py` |
 | Scenario census (11 LLM + 9 negatives) | `ls apps/api/evals/scenarios/*.yaml \| wc -l && ls apps/api/evals/scenarios/negative_prefilter \| wc -l` |
 | Latest gate result (volatile — overwritten every run) | `python3 -c "import json;d=json.load(open('apps/api/evals/results/last-run.json'));print(d['generated_at'],d['summary'])"` |
 | Free dry-run of the eval harness (no API calls) | `cd apps/api && EVAL_DRY_RUN=1 uv run python -m evals.runner` |

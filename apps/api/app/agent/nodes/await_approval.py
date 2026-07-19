@@ -197,6 +197,46 @@ never a message body or phone number. The ``reasoning_log`` line is
 landlord-facing copy (approval-card, CLAUDE.md rule #8): warm, plain
 English, no ids.
 
+The push-notification enqueue seam (#210 M3)
+---------------------------------------------
+``mark_awaiting_approval`` is the ONE place ``cases.status`` flips to
+``'awaiting_approval'`` (see ``app/routers/queue.py``'s own module
+docstring) — so it is also the enqueue seam for
+``docs/03-engineering/schema-v1.md``'s v1.13 amendments: the SAME
+admin-session transaction that flips the status also runs
+:data:`_ENQUEUE_PUSH_OUTBOX_SQL`, an ``INSERT ... SELECT`` fanning out one
+``push_outbox`` row per active (``revoked_at IS NULL``) ``push_tokens``
+row belonging to this case's landlord, joined through the case's own
+pending draft. Two independent conditions both naturally collapse to
+"insert zero rows" via the ``JOIN``s themselves — no branching needed:
+
+- **Zero registered devices** — the ``push_tokens`` join finds nothing.
+- **No pending draft** — the rare ``draft_response`` race-exhausted path
+  (see that module's own docstring) that can leave a case with no
+  ``'pending'`` draft row at all; the ``drafts`` join finds nothing.
+
+A third condition — **this exact (device, draft) pair was already
+enqueued** — ALSO collapses to zero additional rows, via a ``NOT EXISTS``
+guard on :data:`_ENQUEUE_PUSH_OUTBOX_SQL` itself: this node can genuinely
+re-run for the same message/case on crash-then-redelivery
+(``app/agent/graph_entry.py``'s own "Crash-window coherence with #43's
+mark_awaiting_approval"), and without the guard a redelivered run would
+double-enqueue the same push notification. See that SQL constant's own
+comment for why an application-level ``NOT EXISTS`` (rather than a new
+unique index) is sufficient here.
+
+This keeps the insert "trivial enough that [a push-specific exception
+class breaking approval] is moot" (#210's own words): it is one more
+statement in the SAME transaction as the existing ``UPDATE`` above, using
+the SAME session, so a hard DB error rolls both back together — the same
+isolation discipline as every other side effect in this codebase. Push
+NEVER carries the emergency path (CLAUDE.md rule #1) and never gates or
+delays approval — a landlord with zero registered devices gets zero
+``push_outbox`` rows and loses nothing; the dashboard queue and
+approve-by-SMS remain the source of truth regardless. No feature-flag
+read anywhere near this (rule #7) — the insert is unconditional given the
+JOIN's own natural fan-out.
+
 DB access
 ---------
 Admin engine, same pattern as every other node in this package.
@@ -226,6 +266,43 @@ _SELECT_PENDING_DRAFT_ID_SQL = text(
     "SELECT id FROM drafts WHERE case_id = :case_id AND status = 'pending'"
 )
 
+# #210 M3 — the push-notification enqueue seam (see module docstring "The
+# push-notification enqueue seam"). Both JOINs naturally yield zero rows
+# when there is nothing to notify (no active device, or no pending draft
+# to reference) -- no branching needed, and this is the ONLY statement in
+# this module that ever touches push_outbox/push_tokens.
+#
+# Redelivery-safe (NOT just a nice-to-have): app/agent/graph_entry.py's own
+# module docstring ("Crash-window coherence with #43's mark_awaiting_
+# approval") documents a REAL, previously-reproduced crash window where
+# THIS node re-runs for the same message/case on redelivery (draft_response
+# already committed the pending draft; the crash landed before this node's
+# OWN transaction committed). Without the NOT EXISTS guard below, a
+# redelivered run would insert a SECOND push_outbox row per device for the
+# SAME draft -- a duplicate (not lost, not safety-relevant, but avoidable)
+# push notification. No new unique index needed for this: unlike
+# notifications' uq_notifications_message_dedupe (a genuine cross-PROCESS
+# concurrency guard), this is a sequential crash-then-redeliver scenario
+# under app/agent/graph.py's own per-case advisory lock ("Per-case
+# serialization" -- only one case-graph invocation for a given case ever
+# runs at a time), so a plain application-level NOT EXISTS is sufficient.
+_ENQUEUE_PUSH_OUTBOX_SQL = text(
+    """
+    INSERT INTO push_outbox (landlord_id, device_token_id, kind, payload, status, next_attempt_at)
+    SELECT c.landlord_id, pt.id, 'draft_awaiting_approval',
+           jsonb_build_object('case_id', c.id::text, 'draft_id', d.id::text),
+           'pending', now()
+    FROM cases c
+    JOIN push_tokens pt ON pt.landlord_id = c.landlord_id AND pt.revoked_at IS NULL
+    JOIN drafts d ON d.case_id = c.id AND d.status = 'pending'
+    WHERE c.id = :case_id
+      AND NOT EXISTS (
+        SELECT 1 FROM push_outbox po
+        WHERE po.device_token_id = pt.id AND po.payload ->> 'draft_id' = d.id::text
+      )
+    """
+)
+
 
 async def mark_awaiting_approval(state: AgentState) -> dict[str, Any]:
     """Set ``cases.status = 'awaiting_approval'`` and append the
@@ -247,6 +324,9 @@ async def mark_awaiting_approval(state: AgentState) -> dict[str, Any]:
 
     async with asynccontextmanager(get_admin_session)() as session:
         await session.execute(_MARK_AWAITING_APPROVAL_SQL, {"case_id": str(case_id)})
+        # #210 M3 — same transaction as the status flip above; see module
+        # docstring "The push-notification enqueue seam".
+        await session.execute(_ENQUEUE_PUSH_OUTBOX_SQL, {"case_id": str(case_id)})
 
     reasoning_log.append("Your reply is ready — I'm waiting for your approval before it goes out.")
     log.info("mark_awaiting_approval_done", message_id=str(message_id), case_id=str(case_id))
