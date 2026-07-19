@@ -8,11 +8,43 @@
  * This whole group is gated by the root layout's Stack.Protected guard
  * (src/app/_layout.tsx) — it's never rendered for a signed-out user.
  */
-import { Tabs } from "expo-router";
+import { useEffect } from "react";
+import { Tabs, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import { useFirstPropertyPage } from "@/api/properties";
+import {
+  hasOfferedOnboarding,
+  markOnboardingOffered,
+  shouldOfferOnboarding,
+} from "@/features/onboarding/gate";
 import { colors, type } from "@/theme/tokens";
 
+/**
+ * The zero-properties onboarding gate (issue #210 M2): one cheap
+ * `GET /v1/properties?limit=1` read after sign-in — when it SUCCEEDS with
+ * zero items and the wizard hasn't been offered this session, push the
+ * wizard over the tabs (never instead of them; back/Exit always lands
+ * here). Driven by real data, never a flag — see
+ * src/features/onboarding/gate.ts for the full semantics.
+ */
+function useOnboardingGate() {
+  const router = useRouter();
+  const gateQuery = useFirstPropertyPage();
+
+  const itemCount = gateQuery.data?.items.length ?? 0;
+  const fetched = gateQuery.isSuccess;
+
+  useEffect(() => {
+    if (shouldOfferOnboarding({ fetched, itemCount, alreadyOffered: hasOfferedOnboarding() })) {
+      markOnboardingOffered();
+      router.push("/onboarding");
+    }
+  }, [fetched, itemCount, router]);
+}
+
 export default function TabsLayout() {
+  useOnboardingGate();
+
   return (
     <Tabs
       screenOptions={{
