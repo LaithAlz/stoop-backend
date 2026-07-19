@@ -169,6 +169,27 @@ that resends 'sending' rows past some age) would risk exactly the
 double-send this design avoids without a `twilio_sid` idempotency key from
 the provider, which this issue does not have.
 
+Post-send durability page — a dedicated Sentry page for a failed final
+write (#199, fast-follow from PR #198's senior review)
+------------------------------------------------------------------------
+A failure inside the final write-transaction (the block that inserts the
+outbound ``messages`` row and marks ``drafts``/``cases``/``trust_metrics``/
+``audit_log``) is a materially DIFFERENT failure than every guard above:
+the Twilio send has already irreversibly happened by the time this block
+runs, so "send succeeded, recording failed" deserves its own signal, not
+just whatever generic backstop happens to catch the re-raised exception.
+:func:`_process_claimed_draft` wraps that block in its own try/except and
+fires a DEDICATED ``sentry_sdk.capture_message`` ("send delivered but
+recording failed", ``draft_id``/``case_id``/``exc_type`` extras only —
+uuids and an exception class name, never a phone number or message body,
+rule #5) — then re-raises. This ADDS specificity; it never swallows the
+failure or changes the outcome described in "Crash/failure semantics"
+above: the row is left stuck ``'sending'`` (the SAME designed failure
+mode), the exception still reaches ``app/scheduler.py``'s existing
+generic ``_safe_report`` backstop exactly as before, and the claim SQL's
+own single-flight guarantee (see "Idempotent claim" above) already rules
+out a double-send on any future tick.
+
 The edited/empty-``final_body`` guard (safety review, this round)
 --------------------------------------------------------------------
 An edited draft (``edited=true``) whose ``final_body`` is somehow empty
@@ -190,21 +211,21 @@ short transaction) -> read recipient/case context (own short transaction)
 final durable state (one more short transaction). A slow/hanging Twilio
 call therefore never pins a pooled connection.
 
-Wiring (#108 integration, landed)
+Wiring (#108 integration, landed; standalone loop deleted #199)
 ------------------------------------------------------------------------
-:func:`sender_tick` — one tick, not the standalone infinite loop below —
-is called from ``app/scheduler.py``'s existing 60s ticker, alongside the
-emergency escalation chain sweep and the degraded-mode retry sweep, using
+:func:`sender_tick` — one tick — is called from ``app/scheduler.py``'s
+existing 60s ticker, alongside the emergency escalation chain sweep and
+the degraded-mode retry sweep, using
 :func:`app.integrations.sms_sender.get_default_sms_sender`'s real
 Twilio-backed adapter. One scheduler owns all periodic work; this module
-never starts its own competing lifespan task. :func:`run_sender_loop`
-(the standalone, independently-tickable loop with its own interval/
-stop-event) remains as a fully-built, independently testable seam — kept
-for its own test coverage and as a documented alternative wiring, but is
-NOT invoked from ``app/main.py`` or ``app/scheduler.py``; the scheduler
-calls :func:`sender_tick` directly instead. Because that call shares the
-SAME ticker task as the other three sweeps, :func:`sender_tick` bounds its
-own worst-case duration against a wall-clock deadline (see
+never starts its own competing lifespan task. An earlier revision also
+shipped a standalone, independently-tickable ``run_sender_loop`` (its own
+interval/stop-event) as a fully-built, independently testable alternative
+wiring — PR #198's senior review flagged it as unused in production and
+#199 deleted it: sub-60s dispatch, if ever wanted, is a change to
+``app/scheduler.py``'s tick interval, not a second competing loop. Because
+``sender_tick`` shares the SAME ticker task as the other three sweeps, it
+bounds its own worst-case duration against a wall-clock deadline (see
 :data:`DEFAULT_TICK_DEADLINE_SECONDS`) so a large send backlog can never
 push the next tick — and thus the next emergency re-escalation sweep —
 meaningfully late.
@@ -235,15 +256,6 @@ log = structlog.get_logger(__name__)
 DEFAULT_BATCH_SIZE = 25
 """Candidates read per tick — bounded so one tick can never hold the
 candidate-selection connection open indefinitely under a large backlog."""
-
-DEFAULT_INTERVAL_SECONDS = 2.0
-"""Short relative to the 5s undo window on purpose -- a due 'approved' row
-should be picked up promptly, not up to a minute late. This rationale
-applies ONLY to :func:`run_sender_loop`, the unused standalone seam (see
-module docstring "Wiring") -- production dispatch does not use this
-interval at all; it rides ``app/scheduler.py``'s existing 60s tick
-instead, so a due row is picked up somewhere between ~0s and ~60s later in
-production, never governed by this constant."""
 
 DEFAULT_TICK_DEADLINE_SECONDS = 25.0
 """Wall-clock budget for one :func:`sender_tick` call (safety review,
@@ -659,131 +671,168 @@ async def _process_claimed_draft(sender: SmsSender, claimed: dict[str, Any]) -> 
     message_tenant_id = str(tenant_id) if recipient == "tenant" and tenant_id else None
     message_vendor_id = str(vendor_id) if recipient == "vendor" and vendor_id else None
 
-    async with asynccontextmanager(get_admin_session)() as session:
-        message_row = (
-            (
-                await session.execute(
-                    _INSERT_OUTBOUND_MESSAGE_SQL,
-                    {
-                        "landlord_id": str(landlord_id),
-                        "property_id": str(property_id),
-                        "tenant_id": message_tenant_id,
-                        "vendor_id": message_vendor_id,
-                        "case_id": str(case_id),
-                        "party": recipient,
-                        "body": body,
-                        "twilio_sid": twilio_sid,
-                    },
-                )
-            )
-            .mappings()
-            .one()
-        )
-        message_id = message_row["id"]
-
-        await session.execute(
-            _MARK_DRAFT_SENT_SQL, {"draft_id": str(draft_id), "message_id": str(message_id)}
-        )
-        await session.execute(_MARK_CASE_AWAITING_TENANT_SQL, {"case_id": str(case_id)})
-
-        if severity is not None:
-            clean_inc, edited_inc = (0, 1) if edited else (1, 0)
-            trust_row = (
+    # Post-send durability page (safety review, #199 fast-follow): the
+    # Twilio send above is already IRREVERSIBLE by the time this block
+    # runs -- unlike every earlier failure branch in this function (each
+    # refuses BEFORE ever calling send_sms and returns quietly, leaving
+    # nothing sent), a failure HERE means the SMS is already out but the
+    # durable record of it (the outbound `messages` row,
+    # `drafts.status='sent'`, `trust_metrics`, the `'sent'` audit row)
+    # never landed -- "send succeeded, recording failed" is a materially
+    # different failure than a claim-time refusal, so it gets its own
+    # dedicated Sentry page distinct from the scheduler's generic
+    # `_safe_report` backstop (`app/scheduler.py`) this re-raise still
+    # reaches. Re-raised, never swallowed: this ADDS specificity, it
+    # never changes the outcome -- the row stays stuck 'sending' (this
+    # module's own DESIGNED failure mode, see module docstring
+    # "Crash/failure semantics") and the claim SQL's single-flight
+    # guarantee (see module docstring "Idempotent claim") already
+    # prevents any future tick from re-claiming this row and
+    # double-sending.
+    try:
+        async with asynccontextmanager(get_admin_session)() as session:
+            message_row = (
                 (
                     await session.execute(
-                        _UPSERT_TRUST_METRICS_SQL,
+                        _INSERT_OUTBOUND_MESSAGE_SQL,
                         {
                             "landlord_id": str(landlord_id),
                             "property_id": str(property_id),
-                            "severity": severity,
-                            "clean_inc": clean_inc,
-                            "edited_inc": edited_inc,
-                            "edited": edited,
+                            "tenant_id": message_tenant_id,
+                            "vendor_id": message_vendor_id,
+                            "case_id": str(case_id),
+                            "party": recipient,
+                            "body": body,
+                            "twilio_sid": twilio_sid,
                         },
                     )
                 )
                 .mappings()
                 .one()
             )
+            message_id = message_row["id"]
 
-            # #60 graduation — only ever attempted for 'routine' clean
-            # sends (an edit always resets consecutive_clean to 0 above,
-            # so it could never legitimately reach the threshold on the
-            # SAME transaction anyway; skipping the query entirely for
-            # edited/non-routine sends is a cheap belt-and-braces on top
-            # of _GRADUATE_ROUTINE_TRUST_SQL's own hardcoded predicate).
-            if severity == GRADUATION_SEVERITY and not edited:
-                threshold = settings.trust_graduation_threshold
-                graduated_row = (
+            await session.execute(
+                _MARK_DRAFT_SENT_SQL, {"draft_id": str(draft_id), "message_id": str(message_id)}
+            )
+            await session.execute(_MARK_CASE_AWAITING_TENANT_SQL, {"case_id": str(case_id)})
+
+            if severity is not None:
+                clean_inc, edited_inc = (0, 1) if edited else (1, 0)
+                trust_row = (
                     (
                         await session.execute(
-                            _GRADUATE_ROUTINE_TRUST_SQL,
-                            {"property_id": str(property_id), "threshold": threshold},
+                            _UPSERT_TRUST_METRICS_SQL,
+                            {
+                                "landlord_id": str(landlord_id),
+                                "property_id": str(property_id),
+                                "severity": severity,
+                                "clean_inc": clean_inc,
+                                "edited_inc": edited_inc,
+                                "edited": edited,
+                            },
                         )
                     )
                     .mappings()
-                    .one_or_none()
+                    .one()
                 )
-                if graduated_row is not None:
-                    await session.execute(
-                        _INSERT_TRUST_UNLOCKED_AUDIT_SQL,
+
+                # #60 graduation — only ever attempted for 'routine' clean
+                # sends (an edit always resets consecutive_clean to 0 above,
+                # so it could never legitimately reach the threshold on the
+                # SAME transaction anyway; skipping the query entirely for
+                # edited/non-routine sends is a cheap belt-and-braces on top
+                # of _GRADUATE_ROUTINE_TRUST_SQL's own hardcoded predicate).
+                if severity == GRADUATION_SEVERITY and not edited:
+                    threshold = settings.trust_graduation_threshold
+                    graduated_row = (
+                        (
+                            await session.execute(
+                                _GRADUATE_ROUTINE_TRUST_SQL,
+                                {"property_id": str(property_id), "threshold": threshold},
+                            )
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if graduated_row is not None:
+                        await session.execute(
+                            _INSERT_TRUST_UNLOCKED_AUDIT_SQL,
+                            {
+                                "landlord_id": str(landlord_id),
+                                "case_id": str(case_id),
+                                "payload": json.dumps(
+                                    {
+                                        "property_id": str(property_id),
+                                        "severity": GRADUATION_SEVERITY,
+                                        "threshold": threshold,
+                                        "consecutive_clean": trust_row["consecutive_clean"],
+                                    }
+                                ),
+                            },
+                        )
+                        log.info(
+                            "trust_ladder_graduated",
+                            property_id=str(property_id),
+                            case_id=str(case_id),
+                        )
+            else:
+                # #197: cases.severity is now written by classify_severity (post
+                # -clamp) for every case that has ever been through the graph,
+                # so a NULL here is no longer the 100%-of-sends noise it used to
+                # be before that write existed -- it now means either a case
+                # created before #197 shipped (no backfill migration; NULL
+                # stays legal, schema-v1.md) or a genuine anomaly (e.g. a case
+                # whose classify_severity run somehow never reached the case-
+                # -update, or the unknown-sender fallback thread producing a
+                # case some other way). Either way trust_metrics silently loses
+                # a data point for the trust ladder (#60) this table exists to
+                # feed -- worth a page, not just a log line, same as every other
+                # anomaly branch in this module.
+                log.error("draft_sender_missing_severity_for_trust_metrics", case_id=str(case_id))
+                sentry_sdk.capture_message(
+                    "draft_sender: cases.severity is NULL on send -- trust_metrics not "
+                    "incremented for this send",
+                    level="error",
+                    extras={"case_id": str(case_id), "draft_id": str(draft_id)},
+                )
+
+            await session.execute(
+                _INSERT_SENT_AUDIT_SQL,
+                {
+                    "landlord_id": str(landlord_id),
+                    "case_id": str(case_id),
+                    "payload": json.dumps(
                         {
-                            "landlord_id": str(landlord_id),
-                            "case_id": str(case_id),
-                            "payload": json.dumps(
-                                {
-                                    "property_id": str(property_id),
-                                    "severity": GRADUATION_SEVERITY,
-                                    "threshold": threshold,
-                                    "consecutive_clean": trust_row["consecutive_clean"],
-                                }
-                            ),
-                        },
-                    )
-                    log.info(
-                        "trust_ladder_graduated",
-                        property_id=str(property_id),
-                        case_id=str(case_id),
-                    )
-        else:
-            # #197: cases.severity is now written by classify_severity (post
-            # -clamp) for every case that has ever been through the graph,
-            # so a NULL here is no longer the 100%-of-sends noise it used to
-            # be before that write existed -- it now means either a case
-            # created before #197 shipped (no backfill migration; NULL
-            # stays legal, schema-v1.md) or a genuine anomaly (e.g. a case
-            # whose classify_severity run somehow never reached the case-
-            # -update, or the unknown-sender fallback thread producing a
-            # case some other way). Either way trust_metrics silently loses
-            # a data point for the trust ladder (#60) this table exists to
-            # feed -- worth a page, not just a log line, same as every other
-            # anomaly branch in this module.
-            log.error("draft_sender_missing_severity_for_trust_metrics", case_id=str(case_id))
-            sentry_sdk.capture_message(
-                "draft_sender: cases.severity is NULL on send -- trust_metrics not "
-                "incremented for this send",
-                level="error",
-                extras={"case_id": str(case_id), "draft_id": str(draft_id)},
+                            "draft_id": str(draft_id),
+                            "message_id": str(message_id),
+                            "edited": edited,
+                            # #111 cost metering (schema-v1.md v1.12): segment
+                            # count + estimated Twilio cost for THIS send.
+                            "segments": segments,
+                            "sms_cost_cents": sms_cost_cents,
+                        }
+                    ),
+                },
             )
 
-        await session.execute(
-            _INSERT_SENT_AUDIT_SQL,
-            {
-                "landlord_id": str(landlord_id),
+    except Exception as exc:
+        log.error(
+            "draft_sender_post_send_write_failed",
+            draft_id=str(draft_id),
+            case_id=str(case_id),
+            exc_type=type(exc).__name__,
+        )
+        sentry_sdk.capture_message(
+            "draft_sender: send delivered but recording failed",
+            level="error",
+            extras={
+                "draft_id": str(draft_id),
                 "case_id": str(case_id),
-                "payload": json.dumps(
-                    {
-                        "draft_id": str(draft_id),
-                        "message_id": str(message_id),
-                        "edited": edited,
-                        # #111 cost metering (schema-v1.md v1.12): segment
-                        # count + estimated Twilio cost for THIS send.
-                        "segments": segments,
-                        "sms_cost_cents": sms_cost_cents,
-                    }
-                ),
+                "exc_type": type(exc).__name__,
             },
         )
+        raise
 
     log.info("draft_sender_sent", draft_id=str(draft_id), case_id=str(case_id), edited=edited)
 
@@ -848,63 +897,8 @@ async def sender_tick(
     return claimed_count
 
 
-async def run_sender_loop(
-    *,
-    sender: SmsSender | None,
-    interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
-    stop_event: asyncio.Event | None = None,
-) -> None:
-    """The in-process periodic task (skill doc Phase 3, option (a)). See
-    module docstring "Wiring (#108 integration, landed)" — NOT invoked
-    from ``app/main.py`` or ``app/scheduler.py`` today; the scheduler calls
-    :func:`sender_tick` directly instead. Kept as a fully-built,
-    independently testable/usable alternative wiring.
-
-    Ticks :func:`sender_tick` every *interval_seconds* until *stop_event*
-    is set (runs forever if no *stop_event* is supplied — a caller that
-    wants to stop this loop must supply one and ``set()`` it, e.g. on
-    application shutdown).
-
-    Deployment gating (matches #109's own pattern — see
-    ``app/integrations/sms_sender.py``'s module docstring): if *sender* is
-    ``None``, this loop refuses to run at all — logs ONE loud error and
-    returns immediately, rather than looping forever doing nothing or
-    (worse) ever reaching a call site that could invoke
-    :class:`app.integrations.sms_sender.NotImplementedSmsSender`. No
-    production caller passes ``None`` today (``get_default_sms_sender``
-    always returns a real binding), but this contract stays enforced for
-    any future caller that does.
-    """
-    if sender is None:
-        log.error(
-            "draft_sender_worker_disabled",
-            detail=(
-                "no SmsSender configured -- approved drafts will wait until a real "
-                "binding is wired in (app/integrations/sms_sender.py's module docstring)"
-            ),
-        )
-        return
-
-    log.info("draft_sender_worker_started", interval_seconds=interval_seconds)
-    while stop_event is None or not stop_event.is_set():
-        try:
-            await sender_tick(sender=sender)
-        except Exception as exc:  # never let one bad tick kill the loop
-            log.error("draft_sender_tick_failed", exc_type=type(exc).__name__)
-
-        if stop_event is None:
-            await asyncio.sleep(interval_seconds)
-            continue
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
-        except TimeoutError:
-            pass
-
-
 __all__: list[str] = [
     "DEFAULT_BATCH_SIZE",
-    "DEFAULT_INTERVAL_SECONDS",
     "DEFAULT_TICK_DEADLINE_SECONDS",
-    "run_sender_loop",
     "sender_tick",
 ]
