@@ -10,11 +10,13 @@
  * `toHouseApiError` is the ONE place a raw server/library string turns into
  * a landlord-facing line (CLAUDE.md rule 8 / plain-language-rules.md) — no
  * screen renders `error.message` directly, same seam shape as
- * src/auth/AuthProvider.tsx's `toHouseAuthError`. Only codes M1 actually
- * surfaces get a bespoke line; everything else — including real but
- * out-of-scope-for-M1 codes like `property_limit_reached` — gets the
- * honest generic fallback rather than a guessed-at line for a screen this
- * phase doesn't ship.
+ * src/auth/AuthProvider.tsx's `toHouseAuthError`. Only codes a shipped
+ * screen actually surfaces get a bespoke line; everything else gets the
+ * honest generic fallback rather than a guessed-at line for a screen that
+ * doesn't exist yet. M2 added the provisioning/property/tenant/trust codes
+ * (api-contracts.md's Properties + Tenants sections, v1.12 amendment) —
+ * each line states what happened and what the landlord can actually do,
+ * never a raw code, never "soon".
  */
 import type { ApiErrorBody } from "./types";
 
@@ -54,6 +56,29 @@ export function toHouseApiError(error: ApiError): string {
       return "This account isn't active. Contact support if that's unexpected.";
     case "invalid_cursor":
       return "Couldn't load more — try refreshing the list.";
+    // --- Property provisioning (POST /v1/properties, v1.12 amendment) ---
+    case "property_limit_reached":
+      return "Your account is at its property limit, so this one wasn't added. Contact support to raise it.";
+    case "duplicate_property":
+      return "You've already added a property at this address — it's in your Properties list.";
+    case "no_numbers_available":
+      return "No phone numbers were available just now, so nothing was set up. Try a different area code, or try again in a few minutes.";
+    case "provisioning_failed":
+      return "Setting up this property's phone number didn't work, so nothing was saved. Try again.";
+    // --- Property delete (DELETE /v1/properties/{id}) ---
+    case "has_open_cases":
+      return "This property still has open cases, so it can't be deleted yet.";
+    case "has_dependents":
+      return "This property has tenants or saved history attached, so it can't be deleted.";
+    case "property_not_found":
+      return "That property isn't there anymore.";
+    // --- Tenants ---
+    case "tenant_not_found":
+      return "That tenant isn't on file anymore.";
+    case "duplicate_phone":
+      return "That phone number is already on a tenant at this property.";
+    case "invalid_field":
+      return "Something in the form didn't look right. Check it and try again.";
     default:
       return GENERIC_ERROR;
   }

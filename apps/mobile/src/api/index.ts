@@ -7,3 +7,6 @@ export * from "./drafts";
 export * from "./cases";
 export * from "./notifications";
 export * from "./me";
+export * from "./properties";
+export * from "./tenants";
+export * from "./trust";
