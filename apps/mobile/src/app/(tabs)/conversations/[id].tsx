@@ -19,10 +19,16 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { colors, spacing, type } from "@/theme/tokens";
-import { useCase } from "@/api/cases";
+import { resolveCase, useCase } from "@/api/cases";
 import { ApiError, toHouseApiError } from "@/api/errors";
+import {
+  RESOLVE_CONFIRM_LABEL,
+  RESOLVE_CONFIRM_MESSAGE,
+  RESOLVE_CONFIRM_TITLE,
+  RESOLVE_DONE_NOTICE,
+} from "@/features/cases/resolveCase";
 import type { ClassifiedAuditPayload, TimelineDraftEntry, TimelineEntry } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
 import { SeverityPlaque } from "@/components/clarity/SeverityPlaque";
@@ -80,6 +86,36 @@ export default function CaseDetailScreen() {
     (classifiedEntry?.payload as ClassifiedAuditPayload | undefined)?.summary ?? DEFAULT_WHY;
 
   const caseIsOpen = caseDetail ? caseDetail.status !== "resolved" : false;
+
+  // "Mark resolved" (api-contracts.md v1.14) — 200-idempotent, so a repeat
+  // tap (or a case another surface resolved first) succeeds identically;
+  // the refetch below is what makes the timeline show the resolution and
+  // the cancelled draft honestly.
+  const resolveMutation = useMutation({
+    mutationFn: () => resolveCase(id as string),
+    onSuccess: () => {
+      Alert.alert("Stoop", RESOLVE_DONE_NOTICE);
+      onSettled();
+      // A resolve also moves this case out of every open-case list — the
+      // Conversations tab must not keep showing it as open until the next
+      // app-level focus event.
+      void reactQueryClient.invalidateQueries({ queryKey: ["cases"] });
+    },
+    onError: (error) =>
+      Alert.alert(
+        "Stoop",
+        error instanceof ApiError
+          ? toHouseApiError(error)
+          : "Something didn't go through. Try again in a moment.",
+      ),
+  });
+
+  const confirmResolve = useCallback(() => {
+    Alert.alert(RESOLVE_CONFIRM_TITLE, RESOLVE_CONFIRM_MESSAGE, [
+      { text: "Cancel", style: "cancel" },
+      { text: RESOLVE_CONFIRM_LABEL, onPress: () => resolveMutation.mutate() },
+    ]);
+  }, [resolveMutation]);
 
   function renderTimelineRow({ item: row }: { item: TimelineRow }) {
     if (row.kind === "day-divider") return <DayDivider>{row.label}</DayDivider>;
@@ -141,73 +177,96 @@ export default function CaseDetailScreen() {
             ) : null
           }
           ListFooterComponent={
-            draftId && draftBody !== undefined ? (
-              <View style={styles.draftFooter}>
-                <DraftBubble
-                  label={
-                    draftEntry.status === "sending"
-                      ? `On its way to ${tenantFirst}`
-                      : "I'd like to reply"
-                  }
-                  body={draftBody}
-                />
-                {draftActions.staleNotices[caseDetail.id] ? (
-                  <Text style={styles.staleNotice}>{draftActions.staleNotices[caseDetail.id]}</Text>
-                ) : null}
-                {draftEntry.status === "sending" ? (
-                  <UndoTicket
-                    secondsLeft={secondsRemaining(draftEntry.undoUntil)}
-                    totalSeconds={totalUndoSeconds(draftEntry)}
-                    onUndo={() =>
-                      draftActions.undo({
-                        draftId,
-                        caseId: caseDetail.id,
-                        tenantName: caseDetail.tenant.name ?? "",
-                      })
+            <View>
+              {draftId && draftBody !== undefined ? (
+                <View style={styles.draftFooter}>
+                  <DraftBubble
+                    label={
+                      draftEntry.status === "sending"
+                        ? `On its way to ${tenantFirst}`
+                        : "I'd like to reply"
                     }
+                    body={draftBody}
                   />
-                ) : draftEntry.status === "sent" ? (
-                  <Text style={styles.sentNote}>Sent.</Text>
-                ) : draftEntry.status !== "skipped" ? (
-                  <>
-                    <MarginNote>{why}</MarginNote>
-                    <DecisionActions
-                      onApprove={() =>
-                        draftActions.approve({
-                          draftId,
-                          caseId: caseDetail.id,
-                          tenantName: caseDetail.tenant.name ?? "",
-                        })
-                      }
-                      onEdit={() =>
-                        draftActions.openEditor(
-                          {
-                            draftId,
-                            caseId: caseDetail.id,
-                            tenantName: caseDetail.tenant.name ?? "",
-                          },
-                          draftBody,
-                        )
-                      }
-                      onSkip={() =>
-                        draftActions.skip({
+                  {draftActions.staleNotices[caseDetail.id] ? (
+                    <Text style={styles.staleNotice}>
+                      {draftActions.staleNotices[caseDetail.id]}
+                    </Text>
+                  ) : null}
+                  {draftEntry.status === "sending" ? (
+                    <UndoTicket
+                      secondsLeft={secondsRemaining(draftEntry.undoUntil)}
+                      totalSeconds={totalUndoSeconds(draftEntry)}
+                      onUndo={() =>
+                        draftActions.undo({
                           draftId,
                           caseId: caseDetail.id,
                           tenantName: caseDetail.tenant.name ?? "",
                         })
                       }
                     />
-                  </>
-                ) : (
-                  <Text style={styles.sentNote}>No reply sent — case still open</Text>
-                )}
-              </View>
-            ) : (
-              <Text style={styles.appendOnlyNote}>
-                Nothing here can be edited or removed once it&rsquo;s sent — that&rsquo;s what makes
-                it useful if you ever need the record.
-              </Text>
-            )
+                  ) : draftEntry.status === "sent" ? (
+                    <Text style={styles.sentNote}>Sent.</Text>
+                  ) : draftEntry.status !== "skipped" ? (
+                    <>
+                      <MarginNote>{why}</MarginNote>
+                      <DecisionActions
+                        onApprove={() =>
+                          draftActions.approve({
+                            draftId,
+                            caseId: caseDetail.id,
+                            tenantName: caseDetail.tenant.name ?? "",
+                          })
+                        }
+                        onEdit={() =>
+                          draftActions.openEditor(
+                            {
+                              draftId,
+                              caseId: caseDetail.id,
+                              tenantName: caseDetail.tenant.name ?? "",
+                            },
+                            draftBody,
+                          )
+                        }
+                        onSkip={() =>
+                          draftActions.skip({
+                            draftId,
+                            caseId: caseDetail.id,
+                            tenantName: caseDetail.tenant.name ?? "",
+                          })
+                        }
+                      />
+                    </>
+                  ) : (
+                    <Text style={styles.sentNote}>No reply sent — case still open</Text>
+                  )}
+                </View>
+              ) : (
+                <Text style={styles.appendOnlyNote}>
+                  Nothing here can be edited or removed once it&rsquo;s sent — that&rsquo;s what
+                  makes it useful if you ever need the record.
+                </Text>
+              )}
+              {caseIsOpen ? (
+                <View style={styles.resolveBlock}>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={confirmResolve}
+                    disabled={resolveMutation.isPending}
+                    style={({ pressed }) => [styles.resolveButton, pressed && styles.pressed]}
+                    testID="mark-resolved"
+                  >
+                    <Ionicons name="checkmark-done-outline" size={16} color={colors.brand} />
+                    <Text style={styles.resolveLabel}>
+                      {resolveMutation.isPending ? "Resolving…" : "Mark resolved"}
+                    </Text>
+                  </Pressable>
+                  <Text style={styles.resolveNote}>
+                    Closes the case. A drafted reply that hasn&rsquo;t sent won&rsquo;t go out.
+                  </Text>
+                </View>
+              ) : null}
+            </View>
           }
         />
       )}
@@ -295,5 +354,28 @@ const styles = StyleSheet.create({
     ...type.footnote,
     color: colors.inkDim,
     marginTop: spacing.base,
+  },
+  resolveBlock: {
+    marginTop: spacing.xl,
+    gap: spacing.xs,
+  },
+  resolveButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    minHeight: 44,
+  },
+  pressed: {
+    opacity: 0.7,
+  },
+  resolveLabel: {
+    ...type.button,
+    fontSize: 14,
+    color: colors.brand,
+  },
+  resolveNote: {
+    ...type.footnote,
+    fontSize: 12,
+    color: colors.inkDim,
   },
 });
