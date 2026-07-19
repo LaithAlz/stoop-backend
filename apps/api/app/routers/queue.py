@@ -105,6 +105,38 @@ Auto-handled feed
 --------------------
 Deferred per the contract (needs the trust ladder, #60) — not implemented
 here.
+
+``notification_id`` (#213 — wiring the emergency ack path for clients)
+------------------------------------------------------------------------
+api-contracts.md's v1.15 amendment. Populated only when the card's case
+has an unacknowledged ``emergency_call`` notification
+(``type = 'emergency_call' AND acknowledged_at IS NULL``); ``null``
+otherwise (no such notification ever existed, or it's already
+acknowledged). A third LATERAL, same belt-and-braces shape as the two
+above (explicit ``landlord_id`` predicate on ``n``).
+
+Correlation: ``notifications.case_id`` is ``NULL`` at the webhook's
+original INSERT (no case exists yet, pre-routing —
+``app/routers/webhooks/twilio.py``'s own note), but
+``app/agent/nodes/identify_case.py`` backfills it directly the moment a
+case is assigned to that message (an ordinary, non-append-only column —
+unlike ``messages.case_id``/``audit_log.case_id``, which stay ``NULL``
+forever for their own pre-case rows). This LATERAL matches on
+``n.case_id = c.id`` directly, OR'd with the SAME ``message_cases``
+correlation (via ``payload ->> 'message_id'``) this module already uses
+for ``tenant_message`` and ``app/routers/cases.py``'s
+``_SELECT_AUDIT_SQL`` uses for the sibling ``emergency_triggered`` audit
+row — belt-and-braces for the narrow window before that backfill runs,
+honest regardless of whether it ever does. By the time a case has a queue
+card at all (``awaiting_approval``), ``identify_case`` has already run for
+it, so the direct match is what resolves this in practice; the
+``message_cases`` fallback is defense-in-depth only.
+
+Latest wins: a case could in principle have more than one unacknowledged
+``emergency_call`` notification (a reopened case, or a second emergency
+report before the first is acknowledged) — ``ORDER BY n.created_at DESC
+LIMIT 1`` picks the newest, matching the contract's own documented
+tie-break.
 """
 
 from __future__ import annotations
@@ -153,6 +185,7 @@ class QueueCard(BaseModel):
     refusal_flags: list[str]
     has_media: bool
     media_note: str | None
+    notification_id: UUID | None
 
 
 class QueueCounts(BaseModel):
@@ -192,7 +225,8 @@ _SELECT_QUEUE_SQL = text(
         d.recipient AS draft_recipient,
         msg.body AS tenant_message_body,
         msg.created_at AS tenant_message_at,
-        audit.payload AS classified_payload
+        audit.payload AS classified_payload,
+        notif.id AS notification_id
     FROM cases c
     JOIN properties p ON p.id = c.property_id
     JOIN tenants t ON t.id = c.tenant_id
@@ -220,6 +254,22 @@ _SELECT_QUEUE_SQL = text(
         ORDER BY a.created_at DESC
         LIMIT 1
     ) audit ON true
+    LEFT JOIN LATERAL (
+        SELECT n.id
+        FROM notifications n
+        WHERE n.landlord_id = :landlord_id
+          AND n.type = 'emergency_call'
+          AND n.acknowledged_at IS NULL
+          AND (
+            n.case_id = c.id
+            OR EXISTS (
+              SELECT 1 FROM message_cases mc
+              WHERE mc.case_id = c.id AND mc.message_id::text = n.payload ->> 'message_id'
+            )
+          )
+        ORDER BY n.created_at DESC
+        LIMIT 1
+    ) notif ON true
     WHERE c.landlord_id = :landlord_id AND c.status = :awaiting_approval_status
     """
 )
@@ -266,6 +316,7 @@ def _row_to_card(row: RowMapping) -> QueueCard:
         refusal_flags=list(refusal_flags) if isinstance(refusal_flags, list) else [],
         has_media=False,
         media_note=None,
+        notification_id=row["notification_id"],
     )
 
 

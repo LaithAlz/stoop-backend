@@ -30,6 +30,13 @@ further kwargs (``vendor_id``, ``recipient``, ``scheduled_send_at``,
 ``test_agent_draft_sender.py``) — these bypass the graph entirely (no
 Anthropic mocking needed) to seed a case/draft directly at whatever
 status a given approve/reject/edit-and-send/sender test needs.
+
+``insert_notification`` was added for #213's ``GET /v1/queue``
+``notification_id`` correlation tests (``test_queue_router.py``) — seeds a
+``notifications`` row directly at whatever ``type``/``case_id``/
+``acknowledged_at``/``created_at`` a given correlation/latest-wins/
+cross-tenant test needs, bypassing the webhook + escalation-chain
+machinery that would normally create one.
 """
 
 from __future__ import annotations
@@ -333,6 +340,50 @@ async def insert_draft(
     return draft_id
 
 
+async def insert_notification(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    case_id: str | None = None,
+    type_: str = "emergency_call",
+    channel: str = "voice",
+    status: str = "pending",
+    payload: dict[str, Any] | None = None,
+    acknowledged_at: Any = None,
+    created_at: Any = None,
+) -> str:
+    """Seeds a ``notifications`` row directly (bypassing the webhook/
+    escalation-chain machinery) — #213's queue-card ``notification_id``
+    tests exercise the read side against a KNOWN notification state
+    (type/ack/case-linkage), not against a full emergency-chain run.
+    ``created_at`` defaults to the column's own DB default (``now()``) but
+    can be overridden to make "latest wins" ordering deterministic in
+    tests without relying on real-clock granularity between two inserts."""
+    notification_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO notifications "
+            "(id, landlord_id, case_id, type, channel, status, payload, acknowledged_at, "
+            " created_at) "
+            "VALUES (:id, :landlord_id, :case_id, :type, :channel, :status, "
+            "CAST(:payload AS jsonb), :acknowledged_at, COALESCE(:created_at, now()))"
+        ),
+        {
+            "id": notification_id,
+            "landlord_id": landlord_id,
+            "case_id": case_id,
+            "type": type_,
+            "channel": channel,
+            "status": status,
+            "payload": json.dumps(payload or {}),
+            "acknowledged_at": acknowledged_at,
+            "created_at": created_at,
+        },
+    )
+    await session.commit()
+    return notification_id
+
+
 async def insert_trust_metrics(
     session: AsyncSession,
     *,
@@ -388,6 +439,7 @@ __all__: list[str] = [
     "insert_landlord",
     "insert_message",
     "insert_message_case",
+    "insert_notification",
     "insert_property",
     "insert_tenant",
     "insert_trust_metrics",
