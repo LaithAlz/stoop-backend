@@ -688,7 +688,7 @@ strings per this doc's own "Conventions" section.
 
 ## Devices (push notifications, #210 M3)
 
-**v1.15 amendment (2026-07-18)** — doc-first, no prior contract existed
+**v1.18 amendment (2026-07-18)** — doc-first, no prior contract existed
 for push-notification device registration. Landlord-scoped
 (`require_landlord`), standard error envelope. Push is for
 approvals/status only — **never the emergency path** (rule #1; voice +

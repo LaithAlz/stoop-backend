@@ -395,3 +395,127 @@ def test_build_message_never_forwards_anything_but_uuids() -> None:
         assert "Maria" not in value
         assert "+1416" not in value
         assert "overflowing" not in value
+
+
+# ---------------------------------------------------------------------------
+# 6. Wall-clock tick deadline (safety review HIGH-1) -- mirrors
+#    tests/test_agent_draft_sender.py's own deadline test pattern exactly.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """A mutable, injectable time source for the sweep's deadline check —
+    advanced explicitly by the fake sender below rather than sleeping for
+    real seconds. Mirrors ``tests/test_agent_draft_sender.py``'s own
+    ``_FakeClock``."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _DeadlineBlowingSender:
+    """Records every call; advances a shared :class:`_FakeClock` past the
+    tick's deadline on its FIRST send, simulating a slow/hanging Expo
+    round-trip that must not be allowed to also delay claiming every OTHER
+    due row in the same tick."""
+
+    def __init__(self, clock: _FakeClock, *, advance_by: float) -> None:
+        self._clock = clock
+        self._advance_by = advance_by
+        self.calls: list[ExpoPushMessage] = []
+
+    async def send_push(self, message: ExpoPushMessage) -> ExpoPushTicket:
+        self.calls.append(message)
+        self._clock.now += self._advance_by
+        return ExpoPushTicket(status="ok")
+
+
+@pytest.mark.integration
+async def test_sweep_stops_claiming_after_deadline_then_resumes_next_tick(
+    db_session: AsyncSession,
+) -> None:
+    """Two due rows; the first send blows the (tiny, test-only) deadline.
+    The SECOND due row must NOT be claimed in the same tick -- it stays
+    'pending' and due, claimed whole by the very next tick call. Nothing
+    lost; the tick's own total work is bounded regardless of backlog size
+    (safety review HIGH-1 — this is what stops an Expo black-hole from
+    delaying the emergency chain sweep's next run)."""
+    landlord_id_a, _token_a, outbox_id_a = await _seed_pending_row(db_session)
+    landlord_id_b, _token_b, outbox_id_b = await _seed_pending_row(db_session)
+    clock = _FakeClock(start=0.0)
+    sender = _DeadlineBlowingSender(clock, advance_by=10.0)
+    set_expo_push_sender_for_tests(sender)
+    try:
+        await run_push_outbox_sweep(deadline_seconds=5.0, time_source=clock)
+        assert len(sender.calls) == 1  # bounded: NOT both due rows attempted this tick
+
+        status_a, _ = await _row_status(db_session, outbox_id_a)
+        status_b, _ = await _row_status(db_session, outbox_id_b)
+        statuses = {status_a, status_b}
+        assert statuses == {"sent", "pending"}  # exactly one sent, one left due
+
+        # The next tick call (clock already past the first deadline window,
+        # but the sweep recomputes its OWN start from time_source() every
+        # call) claims and sends the leftover row.
+        await run_push_outbox_sweep(deadline_seconds=5.0, time_source=clock)
+        assert len(sender.calls) == 2
+
+        status_a_after, _ = await _row_status(db_session, outbox_id_a)
+        status_b_after, _ = await _row_status(db_session, outbox_id_b)
+        assert status_a_after == "sent"
+        assert status_b_after == "sent"
+    finally:
+        set_expo_push_sender_for_tests(None)
+        await _cleanup(db_session, landlord_id_a)
+        await _cleanup(db_session, landlord_id_b)
+
+
+# ---------------------------------------------------------------------------
+# 7. Ownership-transfer safety (safety review MEDIUM-1) -- a shared device
+#    that changed hands must never deliver to its new owner's landlord,
+#    and the orphaned row must resolve to a terminal state, never sit
+#    'pending' forever.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_ownership_transfer_orphans_row_never_delivers_marks_terminal(
+    db_session: AsyncSession, fake_sender: _FakeExpoPushSender
+) -> None:
+    landlord_a_id, push_token_id, outbox_id = await _seed_pending_row(db_session)
+    landlord_b_id = await factories.insert_landlord(db_session)
+    try:
+        # Simulate the device changing hands via the SAME upsert
+        # app/routers/devices.py's POST /v1/devices performs on
+        # ON CONFLICT (token) -- the row now belongs to landlord B while
+        # this push_outbox row still carries landlord_id = A.
+        await db_session.execute(
+            text("UPDATE push_tokens SET landlord_id = :new_landlord WHERE id = :id"),
+            {"new_landlord": landlord_b_id, "id": push_token_id},
+        )
+        await db_session.commit()
+
+        outcomes = await run_push_outbox_sweep()
+        assert [o.outcome for o in outcomes] == ["failed_device_reassigned"]
+        # never even attempted -- misdelivery is structurally impossible
+        assert fake_sender.calls == []
+
+        status, _attempt = await _row_status(db_session, outbox_id)
+        assert status == "failed"
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT payload FROM push_outbox WHERE id = :id"), {"id": outbox_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["payload"]["terminal_reason"] == "device_reassigned"
+    finally:
+        await _cleanup(db_session, landlord_a_id)
+        await _cleanup(db_session, landlord_b_id)

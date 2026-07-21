@@ -537,7 +537,13 @@
 > only — **push never carries the emergency path** (rule #1: voice + SMS
 > remain the only emergency channels; nothing here touches, delays, or
 > conditions the escalation chain in `notifications`/`emergency_chain.py`).
-> No feature-flag reads anywhere near this (rule #7).
+> No feature-flag reads anywhere near this (rule #7). **Not to be confused
+> with `notifications.channel = 'push'`** (v1.8/v1.11's `degraded_retry`/
+> `number_release` types) — that is a purely INTERNAL scheduling marker,
+> never actually delivered to a person (those rows' own amendments say so
+> explicitly). `push_outbox` below is the opposite: every row it holds is
+> a REAL Expo push notification, actually delivered to a landlord's
+> device.
 > 1. **Reused `push_tokens` — did NOT invent a `device_tokens` table.**
 >    This table has existed since v1.0/migration 0002 (RLS'd since
 >    migration 0005) but had no real writer until now. Per CLAUDE.md rule 6

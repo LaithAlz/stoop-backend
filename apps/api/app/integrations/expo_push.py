@@ -50,9 +50,15 @@ log = structlog.get_logger(__name__)
 
 _EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
-_HTTP_TIMEOUT_SECONDS: float = 10.0
-"""Matches ``app/integrations/twilio_send.py``'s own outbound timeout —
-a hung Expo request must never stall the push sweep's whole tick."""
+_HTTP_TIMEOUT_SECONDS: float = 5.0
+"""Tighter than ``app/integrations/twilio_send.py``'s own 10s outbound
+timeout — defense-in-depth (safety review HIGH-1) alongside
+``app/push_outbox.py``'s own wall-clock tick deadline: a hung Expo
+request must never stall the push sweep's whole tick, and a shorter
+per-call timeout means more of the shared batch gets a real attempt
+before that deadline is reached. Halving it costs nothing here (unlike
+the emergency chain, this sender is never on a critical single-attempt
+path — a timed-out attempt just retries on the next tick)."""
 
 DEVICE_NOT_REGISTERED_ERROR_CODE: str = "DeviceNotRegistered"
 """Expo's per-receipt error code for a permanently dead token (app

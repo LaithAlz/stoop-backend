@@ -36,6 +36,9 @@ sweep:
   ticker does (push never carries the emergency path, CLAUDE.md rule #1,
   and push failure is invisible to the approval flow by design — see that
   module's own docstring), so it must never sit ahead of anything else.
+  Like ``sender_tick``, it is wall-clock-bounded (safety review HIGH-1 —
+  see "Bounding sender_tick's own worst-case duration" below) so an Expo
+  outage can never starve the emergency sweep's NEXT run either.
 
 Design choice (the campaign's "sender design menu" — (a) in-process
 asyncio periodic task, RECOMMENDED for v1; matches
@@ -50,7 +53,8 @@ file for the entire scheduler surface; if a FIFTH sweep ever needs
 combining here and this file starts to sprawl, split it back out rather
 than let it bloat.
 
-Bounding sender_tick's own worst-case duration (safety review, MEDIUM)
+Bounding sender_tick's (and, since #210, run_push_outbox_sweep's) own
+worst-case duration (safety review, MEDIUM; extended HIGH-1 for push)
 ------------------------------------------------------------------------
 ``sender_tick`` shares this SAME single ticker task with the three sweeps
 above — a slow tick here is a slow tick for the emergency chain sweep's
@@ -69,6 +73,16 @@ send's tail latency, so the sweeps that run after it in the tick are never
 starved by an unbounded draft-sending backlog. The emergency chain sweep
 still runs FIRST in ``_run_one_tick_body`` (unchanged) — this deadline is
 additive insurance for the sweeps after it, not a reordering.
+
+``app/push_outbox.py::run_push_outbox_sweep`` (#210 M3, safety review
+HIGH-1) shares the exact same risk shape — up to 50 candidates, each
+risking Expo's own timeout (``app/integrations/expo_push.py``'s
+``_HTTP_TIMEOUT_SECONDS``, 5s) — and is bounded the identical way: its
+own ``DEFAULT_TICK_DEADLINE_SECONDS`` (25s), an injectable time source,
+stop-claiming-not-abandoning semantics. Being the LAST sweep in the tick,
+an unbounded push backlog would otherwise delay only the NEXT tick's
+FIRST sweep (the emergency chain) — exactly the scenario this deadline
+exists to prevent, symmetric with sender_tick's own rationale above.
 
 Crash-safety
 ------------
