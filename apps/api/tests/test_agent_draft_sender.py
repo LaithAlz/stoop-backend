@@ -30,7 +30,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 import app.db.session as db_mod
-from app.agent.draft_sender import DEFAULT_BATCH_SIZE, run_sender_loop, sender_tick
+from app.agent.draft_sender import DEFAULT_BATCH_SIZE, sender_tick
 from app.agent.nodes.classify_severity import classify_severity
 from app.agent.schemas import CaseContext, PrefilterResult
 from app.agent.state import AgentState
@@ -389,44 +389,77 @@ async def test_send_failure_leaves_draft_stuck_sending_not_lost_or_duplicated(
         await _cleanup(db_session, landlord_id)
 
 
-# ---------------------------------------------------------------------------
-# 5. Deployment gating — the worker refuses to run with no sender bound.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-async def test_run_sender_loop_disabled_with_no_sender_configured() -> None:
-    """Deployment gating (matches #109's own pattern): a ``None`` sender
-    means the worker is disabled — this must return promptly (never loop
-    forever, never raise), not merely "eventually work" behind a timeout.
-    The loud-log assertion lives in ``test_integrations_sms_sender.py``-style
-    coverage is out of scope here; the behavioral contract (never loops,
-    never touches the claim SQL) is what this test pins."""
-    await asyncio.wait_for(run_sender_loop(sender=None), timeout=1.0)
-
-
 @pytest.mark.integration
-async def test_run_sender_loop_stops_on_stop_event(db_session: AsyncSession) -> None:
-    landlord_id, _case_id, draft_id = await _seed_approved_draft(db_session)
+async def test_post_send_write_failure_pages_dedicated_sentry_and_leaves_draft_stuck(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#199 fast-follow (PR #198 senior review, item 1): a failure in the
+    FINAL write-transaction -- AFTER the (irreversible) Twilio send has
+    already gone out -- fires its OWN dedicated Sentry page ("send
+    delivered but recording failed", distinct from the send-failure page
+    above), re-raises rather than swallowing (the generic
+    ``app/scheduler.py`` backstop still catches it exactly as before), and
+    leaves the draft stuck ``'sending'`` -- the SAME designed failure mode
+    as any other send failure. The claim CAS alone (not any new code this
+    fix adds) already rules out a double-send on the very next tick."""
+    import app.agent.draft_sender as draft_sender_mod
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_capture_message(
+        message: str, *, level: str | None = None, extras: dict[str, object] | None = None
+    ) -> None:
+        calls.append({"message": message, "level": level, "extras": extras})
+
+    monkeypatch.setattr(draft_sender_mod.sentry_sdk, "capture_message", _fake_capture_message)
+    # Force the final write-transaction to fail AFTER the fake send already
+    # "went out" -- a broken INSERT (a table that doesn't exist) raises the
+    # same way any real write failure would (a constraint violation, a
+    # dropped connection, ...) without needing to fake the DB itself.
+    monkeypatch.setattr(
+        draft_sender_mod,
+        "_INSERT_OUTBOUND_MESSAGE_SQL",
+        text("INSERT INTO nonexistent_table_for_post_send_write_failure_test (id) VALUES (1)"),
+    )
+
+    landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
     sender = _FakeSmsSender()
-    stop_event = asyncio.Event()
-
-    async def _stop_soon() -> None:
-        await asyncio.sleep(0.05)
-        stop_event.set()
-
     try:
-        await asyncio.gather(
-            run_sender_loop(sender=sender, interval_seconds=0.01, stop_event=stop_event),
-            _stop_soon(),
-        )
-        # At least one tick ran before the stop fired.
+        with pytest.raises(Exception):  # noqa: B017 -- re-raised on purpose, see module docstring
+            await sender_tick(sender=sender)
+
+        assert len(sender.calls) == 1  # the send itself DID go out -- irreversible
+
+        assert len(calls) == 1
+        assert calls[0]["message"] == "draft_sender: send delivered but recording failed"
+        assert calls[0]["level"] == "error"
+        extras = calls[0]["extras"]
+        assert extras is not None
+        assert extras["draft_id"] == draft_id
+        assert extras["case_id"] == case_id
+        assert extras["exc_type"]  # a non-empty exception class name, never a phone/body
+
         status = (
             await db_session.execute(
                 text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
             )
         ).scalar_one()
-        assert status == "sent"
+        assert status == "sending"  # stuck, visible -- never silently re-attempted
+
+        message_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM messages WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert message_count == 0  # the broken write never committed
+
+        # No double-send on the very next tick -- the row is 'sending', not
+        # 'approved', so the claim SQL's own WHERE clause matches nothing.
+        # This assertion is the point of this test: the claim CAS alone
+        # (pre-existing, untouched by this fix) already prevents it.
+        claimed_again = await sender_tick(sender=sender)
+        assert claimed_again == 0
+        assert len(sender.calls) == 1  # never sent a second time
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -481,7 +514,7 @@ async def test_edited_draft_with_empty_final_body_never_sends_original_text(
 
 
 # ---------------------------------------------------------------------------
-# 6. No twilio_number provisioned yet -- refuse to send, never misroute.
+# 5. No twilio_number provisioned yet -- refuse to send, never misroute.
 # ---------------------------------------------------------------------------
 
 
@@ -520,7 +553,7 @@ async def test_no_property_twilio_number_refuses_to_send(db_session: AsyncSessio
 
 
 # ---------------------------------------------------------------------------
-# 7. Wall-clock deadline (safety review, MEDIUM) -- sender_tick bounds its
+# 6. Wall-clock deadline (safety review, MEDIUM) -- sender_tick bounds its
 #    own worst-case duration; leftovers wait for the next tick, never lost.
 # ---------------------------------------------------------------------------
 

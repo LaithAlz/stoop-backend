@@ -238,16 +238,28 @@ async def insert_case(
     property_id: str,
     tenant_id: str,
     vendor_id: str | None = None,
-    status: str = "awaiting_approval",
-    severity: str | None = "urgent",
-    title: str | None = "Test case",
+    status: str = "open",
+    severity: str | None = None,
+    title: str | None = None,
 ) -> str:
     """Seeds a ``cases`` row directly (bypassing the graph) — #44/#45's new
     test modules exercise ``resolve_draft_decision``/the drafts router
     against a known status, not against whatever ``run_graph`` would
     naturally produce. Also used by #54/#55/#57's router test modules
-    (``test_properties_router.py``, ``test_cases_router.py``), which pass
-    ``status``/``severity``/``title`` explicitly."""
+    (``test_properties_router.py``, ``test_cases_router.py``).
+
+    Defaults are NEUTRAL — ``status='open'``/``severity=None``/
+    ``title=None`` — matching ``schema-v1.md``'s own column defaults (a
+    freshly-created, never-classified case) rather than any one caller's
+    preferred fixture shape. A #198 revision briefly flipped these to
+    ``status='awaiting_approval'``/``severity='urgent'``/``title='Test
+    case'`` to save a few callers a kwarg; PR #198's senior review flagged
+    the wide implicit blast radius that created (every OTHER caller of this
+    shared factory silently inherited a non-neutral case shape it never
+    asked for), and #199 reverted it: every call site that actually needs
+    a non-open/classified/titled case now passes ``status``/``severity``/
+    ``title`` EXPLICITLY — see each call site for why. Explicit beats
+    implicit for a shared test helper this widely used."""
     case_id = str(uuid.uuid4())
     await session.execute(
         text(

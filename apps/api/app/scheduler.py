@@ -11,14 +11,17 @@ sender, and the deprovisioning number-release sweep:
   the ONLY other sanctioned outbound-send call site besides the emergency
   chain above; see ``apps/api/CLAUDE.md``'s "Send to tenant/vendor happens
   only through the draft flow or the emergency safety path"). This reuses
-  the SAME 60s cadence as the other three sweeps rather than draft_sender.
-  py's own faster standalone loop (``run_sender_loop``) — one scheduler
-  owns all periodic work, never a second competing lifespan task. A
-  landlord's undo window is unaffected in the COMMON case (the window is
-  measured from approval, and a tick already runs every 60s regardless of
-  when within that window approval happened); the worst case is a due
-  send waiting up to just under 60s for the next tick, matching this
-  ticker's existing coarse-grained cadence for every other sweep it drives.
+  the SAME 60s cadence as the other three sweeps — one scheduler owns all
+  periodic work, never a second competing lifespan task. (An earlier
+  revision also shipped a faster standalone loop, ``run_sender_loop``, as
+  an alternative wiring; #199 deleted it as dead surface — sub-60s
+  dispatch, if ever wanted, is a change to this ticker's own interval, not
+  a second loop.) A landlord's undo window is unaffected in the COMMON
+  case (the window is measured from approval, and a tick already runs
+  every 60s regardless of when within that window approval happened); the
+  worst case is a due send waiting up to just under 60s for the next
+  tick, matching this ticker's existing coarse-grained cadence for every
+  other sweep it drives.
 - ``app/property_provisioning.py::sweep_pending_number_releases`` (#53 —
   releases a deleted property's Twilio number once its 24h grace period
   has elapsed; same "the timer only decides WHEN TO LOOK, never WHAT'S

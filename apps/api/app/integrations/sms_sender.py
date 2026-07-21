@@ -36,18 +36,21 @@ case's property's ``twilio_number`` and passes it through as
 never a send from some other property's number, and never a fabricated
 placeholder number.
 
-The deployment-gating pattern this module used to rely on
+The deployment-gating pattern this module used to rely on (removed #199)
 ------------------------------------------------------------------------
 Before this integration, :func:`get_default_sms_sender` returned ``None``
-and ``app/agent/draft_sender.py``'s ``run_sender_loop`` treated that as
-"the worker is disabled." That gate is no longer needed for the real
-binding below (``twilio_account_sid``/``twilio_auth_token`` are required,
-non-optional settings — see ``app/config.py`` — so constructing a real
-sender never depends on an absent credential the way it hypothetically
-could have). :class:`NotImplementedSmsSender` is kept, unused, as a
-documented, loudly-failing placeholder contract for any FUTURE binding
-that bypasses :func:`get_default_sms_sender` by mistake — never
-constructed by this module today.
+and ``app/agent/draft_sender.py``'s standalone ``run_sender_loop`` treated
+that as "the worker is disabled." That gate is no longer needed for the
+real binding below (``twilio_account_sid``/``twilio_auth_token`` are
+required, non-optional settings — see ``app/config.py`` — so constructing
+a real sender never depends on an absent credential the way it
+hypothetically could have). The ``NotImplementedSmsSender`` placeholder
+and ``run_sender_loop`` itself were both built-and-tested but never wired
+into production (the scheduler always calls ``sender_tick`` directly);
+PR #198's senior review flagged both as dead surface and #199 deleted
+them — sub-60s dispatch, if ever wanted, is a change to
+``app/scheduler.py``'s tick interval, never a second competing loop or a
+placeholder sender that no production path can ever reach.
 """
 
 from __future__ import annotations
@@ -72,20 +75,6 @@ class SmsSender(Protocol):
     default number."""
 
     async def send_sms(self, *, to_e164: str, from_e164: str, body: str) -> str: ...
-
-
-class NotImplementedSmsSender:
-    """Documented, loudly-failing placeholder — see module docstring "The
-    deployment-gating pattern this module used to rely on". Never
-    constructed by :func:`get_default_sms_sender`; exists only so a future
-    caller that bypasses the sanctioned binding by mistake fails loudly
-    instead of pretending to succeed."""
-
-    async def send_sms(self, *, to_e164: str, from_e164: str, body: str) -> str:
-        raise NotImplementedError(
-            "No real SmsSender is wired in yet -- get_default_sms_sender() "
-            "(app/integrations/sms_sender.py) is the sanctioned way to obtain one."
-        )
 
 
 class TwilioBackedSmsSender:
@@ -115,7 +104,6 @@ def get_default_sms_sender() -> SmsSender:
 
 
 __all__: list[str] = [
-    "NotImplementedSmsSender",
     "SmsSender",
     "TwilioBackedSmsSender",
     "get_default_sms_sender",
