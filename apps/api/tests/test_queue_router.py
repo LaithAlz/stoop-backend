@@ -564,7 +564,13 @@ async def test_queue_notification_id_present_via_message_cases_correlation(
         property_id = await factories.insert_property(session, landlord_id)
         tenant_id = await factories.insert_tenant(session, landlord_id, property_id)
         case_id = await factories.insert_case(
-            session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+            session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            # Explicit: the queue only surfaces awaiting_approval cases, and
+            # factories.insert_case deliberately defaults to neutral 'open'.
+            status="awaiting_approval",
         )
         message_id = await factories.insert_message(
             session,
