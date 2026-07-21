@@ -112,6 +112,27 @@ the retry sweep itself (``app/agent/degraded_mode_sweep.py`` does that,
 callable but not yet wired to any cron — same seam pattern as
 ``app/agent/case_lifecycle.py::sweep_cases``).
 
+Cost accounting on the classification_failed leg (#208) — payload-only,
+never a routing/notification change
+------------------------------------------------------------------------
+``classify_severity.py`` never writes its own audit row on failure
+(unchanged — see that module's docstring). When its double-failed
+attempt(s) genuinely reached the API and consumed billed tokens, it hands
+that usage forward via ``state["classification_failed_usage"]``
+(``{model, tokens_in, tokens_out, cost_cents}``, absent when neither
+attempt ever reached the API). :func:`degraded_mode` folds those keys
+into the SAME ``payload`` dict every leg of
+:func:`_handle_classification_failed` below already spreads into its own
+``audit_log`` ``'degraded_mode'`` INSERT — so the cost keys ride along on
+whichever leg's row actually gets written, with zero changes to routing,
+notification content, or idempotency logic anywhere in this module (see
+``app/cost_reporting.py``'s new ``action = 'degraded_mode'`` CTE branch,
+schema-v1.md v1.13 amendment). This key is NEVER read by
+:func:`_handle_generic_degraded` (the ``severity_emergency``/
+``draft_guard_failed`` legs) — those already get their own cost recorded
+unconditionally via ``draft_response.py``'s own ``'drafted'`` row, so
+there is nothing for THIS node to add there.
+
 Idempotency
 -----------
 Every notification INSERT in this module targets its own partial unique
@@ -633,11 +654,25 @@ async def degraded_mode(state: AgentState) -> dict[str, Any]:
         return {"reasoning_log": reasoning_log}
 
     case_id = case_context.case_id
-    payload = {
+    payload: dict[str, Any] = {
         "message_id": str(message_id),
         "case_id": str(case_id) if case_id is not None else None,
         "reasons": reasons,
     }
+    # #208 — payload-only amendment (schema-v1.md v1.13): when
+    # classify_severity's own failed attempt(s) genuinely reached the API
+    # and consumed billed tokens, it hands that usage forward via
+    # ``state["classification_failed_usage"]`` (absent when neither attempt
+    # ever reached the API). Folding those keys into THIS payload means
+    # they ride along on the SAME ``'degraded_mode'`` audit row every leg of
+    # ``_handle_classification_failed`` below already writes for a genuine
+    # new activation — no new audit row, no new action value, no migration.
+    # See ``classify_severity.py``'s own module docstring "Cost accounting
+    # on the failure path (#208)" for the full design rationale.
+    if reasons == [REASON_CLASSIFICATION_FAILED]:
+        failed_usage = state.get("classification_failed_usage")
+        if failed_usage:
+            payload.update(failed_usage)
 
     try:
         if reasons == [REASON_CLASSIFICATION_FAILED]:

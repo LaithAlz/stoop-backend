@@ -536,6 +536,120 @@ async def test_degraded_mode_classification_failed_no_keywords_queues_retry(
 
 
 @pytest.mark.integration
+async def test_degraded_mode_classification_failed_folds_usage_into_audit_payload(
+    db_session: AsyncSession,
+) -> None:
+    """#208: when classify_severity hands forward reached-the-API usage
+    from its failed attempt(s) via ``state["classification_failed_usage"]``,
+    this node folds those keys into the SAME 'degraded_mode' audit row it
+    already writes for this leg -- payload-only, no new row, no new
+    action value."""
+    landlord_id = await factories.insert_landlord(db_session, full_name="Sam Okafor")
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="not sure what's going on but something seems off",
+        prefilter=PrefilterResult(hard_hit=False).model_dump_json(),
+    )
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "classification_failed": True,
+            "classification_failed_usage": {
+                "model": "claude-sonnet-5",
+                "tokens_in": 400,
+                "tokens_out": 120,
+                "cost_cents": 1.98,
+            },
+            "reasoning_log": [],
+        }
+        await degraded_mode(state)
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text("SELECT payload FROM audit_log WHERE landlord_id = :lid"),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"]["leg"] == "queued_for_retry"
+        assert audit_row["payload"]["model"] == "claude-sonnet-5"
+        assert audit_row["payload"]["tokens_in"] == 400
+        assert audit_row["payload"]["tokens_out"] == 120
+        assert audit_row["payload"]["cost_cents"] == 1.98
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_degraded_mode_classification_failed_hard_hit_leg_also_gets_usage(
+    db_session: AsyncSession,
+) -> None:
+    """The hard-hit leg's audit row (unconditional, never idempotency
+    -gated) ALSO gets the cost keys -- the payload merge happens once, in
+    ``degraded_mode()`` itself, before dispatch to any leg."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        prefilter=PrefilterResult(hard_hit=True, categories=["fire"]).model_dump_json(),
+    )
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id), property_id=uuid.UUID(property_id)
+            ),
+            "classification_failed": True,
+            "classification_failed_usage": {
+                "model": "claude-sonnet-5",
+                "tokens_in": 50,
+                "tokens_out": 10,
+                "cost_cents": 0.15,
+            },
+            "reasoning_log": [],
+        }
+        await degraded_mode(state)
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text("SELECT payload FROM audit_log WHERE landlord_id = :lid"),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"]["leg"] == "hard_hit_already_handled"
+        assert audit_row["payload"]["cost_cents"] == 0.15
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_degraded_mode_no_keywords_fires_sentry_activation_alert(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

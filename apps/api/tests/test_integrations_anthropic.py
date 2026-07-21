@@ -161,7 +161,7 @@ async def test_call_tool_forced_raises_on_timeout(monkeypatch: pytest.MonkeyPatc
     fake_messages = _FakeMessages(response=_fake_message(), delay=0.2)
     monkeypatch.setattr(anthropic_mod, "get_client", lambda: _FakeClient(fake_messages))
 
-    with pytest.raises(anthropic_mod.AnthropicCallError, match="timed out"):
+    with pytest.raises(anthropic_mod.AnthropicCallError, match="timed out") as exc_info:
         await anthropic_mod.call_tool_forced(
             system="s",
             user_content="u",
@@ -169,6 +169,11 @@ async def test_call_tool_forced_raises_on_timeout(monkeypatch: pytest.MonkeyPatc
             tool_name="classify_severity",
             timeout_seconds=0.01,
         )
+    # #208: a timeout never actually receives a response -- no usage data
+    # exists to report, ever (never a fabricated cost figure).
+    assert exc_info.value.tokens_in is None
+    assert exc_info.value.tokens_out is None
+    assert exc_info.value.model is None
 
 
 @pytest.mark.unit
@@ -178,23 +183,36 @@ async def test_call_tool_forced_raises_on_api_error(monkeypatch: pytest.MonkeyPa
     fake_messages = _FakeMessages(exception=api_error)
     monkeypatch.setattr(anthropic_mod, "get_client", lambda: _FakeClient(fake_messages))
 
-    with pytest.raises(anthropic_mod.AnthropicCallError, match="Anthropic API error"):
+    with pytest.raises(anthropic_mod.AnthropicCallError, match="Anthropic API error") as exc_info:
         await anthropic_mod.call_tool_forced(
             system="s", user_content="u", tool=_TOOL, tool_name="classify_severity"
         )
+    # #208: a pre-flight connection failure never reached the API -- no
+    # usage data exists, ever (never a fabricated cost figure).
+    assert exc_info.value.tokens_in is None
+    assert exc_info.value.tokens_out is None
+    assert exc_info.value.model is None
 
 
 @pytest.mark.unit
 async def test_call_tool_forced_raises_when_no_tool_use_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_messages = _FakeMessages(response=_fake_message(include_tool_use=False))
+    fake_messages = _FakeMessages(
+        response=_fake_message(include_tool_use=False, input_tokens=321, output_tokens=65)
+    )
     monkeypatch.setattr(anthropic_mod, "get_client", lambda: _FakeClient(fake_messages))
 
-    with pytest.raises(anthropic_mod.AnthropicCallError, match="no tool_use block"):
+    with pytest.raises(anthropic_mod.AnthropicCallError, match="no tool_use block") as exc_info:
         await anthropic_mod.call_tool_forced(
             system="s", user_content="u", tool=_TOOL, tool_name="classify_severity"
         )
+    # #208: a FULL response WAS received here -- real, billed usage exists
+    # even though there's no tool_use block to parse a result from. This is
+    # the ONE AnthropicCallError sub-case that carries real usage.
+    assert exc_info.value.tokens_in == 321
+    assert exc_info.value.tokens_out == 65
+    assert exc_info.value.model == "claude-sonnet-5"
 
 
 # ---------------------------------------------------------------------------

@@ -246,7 +246,39 @@ class AnthropicCallError(RuntimeError):
     """Raised when a single forced tool-use call fails: timeout, any
     Anthropic API error, or a response that (despite ``tool_choice`` forcing
     exactly one tool) carries no usable ``tool_use`` content block. Callers
-    own the retry-once + degraded-mode policy — see module docstring."""
+    own the retry-once + degraded-mode policy — see module docstring.
+
+    Reached-the-API usage, when it exists (#208)
+    ---------------------------------------------
+    Two of the three failure modes above genuinely never have billed-token
+    evidence available: a timeout (``asyncio.wait_for`` cancels the
+    in-flight call; no response object is ever produced) and an
+    ``anthropic.APIError`` (a pre-flight connection failure never reached
+    the API at all; a 4xx/5xx status response's error body carries no
+    ``usage`` field per the SDK's own ``APIStatusError`` shape — see
+    ``app/integrations/anthropic.py``'s module docstring for the
+    "guarded by key-existence, never fabricated" convention this mirrors).
+    The THIRD failure mode — a full response WAS received (real, billed
+    tokens) but it carries no ``tool_use`` block despite the forced
+    ``tool_choice`` — is the one case where usage genuinely exists at the
+    moment of failure, so :attr:`tokens_in`/:attr:`tokens_out`/:attr:`model`
+    are populated there (see the raise site below) and left ``None``
+    (never fabricated/zeroed) for the other two. Callers (the three
+    ``agent/nodes`` retry loops) check ``tokens_in is not None`` before
+    ever recording a cost figure from a failed attempt."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        model: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.tokens_in = tokens_in
+        self.tokens_out = tokens_out
+        self.model = model
 
 
 @dataclass(frozen=True)
@@ -313,7 +345,17 @@ async def call_tool_forced(
         None,
     )
     if tool_use is None:
-        raise AnthropicCallError("no tool_use block in response despite forced tool_choice")
+        # A full response WAS received here -- real, billed usage exists
+        # even though there's no tool_use block to parse a result from.
+        # Attach it to the error so callers can still record the cost of
+        # this reached-the-API attempt (#208) -- see AnthropicCallError's
+        # own docstring "Reached-the-API usage, when it exists".
+        raise AnthropicCallError(
+            "no tool_use block in response despite forced tool_choice",
+            tokens_in=response.usage.input_tokens,
+            tokens_out=response.usage.output_tokens,
+            model=response.model,
+        )
 
     usage = response.usage
     return ToolCallResult(

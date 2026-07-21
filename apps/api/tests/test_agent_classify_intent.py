@@ -34,6 +34,8 @@ from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any
 
+import anthropic
+import httpx
 import pytest
 import pytest_asyncio
 from anthropic.types import ToolUseBlock
@@ -409,9 +411,95 @@ async def test_classify_intent_retries_once_on_validation_failure_then_succeeds(
 
 
 @pytest.mark.integration
+async def test_classify_intent_success_row_only_carries_winning_attempt_usage(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208, "Scope, honestly stated": a first attempt that reaches the API
+    and fails, followed by a second that succeeds, does NOT get its own
+    failed-attempt tokens folded into the SUCCESS 'classified' row -- that
+    row is BYTE-IDENTICAL to before #208, carrying only the winning
+    attempt's usage (80/20, per _fake_message's default), never 160/40.
+    This is a documented, accepted gap (see this node's own module
+    docstring "Cost accounting on TOTAL failure (#208)"), not an oversight
+    -- no separate audit row exists for the first attempt either, since the
+    node ultimately succeeded."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="could I get rent receipts for March to May?",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(
+                tool_input={
+                    "intent": "not-a-real-category",
+                    "is_new_issue": True,
+                    "summary": "bad payload",
+                }
+            ),
+            _fake_message(
+                tool_input={
+                    "intent": "admin",
+                    "is_new_issue": True,
+                    "summary": "Rent receipts for March to May",
+                }
+            ),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "reasoning_log": [],
+        }
+        update = await classify_intent(state)
+        assert update["intent"].intent.value == "admin"
+
+        audit_rows = (
+            (
+                await db_session.execute(
+                    text("SELECT payload FROM audit_log WHERE case_id = :cid"), {"cid": case_id}
+                )
+            )
+            .mappings()
+            .all()
+        )
+        # Exactly ONE row -- no separate row for the first, failed attempt.
+        assert len(audit_rows) == 1
+        payload = audit_rows[0]["payload"]
+        assert payload["kind"] == "intent"
+        assert payload["tokens_in"] == 80
+        assert payload["tokens_out"] == 20
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_classify_intent_double_failure_leaves_intent_unset(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """#208: both attempts reach the API (real usage, per ``_fake_message``'s
+    default 80/20 tokens) but fail OUR OWN ``IntentResult`` validation -- a
+    'classified' audit row IS now written (unlike the pre-#208 behavior),
+    but disambiguated as a FAILURE via ``payload.kind`` and carrying no
+    ``intent``/``summary`` -- this row never claims a classification
+    happened, only that an attempt was made and here is what it cost."""
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -451,12 +539,90 @@ async def test_classify_intent_double_failure_leaves_intent_unset(
         assert any("couldn't figure out" in line for line in update["reasoning_log"])
         assert len(fake_messages.calls) == 2
 
+        audit_row = (
+            (
+                await db_session.execute(
+                    text("SELECT actor, action, payload FROM audit_log WHERE case_id = :cid"),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["actor"] == "agent"
+        assert audit_row["action"] == "classified"  # existing vocabulary, no migration
+        payload = audit_row["payload"]
+        assert payload["kind"] == "intent_classification_failed"
+        assert "intent" not in payload
+        assert "summary" not in payload
+        assert "is_new_issue" not in payload
+        assert payload["message_id"] == message_id
+        assert payload["case_id"] == case_id
+        assert payload["model"] == "claude-sonnet-5"
+        # Both failed attempts reached the API -- 80/20 tokens EACH (see
+        # _fake_message's default), summed, never just the last one.
+        assert payload["tokens_in"] == 160
+        assert payload["tokens_out"] == 40
+        assert isinstance(payload["cost_cents"], (int, float))
+        assert payload["cost_cents"] > 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_intent_double_failure_with_no_usage_writes_no_audit_row(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208: when NEITHER attempt ever reaches the API (a pre-flight
+    connection failure here; a timeout behaves identically -- see
+    ``test_integrations_anthropic.py``), there is genuinely no billed cost
+    to report, so no NEW audit row is written -- the pre-#208 "no audit row
+    on failure" invariant still holds in this specific case."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="anyone home? need to ask about parking",
+    )
+
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    fake_messages = _FakeMessages(
+        responses=[
+            anthropic.APIConnectionError(request=request),
+            anthropic.APIConnectionError(request=request),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "reasoning_log": [],
+        }
+        update = await classify_intent(state)
+
+        assert update["intent"] is None
+        assert len(fake_messages.calls) == 2
+
         audit_count = (
             await db_session.execute(
                 text("SELECT COUNT(*) FROM audit_log WHERE case_id = :cid"), {"cid": case_id}
             )
         ).scalar_one()
-        assert audit_count == 0  # no audit row on failure
+        assert audit_count == 0  # no billed usage -- no fabricated record
     finally:
         await _cleanup(db_session, landlord_id)
 

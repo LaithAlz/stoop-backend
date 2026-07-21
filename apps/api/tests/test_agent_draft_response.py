@@ -24,6 +24,8 @@ from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any
 
+import anthropic
+import httpx
 import pytest
 import pytest_asyncio
 from anthropic.types import ToolUseBlock
@@ -1893,6 +1895,301 @@ async def test_draft_response_length_over_budget_cost_accumulates_across_both_ca
         # across both attempts, never just the last one.
         assert audit_row["payload"]["tokens_in"] == 300
         assert audit_row["payload"]["tokens_out"] == 80
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #208 -- an Anthropic call that reaches the API (real, billed usage) but
+# then fails must still contribute its cost, whether that failure is OUR
+# OWN DraftResult validation or the SDK's "no tool_use block" sub-case.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_draft_response_validation_failure_then_success_accumulates_both_calls(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208 bug fix: the first attempt's Anthropic call succeeds (real,
+    billed usage) but its own DraftResult.model_validate rejects an empty
+    body -- an earlier revision silently dropped that attempt's tokens
+    because accumulation happened AFTER model_validate. Now both attempts'
+    usage is summed into the single 'drafted' row, matching this module's
+    own "every call costs real money even when its output is rejected"
+    docstring claim for every failure mode, not just guard/length ones."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="dripping faucet",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            # First attempt: reaches the API, but body="" fails DraftResult's
+            # min_length=1 validation -- a genuinely different failure mode
+            # than a hard-guard/length rejection.
+            _fake_message(body="", refusal_templates_used=[]),
+            _fake_message(
+                body="Thanks, I'll send someone Thursday between 10 and 12.",
+                refusal_templates_used=[],
+            ),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        assert len(fake_messages.calls) == 2
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload FROM audit_log WHERE case_id = :cid AND action = 'drafted'"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        # 150/40 tokens PER call -- BOTH attempts counted, including the
+        # one whose own schema validation failed.
+        assert audit_row["payload"]["tokens_in"] == 300
+        assert audit_row["payload"]["tokens_out"] == 80
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_double_validation_failure_fallback_still_has_real_cost(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208 regression test for the bug itself: BOTH attempts reach the API
+    (real, billed usage) but fail DraftResult validation -- before the fix,
+    the final safe-fallback 'drafted' row would have recorded
+    tokens_in=0/tokens_out=0/cost_cents=0 (real spend, invisible). Now it
+    carries the true summed cost even though the model's own text was
+    rejected both times."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="dripping faucet",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(body="", refusal_templates_used=[]),
+            _fake_message(body="", refusal_templates_used=[]),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is True  # safe generic fallback used
+        assert update["draft"].body.startswith("Thanks for letting me know")
+        assert len(fake_messages.calls) == 2
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload FROM audit_log WHERE case_id = :cid AND action = 'drafted'"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"]["tokens_in"] == 300
+        assert audit_row["payload"]["tokens_out"] == 80
+        assert audit_row["payload"]["cost_cents"] > 0
+        assert audit_row["payload"]["model"] == "claude-sonnet-5"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_no_tool_use_block_still_contributes_usage(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208: the OTHER reached-the-API AnthropicCallError sub-case (a full
+    response received, but no tool_use block despite forced tool_choice)
+    also contributes its usage to the running total -- not just OUR OWN
+    DraftResult validation failures."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="dripping faucet",
+    )
+
+    no_tool_use_response = SimpleNamespace(
+        content=[],
+        usage=SimpleNamespace(input_tokens=90, output_tokens=15),
+        model="claude-sonnet-5",
+    )
+    fake_messages = _FakeMessages(
+        responses=[
+            no_tool_use_response,
+            _fake_message(
+                body="Thanks, I'll send someone Thursday between 10 and 12.",
+                refusal_templates_used=[],
+            ),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is False
+        assert len(fake_messages.calls) == 2
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload FROM audit_log WHERE case_id = :cid AND action = 'drafted'"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        # 90/15 from the failed first attempt + 150/40 from the successful
+        # second -- both counted.
+        assert audit_row["payload"]["tokens_in"] == 240
+        assert audit_row["payload"]["tokens_out"] == 55
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_response_double_transport_failure_has_no_fabricated_cost(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208: when NEITHER attempt ever reaches the API (both raise a
+    pre-flight connection error here), the safe-fallback 'drafted' row
+    still gets written (unchanged, #34/#60 behavior) but with zero cost --
+    honest, since no usage was ever available, never a fabricated figure."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="dripping faucet",
+    )
+
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    fake_messages = _FakeMessages(
+        responses=[
+            anthropic.APIConnectionError(request=request),
+            anthropic.APIConnectionError(request=request),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "severity": _routine_severity(),
+            "reasoning_log": [],
+        }
+        update = await draft_response(state)
+
+        assert update["draft_guard_failed"] is True
+
+        audit_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload FROM audit_log WHERE case_id = :cid AND action = 'drafted'"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"]["tokens_in"] == 0
+        assert audit_row["payload"]["tokens_out"] == 0
+        assert audit_row["payload"]["cost_cents"] == 0
+        assert audit_row["payload"]["model"] is None
     finally:
         await _cleanup(db_session, landlord_id)
 
