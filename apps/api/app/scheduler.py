@@ -1,7 +1,8 @@
-"""In-process 60-second scheduler ticker (#108/#109/#53) — FastAPI
+"""In-process 60-second scheduler ticker (#108/#109/#53/#210) — FastAPI
 lifespan-managed, drives the emergency escalation chain sweep, the SMS
 drain sweep, the degraded-mode retry sweep, the approve-flow draft
-sender, and the deprovisioning number-release sweep:
+sender, the deprovisioning number-release sweep, and the push-outbox
+sweep:
 - ``app/agent/emergency_chain.py::run_emergency_chain_sweep``
 - ``app/agent/emergency_chain.py::run_sms_drain_sweep`` (safety review,
   2026-07-12, spec finding S1 / safety finding 3 — drains
@@ -25,9 +26,19 @@ sender, and the deprovisioning number-release sweep:
 - ``app/property_provisioning.py::sweep_pending_number_releases`` (#53 —
   releases a deleted property's Twilio number once its 24h grace period
   has elapsed; same "the timer only decides WHEN TO LOOK, never WHAT'S
-  DUE" doctrine as every other sweep here). Runs LAST, after the draft
-  sender: a release tolerates hours of delay by design (the grace period
-  is 24h), so it must never sit ahead of anything time-sensitive.
+  DUE" doctrine as every other sweep here). Runs BEFORE the push-outbox
+  sweep, after the draft sender: a release tolerates hours of delay by
+  design (the grace period is 24h), so it must never sit ahead of
+  anything time-sensitive.
+- ``app/push_outbox.py::run_push_outbox_sweep`` (#210 M3 — drains the
+  landlord push-notification queue). Runs LAST, after ``number_release``:
+  a push nudge is the LEAST time-sensitive/safety-relevant work this
+  ticker does (push never carries the emergency path, CLAUDE.md rule #1,
+  and push failure is invisible to the approval flow by design — see that
+  module's own docstring), so it must never sit ahead of anything else.
+  Like ``sender_tick``, it is wall-clock-bounded (safety review HIGH-1 —
+  see "Bounding sender_tick's own worst-case duration" below) so an Expo
+  outage can never starve the emergency sweep's NEXT run either.
 
 Design choice (the campaign's "sender design menu" — (a) in-process
 asyncio periodic task, RECOMMENDED for v1; matches
@@ -42,7 +53,8 @@ file for the entire scheduler surface; if a FIFTH sweep ever needs
 combining here and this file starts to sprawl, split it back out rather
 than let it bloat.
 
-Bounding sender_tick's own worst-case duration (safety review, MEDIUM)
+Bounding sender_tick's (and, since #210, run_push_outbox_sweep's) own
+worst-case duration (safety review, MEDIUM; extended HIGH-1 for push)
 ------------------------------------------------------------------------
 ``sender_tick`` shares this SAME single ticker task with the three sweeps
 above — a slow tick here is a slow tick for the emergency chain sweep's
@@ -57,18 +69,31 @@ already claimed always finishes; leftover due candidates simply wait,
 unclaimed and still ``'approved'``, for the very next tick — nothing is
 lost). This bounds sender_tick's own contribution to a single tick's
 duration to roughly ``DEFAULT_TICK_DEADLINE_SECONDS`` plus one in-flight
-send's tail latency, so the other three sweeps' own cadence is never
+send's tail latency, so the sweeps that run after it in the tick are never
 starved by an unbounded draft-sending backlog. The emergency chain sweep
 still runs FIRST in ``_run_one_tick_body`` (unchanged) — this deadline is
-additive insurance for the LAST sweep in the tick, not a reordering.
+additive insurance for the sweeps after it, not a reordering.
+
+``app/push_outbox.py::run_push_outbox_sweep`` (#210 M3, safety review
+HIGH-1) shares the exact same risk shape — up to 50 candidates, each
+risking Expo's own timeout (``app/integrations/expo_push.py``'s
+``_HTTP_TIMEOUT_SECONDS``, 5s) — and is bounded the identical way: its
+own ``DEFAULT_TICK_DEADLINE_SECONDS`` (25s), an injectable time source,
+stop-claiming-not-abandoning semantics. Being the LAST sweep in the tick,
+an unbounded push backlog would otherwise delay only the NEXT tick's
+FIRST sweep (the emergency chain) — exactly the scenario this deadline
+exists to prevent, symmetric with sender_tick's own rationale above.
 
 Crash-safety
 ------------
 The ticker itself carries NO schedule state — it only wakes every
 :data:`TICK_INTERVAL_SECONDS` and asks each sweep function "what's due
-right now?", which reads directly from the ``notifications`` table (the
-first three sweeps) or the ``drafts`` table (``sender_tick`` — "the undo
-window is data, not a sleep", ``app/agent/draft_sender.py``'s own phrase).
+right now?", which reads directly from the ``notifications`` table
+(``run_emergency_chain_sweep``/``run_sms_drain_sweep``/
+``sweep_degraded_mode_retries``/``sweep_pending_number_releases``), the
+``drafts`` table (``sender_tick`` — "the undo window is data, not a
+sleep", ``app/agent/draft_sender.py``'s own phrase), or the
+``push_outbox`` table (``run_push_outbox_sweep`` — #210 M3).
 A process restart loses only the in-memory tick loop, never the schedule:
 every due row is still due (or becomes due) after restart, and the very
 next tick catches up — the literal meaning of the task's "retries/chain
@@ -124,6 +149,7 @@ from app.agent.draft_sender import sender_tick
 from app.agent.emergency_chain import run_emergency_chain_sweep, run_sms_drain_sweep
 from app.integrations.sms_sender import get_default_sms_sender
 from app.property_provisioning import sweep_pending_number_releases
+from app.push_outbox import run_push_outbox_sweep
 
 log = structlog.get_logger(__name__)
 
@@ -196,6 +222,15 @@ async def _run_one_tick_body() -> None:
         _safe_report(
             "scheduler_number_release_sweep_failed",
             "scheduler: number-release sweep tick raised",
+            exc,
+        )
+
+    try:
+        await run_push_outbox_sweep()
+    except Exception as exc:
+        _safe_report(
+            "scheduler_push_outbox_sweep_failed",
+            "scheduler: push outbox sweep tick raised",
             exc,
         )
 

@@ -24,6 +24,7 @@ from app.middleware.request_id import RequestIDMiddleware
 from app.observability import configure_logging, init_langsmith_tracing, init_sentry
 from app.routers import (
     cases,
+    devices,
     drafts,
     health,
     me,
@@ -212,6 +213,7 @@ def create_app() -> fastapi.FastAPI:
     application.include_router(drafts.router)
     application.include_router(notifications.router)
     application.include_router(trust.router)
+    application.include_router(devices.router)
     application.include_router(webhooks_twilio.router)
 
     # auth-test: always registered so engineers can verify JWT plumbing with

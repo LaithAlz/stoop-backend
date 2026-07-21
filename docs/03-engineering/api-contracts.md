@@ -686,6 +686,67 @@ rejected. `rate_limited` joins this doc's stable error-code vocabulary
 `email_required`, `account_deleted`) — codes are stable snake_case
 strings per this doc's own "Conventions" section.
 
+## Devices (push notifications, #210 M3)
+
+**v1.18 amendment (2026-07-18)** — doc-first, no prior contract existed
+for push-notification device registration. Landlord-scoped
+(`require_landlord`), standard error envelope. Push is for
+approvals/status only — **never the emergency path** (rule #1; voice +
+SMS remain the only emergency channels). No rate limiting (auth'd,
+idempotent upsert). Field names follow `schema-v1.md`'s existing
+`push_tokens` table exactly (`token`/`platform`) — this issue reuses that
+table rather than inventing a `device_tokens` one (see that doc's v1.13
+amendments for the full reasoning); there is no `expo_push_token` field
+at either the schema or the API layer.
+
+`POST /v1/devices` — body `{ "token": "ExponentPushToken[...]", "platform": "ios" | "android" }`
+→ 201
+```json
+{ "id": "…", "platform": "ios", "created_at": "…" }
+```
+- Upsert on `token` (`schema-v1.md`'s `UNIQUE` constraint) — `ON CONFLICT
+  (token) DO UPDATE SET landlord_id = EXCLUDED.landlord_id, platform =
+  EXCLUDED.platform, last_seen_at = now(), revoked_at = NULL`. **Token
+  ownership model**: a token belongs to whoever registered it LAST — this
+  is what makes the shared-device/sign-out-sign-in flow safe (landlord B
+  signs into a phone landlord A previously used on the same app install:
+  B's registration call silently moves the row to B, A's stale
+  registration on that device is simply gone). Re-registering the SAME
+  token under the SAME landlord (e.g. app relaunch) is a no-op upsert,
+  never a 409.
+- The upsert also clears `revoked_at` — a token the push sweep previously
+  marked dead (`DeviceNotRegistered`) is trusted again the instant a real
+  registration call proves it live once more.
+- 422 on a malformed body (missing/empty `token`, `platform` outside
+  `"ios"`/`"android"`) — standard FastAPI validation envelope.
+
+`DELETE /v1/devices/{device_id}` → 200 `{ "status": "deleted" }` — the
+explicit sign-out/unregister surface. **Contract choice: delete by the
+row's own `id`, not by the raw token** (mirrors every other `/v1/{resource}/{id}`
+endpoint in this doc — `vendors`, `tenants`, `properties` — none of which
+delete by a natural key), for two reasons: (1) consistency with the
+house convention, and (2) a push token is credential-adjacent (rule
+#5-adjacent) — putting it in a URL path risks it landing in access logs;
+an opaque row id never does. A HARD delete (not `push_tokens.revoked_at`)
+— an explicit unregister means "this row should not exist," distinct
+from the sweep's own soft dead-token marker (`schema-v1.md`'s v1.13
+amendments). **Not idempotent-200 on repeat** — unlike `POST
+/v1/cases/{id}/resolve`'s v1.14 amendment (a state-flag flip whose row
+still exists to re-confirm), this is a genuine hard delete: once gone,
+there is no row left to distinguish "already deleted by you" from
+"never existed" from "belongs to someone else", so — same as `DELETE
+/v1/properties/{id}` — a repeat call 404s exactly like the first
+call would for any other missing id.
+- 404 `device_not_found` for a missing OR cross-tenant `device_id` (same
+  non-disclosure convention as every other `/v1/{resource}/{id}` 404 in
+  this doc — checked via an explicit `landlord_id` predicate in the
+  `DELETE` statement itself, never RLS alone).
+
+Any `push_tokens`/`push_outbox` row a landlord's devices accumulate is
+never surfaced by a GET endpoint in this v1 amendment — no dashboard/app
+UI needs to list registered devices yet; add one in a later amendment if
+that changes.
+
 ## Billing (Train 2)
 
 `POST /v1/billing/checkout` — body `{ "plan": "full" }` → `{ "checkout_url": "…" }`

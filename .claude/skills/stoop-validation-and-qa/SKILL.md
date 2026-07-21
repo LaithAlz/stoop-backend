@@ -306,7 +306,7 @@ unless the command `cd`s):
 | temperature absence is test-asserted | `grep -rn '"temperature" not in' apps/api/tests/` |
 | Rubric checksum pair green | `cd apps/api && uv run pytest tests/test_rubric.py -m unit -q; echo EXIT=$?` |
 | Admin-session allowlist test exists | `grep -n test_get_admin_session_referenced_only_by_allowlisted_files apps/api/tests/test_migrations_0005.py` |
-| RLS matrix pins exactly 13 tables | `grep -n thirteen apps/api/tests/test_rls_isolation_matrix.py` |
+| RLS matrix pins exactly 14 tables (13 + push_outbox, #210 M3/migration 0012) | `grep -n fourteen apps/api/tests/test_rls_isolation_matrix.py` |
 | CI runs `-m "not eval"`; no web job | `grep -n 'pytest\|name:' .github/workflows/ci.yml` |
 | Web has no test/typecheck script | `python3 -c "import json;print(json.load(open('apps/web/package.json'))['scripts'])"` |
 | `EVAL_TOKEN_BUDGET_PER_MIN` default 25000 | `grep -n EVAL_TOKEN_BUDGET_PER_MIN apps/api/evals/runner.py` |
