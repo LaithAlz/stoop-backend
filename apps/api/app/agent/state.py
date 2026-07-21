@@ -119,6 +119,32 @@ class AgentState(TypedDict, total=False):
         documents the seam the same way ``app/agent/emergency.py`` does for
         #108. Absent/``False`` in every other case.
 
+    classification_failed_usage:
+        Set by ``classify_severity`` (#208) ONLY alongside
+        ``classification_failed=True``, and ONLY when at least one of the
+        two failed Anthropic attempts genuinely reached the API and
+        consumed billed tokens (a response was received but either this
+        node's own ``SeverityResult`` validation failed, or the SDK's own
+        forced-tool_choice response carried no usable ``tool_use`` block —
+        see ``app/integrations/anthropic.py``'s ``AnthropicCallError``
+        docstring "Reached-the-API usage, when it exists"). Shape:
+        ``{"model": str | None, "tokens_in": int, "tokens_out": int,
+        "cost_cents": float}`` — the SUM across both attempts' reached-the
+        -API usage, never just the last one (mirrors ``draft_response``'s
+        own "every real call costs money" running-total convention).
+        Absent/``None`` when classification failed but NEITHER attempt ever
+        reached the API (e.g. both were pre-flight connection failures or
+        timeouts) — there is genuinely no billed cost to report in that
+        case, never a fabricated zero-cost record. Consumed EXCLUSIVELY by
+        ``app.agent.nodes.degraded_mode`` to fold these cost keys into the
+        SAME ``audit_log`` ``'degraded_mode'`` row it already writes for
+        this leg (a payload-only amendment, schema-v1.md v1.14) — this key
+        never causes a NEW audit row on its own; it only enriches one that
+        was already going to be written. See ``classify_severity.py``'s
+        own module docstring "Cost accounting on the failure path (#208)"
+        for the full design rationale, including why the SUCCESS path
+        (this same node's ``'classified'`` row) is unchanged.
+
     draft_guard_failed:
         Set ``True`` by ``draft_response`` (#33) when the model's own
         acknowledgment text still violates a hard guard (dollar amounts/
@@ -224,6 +250,7 @@ class AgentState(TypedDict, total=False):
     severity: SeverityResult | None
     draft: DraftResult | None
     classification_failed: bool
+    classification_failed_usage: dict[str, Any] | None
     draft_guard_failed: bool
     length_over_budget: bool
     approval_resume: dict[str, Any] | None

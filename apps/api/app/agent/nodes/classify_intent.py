@@ -60,19 +60,68 @@ returns with ``intent`` left unset -- no invented category.
 
 Cost accounting (audit_log 'classified' payload)
 -----------------------------------------------------
-On a SUCCESSFUL classification only (mirroring ``classify_severity.py``'s
-"no audit row on failure"), this node writes its OWN ``audit_log`` row:
-``actor='agent'``, ``action='classified'`` (the SAME existing vocabulary
-entry ``classify_severity.py`` uses — schema-v1.md's ``audit_log.action``
-CHECK doesn't have a separate "intent classified" action, and doesn't need
-one), ``payload = {kind: 'intent', intent, summary, model, tokens_in,
-tokens_out, cost_cents, prompt_version: 'inline-v0'}``. ``kind`` disambig
-uates this row from a severity-classification 'classified' row on the same
-case's timeline. ``prompt_version`` is ``'inline-v0'``, not ``'v1'`` —
-this node's system prompt is the small INLINE, unversioned string above
-(see "Prompt-file gap"), never the governed ``prompts/v1.py`` module, so
-it gets its own, clearly-distinct version tag rather than borrowing the
-governed one. No message body ever enters this payload.
+On a SUCCESSFUL classification, this node writes its OWN ``audit_log``
+row: ``actor='agent'``, ``action='classified'`` (the SAME existing
+vocabulary entry ``classify_severity.py`` uses — schema-v1.md's
+``audit_log.action`` CHECK doesn't have a separate "intent classified"
+action, and doesn't need one), ``payload = {kind: 'intent', intent,
+summary, model, tokens_in, tokens_out, cost_cents, prompt_version:
+'inline-v0'}``. ``kind`` disambiguates this row from a
+severity-classification 'classified' row on the same case's timeline.
+``prompt_version`` is ``'inline-v0'``, not ``'v1'`` — this node's system
+prompt is the small INLINE, unversioned string above (see "Prompt-file
+gap"), never the governed ``prompts/v1.py`` module, so it gets its own,
+clearly-distinct version tag rather than borrowing the governed one. No
+message body ever enters this payload.
+
+Cost accounting on TOTAL failure (#208)
+-------------------------------------------
+Unlike ``classify_severity``, a double failure here has NO downstream
+node to piggyback a cost record on — ``app.agent.graph`` never routes an
+intent-only failure to ``degraded_mode`` (this node's own failure doesn't
+set any dedicated state flag; see this module's own docstring above,
+"20 s END-TO-END budget / retry", and the graph's own routing docstring
+for why: no consumer of ``state["intent"]`` exists yet, so nothing gates
+on it). Before #208, that
+meant an Anthropic attempt which reached the API and consumed billed
+tokens (this node's own ``IntentResult`` validation rejecting the model's
+output, or the SDK's forced-``tool_choice`` response carrying no usable
+``tool_use`` block — see ``app/integrations/anthropic.py``'s
+``AnthropicCallError`` docstring "Reached-the-API usage, when it exists")
+left literally no durable trace anywhere, understating real spend.
+
+Reusing the EXISTING ``'classified'`` action (no new ``audit_log.action``
+CHECK value, no migration) is the minimal honest fix: when BOTH attempts
+fail AND at least one genuinely reached the API (real usage exists), this
+node writes ONE additional ``'classified'`` row itself —
+``payload = {kind: 'intent_classification_failed', message_id, case_id,
+model, tokens_in, tokens_out, cost_cents}`` — summed across every failed
+attempt's reached-the-API usage, never fabricated when neither attempt
+ever reached the API (a pure connection/timeout failure writes nothing,
+same as before #208). No ``intent``/``summary``/``is_new_issue`` keys —
+this payload never claims a classification happened, only that an attempt
+was made and here is what it cost. ``app/cost_reporting.py``'s existing
+``action IN ('classified', 'drafted') AND payload ? 'cost_cents'`` branch
+already matches this shape unmodified (schema-v1.md v1.14 amendment) —
+no CTE change needed for this half of #208's fix (contrast
+``classify_severity.py``'s failure path, which DOES need a new CTE branch
+because it piggybacks on the ``'degraded_mode'`` action instead).
+
+**Scope, honestly stated (same caveat as ``classify_severity.py``):** only
+the DOUBLE-failure case is covered. A first attempt that reaches the API
+and fails, followed by a second that succeeds, still records only the
+winning attempt's usage on the SUCCESS row above — unchanged, not this
+issue's scope.
+
+**Best-effort write (safety review LOW-2):** the failed-cost audit INSERT
+is wrapped in its own ``try``/``except`` in :func:`classify_intent` —
+logged and swallowed, never re-raised. This write only RECORDS spend; it
+is not load-bearing for classification behavior, so a transient DB error
+here must never abort this node (and, transitively, block the graph from
+continuing on to ``classify_severity``) just because a nice-to-have cost
+record failed to write. The SUCCESS-path insert
+(:func:`_insert_intent_classified_audit`) is deliberately left as-is —
+out of this fix's scope.
 
 DB access
 ---------
@@ -175,16 +224,20 @@ def _build_user_content(
 
 async def _classify_intent_once(
     *, user_content: str, budget_seconds: float
-) -> tuple[IntentResult, anthropic_mod.ToolCallResult]:
-    call_result = await anthropic_mod.call_tool_forced(
+) -> anthropic_mod.ToolCallResult:
+    """Make ONE Anthropic call and return its raw, parsed result — does NOT
+    validate ``tool_input`` into :class:`IntentResult` (#208 fix: see
+    ``classify_severity.py``'s identical split for the full rationale —
+    bundling validation into this function meant a call that reached the
+    API and consumed billed tokens but then failed OUR OWN schema
+    validation never surfaced that usage to the caller)."""
+    return await anthropic_mod.call_tool_forced(
         system=_INTENT_SYSTEM_PROMPT,
         user_content=user_content,
         tool=CLASSIFY_INTENT_TOOL,
         tool_name="classify_intent",
         timeout_seconds=budget_seconds,
     )
-    intent_result = IntentResult.model_validate(call_result.tool_input)
-    return intent_result, call_result
 
 
 async def _insert_intent_classified_audit(
@@ -204,6 +257,42 @@ async def _insert_intent_classified_audit(
         "tokens_out": call_result.tokens_out,
         "cost_cents": cost_cents,
         "prompt_version": _INTENT_PROMPT_VERSION,
+    }
+    async with asynccontextmanager(get_admin_session)() as session:
+        await session.execute(
+            _INSERT_CLASSIFIED_AUDIT_SQL,
+            {
+                "landlord_id": str(landlord_id),
+                "case_id": str(case_id) if case_id is not None else None,
+                "payload": json.dumps(payload),
+            },
+        )
+
+
+async def _insert_intent_classification_failed_audit(
+    *,
+    landlord_id: UUID,
+    case_id: UUID | None,
+    message_id: UUID,
+    model: str | None,
+    tokens_in: int,
+    tokens_out: int,
+    cost_cents: float,
+) -> None:
+    """#208 — reuses the SAME ``'classified'`` action as a successful
+    intent classification (no new ``audit_log.action`` CHECK value), but a
+    payload shape that never claims a classification happened: no
+    ``intent``/``summary``/``is_new_issue`` keys, only the cost of a
+    DOUBLE-failed attempt that genuinely reached the API at least once. See
+    this module's docstring "Cost accounting on TOTAL failure (#208)"."""
+    payload = {
+        "kind": "intent_classification_failed",
+        "message_id": str(message_id),
+        "case_id": str(case_id) if case_id is not None else None,
+        "model": model,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cost_cents": cost_cents,
     }
     async with asynccontextmanager(get_admin_session)() as session:
         await session.execute(
@@ -238,28 +327,81 @@ async def classify_intent(state: AgentState) -> dict[str, Any]:
     deadline = anthropic_mod.new_deadline()
     intent_result: IntentResult | None = None
     call_result: anthropic_mod.ToolCallResult | None = None
+    # #208: sum of every FAILED attempt's reached-the-API usage -- see this
+    # module's docstring "Cost accounting on TOTAL failure (#208)".
+    failed_tokens_in = 0
+    failed_tokens_out = 0
+    failed_model: str | None = None
     for attempt in range(2):
         timeout = anthropic_mod.attempt_timeout(deadline, is_retry=attempt == 1)
         if timeout is None:
             log.error("classify_intent_retry_skipped_budget_exhausted", message_id=str(message_id))
             break
         try:
-            intent_result, call_result = await _classify_intent_once(
+            call_result = await _classify_intent_once(
                 user_content=user_content, budget_seconds=timeout
             )
-            break
-        except (anthropic_mod.AnthropicCallError, ValidationError) as exc:
+        except anthropic_mod.AnthropicCallError as exc:
             log.error(
                 "classify_intent_attempt_failed",
                 message_id=str(message_id),
                 attempt=attempt,
                 exc_type=type(exc).__name__,
             )
+            call_result = None
+            if exc.tokens_in is not None:
+                failed_tokens_in += exc.tokens_in
+                failed_tokens_out += exc.tokens_out or 0
+                failed_model = exc.model
+            continue
+
+        try:
+            intent_result = IntentResult.model_validate(call_result.tool_input)
+            break
+        except ValidationError as exc:
+            log.error(
+                "classify_intent_attempt_failed",
+                message_id=str(message_id),
+                attempt=attempt,
+                exc_type=type(exc).__name__,
+            )
+            failed_tokens_in += call_result.tokens_in
+            failed_tokens_out += call_result.tokens_out
+            failed_model = call_result.model
+            call_result = None
 
     if intent_result is None or call_result is None:
         reasoning_log.append(
             "I couldn't figure out what kind of message this is right now — moving on without it."
         )
+        if (failed_tokens_in or failed_tokens_out) and case_context.landlord_id is not None:
+            failed_cost_cents = anthropic_mod.estimate_cost_cents(
+                tokens_in=failed_tokens_in, tokens_out=failed_tokens_out
+            )
+            # Best-effort (safety review LOW-2): this write only RECORDS
+            # cost -- it is not load-bearing for classification behavior at
+            # all. A transient DB error here must never abort this node
+            # (and, via that, block the graph from continuing on to
+            # classify_severity) just because a nice-to-have cost record
+            # couldn't be written. Log and move on, same "never let a
+            # non-critical write gate the real work" posture as
+            # app/agent/emergency.py's own fire_emergency_protocol seam.
+            try:
+                await _insert_intent_classification_failed_audit(
+                    landlord_id=case_context.landlord_id,
+                    case_id=case_context.case_id,
+                    message_id=message_id,
+                    model=failed_model,
+                    tokens_in=failed_tokens_in,
+                    tokens_out=failed_tokens_out,
+                    cost_cents=failed_cost_cents,
+                )
+            except Exception as exc:  # noqa: BLE001 -- see comment above
+                log.error(
+                    "classify_intent_failed_cost_audit_write_failed",
+                    message_id=str(message_id),
+                    exc_type=type(exc).__name__,
+                )
         return {"intent": None, "reasoning_log": reasoning_log}
 
     display = _INTENT_DISPLAY[intent_result.intent]

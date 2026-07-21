@@ -368,6 +368,106 @@ async def test_queue_uses_latest_classified_row_when_reclassified(session: Async
 
 
 @pytest.mark.integration
+async def test_queue_latest_classified_row_must_be_severity_bearing(
+    session: AsyncSession,
+) -> None:
+    """#208 spec review (MAJOR-2): ``classify_intent.py`` also writes
+    ``action='classified'`` rows (``payload.kind`` disambiguates: 'intent'
+    on success, 'intent_classification_failed' on total failure, #208) —
+    the queue's "latest classified row per case" LATERAL was previously
+    kind-blind (``ORDER BY created_at DESC LIMIT 1`` with no payload-shape
+    filter), so an intent row landing AFTER the genuine severity row (e.g.
+    a stale-draft re-run that reruns ``classify_intent`` again without a
+    fresh severity classification) could win "latest" and blank the
+    card's severity chip (and clobber ``why``/``reasoning`` with the
+    intent row's own, differently-shaped fields).
+
+    This is NOT a #208-introduced bug — a successful ``kind='intent'`` row
+    already carried its own ``summary`` key and could have shadowed the
+    severity row's ``why`` the exact same way before #208 ever existed;
+    #208's new ``kind='intent_classification_failed'`` row just made it
+    easy to notice and worth fixing properly rather than shipping a second
+    instance of the same shadow. Fixed by requiring the LATERAL's row to
+    carry a ``severity`` key (``AND (a.payload ? 'severity')``) — the only
+    payload shape that predicate ever excludes is exactly the intent
+    variants, since every OTHER field this endpoint reads
+    (``rules_fired``, ``refusal_flags``, ``summary``) only ever
+    co-occurs with ``severity`` on a genuine ``classify_severity.py`` row.
+
+    Covers BOTH the pre-existing successful-intent shadow and #208's new
+    failed-intent shadow with the same two rows below (a real intent
+    'classified' row landing between them would fail identically without
+    the fix)."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        _p, _t, case_id = await _seed_awaiting_case(
+            session,
+            landlord_id=landlord_id,
+            classified_payload={
+                "severity": "urgent",
+                "summary": "No heat overnight can't wait, so I treated it as urgent.",
+                "rules_fired": ["no_heat_overnight"],
+                "refusal_flags": [],
+            },
+        )
+        await session.commit()
+        # A later message on the SAME case re-ran classify_intent (success
+        # case) -- no fresh severity classification this run, just an
+        # intent 'classified' row with NO "severity" key.
+        await factories.insert_audit_log(
+            session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            actor="agent",
+            action="classified",
+            payload={
+                "kind": "intent",
+                "intent": "maintenance",
+                "summary": "Tenant is following up about the same issue.",
+                "model": "claude-sonnet-5",
+                "tokens_in": 80,
+                "tokens_out": 20,
+                "cost_cents": 0.03,
+                "prompt_version": "inline-v0",
+            },
+        )
+        await session.commit()
+        # Then classify_intent failed twice on a STILL LATER message (#208's
+        # new failure-path row) -- also no "severity" key.
+        await factories.insert_audit_log(
+            session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            actor="agent",
+            action="classified",
+            payload={
+                "kind": "intent_classification_failed",
+                "message_id": str(uuid.uuid4()),
+                "case_id": case_id,
+                "model": "claude-sonnet-5",
+                "tokens_in": 160,
+                "tokens_out": 40,
+                "cost_cents": 0.06,
+            },
+        )
+        await session.commit()
+
+        result = await get_queue((landlord, session))
+
+        assert len(result.items) == 1
+        card = result.items[0]
+        # The severity chip/why/reasoning still come from the GENUINE
+        # severity row, never blanked or clobbered by either later intent
+        # row despite both being newer 'classified' rows on the same case.
+        assert card.severity == "urgent"
+        assert card.why == "No heat overnight can't wait, so I treated it as urgent."
+        assert card.reasoning == ["no_heat_overnight"]
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_queue_counts_tally_by_severity_and_awaiting_tenant_excluded_from_total(
     session: AsyncSession,
 ) -> None:

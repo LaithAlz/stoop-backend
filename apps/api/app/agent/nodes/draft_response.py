@@ -276,6 +276,39 @@ included (#34 safety review): ``app/agent/graph_entry.py`` uses a
 as the completion marker that decides whether a redelivered/retried graph
 invocation should re-run the pipeline — see that module's own docstring.
 
+**#208 fix — this running total now actually includes every reached-the
+-API attempt.** An earlier revision accumulated ``tokens_in``/
+``tokens_out`` only AFTER ``DraftResult.model_validate`` succeeded — so an
+attempt whose Anthropic call itself succeeded (real, billed usage) but
+whose OWN schema validation then failed silently contributed nothing to
+the total, understating cost exactly like #208's other two nodes. Since
+this node ALREADY writes an unconditional ``'drafted'`` row on every run
+(the safe generic fallback body when both attempts fail entirely — see
+"Hard guards" above), this needed no new audit row, no new payload shape,
+and no migration: purely a bug fix inside the existing running total, now
+delivering on this docstring's OWN pre-existing claim. Also now captures
+usage from the "no tool_use block despite forced tool_choice" failure
+sub-case (``AnthropicCallError.tokens_in``, populated only when a full
+response really was received — see
+``app/integrations/anthropic.py``'s ``AnthropicCallError`` docstring). A
+genuine transport failure with NO response at all (timeout, pre-flight
+connection error) still contributes nothing, honestly — there is no usage
+to report.
+
+Retry-then-success accounting (#208, explicit, since another node in this
+issue draws the opposite line): unlike ``classify_severity``/
+``classify_intent`` (whose SUCCESS row only ever carries the WINNING
+attempt's usage — see those modules' own "Scope, honestly stated" notes),
+THIS node's single ``'drafted'`` row is written exactly once per
+invocation and was ALREADY designed (before #208) to sum every attempt's
+usage into it, success or failure alike — so here, a first attempt that
+reaches the API and fails, followed by a second that succeeds, DOES have
+both attempts' tokens recorded together, by construction. The difference
+is structural, not a judgment call: this node has exactly one audit-writing
+call site per invocation to fold a running total into, while the other
+two only ever build their SUCCESS payload from the one ``call_result`` that
+actually validated.
+
 Reported gap: the EMERGENCY safety instruction
 --------------------------------------------------
 ``prompts/v1.py``'s frozen draft system prompt says: "For EMERGENCY
@@ -1110,8 +1143,40 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
                 tool_name="draft_message",
                 timeout_seconds=timeout,
             )
+        except anthropic_mod.AnthropicCallError as exc:
+            call_errors.append(type(exc).__name__)
+            log.error(
+                "draft_response_attempt_failed",
+                message_id=str(message_id),
+                attempt=attempt,
+                exc_type=type(exc).__name__,
+            )
+            # #208: the ONLY AnthropicCallError sub-case with real, billed
+            # usage is "a full response came back but carried no tool_use
+            # block" (see that exception's own docstring) -- every other
+            # sub-case (timeout, API error) never reached a state where
+            # usage exists, so exc.tokens_in stays None and nothing is
+            # added here, honestly.
+            if exc.tokens_in is not None:
+                total_tokens_in += exc.tokens_in
+                total_tokens_out += exc.tokens_out or 0
+                last_model = exc.model
+            continue
+
+        # The call itself succeeded here -- real, billed usage exists in
+        # call_result regardless of what happens to OUR OWN DraftResult
+        # validation next (#208 fix: an earlier revision accumulated tokens
+        # AFTER model_validate, silently losing this attempt's cost whenever
+        # validation failed -- every real call costs money even when its
+        # output is rejected, per this module's own "Cost accounting"
+        # docstring, which this now actually delivers on for every attempt).
+        total_tokens_in += call_result.tokens_in
+        total_tokens_out += call_result.tokens_out
+        last_model = call_result.model
+
+        try:
             candidate = DraftResult.model_validate(call_result.tool_input)
-        except (anthropic_mod.AnthropicCallError, ValidationError) as exc:
+        except ValidationError as exc:
             call_errors.append(type(exc).__name__)
             log.error(
                 "draft_response_attempt_failed",
@@ -1120,10 +1185,6 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
                 exc_type=type(exc).__name__,
             )
             continue
-
-        total_tokens_in += call_result.tokens_in
-        total_tokens_out += call_result.tokens_out
-        last_model = call_result.model
 
         violations = _check_hard_guards(body=candidate.body)
         too_long = enforce_length_budget and len(candidate.body) > _LENGTH_BUDGET_CHARS

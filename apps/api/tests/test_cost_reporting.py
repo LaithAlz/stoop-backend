@@ -205,6 +205,74 @@ async def test_cost_per_case_missing_cost_key_reads_as_zero_never_crashes(
 
 
 @pytest.mark.integration
+async def test_cost_per_case_counts_degraded_mode_cost_cents(db_session: AsyncSession) -> None:
+    """#208 (schema-v1.md v1.14): a 'degraded_mode' audit row that carries
+    cost_cents (classify_severity's failed-attempt usage, folded in by
+    app/agent/nodes/degraded_mode.py) counts as 'llm' cost, exactly like a
+    'classified'/'drafted' row -- the new CTE branch this issue added."""
+    landlord_id, _property_id, case_id = await _seed_case(db_session)
+    try:
+        await factories.insert_audit_log(
+            db_session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            action="degraded_mode",
+            payload={
+                "reasons": ["classification_failed"],
+                "leg": "queued_for_retry",
+                "model": "claude-sonnet-5",
+                "tokens_in": 400,
+                "tokens_out": 120,
+                "cost_cents": 1.98,
+            },
+        )
+        # Noise: a 'degraded_mode' row with NO cost_cents key (the common
+        # case -- neither failed attempt ever reached the API) must read
+        # as zero, never crash.
+        await factories.insert_audit_log(
+            db_session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            action="degraded_mode",
+            payload={"reasons": ["classification_failed"], "leg": "queued_for_retry"},
+        )
+
+        rollup = await cost_per_case(
+            db_session, landlord_id=uuid.UUID(landlord_id), case_id=uuid.UUID(case_id)
+        )
+        assert rollup.llm_cost_cents == pytest.approx(1.98)
+        assert rollup.sms_cost_cents == 0.0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_cost_per_property_and_month_count_degraded_mode_cost_cents(
+    db_session: AsyncSession,
+) -> None:
+    landlord_id, property_id, case_id = await _seed_case(db_session)
+    try:
+        await factories.insert_audit_log(
+            db_session,
+            landlord_id=landlord_id,
+            case_id=case_id,
+            action="degraded_mode",
+            payload={"reasons": ["classification_failed"], "cost_cents": 0.42},
+        )
+
+        property_rollup = await cost_per_property(
+            db_session, landlord_id=uuid.UUID(landlord_id), property_id=uuid.UUID(property_id)
+        )
+        assert property_rollup.llm_cost_cents == pytest.approx(0.42)
+
+        month_rollups = await cost_per_month(db_session, landlord_id=uuid.UUID(landlord_id))
+        assert len(month_rollups) == 1
+        assert month_rollups[0].llm_cost_cents == pytest.approx(0.42)
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_cost_per_case_scoped_by_landlord_id(db_session: AsyncSession) -> None:
     landlord_id, _property_id, case_id = await _seed_case(db_session)
     other_landlord_id = await factories.insert_landlord(db_session)

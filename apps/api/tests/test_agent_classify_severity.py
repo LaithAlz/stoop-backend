@@ -22,6 +22,8 @@ from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any
 
+import anthropic
+import httpx
 import pytest
 import pytest_asyncio
 from anthropic.types import ToolUseBlock
@@ -496,6 +498,122 @@ async def test_classify_severity_double_failure_sets_classification_failed_flag(
             )
         ).scalar_one()
         assert audit_count == 0  # no audit row on failure -- see module docstring
+
+        # #208: this node STILL writes no audit row of its own on failure
+        # (unchanged, asserted above) -- but it now hands the reached-the
+        # -API usage from both (schema-invalid) attempts forward for
+        # app/agent/nodes/degraded_mode.py to fold into ITS OWN audit row.
+        # Both fake responses carry real usage (200/60 tokens, the
+        # _fake_message default), so the sum is 400/120.
+        assert update["classification_failed_usage"] == {
+            "model": "claude-sonnet-5",
+            "tokens_in": 400,
+            "tokens_out": 120,
+            "cost_cents": pytest.approx(
+                anthropic_mod.estimate_cost_cents(tokens_in=400, tokens_out=120)
+            ),
+        }
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_severity_double_failure_no_tool_use_block_still_records_usage(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208: a response that carries NO tool_use block despite the forced
+    tool_choice is the OTHER reached-the-API failure mode (see
+    AnthropicCallError's own docstring) -- a full response WAS received
+    (real, billed usage) even though there's nothing to parse a severity
+    out of. Both attempts hit this failure mode here."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="not sure what's going on but something seems off",
+    )
+
+    no_tool_use_response = SimpleNamespace(
+        content=[],
+        usage=SimpleNamespace(input_tokens=150, output_tokens=30),
+        model="claude-sonnet-5",
+    )
+    fake_messages = _FakeMessages(responses=[no_tool_use_response, no_tool_use_response])
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state = _base_state(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+        )
+        update = await classify_severity(state)
+
+        assert update["classification_failed"] is True
+        assert update["classification_failed_usage"] == {
+            "model": "claude-sonnet-5",
+            "tokens_in": 300,
+            "tokens_out": 60,
+            "cost_cents": pytest.approx(
+                anthropic_mod.estimate_cost_cents(tokens_in=300, tokens_out=60)
+            ),
+        }
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_severity_double_failure_with_no_usage_omits_usage_key(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208: when NEITHER attempt ever reaches the API (both raise a
+    pre-flight connection error here; a timeout behaves identically), there
+    is genuinely no billed cost to report -- ``classification_failed_usage``
+    is absent entirely, never a fabricated zero-cost record."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="not sure what's going on but something seems off",
+    )
+
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    fake_messages = _FakeMessages(
+        responses=[
+            anthropic.APIConnectionError(request=request),
+            anthropic.APIConnectionError(request=request),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        state = _base_state(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            case_id=case_id,
+        )
+        update = await classify_severity(state)
+
+        assert update["classification_failed"] is True
+        assert "classification_failed_usage" not in update
     finally:
         await _cleanup(db_session, landlord_id)
 

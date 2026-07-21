@@ -24,6 +24,17 @@ schema-v1.md's v1.12 amendment note 3):
   irrelevant here) and ``'drafted'`` (``draft_response``) audit rows each
   carry a top-level ``cost_cents`` key (``app/integrations/anthropic.py``'s
   ``estimate_cost_cents``). Always case-scoped (``audit_log.case_id``).
+  **Also** (#208, schema-v1.md v1.14) the ``'degraded_mode'`` row
+  ``app/agent/nodes/degraded_mode.py`` writes for a
+  ``classification_failed`` leg — when ``classify_severity``'s failed
+  attempt(s) genuinely reached the API and consumed billed tokens, that
+  cost rides along on this SAME existing row (payload-only amendment,
+  never a new ``audit_log.action`` value). A DOUBLE-failed
+  ``classify_intent`` call with reached-the-API usage instead writes its
+  OWN extra ``'classified'`` row (``payload.kind =
+  'intent_classification_failed'``) — already covered by the first branch
+  above with no CTE change needed, since it reuses the existing
+  ``action IN ('classified', 'drafted')`` shape verbatim.
 - **``"sms"``** — the draft-flow ``'sent'`` row (``app/agent/
   draft_sender.py``) carries a top-level ``sms_cost_cents`` key, also
   case-scoped; the emergency safety path's ``'emergency_call_attempt'`` row
@@ -47,6 +58,40 @@ payload-key amendments landed (missing the new keys entirely) is excluded
 from the UNION outright, never reaches the ``::numeric`` cast, and
 therefore never raises. Its contribution reads as the honest ``0`` a
 ``COALESCE(SUM(...), 0)`` produces over zero matching rows.
+
+Accounting completeness for reached-the-API calls (#208)
+------------------------------------------------------------------------
+Before #208: an Anthropic attempt that reached the API and consumed billed
+tokens but then failed (the calling node's own schema validation rejecting
+the model's output, or the SDK's forced-``tool_choice`` response carrying
+no usable ``tool_use`` block) wrote no durable record anywhere once its
+own node ultimately gave up (``classify_severity``/``classify_intent``'s
+"no audit row on failure" precedent, #31/#32) — real spend, invisible to
+every rollup below. As of #208, EVERY Anthropic attempt that genuinely
+reached the API (i.e. usage data was actually returned, however the call
+ultimately turned out) is covered by one of the ``'llm'`` branches above:
+a successful classification/draft (unchanged), a draft node's rejected-
+but-reached attempt (``draft_response.py``'s existing running total, bug
+-fixed), a double-failed severity classification (the ``'degraded_mode'``
+branch, new), or a double-failed intent classification (the
+``'intent_classification_failed'`` payload, existing branch). Calls still
+invisible to these rollups are ones that NEVER reached the API at all (a
+pre-flight connection failure, or a timeout where no response was ever
+received) — by construction there is no billed cost to report for those,
+so their absence is correct, not a gap.
+
+**One named exception, not "the ONLY gap" above:** for
+``classify_severity``/``classify_intent`` specifically (unlike
+``draft_response``, whose single row already sums every attempt), a FIRST
+attempt that reaches the API and fails, followed by a SECOND attempt that
+succeeds, still drops the first attempt's billed tokens — the SUCCESS
+``'classified'`` row those two nodes write is byte-identical to before
+#208 and carries only the winning attempt's usage; the failed-attempt
+accumulator those nodes build is discarded once the loop breaks on
+success, never merged into it. A real, accepted, documented gap
+(schema-v1.md v1.14 amendment point 4; each node's own module docstring
+"Scope, honestly stated"), not silently assumed fixed by this module's
+own completeness claim above.
 """
 
 from __future__ import annotations
@@ -77,6 +122,30 @@ _COST_EVENTS_CTE_SQL = """
     FROM audit_log a
     LEFT JOIN cases c ON c.id = a.case_id
     WHERE a.action IN ('classified', 'drafted')
+      AND a.payload ? 'cost_cents'
+
+    UNION ALL
+
+    -- #208 (schema-v1.md v1.14): a classify_severity failed-classification
+    -- attempt that reached the API and consumed billed tokens has no
+    -- 'classified' row of its own (that node never writes one on
+    -- failure) -- its cost, when it exists, rides along on the SAME
+    -- 'degraded_mode' audit row app/agent/nodes/degraded_mode.py already
+    -- writes for this leg (payload-only amendment, never a new action
+    -- value). Same key-existence guard as every other branch: a
+    -- 'degraded_mode' row written before this amendment (or one whose
+    -- failed attempt(s) never reached the API at all) has no cost_cents
+    -- key and is excluded here, contributing an honest 0.
+    SELECT
+        a.landlord_id AS landlord_id,
+        a.case_id     AS case_id,
+        c.property_id AS property_id,
+        'llm'::text   AS kind,
+        (a.payload ->> 'cost_cents')::numeric AS cost_cents,
+        a.created_at  AS created_at
+    FROM audit_log a
+    LEFT JOIN cases c ON c.id = a.case_id
+    WHERE a.action = 'degraded_mode'
       AND a.payload ? 'cost_cents'
 
     UNION ALL
