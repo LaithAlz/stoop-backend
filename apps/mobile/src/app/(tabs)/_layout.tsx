@@ -17,6 +17,7 @@ import {
   markOnboardingOffered,
   shouldOfferOnboarding,
 } from "@/features/onboarding/gate";
+import { usePushRegistration } from "@/features/push/usePushRegistration";
 import { colors, type } from "@/theme/tokens";
 
 /**
@@ -44,6 +45,11 @@ function useOnboardingGate() {
 
 export default function TabsLayout() {
   useOnboardingGate();
+  // Push registration (issue #210 M3) — only ever runs for a signed-in
+  // session, since this whole layout is gated behind the root Stack's
+  // route === "tabs" guard (src/app/_layout.tsx). See
+  // src/features/push/usePushRegistration.ts for the full lifecycle.
+  usePushRegistration();
 
   return (
     <Tabs

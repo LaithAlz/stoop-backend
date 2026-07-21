@@ -10,3 +10,4 @@ export * from "./me";
 export * from "./properties";
 export * from "./tenants";
 export * from "./trust";
+export * from "./devices";

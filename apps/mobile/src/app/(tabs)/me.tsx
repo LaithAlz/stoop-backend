@@ -10,7 +10,7 @@
  * (src/api/trust.ts).
  */
 import { useState } from "react";
-import { ActivityIndicator, Alert, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, Linking, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useMutation } from "@tanstack/react-query";
 import { useAuth } from "@/auth/AuthProvider";
@@ -24,15 +24,45 @@ import { ApiError, toHouseApiError } from "@/api/errors";
 import { planDisplayName } from "@/features/account/plan";
 import { ProfileEditModal } from "@/features/account/ProfileEditModal";
 import { revokeConfirmation, revokeResultNotice } from "@/features/trust/revoke";
+import { usePushPermission } from "@/features/push/usePushPermission";
+import { pushStatusLine, resolvePushControlAction } from "@/features/push/pushControl";
+import {
+  PUSH_ENABLE_BUTTON_LABEL,
+  PUSH_EXPLAINER,
+  PUSH_OPEN_SETTINGS_BUTTON_LABEL,
+  PUSH_REQUEST_FAILED_NOTICE,
+  PUSH_SECTION_TITLE,
+} from "@/features/push/pushCopy";
 
 export default function MeScreen() {
   const { session, signOut } = useAuth();
   const meQuery = useMe();
   const firstPageQuery = useFirstPropertyPage();
+  const push = usePushPermission();
 
   const [editOpen, setEditOpen] = useState(false);
 
   const firstPropertyId = firstPageQuery.data?.items[0]?.id;
+
+  const pushAction = resolvePushControlAction(push.state);
+
+  async function handlePushButton() {
+    if (pushAction === "open-settings") {
+      // iOS after a prior denial (or Android after "don't ask again"): an
+      // in-app prompt is a guaranteed no-op, so send them to the OS
+      // setting instead of a dead button (pushControl.resolvePushControl
+      // Action encodes exactly when this applies).
+      await Linking.openSettings();
+      return;
+    }
+    const result = await push.requestPermission();
+    // 'unsupported' after an explicit tap means the native call couldn't
+    // run at all (e.g. a simulator with no push capability) — say so
+    // honestly rather than leaving the button looking broken.
+    if (result.status === "unsupported") {
+      Alert.alert("Stoop", PUSH_REQUEST_FAILED_NOTICE);
+    }
+  }
 
   const revokeMutation = useMutation({
     mutationFn: () => revokeTrust(firstPropertyId as string, "global"),
@@ -92,6 +122,33 @@ export default function MeScreen() {
           ) : (
             <ActivityIndicator color={colors.brand} style={styles.planSpinner} />
           )}
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.label}>{PUSH_SECTION_TITLE}</Text>
+          {push.loading ? (
+            <ActivityIndicator color={colors.brand} style={styles.planSpinner} />
+          ) : (
+            <Text style={styles.pushStatus} testID="push-status">
+              {pushStatusLine(push.state)}
+            </Text>
+          )}
+          <Text style={styles.cardBody}>{PUSH_EXPLAINER}</Text>
+          {pushAction !== "none" ? (
+            <View style={styles.cardAction}>
+              <Button
+                label={
+                  pushAction === "open-settings"
+                    ? PUSH_OPEN_SETTINGS_BUTTON_LABEL
+                    : PUSH_ENABLE_BUTTON_LABEL
+                }
+                variant="ghost"
+                disabled={push.requesting}
+                onPress={() => void handlePushButton()}
+                testID="push-permission-action"
+              />
+            </View>
+          ) : null}
         </View>
 
         {firstPropertyId ? (
@@ -161,6 +218,11 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     color: colors.inkDim,
+  },
+  pushStatus: {
+    ...type.cardTitle,
+    fontSize: 15,
+    color: colors.ink,
   },
   cardAction: {
     marginTop: spacing.sm,
