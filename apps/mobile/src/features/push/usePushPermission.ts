@@ -11,10 +11,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
-import {
-  getPushPermissionState,
-  requestPushPermission,
-} from "./deviceRegistration";
+import { getPushPermissionState, requestPushPermission } from "./deviceRegistration";
 import type { PushPermissionState } from "./pushControl";
 
 const INITIAL_STATE: PushPermissionState = { status: "undetermined", canAskAgain: true };
@@ -31,6 +28,12 @@ export function usePushPermission() {
   }, []);
 
   useEffect(() => {
+    // `refresh` setStates only AFTER awaiting the OS permission read, so
+    // this is not the synchronous cascading-render pattern the rule guards
+    // against — it's the allowed "seed initial state + subscribe to an
+    // external system (AppState)" shape. The AppState callback below is a
+    // subscription callback, exactly what the rule says setState belongs in.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refresh();
     const subscription = AppState.addEventListener("change", (next: AppStateStatus) => {
       if (next === "active") void refresh();

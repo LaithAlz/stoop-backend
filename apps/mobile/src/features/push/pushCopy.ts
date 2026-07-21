@@ -19,8 +19,7 @@ export const PUSH_EXPLAINER =
 
 export const PUSH_STATUS_ON = "On — you'll get a nudge when a reply needs you.";
 
-export const PUSH_STATUS_OFF_CAN_ASK =
-  "Off. Turn them on to get a nudge when a reply needs you.";
+export const PUSH_STATUS_OFF_CAN_ASK = "Off. Turn them on to get a nudge when a reply needs you.";
 
 export const PUSH_STATUS_OFF_SETTINGS =
   "Off. You said no to notifications earlier — turn them on in your phone's Settings if you change your mind.";

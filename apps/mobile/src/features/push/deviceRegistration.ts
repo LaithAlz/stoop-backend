@@ -66,8 +66,10 @@ function currentPlatform(): DevicePlatform | null {
  *  "registration silently no-ops" path exercised in this module's tests. */
 function projectId(): string | undefined {
   const extra = Constants.expoConfig?.extra as { eas?: { projectId?: string } } | undefined;
-  return extra?.eas?.projectId ?? (Constants as { easConfig?: { projectId?: string } }).easConfig
-    ?.projectId;
+  return (
+    extra?.eas?.projectId ??
+    (Constants as { easConfig?: { projectId?: string } }).easConfig?.projectId
+  );
 }
 
 const ANDROID_DEFAULT_CHANNEL_ID = "default";
@@ -85,7 +87,9 @@ async function ensureAndroidChannelAsync(): Promise<void> {
   });
 }
 
-function toPermissionState(settings: Notifications.NotificationPermissionsStatus): PushPermissionState {
+function toPermissionState(
+  settings: Notifications.NotificationPermissionsStatus,
+): PushPermissionState {
   return { status: settings.status, canAskAgain: settings.canAskAgain };
 }
 
@@ -179,14 +183,23 @@ export async function unregisterCurrentDeviceBestEffort(): Promise<void> {
   const id = registeredDeviceId;
   registeredDeviceId = null;
   if (!id) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
       unregisterDevice(id),
       new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error("device unregister timed out")), UNREGISTER_TIMEOUT_MS);
+        timer = setTimeout(
+          () => reject(new Error("device unregister timed out")),
+          UNREGISTER_TIMEOUT_MS,
+        );
       }),
     ]);
   } catch {
     // Best-effort -- see docstring above.
+  } finally {
+    // Clear the deadline timer whichever side of the race won — so a
+    // fast DELETE never leaves a pending 3s timer that would later reject
+    // an orphan promise (and, in tests, leak an open handle).
+    if (timer) clearTimeout(timer);
   }
 }
