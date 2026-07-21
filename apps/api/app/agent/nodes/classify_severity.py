@@ -71,7 +71,7 @@ usage its failed attempt(s) produced into
 ``state["classification_failed_usage"]`` (absent when NEITHER attempt ever
 reached the API — a pure connection/timeout failure has no billed cost to
 report, never a fabricated one), and ``degraded_mode.py`` folds those keys
-into the SAME payload it already writes (schema-v1.md v1.13 amendment;
+into the SAME payload it already writes (schema-v1.md v1.14 amendment;
 ``app/cost_reporting.py``'s CTE gained one new branch for
 ``action = 'degraded_mode'``). See ``app/agent/state.py``'s own
 ``classification_failed_usage`` docstring for the exact shape.

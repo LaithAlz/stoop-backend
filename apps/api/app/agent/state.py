@@ -138,7 +138,7 @@ class AgentState(TypedDict, total=False):
         case, never a fabricated zero-cost record. Consumed EXCLUSIVELY by
         ``app.agent.nodes.degraded_mode`` to fold these cost keys into the
         SAME ``audit_log`` ``'degraded_mode'`` row it already writes for
-        this leg (a payload-only amendment, schema-v1.md v1.13) — this key
+        this leg (a payload-only amendment, schema-v1.md v1.14) — this key
         never causes a NEW audit row on its own; it only enriches one that
         was already going to be written. See ``classify_severity.py``'s
         own module docstring "Cost accounting on the failure path (#208)"

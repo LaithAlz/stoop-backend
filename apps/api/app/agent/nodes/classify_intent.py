@@ -102,7 +102,7 @@ same as before #208). No ``intent``/``summary``/``is_new_issue`` keys —
 this payload never claims a classification happened, only that an attempt
 was made and here is what it cost. ``app/cost_reporting.py``'s existing
 ``action IN ('classified', 'drafted') AND payload ? 'cost_cents'`` branch
-already matches this shape unmodified (schema-v1.md v1.13 amendment) —
+already matches this shape unmodified (schema-v1.md v1.14 amendment) —
 no CTE change needed for this half of #208's fix (contrast
 ``classify_severity.py``'s failure path, which DOES need a new CTE branch
 because it piggybacks on the ``'degraded_mode'`` action instead).

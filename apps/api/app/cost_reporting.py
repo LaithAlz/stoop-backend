@@ -24,7 +24,7 @@ schema-v1.md's v1.12 amendment note 3):
   irrelevant here) and ``'drafted'`` (``draft_response``) audit rows each
   carry a top-level ``cost_cents`` key (``app/integrations/anthropic.py``'s
   ``estimate_cost_cents``). Always case-scoped (``audit_log.case_id``).
-  **Also** (#208, schema-v1.md v1.13) the ``'degraded_mode'`` row
+  **Also** (#208, schema-v1.md v1.14) the ``'degraded_mode'`` row
   ``app/agent/nodes/degraded_mode.py`` writes for a
   ``classification_failed`` leg — when ``classify_severity``'s failed
   attempt(s) genuinely reached the API and consumed billed tokens, that
@@ -89,7 +89,7 @@ succeeds, still drops the first attempt's billed tokens — the SUCCESS
 #208 and carries only the winning attempt's usage; the failed-attempt
 accumulator those nodes build is discarded once the loop breaks on
 success, never merged into it. A real, accepted, documented gap
-(schema-v1.md v1.13 amendment point 4; each node's own module docstring
+(schema-v1.md v1.14 amendment point 4; each node's own module docstring
 "Scope, honestly stated"), not silently assumed fixed by this module's
 own completeness claim above.
 """
@@ -126,7 +126,7 @@ _COST_EVENTS_CTE_SQL = """
 
     UNION ALL
 
-    -- #208 (schema-v1.md v1.13): a classify_severity failed-classification
+    -- #208 (schema-v1.md v1.14): a classify_severity failed-classification
     -- attempt that reached the API and consumed billed tokens has no
     -- 'classified' row of its own (that node never writes one on
     -- failure) -- its cost, when it exists, rides along on the SAME

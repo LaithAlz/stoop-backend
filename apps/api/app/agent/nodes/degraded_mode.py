@@ -127,7 +127,7 @@ into the SAME ``payload`` dict every leg of
 whichever leg's row actually gets written, with zero changes to routing,
 notification content, or idempotency logic anywhere in this module (see
 ``app/cost_reporting.py``'s new ``action = 'degraded_mode'`` CTE branch,
-schema-v1.md v1.13 amendment). This key is NEVER read by
+schema-v1.md v1.14 amendment). This key is NEVER read by
 :func:`_handle_generic_degraded` (the ``severity_emergency``/
 ``draft_guard_failed`` legs) — those already get their own cost recorded
 unconditionally via ``draft_response.py``'s own ``'drafted'`` row, so
@@ -659,7 +659,7 @@ async def degraded_mode(state: AgentState) -> dict[str, Any]:
         "case_id": str(case_id) if case_id is not None else None,
         "reasons": reasons,
     }
-    # #208 — payload-only amendment (schema-v1.md v1.13): when
+    # #208 — payload-only amendment (schema-v1.md v1.14): when
     # classify_severity's own failed attempt(s) genuinely reached the API
     # and consumed billed tokens, it hands that usage forward via
     # ``state["classification_failed_usage"]`` (absent when neither attempt

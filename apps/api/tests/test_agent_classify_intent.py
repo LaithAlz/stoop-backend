@@ -42,6 +42,7 @@ from anthropic.types import ToolUseBlock
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
+import app.agent.nodes.classify_intent as node_mod
 import app.db.session as db_mod
 from app.agent.nodes.classify_intent import classify_intent
 from app.agent.schemas import CaseContext, PrefilterResult
@@ -623,6 +624,76 @@ async def test_classify_intent_double_failure_with_no_usage_writes_no_audit_row(
             )
         ).scalar_one()
         assert audit_count == 0  # no billed usage -- no fabricated record
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_classify_intent_failed_cost_audit_write_error_does_not_raise(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208 safety review LOW-2: the failed-cost audit INSERT is best-effort
+    -- it only RECORDS spend, it is not load-bearing for classification.
+    A transient DB error while writing it (simulated here by making
+    ``_insert_intent_classification_failed_audit`` itself raise) must be
+    logged and swallowed, never propagated -- ``classify_intent`` still
+    returns its normal double-failure result (``intent=None``, a plain
+    reasoning_log line), so the graph can proceed on to
+    ``classify_severity`` exactly as it would if the cost record had
+    written successfully."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await _insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="anyone home? need to ask about parking",
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _fake_message(tool_input={"intent": "bogus", "is_new_issue": True, "summary": "x"}),
+            _fake_message(tool_input={"intent": "bogus2", "is_new_issue": True, "summary": "y"}),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    async def _raising_insert(**kwargs: Any) -> None:
+        raise RuntimeError("simulated transient DB failure")
+
+    monkeypatch.setattr(node_mod, "_insert_intent_classification_failed_audit", _raising_insert)
+
+    try:
+        state: AgentState = {
+            "message_id": uuid.UUID(message_id),
+            "case_context": CaseContext(
+                landlord_id=uuid.UUID(landlord_id),
+                property_id=uuid.UUID(property_id),
+                tenant_id=uuid.UUID(tenant_id),
+                case_id=uuid.UUID(case_id),
+            ),
+            "reasoning_log": [],
+        }
+        # Must not raise -- the best-effort try/except swallows it.
+        update = await classify_intent(state)
+
+        assert update["intent"] is None
+        assert any("couldn't figure out" in line for line in update["reasoning_log"])
+        assert len(fake_messages.calls) == 2
+
+        # The write genuinely failed (it was never actually persisted) --
+        # this test proves the SWALLOW, not that the row still landed.
+        audit_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM audit_log WHERE case_id = :cid"), {"cid": case_id}
+            )
+        ).scalar_one()
+        assert audit_count == 0
     finally:
         await _cleanup(db_session, landlord_id)
 

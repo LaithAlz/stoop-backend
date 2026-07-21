@@ -206,7 +206,7 @@ async def test_cost_per_case_missing_cost_key_reads_as_zero_never_crashes(
 
 @pytest.mark.integration
 async def test_cost_per_case_counts_degraded_mode_cost_cents(db_session: AsyncSession) -> None:
-    """#208 (schema-v1.md v1.13): a 'degraded_mode' audit row that carries
+    """#208 (schema-v1.md v1.14): a 'degraded_mode' audit row that carries
     cost_cents (classify_severity's failed-attempt usage, folded in by
     app/agent/nodes/degraded_mode.py) counts as 'llm' cost, exactly like a
     'classified'/'drafted' row -- the new CTE branch this issue added."""

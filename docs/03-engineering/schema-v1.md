@@ -531,83 +531,6 @@
 > 6. **Reconciliation note:** verified at review time — the sibling
 >    `feat/audit-completeness` branch (merged as PR #207) makes no schema
 >    changes, so v1.12 is uncontested.
->
-> **v1.13 amendment (2026-07-21)** — no migration required (#208, "failed
-> -after-real-API-call Anthropic attempts are invisible to cost rollups").
-> No new `action` CHECK value and no new column: both fixes below are
-> payload-only, the same "doc-first, no migration" path v1.6/v1.7/v1.10/
-> v1.12 already used. Investigated end-to-end before picking this design
-> (see `app/agent/nodes/classify_severity.py`/`classify_intent.py`'s own
-> module docstrings for the full per-node rationale) — the honest options
-> were (a) a payload-only amendment onto a RELIABLY-existing failure-path
-> row, wherever one exists, or (b) a new `audit_log.action` CHECK value +
-> migration. (a) was possible for both affected nodes without inventing
-> anything:
-> 1. **`classify_severity` → the EXISTING `'degraded_mode'` row.** This
->    node itself still writes NO audit row on any failure (unchanged) —
->    but `app.agent.graph` unconditionally routes
->    `classification_failed=True` to `app.agent.nodes.degraded_mode`,
->    which reliably writes exactly one `'degraded_mode'` row for a genuine
->    new activation (existing idempotency, unchanged). When the failed
->    attempt(s) genuinely reached the API and consumed billed tokens (a
->    response was received but this node's own `SeverityResult` validation
->    rejected it, or the SDK's forced-`tool_choice` response carried no
->    usable `tool_use` block), that row's payload gains **`model`**
->    (nullable text), **`tokens_in`**/**`tokens_out`** (integer), and
->    **`cost_cents`** (numeric) — summed across both attempts' reached-the
->    -API usage. Absent entirely when neither attempt ever reached the API
->    (a pure connection/timeout failure) — never a fabricated zero-cost
->    key. `app/cost_reporting.py` gained one new CTE branch,
->    `WHERE a.action = 'degraded_mode' AND a.payload ? 'cost_cents'`,
->    guarded by the same key-existence check as every other branch.
-> 2. **`classify_intent` → a NEW row on the EXISTING `'classified'`
->    action.** Unlike `classify_severity`, a double-failed intent
->    classification has no downstream node to piggyback on (nothing routes
->    on `state["intent"]` yet). This node now writes one additional
->    `'classified'` row of its own on total failure, but ONLY when at least
->    one attempt genuinely reached the API: `payload = {kind:
->    'intent_classification_failed', message_id, case_id, model,
->    tokens_in, tokens_out, cost_cents}` — deliberately no `intent`/
->    `summary`/`is_new_issue` keys, so this payload never claims a
->    classification actually happened. Matches the EXISTING
->    `action IN ('classified', 'drafted') AND payload ? 'cost_cents'` CTE
->    branch verbatim — no query change needed for this half of the fix.
-> 3. **`draft_response` — bug fix, no schema change at all.** This node
->    already writes an unconditional `'drafted'` row every run (the safe
->    generic fallback body when both attempts fail) and already summed
->    reached-the-API usage across attempts into that row's existing
->    `cost_cents`/`tokens_in`/`tokens_out` — but only for attempts whose
->    OWN `DraftResult` validation also succeeded, silently dropping a
->    reached-the-API attempt that failed ONLY that validation step. Fixed
->    in code (accumulate right after the Anthropic call succeeds, before
->    validating it), not in this doc — no new payload key, no migration.
-> 4. **Retry-then-success accounting, stated explicitly (differs by
->    node, on purpose):** `draft_response`'s single `'drafted'` row sums
->    EVERY attempt's reached-the-API usage into one payload, success or
->    failure alike (unchanged design, now bug-fixed to actually do this).
->    `classify_severity`/`classify_intent`'s SUCCESS row (`'classified'`)
->    is BYTE-IDENTICAL to before this amendment — it still carries only
->    the WINNING attempt's usage. A first attempt that reaches the API and
->    fails, followed by a second that succeeds, therefore still loses that
->    first attempt's cost for these two nodes specifically — a known,
->    accepted, explicitly-scoped-out gap (folding a rejected attempt's cost
->    into a row that represents "this is what got classified" is a bigger
->    design question than this amendment's "make TOTAL failure visible"
->    scope), not silently assumed fixed.
-> 5. **Numbering note, corrected:** this amendment needed no migration at
->    all, but that does NOT make the `v1.13` LABEL itself uncontended — a
->    doc-heading amendment number is claimed the same way a migration
->    number is, whether or not a migration ships with it (v1.10/v1.12
->    needed no migration either and still consumed a real slot). The
->    SIBLING `feat/push-backend` branch (#210, its push-notification
->    tables) is independently claiming `v1.13` for its OWN schema-v1.md
->    heading at the same time this was written — same collision class as
->    v1.11's own precedent above ("renumbered from v1.10 — PR #202 took
->    that label first"). Whichever of #208/#210 merges or rebases second
->    must renumber ITS heading to the next free number (`v1.14` today).
->    Push-backend is further along at review time, so the renumbering will
->    most likely fall on #208 at rebase — noted here so that's expected,
->    not a surprise.
 
 > **v1.13 amendment (2026-07-18)** — migration 0012 implements this (#210
 > M3, push-notifications backend surface). Push is for approvals/status
@@ -740,6 +663,77 @@
 >    migration is RLS/role-grant-adjacent, so per that rule it must be
 >    dry-run against a real (non-local) Supabase-shaped database before
 >    merge, same as migration 0005 itself was.
+
+> **v1.14 amendment (2026-07-21)** — no migration required (#208, "failed
+> -after-real-API-call Anthropic attempts are invisible to cost rollups").
+> No new `action` CHECK value and no new column: both fixes below are
+> payload-only, the same "doc-first, no migration" path v1.6/v1.7/v1.10/
+> v1.12 already used. Investigated end-to-end before picking this design
+> (see `app/agent/nodes/classify_severity.py`/`classify_intent.py`'s own
+> module docstrings for the full per-node rationale) — the honest options
+> were (a) a payload-only amendment onto a RELIABLY-existing failure-path
+> row, wherever one exists, or (b) a new `audit_log.action` CHECK value +
+> migration. (a) was possible for both affected nodes without inventing
+> anything:
+> 1. **`classify_severity` → the EXISTING `'degraded_mode'` row.** This
+>    node itself still writes NO audit row on any failure (unchanged) —
+>    but `app.agent.graph` unconditionally routes
+>    `classification_failed=True` to `app.agent.nodes.degraded_mode`,
+>    which reliably writes exactly one `'degraded_mode'` row for a genuine
+>    new activation (existing idempotency, unchanged). When the failed
+>    attempt(s) genuinely reached the API and consumed billed tokens (a
+>    response was received but this node's own `SeverityResult` validation
+>    rejected it, or the SDK's forced-`tool_choice` response carried no
+>    usable `tool_use` block), that row's payload gains **`model`**
+>    (nullable text), **`tokens_in`**/**`tokens_out`** (integer), and
+>    **`cost_cents`** (numeric) — summed across both attempts' reached-the
+>    -API usage. Absent entirely when neither attempt ever reached the API
+>    (a pure connection/timeout failure) — never a fabricated zero-cost
+>    key. `app/cost_reporting.py` gained one new CTE branch,
+>    `WHERE a.action = 'degraded_mode' AND a.payload ? 'cost_cents'`,
+>    guarded by the same key-existence check as every other branch.
+> 2. **`classify_intent` → a NEW row on the EXISTING `'classified'`
+>    action.** Unlike `classify_severity`, a double-failed intent
+>    classification has no downstream node to piggyback on (nothing routes
+>    on `state["intent"]` yet). This node now writes one additional
+>    `'classified'` row of its own on total failure, but ONLY when at least
+>    one attempt genuinely reached the API: `payload = {kind:
+>    'intent_classification_failed', message_id, case_id, model,
+>    tokens_in, tokens_out, cost_cents}` — deliberately no `intent`/
+>    `summary`/`is_new_issue` keys, so this payload never claims a
+>    classification actually happened. Matches the EXISTING
+>    `action IN ('classified', 'drafted') AND payload ? 'cost_cents'` CTE
+>    branch verbatim — no query change needed for this half of the fix.
+> 3. **`draft_response` — bug fix, no schema change at all.** This node
+>    already writes an unconditional `'drafted'` row every run (the safe
+>    generic fallback body when both attempts fail) and already summed
+>    reached-the-API usage across attempts into that row's existing
+>    `cost_cents`/`tokens_in`/`tokens_out` — but only for attempts whose
+>    OWN `DraftResult` validation also succeeded, silently dropping a
+>    reached-the-API attempt that failed ONLY that validation step. Fixed
+>    in code (accumulate right after the Anthropic call succeeds, before
+>    validating it), not in this doc — no new payload key, no migration.
+> 4. **Retry-then-success accounting, stated explicitly (differs by
+>    node, on purpose):** `draft_response`'s single `'drafted'` row sums
+>    EVERY attempt's reached-the-API usage into one payload, success or
+>    failure alike (unchanged design, now bug-fixed to actually do this).
+>    `classify_severity`/`classify_intent`'s SUCCESS row (`'classified'`)
+>    is BYTE-IDENTICAL to before this amendment — it still carries only
+>    the WINNING attempt's usage. A first attempt that reaches the API and
+>    fails, followed by a second that succeeds, therefore still loses that
+>    first attempt's cost for these two nodes specifically — a known,
+>    accepted, explicitly-scoped-out gap (folding a rejected attempt's cost
+>    into a row that represents "this is what got classified" is a bigger
+>    design question than this amendment's "make TOTAL failure visible"
+>    scope), not silently assumed fixed.
+> 5. **Numbering note, confirmed:** push-backend's `v1.13` (#210, directly
+>    above) is already on `main` (merged as PR #220) by the time this
+>    amendment was rebased — so this #208 amendment is `v1.14`, not
+>    `v1.13`. Needing no migration does NOT make a doc-heading amendment
+>    number uncontended on its own (v1.10/v1.12 needed no migration either
+>    and still consumed a real slot) — same collision class as v1.11's own
+>    precedent above ("renumbered from v1.10 — PR #202 took that label
+>    first"), just resolved at rebase time instead of at merge time.
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
