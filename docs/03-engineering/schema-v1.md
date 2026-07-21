@@ -594,14 +594,20 @@
 >    into a row that represents "this is what got classified" is a bigger
 >    design question than this amendment's "make TOTAL failure visible"
 >    scope), not silently assumed fixed.
-> 5. **Migration-number note:** this amendment needed no migration at all,
->    so it does not contend for migration `0012` — flagged anyway per the
->    house A25 lesson, since a SIBLING branch (`feat/push-backend`) is
->    independently claiming migration `0012` and the "next schema amendment
->    number" at the same time this was written; whichever of the two
->    branches merges second is the one that must renumber ITS migration
->    (this amendment's number, v1.13, is unaffected either way since it
->    carries no migration).
+> 5. **Numbering note, corrected:** this amendment needed no migration at
+>    all, but that does NOT make the `v1.13` LABEL itself uncontended — a
+>    doc-heading amendment number is claimed the same way a migration
+>    number is, whether or not a migration ships with it (v1.10/v1.12
+>    needed no migration either and still consumed a real slot). The
+>    SIBLING `feat/push-backend` branch (#210, its push-notification
+>    tables) is independently claiming `v1.13` for its OWN schema-v1.md
+>    heading at the same time this was written — same collision class as
+>    v1.11's own precedent above ("renumbered from v1.10 — PR #202 took
+>    that label first"). Whichever of #208/#210 merges or rebases second
+>    must renumber ITS heading to the next free number (`v1.14` today).
+>    Push-backend is further along at review time, so the renumbering will
+>    most likely fall on #208 at rebase — noted here so that's expected,
+>    not a surprise.
 
 > **v1.13 amendment (2026-07-18)** — migration 0012 implements this (#210
 > M3, push-notifications backend surface). Push is for approvals/status

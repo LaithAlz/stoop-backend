@@ -74,11 +74,24 @@ a successful classification/draft (unchanged), a draft node's rejected-
 but-reached attempt (``draft_response.py``'s existing running total, bug
 -fixed), a double-failed severity classification (the ``'degraded_mode'``
 branch, new), or a double-failed intent classification (the
-``'intent_classification_failed'`` payload, existing branch). The ONLY
-calls still invisible to these rollups are ones that NEVER reached the
-API at all (a pre-flight connection failure, or a timeout where no
-response was ever received) — by construction there is no billed cost to
-report for those, so their absence is correct, not a gap.
+``'intent_classification_failed'`` payload, existing branch). Calls still
+invisible to these rollups are ones that NEVER reached the API at all (a
+pre-flight connection failure, or a timeout where no response was ever
+received) — by construction there is no billed cost to report for those,
+so their absence is correct, not a gap.
+
+**One named exception, not "the ONLY gap" above:** for
+``classify_severity``/``classify_intent`` specifically (unlike
+``draft_response``, whose single row already sums every attempt), a FIRST
+attempt that reaches the API and fails, followed by a SECOND attempt that
+succeeds, still drops the first attempt's billed tokens — the SUCCESS
+``'classified'`` row those two nodes write is byte-identical to before
+#208 and carries only the winning attempt's usage; the failed-attempt
+accumulator those nodes build is discarded once the loop breaks on
+success, never merged into it. A real, accepted, documented gap
+(schema-v1.md v1.13 amendment point 4; each node's own module docstring
+"Scope, honestly stated"), not silently assumed fixed by this module's
+own completeness claim above.
 """
 
 from __future__ import annotations

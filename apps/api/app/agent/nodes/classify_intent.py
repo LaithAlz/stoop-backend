@@ -113,6 +113,16 @@ and fails, followed by a second that succeeds, still records only the
 winning attempt's usage on the SUCCESS row above — unchanged, not this
 issue's scope.
 
+**Best-effort write (safety review LOW-2):** the failed-cost audit INSERT
+is wrapped in its own ``try``/``except`` in :func:`classify_intent` —
+logged and swallowed, never re-raised. This write only RECORDS spend; it
+is not load-bearing for classification behavior, so a transient DB error
+here must never abort this node (and, transitively, block the graph from
+continuing on to ``classify_severity``) just because a nice-to-have cost
+record failed to write. The SUCCESS-path insert
+(:func:`_insert_intent_classified_audit`) is deliberately left as-is —
+out of this fix's scope.
+
 DB access
 ---------
 Admin engine (background/graph context) — same pattern as the other #30/
@@ -368,15 +378,30 @@ async def classify_intent(state: AgentState) -> dict[str, Any]:
             failed_cost_cents = anthropic_mod.estimate_cost_cents(
                 tokens_in=failed_tokens_in, tokens_out=failed_tokens_out
             )
-            await _insert_intent_classification_failed_audit(
-                landlord_id=case_context.landlord_id,
-                case_id=case_context.case_id,
-                message_id=message_id,
-                model=failed_model,
-                tokens_in=failed_tokens_in,
-                tokens_out=failed_tokens_out,
-                cost_cents=failed_cost_cents,
-            )
+            # Best-effort (safety review LOW-2): this write only RECORDS
+            # cost -- it is not load-bearing for classification behavior at
+            # all. A transient DB error here must never abort this node
+            # (and, via that, block the graph from continuing on to
+            # classify_severity) just because a nice-to-have cost record
+            # couldn't be written. Log and move on, same "never let a
+            # non-critical write gate the real work" posture as
+            # app/agent/emergency.py's own fire_emergency_protocol seam.
+            try:
+                await _insert_intent_classification_failed_audit(
+                    landlord_id=case_context.landlord_id,
+                    case_id=case_context.case_id,
+                    message_id=message_id,
+                    model=failed_model,
+                    tokens_in=failed_tokens_in,
+                    tokens_out=failed_tokens_out,
+                    cost_cents=failed_cost_cents,
+                )
+            except Exception as exc:  # noqa: BLE001 -- see comment above
+                log.error(
+                    "classify_intent_failed_cost_audit_write_failed",
+                    message_id=str(message_id),
+                    exc_type=type(exc).__name__,
+                )
         return {"intent": None, "reasoning_log": reasoning_log}
 
     display = _INTENT_DISPLAY[intent_result.intent]

@@ -53,6 +53,31 @@ the read side unchanged) and not needed to unblock #60's trust ladder,
 which reads ``trust_metrics``, not this endpoint. ``cases.title`` remains
 unwritten (deferred, same as before #197).
 
+**"Latest 'classified' row" must be severity-bearing, not just latest
+(#208 spec review, MAJOR-2)** — ``classify_intent.py`` also writes
+``action='classified'`` rows (disambiguated only by the payload's own
+``kind`` key: ``'intent'`` on success, ``'intent_classification_failed'``
+on total failure, #208), and a case is reclassified via the same
+stale-draft re-run that can reorder which node's row is newest. The
+LATERAL subquery above was previously "latest 'classified' row, full
+stop" — kind-blind — so an intent row winning "latest" over a genuine
+severity row would blank the card's severity chip (``_severity_from_
+payload`` correctly returns ``None`` for a payload with no ``severity``
+key, sorting it to "unknown" per this module's own "never fabricated,
+never dropped" convention — a safe-direction bug, never a crash, but
+still a wrong/missing chip on an otherwise-known-severity case). Fixed by
+adding ``AND (a.payload ? 'severity')`` to the LATERAL's ``WHERE`` — the
+card only ever wants the latest row that actually carries a severity
+classification; every OTHER field this endpoint reads from the SAME row
+(``rules_fired``, ``refusal_flags``, ``summary``) only ever exists
+alongside ``severity`` on a ``classify_severity.py``-written row anyway,
+so this predicate doesn't exclude anything the card actually consumes.
+This also closes the identical, PRE-EXISTING shadow from a successful
+``kind='intent'`` row (which already carried its own, differently
+-scoped ``summary`` key that could have won "latest" and silently
+overwritten the severity row's ``why`` even before #208 — not introduced
+by #208, just found and fixed alongside it).
+
 ``tenant_message``/``received_at``
 -----------------------------------
 The latest INBOUND, tenant-party message on the case — correlated via
@@ -251,6 +276,7 @@ _SELECT_QUEUE_SQL = text(
         SELECT a.payload
         FROM audit_log a
         WHERE a.landlord_id = :landlord_id AND a.case_id = c.id AND a.action = 'classified'
+          AND (a.payload ? 'severity')
         ORDER BY a.created_at DESC
         LIMIT 1
     ) audit ON true
