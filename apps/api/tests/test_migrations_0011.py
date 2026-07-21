@@ -86,7 +86,10 @@ _INSERT_NUMBER_RELEASE_SQL = text(
 
 @pytest.fixture(scope="session", autouse=False)
 def _migrate_once() -> None:  # type: ignore[misc]
-    """Apply migrations exactly once per test session (ends at head/0011)."""
+    """Apply migrations exactly once per test session (ends at head — 0011
+    when this file was written; a later migration, e.g. 0012 (#210), moves
+    head further without affecting this file's own assertions, none of
+    which hardcode "0011" as a synonym for "head" anymore)."""
     _alembic("downgrade", "base")
     _alembic("upgrade", "head")
     yield
@@ -233,15 +236,25 @@ async def test_downgrade_fails_closed_when_number_release_row_exists(db: AsyncEn
         await trans.commit()
 
     try:
+        async with db.connect() as before_conn:
+            version_before = (
+                await before_conn.execute(text("SELECT version_num FROM alembic_version"))
+            ).scalar_one()
+
         loop = asyncio.get_running_loop()
         with pytest.raises(RuntimeError, match="notifications_type_check"):
             await loop.run_in_executor(None, lambda: _alembic("downgrade", "0010"))
 
         async with db.connect() as verify_conn:
-            version = (
+            version_after = (
                 await verify_conn.execute(text("SELECT version_num FROM alembic_version"))
             ).scalar_one()
-            assert version == "0011"
+            # Fails closed: the attempted downgrade rolled back entirely, so
+            # the version is UNCHANGED from before the attempt -- asserted
+            # relative to whatever "head" actually is (not a hardcoded
+            # "0011") so this test survives any later migration (e.g. 0012,
+            # #210) being added on top without going stale itself.
+            assert version_after == version_before
     finally:
         async with db.connect() as cleanup_conn:
             trans = await cleanup_conn.begin()

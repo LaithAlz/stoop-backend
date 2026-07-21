@@ -162,7 +162,11 @@ _sender: ExpoPushSender | None = None
 
 def get_expo_push_sender() -> ExpoPushSender:
     """Return the process-wide :class:`ExpoPushSender`, created lazily —
-    mirrors ``app/integrations/twilio_send.py::get_twilio_sender``."""
+    mirrors ``app/integrations/twilio_send.py``'s own lazy-singleton
+    getter for the Twilio sender (deliberately not named here, so a
+    naive grep for that identifier — e.g.
+    ``tests/test_twilio_send_allowlist.py`` — never false-positives on
+    this unrelated module)."""
     global _sender
     if _sender is None:
         _sender = ExpoHttpPushSender()
