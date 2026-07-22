@@ -187,6 +187,29 @@ async def _case_row(session: AsyncSession, *, case_id: str) -> dict[str, Any]:
     return dict(row)
 
 
+async def _tenant_phone(session: AsyncSession, tenant_id: str) -> str:
+    """The seeded tenant's own phone -- used to scope
+    ``_FakeSmsSender.calls``/``sender_tick`` claim-count assertions to
+    THIS test's own seeded draft, never a raw global count (#212 item 1,
+    same convention as ``tests/test_drafts_router.py``'s
+    ``_tenant_phone_for_case``). ``sender_tick``'s candidate SELECT is
+    intentionally unscoped in production (the admin ticker drains every
+    landlord's due drafts), so a leftover ``approved`` draft from an
+    interrupted prior local run can inflate both ``sender_tick``'s
+    returned count and this shared fake sender's ``calls`` for whichever
+    test happens to run next in the same dirty database -- observed
+    empirically as ``claimed == 2`` where a clean run would see ``1``.
+    Filtering by phone means a stray row can add noise elsewhere but can
+    never flip THIS test's own result."""
+    return str(
+        (
+            await session.execute(
+                text("SELECT phone FROM tenants WHERE id = :id"), {"id": tenant_id}
+            )
+        ).scalar_one()
+    )
+
+
 async def _audit_actions(session: AsyncSession, *, case_id: str) -> list[str]:
     rows = (
         (
@@ -341,12 +364,19 @@ async def test_routine_draft_on_unlocked_property_auto_sends_end_to_end(
             {"id": str(draft["id"])},
         )
         await db_session.commit()
+        tenant_phone = await _tenant_phone(db_session, tenant_id)
 
         # The EXISTING sender ticker drains it -- no new send path.
         sender = _FakeSmsSender()
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1
-        assert len(sender.calls) == 1
+        # Scoped to THIS test's own tenant phone, never a raw global count
+        # (#212 item 1 -- see _tenant_phone's docstring): a stray dirty-DB
+        # row would only add noise to `claimed`/`sender.calls`, never
+        # remove our own send, so `claimed >= 1` is the safe half of the
+        # old exact-equality check and `own_calls` is the precise one.
+        assert claimed >= 1
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
 
         draft_after = await _draft_row(db_session, case_id=case_id)
         assert draft_after["status"] == "sent"
@@ -354,10 +384,11 @@ async def test_routine_draft_on_unlocked_property_auto_sends_end_to_end(
         case_after = await _case_row(db_session, case_id=case_id)
         assert case_after["status"] == "awaiting_tenant"
 
-        # Exactly once -- a second tick finds nothing left to claim.
-        claimed_again = await sender_tick(sender=sender)
-        assert claimed_again == 0
-        assert len(sender.calls) == 1
+        # Exactly once -- a second tick finds nothing left of OURS to
+        # claim (the global count is not asserted here -- see above).
+        await sender_tick(sender=sender)
+        own_calls_after_second_tick = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls_after_second_tick) == 1
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -401,10 +432,15 @@ async def test_undo_works_on_auto_sent_draft_within_window(
         assert "send_cancelled" in actions
 
         # The sender ticker must never touch a pending (un-approved) draft.
+        # Scoped to THIS test's own tenant phone (#212 item 1) -- a stray
+        # dirty-DB row elsewhere could make the raw claim count nonzero
+        # even though OUR draft was correctly left untouched, so the global
+        # count is not asserted here.
+        tenant_phone = await _tenant_phone(db_session, tenant_id)
         sender = _FakeSmsSender()
-        claimed = await sender_tick(sender=sender)
-        assert claimed == 0
-        assert sender.calls == []
+        await sender_tick(sender=sender)
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert own_calls == []
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -661,12 +697,16 @@ async def test_newer_inbound_cancels_unsent_auto_sent_draft_exactly_one_send(
             {"id": str(second_draft["id"])},
         )
         await db_session.commit()
+        tenant_phone = await _tenant_phone(db_session, tenant_id)
 
         sender = _FakeSmsSender()
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1
-        assert len(sender.calls) == 1
-        assert sender.calls[0]["body"] == "I'll fix the mailbox too."
+        # Scoped to THIS test's own tenant phone (#212 item 1) -- see
+        # _tenant_phone's docstring.
+        assert claimed >= 1
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
+        assert own_calls[0]["body"] == "I'll fix the mailbox too."
 
         final_first = (
             (
@@ -759,10 +799,17 @@ async def test_sender_cancels_auto_send_draft_when_newer_inbound_exists(
             db_session, message_id=newer_message_id_2, case_id=other_case_id
         )
 
+        tenant_phone = await _tenant_phone(db_session, tenant_id)
         sender = _FakeSmsSender()
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1  # only the landlord-approved draft
-        assert len(sender.calls) == 1
+        # Scoped to THIS test's own tenant phone (#212 item 1) -- see
+        # _tenant_phone's docstring. Both drafts in this test share the
+        # same tenant, so this still isolates them from any OTHER test's
+        # leftover rows while proving exactly one of the two (the
+        # landlord-approved one) was actually sent.
+        assert claimed >= 1  # only the landlord-approved draft, at minimum
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
 
         auto_draft_after = (
             (

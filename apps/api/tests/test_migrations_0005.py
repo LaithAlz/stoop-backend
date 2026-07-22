@@ -634,11 +634,79 @@ def test_migration_source_pins_default_privileges_and_defensive_nologin() -> Non
 # ---------------------------------------------------------------------------
 
 
+async def _other_databases_holding_app_role_grants(engine: AsyncEngine) -> list[str]:
+    """Detect OTHER databases in this local Postgres cluster whose objects
+    still hold live ACL dependencies on the cluster-level ``app_role`` role
+    (per ``pg_shdepend``) -- i.e. sibling worktree databases at/near 0005
+    head, sharing this same local Postgres instance (#193). ``app_role``
+    is cluster-GLOBAL, not per-database (see the migration module
+    docstring "DOWNGRADE"): if a sibling database also has this migration
+    applied, that other database's grants still reference ``app_role``
+    after THIS database's own ``REVOKE`` runs, and 0005's downgrade
+    correctly REFUSES to ``DROP ROLE`` rather than fail outright or (worse)
+    silently break the sibling database. This test's ORIGINAL
+    single-database assumption predates that multi-worktree-DB topology.
+
+    Deliberately narrow: only counts dependents whose ``dbid`` differs
+    from THIS test's own connected database. This database's OWN grants on
+    ``app_role`` are about to be revoked by the downgrade under test (the
+    statement immediately before the ``DROP ROLE`` guard) -- they must
+    never trip this detector, so that a single-database CI runner (no
+    siblings) ALWAYS sees an empty list here and the skip below can never
+    fire in CI."""
+    async with engine.connect() as connection:
+        role_exists = (
+            await connection.execute(text("SELECT 1 FROM pg_roles WHERE rolname = 'app_role'"))
+        ).scalar_one_or_none()
+        if role_exists is None:
+            # Can't happen at this point in the suite (the session-scoped
+            # _migrate_once fixture already migrated to head), but guards
+            # the ``::regrole`` cast below from erroring if it ever did.
+            return []
+
+        result = await connection.execute(
+            text(
+                "SELECT DISTINCT d.datname FROM pg_shdepend sd "
+                "JOIN pg_database d ON d.oid = sd.dbid "
+                "WHERE sd.refclassid = 'pg_authid'::regclass "
+                "AND sd.refobjid = 'app_role'::regrole "
+                "AND sd.dbid <> (SELECT oid FROM pg_database WHERE datname = current_database())"
+            )
+        )
+        return [row[0] for row in result.fetchall()]
+
+
 @pytest.mark.integration
 async def test_downgrade_to_0004_removes_role_policies_and_grants(db: AsyncEngine) -> None:
     """Downgrading to 0004 must drop every policy, disable RLS on every
     table, and drop app_role entirely (nothing else in this single local
-    database still depends on it after our own REVOKE)."""
+    database still depends on it after our own REVOKE).
+
+    #193 -- topology-aware skip: on a multi-DB local cluster (several
+    worktree databases sharing one Postgres instance, each migrated to
+    0005 head), sibling databases' grants on the cluster-global
+    ``app_role`` role make 0005's downgrade correctly REFUSE to drop it --
+    see the migration module docstring "DOWNGRADE". That is CORRECT,
+    safer behavior, not a bug; asserting the drop anyway would be
+    asserting the WRONG thing for this topology. Detected narrowly via
+    :func:`_other_databases_holding_app_role_grants` (scoped to OTHER
+    databases only -- this database's own soon-to-be-revoked grants never
+    count), so a single-database CI run always executes the full
+    assertion below and can never silently skip."""
+    sibling_dbs = await _other_databases_holding_app_role_grants(db)
+    if sibling_dbs:
+        pytest.skip(
+            "multi-DB local cluster (#193): sibling database(s) "
+            f"{sorted(sibling_dbs)} still hold live grants on the "
+            "cluster-global app_role role (pg_shdepend), so 0005's "
+            "downgrade correctly refuses to DROP ROLE here -- expected "
+            "local multi-worktree topology, not a regression. See "
+            "_other_databases_holding_app_role_grants above and the "
+            "migration module's own 'DOWNGRADE' docstring. CI runs a "
+            "single, sibling-less database and always exercises the full "
+            "assertion below instead of this skip."
+        )
+
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: _alembic("downgrade", "0004"))
 
