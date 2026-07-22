@@ -1103,6 +1103,45 @@ async def _insert_tenant_ack_notification(
     return notification_id
 
 
+async def _insert_emergency_sms_notification(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    message_id: str,
+    property_id: str,
+    category: str,
+    body: str,
+) -> str:
+    """Mirrors the SHAPE of ``emergency_chain.py``'s own
+    ``_INSERT_EMERGENCY_SMS_SQL`` (same payload keys) so a test can seed an
+    ``emergency_sms`` row directly, without needing a full ``emergency_call``
+    chain / step-0 processing run first -- used to deterministically drive
+    the cross-path claim sequence in
+    ``test_inline_claim_after_sweep_failure_marks_sent_not_resent`` below."""
+    notification_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO notifications (id, landlord_id, case_id, type, channel, status, payload) "
+            "VALUES (:id, :landlord_id, NULL, 'emergency_sms', 'sms', 'pending', "
+            "CAST(:payload AS jsonb))"
+        ),
+        {
+            "id": notification_id,
+            "landlord_id": landlord_id,
+            "payload": json.dumps(
+                {
+                    "message_id": message_id,
+                    "property_id": property_id,
+                    "category": category,
+                    "body": body,
+                }
+            ),
+        },
+    )
+    await session.commit()
+    return notification_id
+
+
 @pytest.mark.integration
 async def test_sms_drain_sweep_sends_pending_tenant_ack(
     db_session: AsyncSession, fake_sender: FakeTwilioSender
@@ -1207,6 +1246,99 @@ async def test_sms_drain_sweep_resends_emergency_sms_after_initial_send_failure(
             .one()
         )
         assert sms_row_after["status"] == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_inline_claim_after_sweep_failure_marks_sent_not_resent(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    """Regression for issue #186's confirmed live bug (evidence-based
+    triage, cross-path duplicate-send): an ``emergency_sms`` row can be
+    claimed and sent by TWO independent code paths over its lifetime --
+    ``run_sms_drain_sweep``'s own drain (``_process_sms_drain_candidate``)
+    and the inline claim ``_execute_action`` uses for step 0
+    (``_claim_emergency_sms_for_send`` + ``_mark_emergency_sms_status``).
+    Both share the SAME claim CAS (``_CLAIM_SMS_DRAIN_SQL``), which treats
+    ``status IN ('pending', 'failed')`` as fair game -- so a row the drain
+    sweep marked ``'failed'`` can still be picked up and successfully sent
+    by the inline path afterwards. Before this fix,
+    ``_MARK_EMERGENCY_SMS_SQL`` only matched ``status = 'pending'``, so
+    that later successful send silently no-opped: the row stayed
+    ``'failed'`` forever, and the NEXT drain tick resent the tenant safety
+    SMS again, indefinitely."""
+    landlord_id, property_id, tenant_id = await _seed(db_session)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    category, body = emergency_chain.render_tenant_safety_sms(["fire"])
+    notification_id = await _insert_emergency_sms_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        category=category,
+        body=body,
+    )
+
+    try:
+        # 1. The drain sweep claims the row first and its send FAILS (fake
+        #    sender raises) -- mirrors a sweep tick winning the race
+        #    against the inline step-0 path, per
+        #    _claim_emergency_sms_for_send's own docstring.
+        fake_sender.fail_sms = True
+        sweep_outcomes = await emergency_chain.run_sms_drain_sweep()
+        assert len(sweep_outcomes) == 1
+        assert sweep_outcomes[0].outcome == "failed"
+        assert sweep_outcomes[0].notification_type == "emergency_sms"
+        assert len(fake_sender.calls) == 0, "the fake sender raises before recording a call"
+
+        failed_row = await _fetch_notification(db_session, notification_id)
+        assert failed_row["status"] == "failed"
+        assert failed_row["attempt"] == 1
+
+        # 2. A SUBSEQUENT claim+send via the INLINE code path succeeds --
+        #    the exact _claim_emergency_sms_for_send (inside
+        #    _execute_action) + _mark_emergency_sms_status pair
+        #    _process_due_row's step-0 handling uses.
+        fake_sender.fail_sms = False
+        ctx = await emergency_chain._load_context(  # noqa: SLF001
+            db_session, uuid.UUID(message_id)
+        )
+        assert ctx is not None
+        outcome = await emergency_chain._execute_action(  # noqa: SLF001
+            fake_sender,
+            emergency_chain._ACTION_TENANT_SAFETY_SMS,  # noqa: SLF001
+            ctx,
+            categories=["fire"],
+            notification_id=uuid.uuid4(),
+            ack_token="cross-path-test-token",  # noqa: S106 -- test fixture, not a secret
+            message_id=uuid.UUID(message_id),
+        )
+        assert outcome.status == "sent"
+        assert len(fake_sender.calls) == 1
+
+        await emergency_chain._mark_emergency_sms_status(  # noqa: SLF001
+            db_session, uuid.UUID(message_id), [outcome]
+        )
+        await db_session.commit()
+
+        healed_row = await _fetch_notification(db_session, notification_id)
+        assert healed_row["status"] == "sent", (
+            "a send that succeeds after a sweep-recorded failure must reach "
+            "'sent', not stay stuck at 'failed' forever"
+        )
+
+        # 3. A further drain tick must send NOTHING -- the row is
+        #    terminally 'sent' and excluded from the retry set; zero new
+        #    fake-sender calls proves the duplicate-send loop is closed.
+        final_outcomes = await emergency_chain.run_sms_drain_sweep()
+        assert final_outcomes == []
+        assert len(fake_sender.calls) == 1, "no new send may occur once the row is 'sent'"
     finally:
         await _cleanup(db_session, landlord_id)
 

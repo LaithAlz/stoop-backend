@@ -819,9 +819,54 @@ _INSERT_ATTEMPT_AUDIT_SQL = text(
 _MARK_EMERGENCY_SMS_SQL = text(
     """
     UPDATE notifications SET status = :status, updated_at = now()
-    WHERE type = 'emergency_sms' AND payload ->> 'message_id' = :message_id AND status = 'pending'
+    WHERE type = 'emergency_sms' AND payload ->> 'message_id' = :message_id
+      AND status IN ('pending', 'failed')
     """
 )
+# Bug fix (issue #186 triage, cross-path duplicate-send): this predicate
+# must match every status :func:`_claim_emergency_sms_for_send` was willing
+# to claim (its own SELECT/CAS, ``_SELECT_EMERGENCY_SMS_ROW_SQL`` /
+# ``_CLAIM_SMS_DRAIN_SQL``, both ``status IN ('pending', 'failed')``) --
+# NOT just ``'pending'``. Before this fix: a row that a PRIOR
+# ``run_sms_drain_sweep`` tick had already marked ``'failed'`` (via
+# ``_MARK_SMS_DRAIN_FAILED_SQL``) could still be claimed and successfully
+# sent by THIS (inline T+0, or a later step-0-processing sweep tick) path
+# -- the claim's own CAS treats ``'failed'`` as fair game, by design, so a
+# transient failure can heal on a later attempt. But this write only ever
+# matched ``status = 'pending'``, so a successful send that healed a
+# ``'failed'`` row silently no-opped here: the row stayed ``'failed'``
+# forever, and the NEXT ``run_sms_drain_sweep`` tick saw a ``'failed'`` row
+# with nothing recorded and resent the tenant safety SMS again --
+# indefinitely, once per tick, since ``'sent'`` was never reached.
+#
+# Exactly-once reasoning for the widened predicate (traced every caller):
+# 1. This statement can only ever move a row OUT of {'pending', 'failed'}
+#    (into 'sent' or 'failed') -- it can never match, and therefore never
+#    touch, a row already 'sent' or 'exhausted' (both excluded from the
+#    ``IN (...)`` set). Widening the predicate cannot make it regress an
+#    already-terminal row, however many times it is (re-)called.
+# 2. :func:`_mark_emergency_sms_status` (the only caller of this SQL) is
+#    itself invoked from exactly ONE call site -- inside
+#    :func:`_process_due_row`'s ``step == 0`` handling -- which only ever
+#    runs to completion for whichever single caller wins
+#    ``_CLAIM_STEP_SQL``'s own CAS (``attempt = :old_attempt``) on the
+#    UNRELATED ``emergency_call`` row's ``attempt`` column: that CAS can
+#    transition a given ``emergency_call`` row's step 0 (attempt 0 -> 1)
+#    AT MOST ONCE in the row's entire lifetime, so this mark statement is
+#    reachable AT MOST ONCE, full stop, independent of the ``emergency_sms``
+#    row's own status/attempt at the time it runs. There is no scenario
+#    where two different successful sends both reach this write for the
+#    same ``emergency_sms`` row -- so no attempt/identity check is needed
+#    on THIS statement for it to stay exactly-once.
+# 3. The SEND this one guaranteed write is recording is itself gated,
+#    separately, by :func:`_claim_emergency_sms_for_send`'s own attempt-CAS
+#    (the SAME ``_CLAIM_SMS_DRAIN_SQL`` ``_process_sms_drain_candidate``
+#    uses) immediately before the Twilio call -- that is what stops THIS
+#    path and a concurrent ``run_sms_drain_sweep`` tick from both sending
+#    the tenant safety SMS for the same attempt slot. This write only needs
+#    to persist that already-exclusive claim's outcome into whatever
+#    transient status the row currently holds. See
+#    :func:`_claim_emergency_sms_for_send`'s docstring for the claim side.
 
 
 async def _mark_emergency_sms_status(
