@@ -169,6 +169,45 @@ async def _seed_approved_draft(
     return landlord_id, case_id, draft_id
 
 
+async def _tenant_phone_for_case(session: AsyncSession, *, case_id: str) -> str:
+    """The case's tenant's phone -- used to scope ``_FakeSmsSender.calls``/
+    ``sender_tick``'s claim-count assertions to THIS test's own seeded
+    draft, never a raw global count (#212 item 1, same convention as
+    ``tests/test_drafts_router.py``'s ``_tenant_phone_for_case``).
+    ``sender_tick``'s candidate SELECT is intentionally unscoped in
+    production (the admin ticker drains every landlord's due drafts), so a
+    leftover ``approved`` draft from an interrupted prior local run can
+    inflate both ``sender_tick``'s returned count and this shared fake
+    sender's ``calls`` for whichever test happens to run next in the same
+    dirty database -- observed empirically as ``claimed == 2`` where a
+    clean run would see ``1``. Filtering by phone means a stray row can
+    add noise elsewhere but can never flip THIS test's own result."""
+    row = (
+        await session.execute(
+            text(
+                "SELECT t.phone FROM tenants t JOIN cases c ON c.tenant_id = t.id "
+                "WHERE c.id = :case_id"
+            ),
+            {"case_id": case_id},
+        )
+    ).one()
+    return str(row[0])
+
+
+async def _tenant_phone(session: AsyncSession, tenant_id: str) -> str:
+    """Same rationale as ``_tenant_phone_for_case`` above, for the handful
+    of tests below that already hold a ``tenant_id`` directly (the trust-
+    ladder graduation tests, which reuse one tenant across several seeded
+    drafts) rather than a ``case_id``."""
+    return str(
+        (
+            await session.execute(
+                text("SELECT phone FROM tenants WHERE id = :id"), {"id": tenant_id}
+            )
+        ).scalar_one()
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. Happy path — a due, clean approval.
 # ---------------------------------------------------------------------------
@@ -179,11 +218,15 @@ async def test_sender_tick_sends_due_draft_and_writes_every_durable_side_effect(
     db_session: AsyncSession,
 ) -> None:
     landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
     try:
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1
-        assert len(sender.calls) == 1
+        # Scoped to THIS test's own tenant phone, never a raw global count
+        # (#212 item 1 -- see _tenant_phone_for_case's docstring).
+        assert claimed >= 1
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
 
         draft_row = (
             (
@@ -212,11 +255,11 @@ async def test_sender_tick_sends_due_draft_and_writes_every_durable_side_effect(
         assert message_row["party"] == "tenant"
         assert message_row["twilio_sid"] is not None
         assert message_row["twilio_sid"].startswith("SM")
-        assert message_row["body"] == sender.calls[0]["body"]
+        assert message_row["body"] == own_calls[0]["body"]
         # The send goes out from the CASE's OWN property's twilio_number,
         # never a fabricated/omitted "from" (app/integrations/sms_sender.py's
         # module docstring "Why from_e164 is required").
-        assert sender.calls[0]["from_e164"] is not None
+        assert own_calls[0]["from_e164"] is not None
 
         case_row = (
             (
@@ -275,11 +318,17 @@ async def test_sender_tick_records_edited_approval_in_trust_metrics(
     landlord_id, case_id, draft_id = await _seed_approved_draft(
         db_session, edited=True, final_body="Edited landlord text."
     )
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
     try:
         await sender_tick(sender=sender)
 
-        assert sender.calls[0]["body"] == "Edited landlord text."
+        # Scoped to THIS test's own tenant phone (#212 item 1) rather than
+        # a raw ``sender.calls[0]`` index, which a stray dirty-DB row
+        # sorted earlier by ``scheduled_send_at`` could otherwise occupy.
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
+        assert own_calls[0]["body"] == "Edited landlord text."
 
         trust_row = (
             (
@@ -307,12 +356,17 @@ async def test_sender_tick_records_edited_approval_in_trust_metrics(
 
 @pytest.mark.integration
 async def test_sender_tick_ignores_drafts_not_yet_due(db_session: AsyncSession) -> None:
-    landlord_id, _case_id, draft_id = await _seed_approved_draft(db_session, due_in_seconds=60.0)
+    landlord_id, case_id, draft_id = await _seed_approved_draft(db_session, due_in_seconds=60.0)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
     try:
-        claimed = await sender_tick(sender=sender)
-        assert claimed == 0
-        assert sender.calls == []
+        # The global claim count is not asserted here (#212 item 1): a
+        # stray dirty-DB row elsewhere could make it nonzero even though
+        # OUR not-yet-due draft was correctly left untouched. Scoped to
+        # THIS test's own tenant phone instead.
+        await sender_tick(sender=sender)
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert own_calls == []
 
         status = (
             await db_session.execute(
@@ -331,12 +385,19 @@ async def test_sender_tick_ignores_drafts_not_yet_due(db_session: AsyncSession) 
 
 @pytest.mark.integration
 async def test_concurrent_ticks_send_exactly_once(db_session: AsyncSession) -> None:
-    landlord_id, _case_id, draft_id = await _seed_approved_draft(db_session)
+    landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
     try:
-        results = await asyncio.gather(sender_tick(sender=sender), sender_tick(sender=sender))
-        assert sum(results) == 1  # exactly one tick won the claim
-        assert len(sender.calls) == 1
+        await asyncio.gather(sender_tick(sender=sender), sender_tick(sender=sender))
+        # Scoped to THIS test's own tenant phone (#212 item 1): the raw
+        # combined claim count across both concurrent ticks is not
+        # asserted here (a stray dirty-DB row could be claimed by whichever
+        # tick loses the race for OUR row, inflating the sum without OUR
+        # row ever being double-sent). What matters -- and is immune to
+        # that noise -- is that OUR row's phone was sent to exactly once.
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
 
         status = (
             await db_session.execute(
@@ -359,12 +420,17 @@ async def test_send_failure_leaves_draft_stuck_sending_not_lost_or_duplicated(
     db_session: AsyncSession,
 ) -> None:
     landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
     sender.fail_next = True
     try:
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1  # claimed the row -- the SEND itself then failed
-        assert sender.calls == []
+        # Scoped to THIS test's own tenant phone (#212 item 1) -- see
+        # _tenant_phone_for_case's docstring. The global claim count isn't
+        # asserted exactly: a stray dirty-DB row could add to it.
+        assert claimed >= 1  # claimed the row -- the SEND itself then failed
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert own_calls == []
 
         status = (
             await db_session.execute(
@@ -382,9 +448,9 @@ async def test_send_failure_leaves_draft_stuck_sending_not_lost_or_duplicated(
 
         # A second tick does NOT re-claim the stuck row (status is no
         # longer 'approved') -- never a silent double-send once it's stuck.
-        claimed_again = await sender_tick(sender=sender)
-        assert claimed_again == 0
-        assert sender.calls == []
+        await sender_tick(sender=sender)
+        own_calls_after_second_tick = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert own_calls_after_second_tick == []
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -487,11 +553,15 @@ async def test_edited_draft_with_empty_final_body_never_sends_original_text(
     landlord_id, case_id, draft_id = await _seed_approved_draft(
         db_session, edited=True, final_body=None
     )
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
     try:
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1  # claimed the row -- refused before ever calling send_sms
-        assert sender.calls == []  # NEVER sent the original text
+        # Scoped to THIS test's own tenant phone (#212 item 1) -- see
+        # _tenant_phone_for_case's docstring.
+        assert claimed >= 1  # claimed the row -- refused before ever calling send_sms
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert own_calls == []  # NEVER sent the original text
 
         status = (
             await db_session.execute(
@@ -529,11 +599,15 @@ async def test_no_property_twilio_number_refuses_to_send(db_session: AsyncSessio
     landlord_id, case_id, draft_id = await _seed_approved_draft(
         db_session, provision_twilio_number=False
     )
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
     try:
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1  # claimed the row -- refused before ever calling send_sms
-        assert sender.calls == []
+        # Scoped to THIS test's own tenant phone (#212 item 1) -- see
+        # _tenant_phone_for_case's docstring.
+        assert claimed >= 1  # claimed the row -- refused before ever calling send_sms
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert own_calls == []
 
         status = (
             await db_session.execute(
@@ -595,12 +669,14 @@ async def test_sender_tick_stops_claiming_after_deadline_then_resumes_next_tick(
     The SECOND due draft must NOT be claimed in the same tick -- it stays
     'approved' and due, claimed whole by the very next tick call. Nothing
     lost; never abandoned mid-claim."""
-    landlord_id_a, _case_id_a, draft_id_a = await _seed_approved_draft(
+    landlord_id_a, case_id_a, draft_id_a = await _seed_approved_draft(
         db_session, due_in_seconds=-2.0
     )
-    landlord_id_b, _case_id_b, draft_id_b = await _seed_approved_draft(
+    landlord_id_b, case_id_b, draft_id_b = await _seed_approved_draft(
         db_session, due_in_seconds=-1.0
     )
+    tenant_phone_a = await _tenant_phone_for_case(db_session, case_id=case_id_a)
+    tenant_phone_b = await _tenant_phone_for_case(db_session, case_id=case_id_b)
     clock = _FakeClock(start=0.0)
     sender = _DeadlineBlowingSender(clock, advance_by=10.0)
 
@@ -608,8 +684,13 @@ async def test_sender_tick_stops_claiming_after_deadline_then_resumes_next_tick(
         claimed_first_tick = await sender_tick(
             sender=sender, deadline_seconds=5.0, time_source=clock
         )
-        assert claimed_first_tick == 1
-        assert len(sender.calls) == 1
+        # Scoped to THIS test's own two tenant phones (#212 item 1) --
+        # never a raw global count, which a stray dirty-DB row could
+        # inflate (`_DeadlineBlowingSender.calls` records bare phone
+        # strings, not dicts, unlike `_FakeSmsSender` above).
+        assert claimed_first_tick >= 1
+        assert sender.calls.count(tenant_phone_a) == 1
+        assert sender.calls.count(tenant_phone_b) == 0
 
         status_a = (
             await db_session.execute(
@@ -631,8 +712,9 @@ async def test_sender_tick_stops_claiming_after_deadline_then_resumes_next_tick(
         claimed_second_tick = await sender_tick(
             sender=sender, deadline_seconds=5.0, time_source=clock
         )
-        assert claimed_second_tick == 1
-        assert len(sender.calls) == 2
+        assert claimed_second_tick >= 1
+        assert sender.calls.count(tenant_phone_a) == 1
+        assert sender.calls.count(tenant_phone_b) == 1
 
         status_b_after = (
             await db_session.execute(
@@ -661,6 +743,7 @@ async def test_sender_tick_missing_case_severity_pages_sentry_and_skips_trust_me
     this is no longer expected on 100% of sends, it must page (ERROR log +
     Sentry), not just log quietly."""
     landlord_id, case_id, _draft_id = await _seed_approved_draft(db_session, severity=None)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
 
     captured: list[dict[str, Any]] = []
@@ -672,8 +755,11 @@ async def test_sender_tick_missing_case_severity_pages_sentry_and_skips_trust_me
 
     try:
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1
-        assert len(sender.calls) == 1  # the send itself still happens
+        # Scoped to THIS test's own tenant phone (#212 item 1) -- see
+        # _tenant_phone_for_case's docstring.
+        assert claimed >= 1
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1  # the send itself still happens
 
         trust_row = (
             (
@@ -786,10 +872,14 @@ async def test_severity_written_by_classify_severity_flows_into_trust_metrics_vi
             status="approved",
             scheduled_send_at=datetime.now(UTC) - timedelta(seconds=1),
         )
+        tenant_phone = await _tenant_phone(db_session, tenant_id)
         sender = _FakeSmsSender()
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1
-        assert len(sender.calls) == 1
+        # Scoped to THIS test's own tenant phone (#212 item 1) -- see
+        # _tenant_phone's docstring.
+        assert claimed >= 1
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
 
         trust_row = (
             (
@@ -898,14 +988,21 @@ async def test_graduation_fires_at_exactly_threshold_boundary_with_trust_unlocke
         db_session, landlord_id, twilio_number=factories.fresh_phone()
     )
     tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    tenant_phone = await _tenant_phone(db_session, tenant_id)
     sender = _FakeSmsSender()
     try:
-        for _ in range(2):
+        for i in range(2):
             await _seed_approved_draft_for_property(
                 db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
             )
             claimed = await sender_tick(sender=sender)
-            assert claimed == 1
+            # Scoped to THIS test's own (reused) tenant phone (#212 item
+            # 1) rather than the raw per-tick/global claim count -- see
+            # _tenant_phone's docstring. Cumulative own-call count proves
+            # each iteration's own draft was sent exactly once, in order.
+            assert claimed >= 1
+            own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+            assert len(own_calls) == i + 1
             row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
             assert row["autonomy_unlocked"] is False  # not yet -- below threshold
 
@@ -914,7 +1011,9 @@ async def test_graduation_fires_at_exactly_threshold_boundary_with_trust_unlocke
             db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
         )
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1
+        assert claimed >= 1
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 3
 
         row = await _trust_metrics_row(db_session, landlord_id=landlord_id)
         assert row["consecutive_clean"] == 3
@@ -1166,6 +1265,7 @@ async def test_claim_refuses_draft_on_resolved_case_leaves_it_approved(
     draft, the claim's own belt-and-braces predicate must still refuse to
     send it."""
     landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     await db_session.execute(
         text(
             "UPDATE cases SET status = 'resolved', resolved_reason = 'landlord', "
@@ -1176,9 +1276,13 @@ async def test_claim_refuses_draft_on_resolved_case_leaves_it_approved(
     await db_session.commit()
     sender = _FakeSmsSender()
     try:
-        claimed = await sender_tick(sender=sender)
-        assert claimed == 0
-        assert sender.calls == []
+        # The global claim count is not asserted here (#212 item 1): a
+        # stray dirty-DB row elsewhere could make it nonzero even though
+        # OUR resolved-case draft was correctly left unclaimed. Scoped to
+        # THIS test's own tenant phone instead.
+        await sender_tick(sender=sender)
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert own_calls == []
 
         status = (
             await db_session.execute(
@@ -1200,11 +1304,15 @@ async def test_claim_still_sends_normally_on_a_non_resolved_case(
     """Regression guard for the new predicate: an ordinary due draft on a
     case that is NOT resolved must still send exactly as before."""
     landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
     try:
         claimed = await sender_tick(sender=sender)
-        assert claimed == 1
-        assert len(sender.calls) == 1
+        # Scoped to THIS test's own tenant phone (#212 item 1) -- see
+        # _tenant_phone_for_case's docstring.
+        assert claimed >= 1
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
 
         status = (
             await db_session.execute(
@@ -1241,15 +1349,34 @@ async def test_resolved_case_zombie_does_not_starve_the_batch(
     await db_session.commit()
 
     legitimate_landlord_ids: list[str] = []
+    legitimate_draft_ids: list[str] = []
+    legitimate_phones: list[str] = []
     for _ in range(DEFAULT_BATCH_SIZE):
-        landlord_id, _case_id, _draft_id = await _seed_approved_draft(db_session)
+        landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
         legitimate_landlord_ids.append(landlord_id)
+        legitimate_draft_ids.append(draft_id)
+        legitimate_phones.append(await _tenant_phone_for_case(db_session, case_id=case_id))
 
     sender = _FakeSmsSender()
     try:
         claimed = await sender_tick(sender=sender, batch_size=DEFAULT_BATCH_SIZE)
-        assert claimed == DEFAULT_BATCH_SIZE
-        assert len(sender.calls) == DEFAULT_BATCH_SIZE
+        # The raw totals are a weaker (but still-safe, since `batch_size`
+        # caps the candidate SELECT) sanity check; the assertion that
+        # actually proves the starvation fix -- scoped to THIS test's own
+        # seeded draft ids/phones (#212 item 1), never a raw global count
+        # -- is that EVERY one of our own legitimate drafts got sent
+        # within this SINGLE tick, regardless of any other dirty-DB row
+        # that might also compete for the same limited batch window.
+        assert claimed >= DEFAULT_BATCH_SIZE
+        own_calls = [c for c in sender.calls if c["to_e164"] in legitimate_phones]
+        assert len(own_calls) == DEFAULT_BATCH_SIZE
+        for draft_id in legitimate_draft_ids:
+            status = (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+                )
+            ).scalar_one()
+            assert status == "sent"
 
         zombie_status = (
             await db_session.execute(

@@ -37,6 +37,40 @@ _PLACEHOLDER_ENV: dict[str, str] = {
 for _key, _value in _PLACEHOLDER_ENV.items():
     os.environ.setdefault(_key, _value)
 
+# ---------------------------------------------------------------------------
+# Known bleed class (#212 item 1, comment-only note -- no fixture fixes this):
+# "dirty-DB bleed" across sender_tick integration tests.
+#
+# app/agent/draft_sender.py's sender_tick() candidate SELECT is
+# INTENTIONALLY unscoped (the production ticker drains every landlord's
+# due drafts cluster-wide) -- there is no landlord_id filter to add. Any
+# integration test suite run that is killed/interrupted mid-test (Ctrl-C,
+# OOM, a crashed worker) can leave an 'approved', already-due draft behind
+# in the shared local Postgres database, because these suites clean up
+# their own seeded rows in a `finally:` block that never runs on a hard
+# kill. The NEXT time any sender_tick test runs against that same dirty
+# database, it can claim/send that stray leftover row too, inflating
+# whatever a test asserts about the tick's raw/global counts (observed
+# empirically as `claimed == 2` where a clean run would see `1`).
+#
+# Full per-worker DB isolation (or transaction-rollback-based test
+# fixtures instead of manual `DELETE ... WHERE landlord_id = :lid` cleanup)
+# would close this class properly but is out of scope for a test-only
+# change. The pragmatic fix applied in tests/test_agent_auto_send.py and
+# tests/test_agent_draft_sender.py: scope every sender_tick assertion to
+# THIS test's own seeded landlord/case/draft/tenant-phone (never a raw
+# global `claimed == N` or unscoped `sender.calls` count) -- a stray row
+# can add noise elsewhere but can no longer flip an otherwise-correct
+# test's result. Residual: a small number of tests (the deadline-budget
+# test and the stuck-'sending'-on-provider-failure test) still rely on
+# WHICH due draft a shared tick processes FIRST (a single-shot fake-clock
+# advance / a single-shot simulated provider failure) -- an old enough
+# stray row could still be selected before the test's own row and change
+# that specific test's premise, not just its count. If you hit a stray
+# flake in one of those two, `TRUNCATE`-cleaning the local dev database
+# (see the debugging playbook) is the real fix, not a bigger assertion.
+# ---------------------------------------------------------------------------
+
 
 @pytest.fixture(autouse=True)
 def _reset_jwks_auth_state() -> Iterator[None]:

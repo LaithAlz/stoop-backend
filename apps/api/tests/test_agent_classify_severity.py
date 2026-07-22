@@ -16,7 +16,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import uuid
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
@@ -269,6 +268,57 @@ class _FakeClient:
 
 def _patch_client(monkeypatch: pytest.MonkeyPatch, fake_messages: _FakeMessages) -> None:
     monkeypatch.setattr(anthropic_mod, "get_client", lambda: _FakeClient(fake_messages))
+
+
+class _ScriptedClock:
+    """A controllable stand-in for ``time.monotonic()`` -- same pattern as
+    ``tests/test_integrations_anthropic.py``'s ``_FakeClock``, which pins
+    ``new_deadline``/``attempt_timeout``'s pure arithmetic in isolation.
+    ``app/integrations/anthropic.py``'s ``_now()`` exists as a deliberately
+    patchable seam precisely for this (module docstring: "tests monkeypatch
+    this directly to simulate elapsed time deterministically, with no real
+    sleeps").
+
+    #212 item 2: the double-timeout test below used to assert a real
+    ``time.monotonic()``-measured ``elapsed < 0.6`` bound -- exactly the
+    assertion shape that flakes under CI scheduling load. Patching this
+    clock (together with ``_record_call_tool_forced_timeouts`` below, which
+    advances it by each attempt's allotted timeout) makes the shared
+    -deadline arithmetic the node exercises fully deterministic: no real
+    wall-clock reading is ever consulted for the assertion.
+    """
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.t = start
+
+    def now(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def _record_call_tool_forced_timeouts(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: _ScriptedClock
+) -> list[float]:
+    """Wrap ``anthropic_mod.call_tool_forced`` to record the actual
+    ``timeout_seconds`` each attempt used, then advance *fake_clock* by
+    that same amount -- a deterministic stand-in for "this attempt
+    consumed its full allotted timeout before failing", with zero
+    dependence on real OS/event-loop timing precision. Returns the list
+    that gets appended to (in call order) as the node under test runs."""
+    recorded: list[float] = []
+    real_call_tool_forced = anthropic_mod.call_tool_forced
+
+    async def _wrapper(*, timeout_seconds: float, **kwargs: Any) -> Any:
+        recorded.append(timeout_seconds)
+        try:
+            return await real_call_tool_forced(timeout_seconds=timeout_seconds, **kwargs)
+        finally:
+            fake_clock.advance(timeout_seconds)
+
+    monkeypatch.setattr(anthropic_mod, "call_tool_forced", _wrapper)
+    return recorded
 
 
 def _base_state(
@@ -650,6 +700,9 @@ async def test_classify_severity_double_timeout_shares_one_end_to_end_deadline(
         delay=1.0,
     )
     _patch_client(monkeypatch, fake_messages)
+    fake_clock = _ScriptedClock()
+    monkeypatch.setattr(anthropic_mod, "_now", fake_clock.now)
+    recorded_timeouts = _record_call_tool_forced_timeouts(monkeypatch, fake_clock)
 
     try:
         state = _base_state(
@@ -659,13 +712,23 @@ async def test_classify_severity_double_timeout_shares_one_end_to_end_deadline(
             tenant_id=tenant_id,
             case_id=case_id,
         )
-        start = time.monotonic()
         update = await classify_severity(state)
-        elapsed = time.monotonic() - start
 
         assert update["classification_failed"] is True
         assert len(fake_messages.calls) == 2
-        assert elapsed < 0.6
+        # Deterministic behavioral pin (#212 item 2, replacing a real-
+        # wall-clock ``elapsed < 0.6`` assertion): the SECOND attempt's
+        # timeout is exactly the REMAINDER of the ONE shared 0.3s deadline
+        # after the first attempt's capped 0.1s -- never a fresh,
+        # independent per-attempt budget, and never measured against real
+        # elapsed time.
+        assert recorded_timeouts == [
+            pytest.approx(anthropic_mod.FIRST_ATTEMPT_TIMEOUT_CAP_SECONDS),
+            pytest.approx(
+                anthropic_mod.CLASSIFICATION_BUDGET_SECONDS
+                - anthropic_mod.FIRST_ATTEMPT_TIMEOUT_CAP_SECONDS
+            ),
+        ]
     finally:
         await _cleanup(db_session, landlord_id)
 
