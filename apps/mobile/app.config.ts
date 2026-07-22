@@ -52,6 +52,14 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
         imageWidth: 76,
       },
     ],
+    // Push notifications (issue #210 M3). No custom Android icon/sound asset
+    // is shipped yet — the default app icon is used for the small
+    // notification icon; add a dedicated 96x96 all-white glyph here when
+    // brand assets are finalized (founder-gated with the store submission).
+    // `enableBackgroundRemoteNotifications` stays off: this app's push is a
+    // foreground/tap approval nudge, never a silent background wake, and
+    // NEVER the emergency path (CLAUDE.md rule 1).
+    "expo-notifications",
   ],
   experiments: {
     typedRoutes: true,
@@ -61,5 +69,16 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     supabaseUrl: process.env.EXPO_PUBLIC_SUPABASE_URL,
     supabaseAnonKey: process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY,
     apiUrl: process.env.EXPO_PUBLIC_API_URL,
+    // Expo push token attribution (issue #210 M3). Unset until the founder
+    // creates the EAS project (founder-gated external — real push DELIVERY
+    // needs an Expo/EAS account + APNs/FCM credentials); until then
+    // `getExpoPushTokenAsync` has no project to attribute a token to, and
+    // src/features/push/deviceRegistration.ts silently no-ops registration
+    // (push stays an enhancement, never a gate). EAS Build injects this
+    // automatically, but setting it explicitly here is the recommended
+    // pattern (expo-notifications' own getExpoPushTokenAsync docs).
+    eas: {
+      projectId: process.env.EAS_PROJECT_ID,
+    },
   },
 });

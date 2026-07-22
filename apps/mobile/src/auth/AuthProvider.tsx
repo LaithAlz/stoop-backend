@@ -16,6 +16,10 @@ import type { Session } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase";
 import { queryClient } from "@/api/queryClient";
 import { resetOnboardingOffer } from "@/features/onboarding/gate";
+import {
+  clearRegisteredDeviceId,
+  unregisterCurrentDeviceBestEffort,
+} from "@/features/push/deviceRegistration";
 
 interface AuthContextValue {
   session: Session | null;
@@ -72,6 +76,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // spirit — a different account signing in on this device gets its
         // own zero-properties gate decision (M2).
         resetOnboardingOffer();
+        // M3: drop the locally-tracked device id. This is a pure local
+        // reset (no network call) — safe here even though the session is
+        // already gone by the time this fires, unlike the actual
+        // `DELETE /v1/devices/{id}` call, which needs a still-live token
+        // and therefore runs earlier, in `signOut` below, before
+        // `supabase.auth.signOut()` clears it. Covers the forced-401
+        // sign-out path too (src/api/client.ts), which bypasses `signOut`
+        // below entirely — that path can't authenticate a DELETE either
+        // way, so clearing the stale local ref is all there is to do.
+        clearRegisteredDeviceId();
       }
       setSession(nextSession);
       setInitializing(false);
@@ -92,6 +106,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return { error: error ? toHouseAuthError(error) : null };
       },
       signOut: async () => {
+        // M3: unregister this device BEFORE invalidating the session — the
+        // DELETE needs a still-live bearer token (src/api/client.ts reads
+        // it fresh from the current supabase session on every call), which
+        // is gone the instant supabase.auth.signOut() below completes.
+        // Bounded + best-effort (deviceRegistration.ts's own docstring) —
+        // this can never throw or hang sign-out.
+        await unregisterCurrentDeviceBestEffort();
         await supabase.auth.signOut();
       },
     }),

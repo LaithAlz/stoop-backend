@@ -480,3 +480,37 @@ export type RejectDraftResponse = Record<string, never>;
 export interface AckNotificationResponse {
   acknowledged_at: string;
 }
+
+// ---------------------------------------------------------------------------
+// Devices ("Devices (push notifications, #210 M3)" section, v1.18 amendment)
+// ---------------------------------------------------------------------------
+
+/** Narrower than `push_tokens.platform`'s stored CHECK (`'ios','android',
+ *  'web'`, schema-v1.md) — Expo push tokens have no `'web'` concept, so this
+ *  app only ever registers one of these two (mirrors the backend's own
+ *  `app/routers/devices.py::Platform` narrowing). */
+export type DevicePlatform = "ios" | "android";
+
+/** POST /v1/devices body. Field names (`token`/`platform`) are
+ *  `push_tokens`' own column names verbatim — there is no `expo_push_token`
+ *  field at either the schema or API layer. */
+export interface RegisterDeviceInput {
+  token: string;
+  platform: DevicePlatform;
+}
+
+/** POST /v1/devices → 201. Upsert-by-token: re-registering the same token
+ *  under the same landlord is a no-op that still returns this shape. */
+export interface DeviceResponse {
+  id: string;
+  platform: DevicePlatform;
+  created_at: string;
+}
+
+/** DELETE /v1/devices/{id} → 200. NOT idempotent-200 on repeat — a second
+ *  call 404s `device_not_found` like any other missing id (the doc's own
+ *  explicit call-out: unlike `push_tokens.revoked_at`'s soft marker, this is
+ *  a genuine hard delete with no row left to re-confirm against). */
+export interface DeleteDeviceResponse {
+  status: "deleted";
+}
