@@ -20,16 +20,13 @@ never touches, delays, or conditions it (CLAUDE.md rule #1). No feature
 flags anywhere near it (rule #7). No rate limiting (auth'd, idempotent
 upsert — #210's own instruction).
 
-**Tracked follow-up, NOT built here**: ``DeviceRegisterRequest``'s
-Pydantic validation failures (empty/whitespace ``token``, an out-of
--vocabulary ``platform``) currently 422 via FastAPI's own default
-``RequestValidationError`` body, which is NOT this codebase's house error
-envelope (``{"error": {"code","message","request_id"}}``,
-``app/errors.py``) — the same pre-existing gap every other router in
-this codebase already has (no router-specific fix belongs here). A global
-``RequestValidationError`` -> house-envelope exception handler is a
-cross-cutting ``app/main.py`` change, out of this PR's scope; flagged for
-a separate follow-up rather than built unilaterally here.
+``DeviceRegisterRequest``'s Pydantic validation failures (empty/whitespace
+``token``, an out-of-vocabulary ``platform``) 422 via the global
+``RequestValidationError`` handler registered in ``app/main.py``
+(``app/main.py``'s ``_validation_error_handler`` — issue #219), which
+returns this codebase's house error envelope
+(``{"error": {"code": "invalid_request", "message", "request_id"}}``,
+``app/errors.py``) — no router-specific handling needed here.
 """
 
 from __future__ import annotations

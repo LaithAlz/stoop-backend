@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 import fastapi
 import structlog
 import structlog.contextvars
+from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 
@@ -141,6 +142,56 @@ def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
     )
 
 
+def _validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Convert FastAPI's default ``RequestValidationError`` 422 into the
+    standard error envelope (issue #219).
+
+    Every Pydantic-validated request body/query/path param in this app
+    (``drafts.py``'s ``EditAndSendRequest.body``, ``devices.py``'s
+    ``DeviceRegisterRequest``, and any future validated router) raises this
+    exception when validation fails. Left unhandled, FastAPI returns its
+    OWN default body — ``{"detail": [{"loc": [...], "msg": "...", "input":
+    ...}]}`` — which is neither the house envelope
+    (``{"error": {"code","message","request_id"}}``, ``app/errors.py``) NOR
+    safe: the ``"input"`` key echoes the submitted value verbatim, and for
+    a validated endpoint that field can carry request-supplied PII (a
+    tenant phone number, message-body text, a push token) straight into the
+    HTTP response body — a direct violation of never-break rule #5.
+
+    Security / PII-safety choice: this handler returns a single, static,
+    generic ``message`` and status 422 with ``code: "invalid_request"`` —
+    it NEVER forwards ``exc.errors()`` (or anything derived from it, e.g.
+    the field ``loc`` paths) into the response. ``loc`` paths are almost
+    always just static field names, but they can legally embed
+    client-controlled data too (e.g. a dict/list key parsed from the
+    request body) — omitting them entirely applies the same "never
+    interpolate request data into a response" discipline ``app/errors.py``'s
+    ``AppError.message`` already enforces, reviewed once, here, rather than
+    re-auditing every current AND future validated request model for
+    whether its ``loc`` shape could ever carry a client-supplied key. The
+    generic message costs nothing: ``code`` is the stable, machine-readable
+    signal ("check your request shape"); a landlord-facing client never
+    surfaces this text directly anyway.
+
+    Same ``request_id`` sourcing as ``_auth_error_handler``/
+    ``_app_error_handler`` above (the structlog contextvars bound by
+    ``RequestIDMiddleware``) — may be ``None`` if the middleware hasn't run
+    yet (e.g. a test that calls this handler directly), which is
+    acceptable.
+    """
+    request_id: str | None = structlog.contextvars.get_contextvars().get("request_id")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "invalid_request",
+                "message": "The request body or parameters failed validation.",
+                "request_id": request_id,
+            }
+        },
+    )
+
+
 def create_app() -> fastapi.FastAPI:
     """App factory — returns a fully configured FastAPI application.
 
@@ -155,6 +206,10 @@ def create_app() -> fastapi.FastAPI:
       3. add RequestIDMiddleware
       4. register AuthError exception handler (401 → standard envelope)
       4b. register AppError exception handler (status_code → standard envelope)
+      4c. register RequestValidationError exception handler (422 → standard
+          envelope, code ``invalid_request`` — #219; supersedes every
+          Pydantic-validated router's previous fallback onto FastAPI's own
+          default 422 body)
       5. include health router (always)
       5a. include properties/tenants/vendors/cases/queue routers (#54/#55/
           #56 — always, landlord-scoped via require_landlord), the drafts
@@ -201,6 +256,19 @@ def create_app() -> fastapi.FastAPI:
     application.add_exception_handler(
         AppError,
         _app_error_handler,  # type: ignore[arg-type]
+    )
+
+    # Register the RequestValidationError handler so every Pydantic
+    # -validated request body/query/path param (drafts.py's
+    # EditAndSendRequest.body, devices.py's DeviceRegisterRequest, and any
+    # future validated router) gets the standard 422 envelope instead of
+    # FastAPI's own default body, which can echo submitted request values
+    # (#219). This handler ONLY reshapes RequestValidationError — it never
+    # touches any other exception type, so AuthError/AppError's 401/
+    # status_code envelopes above are unaffected.
+    application.add_exception_handler(
+        RequestValidationError,
+        _validation_error_handler,  # type: ignore[arg-type]
     )
 
     application.include_router(health.router)
