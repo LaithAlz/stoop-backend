@@ -136,13 +136,26 @@ async def _insert_landlord(session: AsyncSession, *, phone: str) -> str:
 
 
 async def _insert_property(session: AsyncSession, landlord_id: str, *, twilio_number: str) -> str:
+    """``address_line1`` is derived from the freshly generated ``property_id``
+    (globally unique) rather than a fixed literal — schema-v1.md's v1.15
+    amendment (#203 item 2, migration 0013) added a landlord-scoped,
+    normalized-address UNIQUE index on ``properties``, and this module's
+    own "different property, same landlord" scenario (below) inserts two
+    properties for one landlord in a single test; a fixed literal address
+    would collide against that index. Matches ``tests/factories.py``'s own
+    identical fix for the same migration."""
     property_id = str(uuid.uuid4())
     await session.execute(
         text(
             "INSERT INTO properties (id, landlord_id, label, address_line1, city, twilio_number) "
-            "VALUES (:id, :landlord_id, 'Palmerston', '41 Palmerston', 'Toronto', :twilio_number)"
+            "VALUES (:id, :landlord_id, 'Palmerston', :address_line1, 'Toronto', :twilio_number)"
         ),
-        {"id": property_id, "landlord_id": landlord_id, "twilio_number": twilio_number},
+        {
+            "id": property_id,
+            "landlord_id": landlord_id,
+            "address_line1": f"{property_id} Palmerston",
+            "twilio_number": twilio_number,
+        },
     )
     await session.commit()
     return property_id
