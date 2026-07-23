@@ -44,7 +44,7 @@ landlord, free or paid):
    Mirrors the existing ``duplicate_phone`` convention (tenants/vendors) in
    spirit.
 
-   **#203 item 1 (closing the DB-level race)** — this pre-check alone is a
+   **#203 item 2 (closing the DB-level race)** — this pre-check alone is a
    TOCTOU SELECT: two genuinely concurrent creates for the same address
    could both pass it before either committed, both purchasing a real
    Twilio number (the #53 safety re-review accepted this as a bounded,
@@ -70,17 +70,21 @@ touching this handler.** ``create_property`` holds its
 connection and the RLS GUC) open across up to ~40s of real Twilio HTTP
 calls (three REQUIRED sequential requests at up to 10s each — search,
 purchase, configure — plus a 4th best-effort A2P call, also up to 10s).
-This is a genuine tradeoff,
-not an oversight: ``require_landlord``'s own module docstring already
-forbids a mid-handler ``session.commit()`` (``SET LOCAL`` — the GUC —
-dies with the transaction), so there is no cheap way to release the
-connection mid-request without a structural redesign (a durable
-"provisioning intent" row + background worker, matching the notifications
--sweep pattern this same module already uses for deprovisioning) — that
-redesign is explicitly a follow-up issue, not this PR's scope. Mitigated
-today by: (a) running the cap/dedupe pre-checks (cheap reads) BEFORE any
-Twilio call, so a request that's going to be rejected never holds the
-connection through a Twilio round trip at all; (b) the property cap itself
+This is a genuine tradeoff, not an oversight: ``require_landlord``'s own
+module docstring already forbids a mid-handler ``session.commit()``
+(``SET LOCAL`` — the GUC — dies with the transaction), so there is no
+cheap way to release the connection mid-request without a structural
+redesign (a durable "provisioning intent" row + background worker,
+matching the notifications-sweep pattern this same module already uses
+for deprovisioning). That redesign is **#203 item 1** — evaluated
+alongside #203 item 2 (this docstring's "Duplicate-address dedupe" note
+above) and explicitly DEFERRED to its own future issue: large, competes
+with the scheduler's existing sweeps, and needs its own reconcile design
+(see that issue and PR #204's senior-review comment on the go-live
+pool-separation gate) — not this PR's scope. Mitigated today by: (a)
+running the cap/dedupe pre-checks (cheap reads) BEFORE any Twilio call,
+so a request that's going to be rejected never holds the connection
+through a Twilio round trip at all; (b) the property cap itself
 also bounds the WORST CASE (a single landlord can only ever hold this
 pattern open `max_properties_per_landlord` times in a row before hitting
 the cap); (c) each Twilio call already has its own 10s timeout
@@ -281,12 +285,15 @@ _COUNT_OPEN_CASES_SQL = text(
 
 _DELETE_SQL = text("DELETE FROM properties WHERE id = :id AND landlord_id = :landlord_id")
 
-# #203 item 1 — migration 0013's uq_properties_landlord_address_dedupe is the
+# #203 item 2 — migration 0013's uq_properties_landlord_address_dedupe is the
 # DB-level backstop for the TOCTOU pre-check above (_DUPLICATE_PROPERTY_SQL).
 # Same detection pattern as app/routers/webhooks/twilio.py's own
 # _is_ack_token_collision: constraint_name first, a substring fallback across
-# driver/version differences in whether it's populated.
+# driver/version differences in whether it's populated -- WIDENED (safety
+# re-review finding 2) with an extra nested-cause lookup and two gates on
+# the fallback, see _is_duplicate_property_unique_violation's own docstring.
 _DUPLICATE_PROPERTY_CONSTRAINT_NAME = "uq_properties_landlord_address_dedupe"
+_UNIQUE_VIOLATION_SQLSTATE = "23505"
 
 
 def _is_duplicate_property_unique_violation(exc: IntegrityError) -> bool:
@@ -294,11 +301,48 @@ def _is_duplicate_property_unique_violation(exc: IntegrityError) -> bool:
     ``uq_properties_landlord_address_dedupe`` specifically — never swallows
     any OTHER integrity error (e.g. a genuine schema/FK problem, or the
     pre-existing ``properties.twilio_number`` UNIQUE constraint), which
-    must still page (``alert_purchased_but_unrecorded``) and 502 normally."""
+    must still page (``alert_purchased_but_unrecorded``) and 502 normally.
+
+    **Safety re-review finding 2 (#203):** the ``str(exc)`` substring
+    fallback below is a client-influenced string (it can embed a
+    landlord-supplied ``address_line1``, and the DB error's own ``DETAIL``
+    text echoes submitted values verbatim) — a landlord who submits
+    ``address_line1`` (or ``city``/``province``) equal to this constraint's
+    own NAME could otherwise make an entirely UNRELATED integrity error
+    (e.g. a ``NOT NULL`` violation on a different column, SQLSTATE
+    ``23502``) misfire as a "duplicate address" 409 instead of the
+    502/page an unrelated failure should get. Two independent gates close
+    this:
+
+    1. **The fallback is consulted ONLY when ``constraint_name`` could not
+       be determined AT ALL** — never when it resolved to some OTHER,
+       real, different constraint name. A resolved name is trusted
+       unconditionally either way (matches → duplicate; doesn't match →
+       NOT a duplicate, no fallback second-guessing).
+    2. **The fallback also requires SQLSTATE ``23505`` (unique_violation)**
+       — checked via ``pgcode``/``sqlstate`` on the underlying DBAPI
+       exception (whichever the installed driver populates) — so a
+       same-named substring appearing in a DIFFERENT class of integrity
+       error (wrong SQLSTATE) can never be mistaken for this one.
+
+    ``constraint_name`` itself is looked up on ``exc.orig`` first, then
+    (some driver/SQLAlchemy-version combinations only populate it one
+    level deeper) ``exc.orig.__cause__`` — the raw ``asyncpg`` exception
+    SQLAlchemy's own DBAPI-compatibility wrapper chains from, empirically
+    confirmed to carry ``constraint_name`` when the wrapper itself does
+    not.
+    """
     orig = getattr(exc, "orig", None)
     constraint_name = getattr(orig, "constraint_name", None)
-    if constraint_name == _DUPLICATE_PROPERTY_CONSTRAINT_NAME:
-        return True
+    if constraint_name is None:
+        constraint_name = getattr(getattr(orig, "__cause__", None), "constraint_name", None)
+
+    if constraint_name is not None:
+        return bool(constraint_name == _DUPLICATE_PROPERTY_CONSTRAINT_NAME)
+
+    pgcode = getattr(orig, "pgcode", None) or getattr(orig, "sqlstate", None)
+    if pgcode != _UNIQUE_VIOLATION_SQLSTATE:
+        return False
     return _DUPLICATE_PROPERTY_CONSTRAINT_NAME in str(exc)
 
 
@@ -478,17 +522,20 @@ async def create_property(
         # purchased number must never go silently unrecorded even if this
         # structurally-shouldn't-fail lookup somehow does.
         row = await _get_property_or_404(session, landlord_id=landlord_id, property_id=str(new_id))
-        # #203 item 2 — commit explicitly HERE, inside this guarded try,
-        # rather than leaving the actual COMMIT to require_landlord's/
-        # get_session's post-handler teardown (app/db/session.py). Safe
-        # specifically because nothing below this line touches `session`
-        # again (only `log.info` + building the response model) — the
-        # mid-handler-commit hazard require_landlord's own docstring warns
-        # about ("a subsequent query on this session runs unscoped, fails
-        # closed to zero rows") cannot occur here. This closes the #204
-        # senior-review finding: previously, a require_landlord teardown
-        # -commit failure after a successful purchase ran entirely OUTSIDE
-        # this try/except, so neither alert_purchased_but_unrecorded nor
+        # #203's orphan-fix (shipped alongside item 2, NOT itself a
+        # numbered #203 item — #203 item 1 is the deferred durable
+        # -intent-row structural fix this partially substitutes for) —
+        # commit explicitly HERE, inside this guarded try, rather than
+        # leaving the actual COMMIT to require_landlord's/get_session's
+        # post-handler teardown (app/db/session.py). Safe specifically
+        # because nothing below this line touches `session` again (only
+        # `log.info` + building the response model) — the mid-handler
+        # -commit hazard require_landlord's own docstring warns about ("a
+        # subsequent query on this session runs unscoped, fails closed to
+        # zero rows") cannot occur here. This closes the #204 senior
+        # -review finding: previously, a require_landlord teardown-commit
+        # failure after a successful purchase ran entirely OUTSIDE this
+        # try/except, so neither alert_purchased_but_unrecorded nor
         # release_number_best_effort ever ran for it — a purchased number
         # could be silently orphaned with zero signal. Folding the commit in
         # here means that failure now hits the SAME except clauses below as
@@ -497,10 +544,19 @@ async def create_property(
         # (SQLAlchemy's Session.commit() begins-and-commits an empty
         # transaction when there is nothing pending) — never a second real
         # round trip that could itself fail silently.
+        #
+        # AMBIGUOUS-COMMIT EDGE (safety re-review finding 1): this commit
+        # can raise even though it durably succeeded (a lost ack, not a
+        # real failure). release_number_best_effort's own L2 guard
+        # (app/property_provisioning.py, mirroring the deprovisioning
+        # sweep's "never release a SID a live property references") is
+        # what makes the except branches below safe even in that case --
+        # never silencing a property's tenant-facing/emergency line by
+        # releasing a number a LIVE row still owns.
         await session.commit()
     except IntegrityError as exc:
         if _is_duplicate_property_unique_violation(exc):
-            # #203 item 1 — the loser of a genuine concurrent-create race:
+            # #203 item 2 — the loser of a genuine concurrent-create race:
             # migration 0013's unique index caught what the pre-check SELECT
             # (TOCTOU) couldn't. Release the just-purchased number through
             # the EXISTING compensation seam (no new Twilio call site) and
