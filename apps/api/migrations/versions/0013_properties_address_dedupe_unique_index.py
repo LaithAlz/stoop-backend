@@ -1,4 +1,4 @@
-"""properties: address-dedupe partial UNIQUE index (v1.15, #203 item 1)
+"""properties: address-dedupe partial UNIQUE index (v1.15, #203 item 2)
 
 Revision ID: 0013
 Revises: 0012
@@ -16,8 +16,11 @@ first"). Whoever merges SECOND must renumber (this file's `revision`/
 optional cleanup, it is how `down_revision` chains stay a single line.
 
 Canonical schema source: docs/03-engineering/schema-v1.md — the v1.15
-amendment (2026-07-23, #203 item 1 — the #53 provisioning safety re-review's
-"cheap, high-value" follow-up).
+amendment (2026-07-23, #203 item 2 — the #53 provisioning safety re-review's
+"cheap, high-value" follow-up. #203's OWN numbering: item 1 is the
+durable-intent-row/M4 structural fix, evaluated and DEFERRED to its own
+follow-up issue; item 3 is the global-spend-bound follow-up, also not this
+one).
 
 WHY
 ---
