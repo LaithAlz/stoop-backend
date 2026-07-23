@@ -24,26 +24,32 @@ level every one of these endpoints actually uses.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
 import sys
 import uuid
 from collections.abc import AsyncGenerator, Iterator
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
+from app import property_provisioning
 from app.config import settings
-from app.deps import Landlord
+from app.deps import Landlord, require_landlord
 from app.errors import AppError
 from app.integrations import twilio_provision
+from app.integrations.supabase_auth import AuthUser
 from app.pagination import decode_cursor
 from app.routers.properties import (
     PropertyCreateRequest,
     PropertyUpdateRequest,
+    _is_duplicate_property_unique_violation,
     create_property,
     delete_property,
     get_property,
@@ -781,3 +787,490 @@ async def test_create_property_purchase_failure_returns_502(
         assert exc_info.value.code == "provisioning_failed"
     finally:
         await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #203 item 2 — the address-dedupe pre-check's TOCTOU race, closed at the DB
+# level by migration 0013's uq_properties_landlord_address_dedupe.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_loses_concurrent_race_gets_409_and_releases_number(
+    db_engine: AsyncEngine, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    """Two genuinely concurrent creates for the SAME normalized address:
+    the pre-check SELECT alone can't stop this (neither request's own
+    uncommitted insert is visible to the other's pre-check). Reproduced
+    here with real DB-level blocking, not a hoped-for asyncio interleaving:
+    session A holds an UNCOMMITTED insert for the address open, session B
+    runs create_property normally as a real task and is proven BLOCKED
+    (not merely fast) on the row lock the new unique index creates before A
+    ever commits. Once A commits, B's blocked INSERT unblocks as a genuine
+    IntegrityError; the router's widened compensation releases B's
+    just-purchased number and returns a clean 409 duplicate_property --
+    never an orphaned billed number."""
+    async with AsyncSession(db_engine) as session_a, AsyncSession(db_engine) as session_b:
+        landlord_id = await factories.insert_landlord(session_a)
+        await session_a.commit()
+        landlord = Landlord(id=uuid.UUID(landlord_id))
+
+        try:
+            # Session A: raw INSERT of the SAME normalized address, held
+            # open (uncommitted) -- simulates "another concurrent request
+            # already got past the same pre-check and is mid-flight."
+            await session_a.execute(
+                text(
+                    "INSERT INTO properties (id, landlord_id, label, address_line1, city, "
+                    "province, twilio_number, twilio_sid) VALUES "
+                    "(:id, :landlord_id, 'Winner', '77 Race St', 'Toronto', 'ON', :tn, :ts)"
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "landlord_id": landlord_id,
+                    "tn": "+19995550000",
+                    "ts": "PNwinnersid00000000000000000000",
+                },
+            )
+
+            # Session B: the normal create_property path, different
+            # casing/whitespace -- same normalized key. Runs as a real task
+            # so it can genuinely block on A's row lock.
+            task_b = asyncio.create_task(
+                create_property(
+                    PropertyCreateRequest(
+                        label="Loser",
+                        address_line1="  77 race st  ",
+                        city="TORONTO",
+                        province="on",
+                    ),
+                    (landlord, session_b),
+                )
+            )
+
+            # Give task_b's own pre-check + fake-Twilio purchase + INSERT a
+            # moment to actually reach Postgres and block on A's row lock.
+            await asyncio.sleep(0.5)
+            assert not task_b.done(), "task_b should be blocked on the row lock, not finished yet"
+
+            # Commit A -- unblocks B's INSERT, which now genuinely conflicts.
+            await session_a.commit()
+
+            with pytest.raises(AppError) as exc_info:
+                await task_b
+            assert exc_info.value.status_code == 409
+            assert exc_info.value.code == "duplicate_property"
+
+            # Exactly one property at this address for this landlord.
+            count = (
+                await session_a.execute(
+                    text("SELECT COUNT(*) FROM properties WHERE landlord_id = :lid"),
+                    {"lid": landlord_id},
+                )
+            ).scalar_one()
+            assert count == 1
+
+            # B's purchase happened (it passed the pre-check, since A's
+            # insert was uncommitted) but was released as compensation --
+            # never an orphaned billed number.
+            assert len(_fake_twilio_provisioner.purchased) == 1
+            assert _fake_twilio_provisioner.released == [_fake_twilio_provisioner.purchased[0]]
+        finally:
+            await session_b.rollback()  # clear the aborted transaction from the IntegrityError
+            await _cleanup(session_a, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #203's orphan-fix (NOT itself a numbered #203 item -- shipped alongside
+# item 2; item 1 is the deferred durable-intent-row structural fix this
+# partially substitutes for) — a require_landlord/get_session teardown
+# -commit failure after a successful purchase must page + release, never
+# silently orphan.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_teardown_commit_failure_after_purchase_pages_and_releases(
+    session: AsyncSession,
+    _fake_twilio_provisioner: _FakeProvisioner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A require_landlord/get_session teardown-commit failure after a
+    successful purchase used to orphan a billed number with zero signal
+    (#204 senior review finding) -- create_property now commits explicitly
+    INSIDE its own guarded try, so a commit-time failure hits the SAME
+    compensation path (alert_purchased_but_unrecorded + release_number_
+    best_effort) as any other post-purchase DB failure. Simulated here by
+    making the FIRST session.commit() call (the new explicit one) raise;
+    the session's real transaction is never actually committed at the
+    Postgres level either, so nothing is left orphaned in the DB."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+
+    real_commit = session.commit
+    call_count = 0
+
+    async def _failing_commit() -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("simulated teardown-commit failure")
+        await real_commit()
+
+    monkeypatch.setattr(session, "commit", _failing_commit)
+
+    alerted_sids: list[str] = []
+    monkeypatch.setattr(
+        property_provisioning,
+        "alert_purchased_but_unrecorded",
+        lambda twilio_sid: alerted_sids.append(twilio_sid),
+    )
+
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Commit fails", address_line1="1 Commit Fail St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.code == "provisioning_failed"
+        assert call_count == 1  # the failing commit was actually reached
+
+        purchased_sid = _fake_twilio_provisioner.purchased[-1]
+        assert alerted_sids == [purchased_sid]  # the loud, always-fires page
+        assert _fake_twilio_provisioner.released == [purchased_sid]  # compensated, never orphaned
+
+        # Restore the real commit before touching the session further --
+        # discard the never-actually-committed INSERT.
+        monkeypatch.setattr(session, "commit", real_commit)
+        await session.rollback()
+        count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM properties WHERE landlord_id = :lid "
+                    "AND label = 'Commit fails'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert count == 0
+    finally:
+        monkeypatch.setattr(session, "commit", real_commit)
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Safety re-review finding 1 (#203, on the item-2/orphan-fix work) — the
+# AMBIGUOUS-commit edge: the row is durably committed but the ack is lost,
+# so create_property's except branch fires release_number_best_effort on a
+# SID a LIVE property now references. release_number_best_effort's own L2
+# guard (mirroring the deprovisioning sweep's) must catch this and skip the
+# release -- releasing here would silence that property's tenant-facing
+# line, INCLUDING the emergency line (never-break rule #1).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_ambiguous_commit_lost_ack_does_not_release_live_number(
+    session: AsyncSession,
+    _fake_twilio_provisioner: _FakeProvisioner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The explicit in-handler ``session.commit()`` (#203's orphan-fix) can
+    raise even though the commit itself durably succeeded -- a lost ack,
+    not a real failure. Simulated here by letting the REAL commit run to
+    completion (the property row genuinely persists) and THEN raising, the
+    exact ambiguous shape the safety re-review flagged. Proves
+    ``release_number_best_effort``'s own L2 guard checks actual DB state
+    (a fresh admin-session SELECT), not just in-memory assumptions: the
+    number must NOT be released, and Sentry must page instead."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+
+    real_commit = session.commit
+    call_count = 0
+
+    async def _lost_ack_commit() -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            await real_commit()  # the commit itself genuinely succeeds...
+            raise RuntimeError("simulated lost ack after a successful commit")
+        await real_commit()
+
+    monkeypatch.setattr(session, "commit", _lost_ack_commit)
+
+    mock_capture = MagicMock()
+    monkeypatch.setattr(property_provisioning.sentry_sdk, "capture_message", mock_capture)
+
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Ambiguous commit", address_line1="1 Ambiguous St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.code == "provisioning_failed"
+        assert call_count == 1  # the lost-ack commit was actually reached
+
+        purchased_sid = _fake_twilio_provisioner.purchased[-1]
+
+        # The number was NOT released -- a live property still owns it.
+        assert _fake_twilio_provisioner.released == []
+
+        # Sentry paged for the SKIP -- ALONGSIDE (not instead of) the
+        # existing, unrelated alert_purchased_but_unrecorded page every
+        # post-purchase DB failure already fires (M3, unchanged): the
+        # generic "purchase had to be compensated" page, plus this NEW,
+        # distinctly-worded "release was skipped" page, so ops can tell
+        # which path fired.
+        skip_calls = [call for call in mock_capture.call_args_list if "SKIPPED" in call.args[0]]
+        assert len(skip_calls) == 1
+        assert skip_calls[0].kwargs["extras"]["twilio_sid"] == purchased_sid
+
+        # The property row genuinely IS live and still owns the number --
+        # the commit really did succeed, so this plain re-fetch just works
+        # (no aborted transaction to clear first, unlike the IntegrityError
+        # /generic-failure tests above).
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT twilio_sid FROM properties WHERE landlord_id = :lid "
+                        "AND label = 'Ambiguous commit'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["twilio_sid"] == purchased_sid
+    finally:
+        monkeypatch.setattr(session, "commit", real_commit)
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Safety re-review finding 2 (#203) — _is_duplicate_property_unique_violation
+# must never let a landlord-influenced str(exc) substring misfire against an
+# UNRELATED integrity error. Pure-function unit tests, no DB needed.
+# ---------------------------------------------------------------------------
+
+
+class _FakeOrigError(Exception):
+    """Stand-in for the underlying DBAPI/asyncpg exception object —
+    settable ``constraint_name``/``pgcode``/``sqlstate`` attributes, and a
+    message (via ``Exception.args``) that becomes ``str(exc)`` once wrapped
+    in a real ``sqlalchemy.exc.IntegrityError``."""
+
+    def __init__(
+        self,
+        message: str = "fake db error",
+        *,
+        constraint_name: str | None = None,
+        pgcode: str | None = None,
+        sqlstate: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        if constraint_name is not None:
+            self.constraint_name = constraint_name
+        if pgcode is not None:
+            self.pgcode = pgcode
+        if sqlstate is not None:
+            self.sqlstate = sqlstate
+
+
+def _make_integrity_error(orig: Exception) -> IntegrityError:
+    return IntegrityError("INSERT INTO properties ...", {}, orig)
+
+
+def test_duplicate_violation_true_when_constraint_name_matches_directly() -> None:
+    exc = _make_integrity_error(
+        _FakeOrigError(constraint_name="uq_properties_landlord_address_dedupe")
+    )
+    assert _is_duplicate_property_unique_violation(exc) is True
+
+
+def test_duplicate_violation_false_when_constraint_name_resolves_to_a_different_constraint() -> (
+    None
+):
+    """A resolved constraint_name is trusted UNCONDITIONALLY -- the
+    substring fallback must never be consulted once a name is known, even
+    if the error text happens to also mention the target constraint's
+    name (e.g. the pre-existing properties.twilio_number UNIQUE
+    constraint firing, whose DETAIL text could echo other submitted
+    values)."""
+    orig = _FakeOrigError(
+        'duplicate key value violates unique constraint "properties_twilio_number_key" '
+        "DETAIL: mentions uq_properties_landlord_address_dedupe coincidentally",
+        constraint_name="properties_twilio_number_key",
+    )
+    exc = _make_integrity_error(orig)
+    assert _is_duplicate_property_unique_violation(exc) is False
+
+
+def test_duplicate_violation_true_via_fallback_when_constraint_name_missing_and_pgcode_23505() -> (
+    None
+):
+    orig = _FakeOrigError(
+        'duplicate key value violates unique constraint "uq_properties_landlord_address_dedupe"',
+        pgcode="23505",
+    )
+    exc = _make_integrity_error(orig)
+    assert _is_duplicate_property_unique_violation(exc) is True
+
+
+def test_duplicate_violation_true_via_fallback_using_sqlstate_when_pgcode_absent() -> None:
+    orig = _FakeOrigError(
+        'duplicate key value violates unique constraint "uq_properties_landlord_address_dedupe"',
+        sqlstate="23505",
+    )
+    exc = _make_integrity_error(orig)
+    assert _is_duplicate_property_unique_violation(exc) is True
+
+
+def test_duplicate_violation_false_when_pgcode_wrong_even_if_substring_present() -> None:
+    """THE attack scenario safety finding 2 flags: a landlord-supplied
+    address_line1 (or city/province) equal to the constraint's own name
+    would make an UNRELATED integrity error's DETAIL text (which echoes
+    submitted values verbatim) contain that exact substring. Gating the
+    fallback on SQLSTATE 23505 (unique_violation) means a NOT NULL
+    violation (23502) or any other class can never misfire as
+    duplicate_property just because the substring happens to match."""
+    orig = _FakeOrigError(
+        'null value in column "city" violates not-null constraint '
+        "DETAIL: Failing row contains (uq_properties_landlord_address_dedupe, ...).",
+        pgcode="23502",
+    )
+    exc = _make_integrity_error(orig)
+    assert _is_duplicate_property_unique_violation(exc) is False
+
+
+def test_duplicate_violation_false_when_constraint_name_and_pgcode_both_missing() -> None:
+    orig = _FakeOrigError(
+        'duplicate key value violates unique constraint "uq_properties_landlord_address_dedupe"'
+    )
+    exc = _make_integrity_error(orig)
+    assert _is_duplicate_property_unique_violation(exc) is False
+
+
+def test_duplicate_violation_true_via_nested_cause_constraint_name() -> None:
+    """Some driver/SQLAlchemy-version combinations only populate
+    ``constraint_name`` on the NESTED underlying exception
+    (``exc.orig.__cause__`` -- the raw asyncpg exception SQLAlchemy's own
+    DBAPI-compatibility wrapper chains from), not on ``exc.orig`` itself."""
+    wrapper = _FakeOrigError("wrapper has no constraint_name of its own")
+    wrapper.__cause__ = _FakeOrigError(constraint_name="uq_properties_landlord_address_dedupe")
+    exc = _make_integrity_error(wrapper)
+    assert _is_duplicate_property_unique_violation(exc) is True
+
+
+# ---------------------------------------------------------------------------
+# Safety re-review finding 3 (#203) — the FIRST real, app_role-RLS-enforced
+# exercise of create_property's own mid-handler commit (#203's orphan-fix).
+# Every OTHER test in this module runs under the local superuser bypass
+# (see module docstring "Cross-tenant isolation here is enforced at the
+# APPLICATION level") -- this one mirrors tests/test_require_landlord.py's
+# own "SET LOCAL ROLE app_role" technique to prove the GUC-drop-then-return
+# path (the explicit commit ends the SAME transaction that both `SET LOCAL
+# ROLE app_role` and require_landlord's `SET LOCAL app.current_landlord_id`
+# were scoped to) is safe under GENUINE RLS enforcement, not just by
+# reasoning about the code.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_mid_handler_commit_under_real_rls_enforcement(
+    db_engine: AsyncEngine,
+    _fake_twilio_provisioner: _FakeProvisioner,
+) -> None:
+    """create_property's explicit in-handler ``session.commit()`` (item
+    2's own fix) ends the CURRENT transaction — and with it, both ``SET
+    LOCAL ROLE app_role`` and the ``app.current_landlord_id`` GUC
+    ``require_landlord`` set on it (both are transaction-scoped). No
+    explicit ``connection.begin()`` here (unlike
+    ``test_require_landlord.py``'s own regression pin, which never
+    commits) — deliberately: an externally-started transaction would make
+    the session's own ``commit()`` a NESTED no-op instead of a REAL one
+    (empirically confirmed while building this test — a row inserted that
+    way was invisible on a separate connection even before any outer
+    rollback), which would prove nothing about the real code path. Letting
+    the session autobegin its own transaction (exactly how ``get_session``
+    itself works in production, and exactly why this matters) means
+    ``create_property``'s commit is the one, real, durable commit.
+    """
+    auth_user_id = str(uuid.uuid4())
+    landlord_id = str(uuid.uuid4())
+
+    # Seed + commit on an ordinary (superuser) connection — durably visible
+    # to require_landlord's own internal admin-session lookup.
+    async with db_engine.connect() as seed_connection:
+        trans = await seed_connection.begin()
+        await seed_connection.execute(
+            text("INSERT INTO landlords (id, auth_user_id, email) VALUES (:id, :auth, :email)"),
+            {"id": landlord_id, "auth": auth_user_id, "email": f"{landlord_id}@example.com"},
+        )
+        await trans.commit()
+
+    created_id: str | None = None
+    try:
+        async with db_engine.connect() as connection:
+            app_role_session = AsyncSession(bind=connection)
+            # Genuinely app_role-scoped for the rest of this (autobegun)
+            # transaction — not the local superuser bypass every OTHER
+            # test in this file relies on.
+            await app_role_session.execute(text("SET LOCAL ROLE app_role"))
+
+            landlord, returned_session = await require_landlord(
+                AuthUser(
+                    user_id=uuid.UUID(auth_user_id), email="test@example.com", full_name="Test"
+                ),
+                app_role_session,
+            )
+            assert returned_session is app_role_session
+
+            created = await create_property(
+                PropertyCreateRequest(label="RLS test", address_line1="1 RLS St", city="Toronto"),
+                (landlord, app_role_session),
+            )
+            created_id = str(created.id)
+            assert created.label == "RLS test"
+            assert created.twilio_number is not None
+
+        # Durability + correctness, verified on an ENTIRELY SEPARATE
+        # connection (no role/GUC state carried over): the row genuinely
+        # persisted, under the RIGHT landlord_id -- RLS's WITH CHECK
+        # didn't silently misfile it, and the commit wasn't lost/rolled
+        # back along with the connection it ran on.
+        async with db_engine.connect() as verify_connection:
+            row = (
+                (
+                    await verify_connection.execute(
+                        text(
+                            "SELECT landlord_id, label, twilio_number FROM properties "
+                            "WHERE id = :id"
+                        ),
+                        {"id": created_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert str(row["landlord_id"]) == landlord_id
+            assert row["label"] == "RLS test"
+            assert row["twilio_number"] == created.twilio_number
+    finally:
+        async with db_engine.connect() as cleanup_connection:
+            cleanup_trans = await cleanup_connection.begin()
+            await cleanup_connection.execute(
+                text("DELETE FROM properties WHERE landlord_id = :lid"), {"lid": landlord_id}
+            )
+            await cleanup_connection.execute(
+                text("DELETE FROM landlords WHERE id = :lid"), {"lid": landlord_id}
+            )
+            await cleanup_trans.commit()

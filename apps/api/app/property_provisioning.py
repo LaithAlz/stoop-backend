@@ -17,6 +17,22 @@ webhook router and ``app/integrations/twilio_send.py``. Two jobs:
    any failure here means the row is never inserted at all, and any
    failure in the router's OWN insert step (extremely unlikely — see
    :func:`release_number_best_effort`'s caller) releases the number too.
+   That "insert step" now also includes the router's OWN explicit,
+   in-handler ``session.commit()`` (#203's "orphan-fix" — shipped
+   alongside item 2 below, but NOT itself a numbered #203 item; #203 item
+   1 is the deferred durable-intent-row structural fix this partially
+   substitutes for, and PR #204's senior review is where the gap was
+   found) — previously, a ``require_landlord``/``get_session``
+   teardown-commit failure ran entirely OUTSIDE the router's guarded
+   ``try``, so a purchased number could be silently orphaned with no page
+   at all; the router now commits before returning so that failure hits
+   the SAME :func:`alert_purchased_but_unrecorded` + release path as every
+   other post-purchase DB failure. Separately, a purchase that loses a
+   genuine concurrent same-address race (#203 item 2, migration 0013's
+   ``uq_properties_landlord_address_dedupe``) is released through this
+   SAME seam but does NOT call :func:`alert_purchased_but_unrecorded` —
+   see that router's own ``IntegrityError`` handling for why (an expected,
+   self-healing race, not a bug worth paging on).
 
 2. **Deprovisioning** (:func:`schedule_number_release` +
    :func:`sweep_pending_number_releases`, called from ``DELETE
@@ -87,6 +103,40 @@ Three additions beyond the original design, all in
   than trusting that invariant to hold forever. A hit here marks the row
   ``exhausted`` with a loud Sentry page (retrying would never help; the
   schedule itself is wrong).
+
+Compensation safety — the SAME L2 guard, in :func:`release_number_best_effort`
+(safety re-review finding 1, #203, on the item-2/orphan-fix work)
+----------------------------------------------------------------------------
+The router's widened post-purchase compensation (module docstring point 1,
+above) has one genuinely ambiguous failure shape:
+``app/routers/properties.py``'s explicit in-handler ``session.commit()``
+can raise even though the COMMIT itself durably succeeded at the database —
+e.g. the network ack for a successful commit is lost, or the pooled
+connection drops right after Postgres applies it. SQLAlchemy/asyncpg
+cannot tell "definitely didn't commit" apart from "committed, but we never
+heard back" in that shape — the router's ``except`` branch treats it like
+any other post-purchase failure and calls :func:`release_number_best_effort`
+on the just-purchased SID. If the row is, in fact, durably committed, that
+call would release a Twilio number a LIVE ``properties`` row still
+references — silencing that property's tenant-facing line, **including the
+emergency line** (never-break rule #1), and re-provisioning is blocked by
+the very dedupe index item 2 above just added (the address is now
+"already in use"). This is the one shape where "compensate by releasing"
+is actively wrong, not merely redundant.
+
+:func:`release_number_best_effort` now runs the EXACT SAME check
+:func:`sweep_pending_number_releases` already does before calling Twilio
+(:data:`_SELECT_LIVE_PROPERTY_FOR_SID_SQL`, a fresh, RLS-unscoped
+``get_admin_session`` — this function is never called with a landlord GUC
+in scope, so an admin session is the only option, same as the sweep's own)
+— if a live ``properties`` row references the SID, the release is SKIPPED
+entirely (Twilio is never called) and a loud Sentry page fires instead
+(distinct wording from the sweep's own L2 page, so ops can tell which path
+hit the guard). Every LEGITIMATE compensation case is unaffected: a
+webhook-config failure, a race-loser's ``IntegrityError``, or a genuine
+rollback all mean the row was NEVER committed, so no live property can
+possibly reference the SID and the guard is a no-op pass-through — only
+the narrow, ambiguous lost-ack case is actually caught.
 """
 
 from __future__ import annotations
@@ -210,15 +260,78 @@ async def _find_candidate_numbers(
     return await provisioner.search_available_numbers()
 
 
+# L2 (safety review, 2026-07-13) — defensive ownership guard, shared by
+# release_number_best_effort (compensation path, safety re-review finding 1,
+# #203) AND sweep_pending_number_releases (deprovisioning path, below):
+# never release a SID a LIVE properties row currently references. See
+# module docstring's "Deprovisioning safety" / "Compensation safety".
+_SELECT_LIVE_PROPERTY_FOR_SID_SQL = text("SELECT 1 FROM properties WHERE twilio_sid = :twilio_sid")
+
+
 async def release_number_best_effort(twilio_sid: str) -> None:
     """Best-effort compensating release — never raises. Used both when a
     purchase can't be fully provisioned (webhook config failure) and when
-    the caller's OWN post-purchase step (the DB insert/read-back in
-    ``app/routers/properties.py``) fails. A failure HERE means a real,
-    billed Twilio number is now orphaned (purchased, but no ``properties``
-    row will ever reference it) — logged loudly (uuid/SID-level only) so
-    ops can release it manually, but must never mask the ORIGINAL failure
-    that triggered the compensation attempt."""
+    the caller's OWN post-purchase step (the DB insert/read-back/explicit
+    commit in ``app/routers/properties.py``) fails. A failure HERE means a
+    real, billed Twilio number is now orphaned (purchased, but no
+    ``properties`` row will ever reference it) — logged loudly (uuid/SID
+    -level only) so ops can release it manually, but must never mask the
+    ORIGINAL failure that triggered the compensation attempt.
+
+    **L2 guard first (safety re-review finding 1, #203)** — before ever
+    calling Twilio, checks whether a LIVE ``properties`` row already
+    references this exact SID (the ambiguous-commit shape: the router's
+    explicit ``session.commit()`` can raise even though the commit itself
+    durably succeeded). If one does, the release is SKIPPED entirely — a
+    real property still needs this number to keep receiving tenant/
+    emergency traffic — and a loud Sentry page fires instead (see module
+    docstring "Compensation safety"). Every LEGITIMATE compensation case
+    (webhook-config failure, a race-loser's ``IntegrityError``, a genuine
+    rollback) never committed the row at all, so this guard is a no-op
+    pass-through for all of them; only the narrow lost-ack case is caught.
+    """
+    try:
+        async with _acm(get_admin_session)() as session:
+            guard_result = await session.execute(
+                _SELECT_LIVE_PROPERTY_FOR_SID_SQL, {"twilio_sid": twilio_sid}
+            )
+            live_property = guard_result.mappings().one_or_none()
+    except Exception as exc:
+        # L2 guard infra failure (safety re-review advisory A1, #203): the
+        # ownership SELECT itself failed, so we CANNOT tell whether a live
+        # property still references this SID. Fail SAFE -- skip the release
+        # (releasing a live property's number would sever its emergency
+        # line), never raise (this function's never-raises contract must
+        # hold so a guard-infra failure in provision_number's compensation
+        # path can't mask the ORIGINAL ProvisioningFailedError), and page
+        # loudly so ops reconciles a possibly-orphaned number by hand.
+        log.error(
+            "twilio_provisioning_compensation_release_skipped_guard_check_failed",
+            twilio_sid=twilio_sid,
+            exc_type=type(exc).__name__,
+        )
+        sentry_sdk.capture_message(
+            "Twilio provisioning: compensation release SKIPPED -- the live-"
+            "property ownership guard could not run; a purchased number may "
+            "be orphaned and must be reconciled by hand",
+            level="error",
+            extras={"twilio_sid": twilio_sid, "exc_type": type(exc).__name__},
+        )
+        return
+    if live_property is not None:
+        log.error(
+            "twilio_provisioning_compensation_release_skipped_live_property_owns_sid",
+            twilio_sid=twilio_sid,
+        )
+        sentry_sdk.capture_message(
+            "Twilio provisioning: compensation release SKIPPED -- a LIVE property "
+            "still references this SID (likely an ambiguous commit: the row "
+            "committed but the request never learned about it)",
+            level="error",
+            extras={"twilio_sid": twilio_sid},
+        )
+        return
+
     provisioner = get_twilio_provisioner()
     try:
         await provisioner.release_number(twilio_sid=twilio_sid)
@@ -436,10 +549,8 @@ _MARK_EXHAUSTED_SQL = text(
     "UPDATE notifications SET status = 'exhausted', updated_at = now() WHERE id = :id"
 )
 
-# L2 (safety review): defensive ownership guard -- never release a SID a
-# LIVE properties row currently references. See module docstring
-# "Deprovisioning safety".
-_SELECT_LIVE_PROPERTY_FOR_SID_SQL = text("SELECT 1 FROM properties WHERE twilio_sid = :twilio_sid")
+# _SELECT_LIVE_PROPERTY_FOR_SID_SQL (L2 guard) is defined once, above,
+# shared with release_number_best_effort's own use of it.
 
 
 async def sweep_pending_number_releases(*, now: datetime | None = None) -> list[str]:

@@ -664,6 +664,83 @@
 >    dry-run against a real (non-local) Supabase-shaped database before
 >    merge, same as migration 0005 itself was.
 
+> **v1.15 amendment (2026-07-23)** — migration 0013 implements this (#203
+> item 2, the #53 provisioning safety re-review's "cheap, high-value"
+> follow-up — #203's OWN numbering: item 1 is the durable-intent-row/M4
+> structural fix, evaluated and DEFERRED to its own follow-up issue, not
+> this one; item 3 is the global-spend-bound follow-up, also not this
+> one). **NUMBERING COLLISION FLAG:** v1.14 (directly above) is head
+> at the time this is written, but sibling lanes (#122/#170/#213) may ALSO
+> be claiming a "v1.15" amendment and/or migration "0013" concurrently on
+> their own branches — same collision class v1.11's and v1.14's own notes
+> already document ("needing no migration does NOT make a doc-heading
+> amendment number uncontended on its own"). Whoever merges SECOND must
+> renumber (this heading, and migration 0013's `revision`/`down_revision`)
+> to the next free slot.
+>
+> No new column. One new index on `properties`:
+> **`uq_properties_landlord_address_dedupe`** — `CREATE UNIQUE INDEX ...
+> ON properties (landlord_id, lower(trim(address_line1)),
+> lower(trim(city)), lower(trim(province)))`, mirroring
+> `app/routers/properties.py`'s own `_DUPLICATE_PROPERTY_SQL` pre-check
+> normalization EXACTLY (same four columns, same case/whitespace
+> -insensitive comparison, same exclusion of `postal_code`). No `WHERE`
+> clause — unlike every other dedupe index in this file (v1.3/v1.8/v1.9/
+> v1.11), `properties` has no polymorphic `type` column and no
+> `deleted_at`/soft-delete column to exclude (`DELETE /v1/properties/{id}`
+> is a genuine hard delete, unchanged) — every live row is already exactly
+> the population that must stay unique, so this is a plain (if
+> expression-based) UNIQUE index, not a partial one, despite the issue's
+> own "partial UNIQUE INDEX" phrasing (by analogy with the other dedupe
+> indexes in this file).
+>
+> **Why:** `POST /v1/properties`'s existing dedupe pre-check
+> (`_DUPLICATE_PROPERTY_SQL`, since #53) is an application-level SELECT,
+> not a DB constraint — a genuine TOCTOU race: two concurrent creates for
+> the SAME normalized address could both pass the pre-check before either
+> committed, each purchasing a real, billed Twilio number (the #53 safety
+> re-review accepted this as a bounded, self-healing 2x-at-most residual,
+> never touching tenancy isolation or the emergency line). This index
+> closes the DB-level half of that race: the loser's `INSERT` now hits a
+> genuine `IntegrityError`, and `create_property`'s widened compensation
+> path releases its just-purchased number through the EXISTING
+> `release_number_best_effort` seam before returning the ordinary 409
+> `duplicate_property` — see `app/routers/properties.py`'s own
+> `_is_duplicate_property_unique_violation` and `api-contracts.md`'s v1.20
+> amendment. The pre-check SELECT itself is UNCHANGED and still runs
+> first — it remains the fast path that stops a client's serial
+> timeout-and-retry before ever calling Twilio at all.
+>
+> **Safety re-review addenda (2026-07-23), both internal-only (no
+> request/response contract change, so no further api-contracts.md
+> amendment):**
+> 1. **Finding 1 — the ambiguous-commit edge.** The router's OWN
+>    in-handler `session.commit()` (v1.14's sibling fix, tracked as #203's
+>    own "orphan-fix," alongside this index as item 2) can raise even
+>    though the commit itself durably succeeded (a lost ack, not a real
+>    failure) — releasing the number in that case would silence a LIVE
+>    property's tenant-facing line, including the emergency line, with
+>    re-provisioning blocked by this very index. `release_number_best_
+>    effort` (`app/property_provisioning.py`) now runs the SAME "never
+>    release a SID a live `properties` row references" guard the
+>    deprovisioning sweep already had (L2), before ever calling Twilio.
+> 2. **Finding 2 — `_is_duplicate_property_unique_violation`'s `str(exc)`
+>    substring fallback.** Only consulted when `constraint_name` could not
+>    be determined AT ALL (never when it resolved to some OTHER, real
+>    constraint), and gated on SQLSTATE `23505` — closes a theoretical
+>    misfire where a landlord-supplied `address_line1`/`city`/`province`
+>    equal to this constraint's own name could otherwise make an unrelated
+>    integrity error's echoed `DETAIL` text falsely match.
+>
+> **Round-trip:** `CREATE UNIQUE INDEX` validates against every existing
+> row at creation time — `upgrade()` FAILS CLOSED (raises, rolls back) if
+> two committed `properties` rows for the same landlord already collide on
+> this key (structurally shouldn't happen today; the pre-check has been in
+> place since #53). `downgrade()` is a plain `DROP INDEX` — unlike v1.8's/
+> v1.11's CHECK-narrowing downgrades, dropping a UNIQUE index never
+> destroys data, so there is no analogous "resolve live rows first" manual
+> remediation step.
+
 > **v1.14 amendment (2026-07-21)** — no migration required (#208, "failed
 > -after-real-API-call Anthropic attempts are invisible to cost rollups").
 > No new `action` CHECK value and no new column: both fixes below are
@@ -779,6 +856,12 @@ CREATE TABLE properties (
 );
 CREATE INDEX idx_properties_landlord ON properties (landlord_id);
 CREATE INDEX idx_properties_twilio   ON properties (twilio_number);
+-- v1.15 (migration 0013, #203 item 2): DB-level backstop for the
+-- application-level dedupe pre-check (_DUPLICATE_PROPERTY_SQL) --
+-- see the v1.15 amendment above.
+CREATE UNIQUE INDEX uq_properties_landlord_address_dedupe
+  ON properties (landlord_id, lower(trim(address_line1)),
+                  lower(trim(city)), lower(trim(province)));
 
 -- ───────────────────────── vendors ───────────────────────────
 CREATE TABLE vendors (

@@ -211,6 +211,37 @@ issue-spec doc exists for #53, unlike #1-#15).
   operator has a same-day window to notice/intervene before the number is
   gone for good.
 
+**v1.20 amendment (2026-07-23 — #203 item 2, the #53 provisioning safety
+re-review's follow-up; NUMBERING per #203's own text: item 1 is the
+durable-intent-row/M4 structural fix, evaluated and DEFERRED — see that
+issue and PR #204's senior-review comment on its go-live gate — item 2 is
+the address-dedupe unique index shipped here, item 3 is the global
+-spend-bound follow-up, not addressed by this amendment either):** no
+request/response shape change; two behavior notes updating the v1.12
+amendment above, which is now stale on both points:
+
+- **409 `duplicate_property` is no longer pre-check-only.** schema-v1.md's
+  v1.15 amendment (migration 0013) adds a genuine landlord-scoped,
+  normalized-address UNIQUE index (`uq_properties_landlord_address_dedupe`)
+  backing the existing pre-check SELECT — closing the TOCTOU race where two
+  genuinely concurrent creates for the same address could both pass the
+  pre-check and both purchase a number before either committed. The
+  pre-check SELECT is unchanged and still runs first (the fast path for a
+  serial retry, before any Twilio call); a request that instead loses a
+  real concurrent race now gets this SAME 409 `duplicate_property` via the
+  new index at INSERT time, with its just-purchased number released
+  through the existing compensation seam — indistinguishable to the client
+  from the pre-check case, same status code and error code either way.
+- **502 `provisioning_failed`'s "a DB failure immediately after a
+  successful purchase" now explicitly includes a `require_landlord`/
+  `get_session` teardown-commit failure** — previously a residual, silent
+  gap (the #204 senior review's finding): that failure ran entirely
+  outside `create_property`'s own compensation `try`/`except`, so a
+  purchased number could be orphaned with no page at all.
+  `app/routers/properties.py` now commits explicitly inside that guarded
+  block, so this case pages and releases exactly like every other
+  post-purchase DB failure already documented in the v1.12 amendment above.
+
 ## Tenants & Vendors
 
 `GET/POST /v1/properties/{id}/tenants` · `PATCH/DELETE /v1/tenants/{id}`

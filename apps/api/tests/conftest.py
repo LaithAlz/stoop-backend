@@ -10,9 +10,10 @@ unit tests.
 """
 
 import os
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 
 import pytest
+import pytest_asyncio
 
 # ---------------------------------------------------------------------------
 # Set required env vars BEFORE any app module is imported.
@@ -184,4 +185,63 @@ def _reset_checkpointer_pool() -> Iterator[None]:
     import app.agent.checkpointer as cp_mod
 
     cp_mod._pool = None  # noqa: SLF001
+    yield
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_admin_engine_pool() -> AsyncIterator[None]:
+    """Recreate ``app.db.session``'s admin/request connection pool(s)
+    before every test — same cross-loop hazard class as
+    ``_reset_checkpointer_pool`` above (surfaced by #203's safety
+    re-review finding 1/3 fallout): a pooled asyncpg connection binds to
+    the event loop that created it, and each test runs its own loop
+    (``asyncio_default_fixture_loop_scope=function``). A connection
+    checked back into this SHARED, process-wide pool by one test can be
+    handed to the very NEXT test (a different, or by-then-closed, loop)
+    by the pool's own checkout order, raising ``RuntimeError: ... attached
+    to a different loop`` the instant that stale connection is used
+    (``pool_pre_ping``'s own ping, or any real query). This went unnoticed
+    until ``property_provisioning.py::release_number_best_effort`` started
+    calling ``get_admin_session()`` unconditionally (the new L2 guard,
+    #203 safety finding 1) — ``tests/test_properties_router.py``'s own
+    directly-invoked-handler tests exercise that call far more densely,
+    back-to-back, than any previous caller did, without ever going through
+    ``require_landlord``'s own (separately admin-session-using) path.
+
+    Two OTHER, narrower fixtures already patch around this exact class of
+    bug locally (``tests/test_me.py``'s ``dispose_app_engine``,
+    ``tests/test_require_landlord.py``'s ``_dispose_admin_engine``) — both
+    call ``engine.dispose()`` with its DEFAULT ``close=True``, which
+    empirically also avoids the crash in the scenarios those two files
+    exercise. This fixture deliberately uses ``dispose(close=False)``
+    instead, for a STRUCTURAL guarantee rather than an empirical one:
+    ``close=True`` tries to gracefully CLOSE every currently-checked-in
+    connection, which for one whose own internal asyncpg loop reference
+    already died with a PREVIOUS test's event loop CAN raise the exact
+    "Event loop is closed" crash this fixture exists to prevent (observed
+    directly while building this fix, via a different code path —
+    ``_ConnectionFairy._checkout``'s pre-ping hitting a stale connection
+    mid-test, not ``dispose()`` itself — but the same underlying "must not
+    ask a dead-loop connection to do anything" hazard). ``close=False``
+    never attempts to close/terminate anything at all: it only
+    de-references the old pool (the engine keeps a fresh one going
+    forward, lazily populated) — the stale connections are garbage
+    -collected along with their dead loop, never actively touched again,
+    same reasoning as ``_reset_checkpointer_pool``'s own "no close(),
+    abandoned pools are GC'd with their loop." This fixture does not
+    replace those two local ones (out of scope to refactor them here) —
+    calling ``dispose()`` more than once per test, from more than one
+    fixture, is harmless and idempotent.
+
+    ``request_engine`` is frequently the SAME object as ``engine``
+    (``APP_DATABASE_URL`` unset locally/in CI — ``app/db/session.py``'s
+    own documented fallback) — disposing both is harmless/idempotent
+    either way, and correct on the day ``APP_DATABASE_URL`` is set and
+    they genuinely diverge.
+    """
+    import app.db.session as db_session_mod
+
+    await db_session_mod.engine.dispose(close=False)
+    if db_session_mod.request_engine is not db_session_mod.engine:
+        await db_session_mod.request_engine.dispose(close=False)
     yield
