@@ -95,24 +95,43 @@ async def insert_property(
     twilio_number: str | None = None,
     twilio_sid: str | None = None,
     backup_contact: dict[str, Any] | None = None,
+    address_line1: str | None = None,
+    city: str = "Toronto",
+    province: str = "ON",
 ) -> str:
     """``twilio_number``/``backup_contact`` added for #108 (the emergency
     escalation chain needs a per-property outbound caller-id number and an
     optional backup contact) — both default ``None``, matching the schema's
     own nullable columns and every EXISTING caller's prior behavior
     unchanged. ``twilio_sid`` added for #53 (deprovisioning tests need a
-    SID to schedule a release for) — also defaults ``None``."""
+    SID to schedule a release for) — also defaults ``None``.
+
+    ``address_line1``/``city``/``province`` added for #203 (migration
+    0013's landlord-scoped, normalized-address UNIQUE index on
+    ``properties``): ``address_line1`` now defaults to a value DERIVED FROM
+    the freshly generated ``property_id`` (globally unique) rather than a
+    fixed literal, so every EXISTING caller that inserts more than one
+    property for the SAME landlord in one test keeps working unchanged with
+    zero call-site changes. Pass an explicit ``address_line1`` (and,
+    if needed, ``city``/``province``) only when a test specifically wants
+    to exercise dedupe/collision behavior."""
     property_id = str(uuid.uuid4())
+    effective_address_line1 = (
+        address_line1 if address_line1 is not None else f"{property_id} Test St"
+    )
     await session.execute(
         text(
-            "INSERT INTO properties (id, landlord_id, label, address_line1, city, house_rules, "
-            "lat, lon, twilio_number, twilio_sid, backup_contact) "
-            "VALUES (:id, :landlord_id, 'Test Property', '123 Test St', 'Toronto', :house_rules, "
-            ":lat, :lon, :twilio_number, :twilio_sid, CAST(:backup_contact AS jsonb))"
+            "INSERT INTO properties (id, landlord_id, label, address_line1, city, province, "
+            "house_rules, lat, lon, twilio_number, twilio_sid, backup_contact) "
+            "VALUES (:id, :landlord_id, 'Test Property', :address_line1, :city, :province, "
+            ":house_rules, :lat, :lon, :twilio_number, :twilio_sid, CAST(:backup_contact AS jsonb))"
         ),
         {
             "id": property_id,
             "landlord_id": landlord_id,
+            "address_line1": effective_address_line1,
+            "city": city,
+            "province": province,
             "house_rules": house_rules,
             "lat": lat,
             "lon": lon,

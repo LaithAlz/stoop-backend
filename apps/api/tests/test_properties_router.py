@@ -24,6 +24,7 @@ level every one of these endpoints actually uses.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
@@ -36,6 +37,7 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
+from app import property_provisioning
 from app.config import settings
 from app.deps import Landlord
 from app.errors import AppError
@@ -780,4 +782,173 @@ async def test_create_property_purchase_failure_returns_502(
         assert exc_info.value.status_code == 502
         assert exc_info.value.code == "provisioning_failed"
     finally:
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #203 item 1 — the address-dedupe pre-check's TOCTOU race, closed at the DB
+# level by migration 0013's uq_properties_landlord_address_dedupe.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_loses_concurrent_race_gets_409_and_releases_number(
+    db_engine: AsyncEngine, _fake_twilio_provisioner: _FakeProvisioner
+) -> None:
+    """Two genuinely concurrent creates for the SAME normalized address:
+    the pre-check SELECT alone can't stop this (neither request's own
+    uncommitted insert is visible to the other's pre-check). Reproduced
+    here with real DB-level blocking, not a hoped-for asyncio interleaving:
+    session A holds an UNCOMMITTED insert for the address open, session B
+    runs create_property normally as a real task and is proven BLOCKED
+    (not merely fast) on the row lock the new unique index creates before A
+    ever commits. Once A commits, B's blocked INSERT unblocks as a genuine
+    IntegrityError; the router's widened compensation releases B's
+    just-purchased number and returns a clean 409 duplicate_property --
+    never an orphaned billed number."""
+    async with AsyncSession(db_engine) as session_a, AsyncSession(db_engine) as session_b:
+        landlord_id = await factories.insert_landlord(session_a)
+        await session_a.commit()
+        landlord = Landlord(id=uuid.UUID(landlord_id))
+
+        try:
+            # Session A: raw INSERT of the SAME normalized address, held
+            # open (uncommitted) -- simulates "another concurrent request
+            # already got past the same pre-check and is mid-flight."
+            await session_a.execute(
+                text(
+                    "INSERT INTO properties (id, landlord_id, label, address_line1, city, "
+                    "province, twilio_number, twilio_sid) VALUES "
+                    "(:id, :landlord_id, 'Winner', '77 Race St', 'Toronto', 'ON', :tn, :ts)"
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "landlord_id": landlord_id,
+                    "tn": "+19995550000",
+                    "ts": "PNwinnersid00000000000000000000",
+                },
+            )
+
+            # Session B: the normal create_property path, different
+            # casing/whitespace -- same normalized key. Runs as a real task
+            # so it can genuinely block on A's row lock.
+            task_b = asyncio.create_task(
+                create_property(
+                    PropertyCreateRequest(
+                        label="Loser",
+                        address_line1="  77 race st  ",
+                        city="TORONTO",
+                        province="on",
+                    ),
+                    (landlord, session_b),
+                )
+            )
+
+            # Give task_b's own pre-check + fake-Twilio purchase + INSERT a
+            # moment to actually reach Postgres and block on A's row lock.
+            await asyncio.sleep(0.5)
+            assert not task_b.done(), "task_b should be blocked on the row lock, not finished yet"
+
+            # Commit A -- unblocks B's INSERT, which now genuinely conflicts.
+            await session_a.commit()
+
+            with pytest.raises(AppError) as exc_info:
+                await task_b
+            assert exc_info.value.status_code == 409
+            assert exc_info.value.code == "duplicate_property"
+
+            # Exactly one property at this address for this landlord.
+            count = (
+                await session_a.execute(
+                    text("SELECT COUNT(*) FROM properties WHERE landlord_id = :lid"),
+                    {"lid": landlord_id},
+                )
+            ).scalar_one()
+            assert count == 1
+
+            # B's purchase happened (it passed the pre-check, since A's
+            # insert was uncommitted) but was released as compensation --
+            # never an orphaned billed number.
+            assert len(_fake_twilio_provisioner.purchased) == 1
+            assert _fake_twilio_provisioner.released == [_fake_twilio_provisioner.purchased[0]]
+        finally:
+            await session_b.rollback()  # clear the aborted transaction from the IntegrityError
+            await _cleanup(session_a, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #203 item 2 — a require_landlord/get_session teardown-commit failure AFTER
+# a successful purchase must page + release, never silently orphan.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_create_property_teardown_commit_failure_after_purchase_pages_and_releases(
+    session: AsyncSession,
+    _fake_twilio_provisioner: _FakeProvisioner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A require_landlord/get_session teardown-commit failure after a
+    successful purchase used to orphan a billed number with zero signal
+    (#204 senior review finding) -- create_property now commits explicitly
+    INSIDE its own guarded try, so a commit-time failure hits the SAME
+    compensation path (alert_purchased_but_unrecorded + release_number_
+    best_effort) as any other post-purchase DB failure. Simulated here by
+    making the FIRST session.commit() call (the new explicit one) raise;
+    the session's real transaction is never actually committed at the
+    Postgres level either, so nothing is left orphaned in the DB."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+
+    real_commit = session.commit
+    call_count = 0
+
+    async def _failing_commit() -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("simulated teardown-commit failure")
+        await real_commit()
+
+    monkeypatch.setattr(session, "commit", _failing_commit)
+
+    alerted_sids: list[str] = []
+    monkeypatch.setattr(
+        property_provisioning,
+        "alert_purchased_but_unrecorded",
+        lambda twilio_sid: alerted_sids.append(twilio_sid),
+    )
+
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Commit fails", address_line1="1 Commit Fail St", city="Toronto"
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.code == "provisioning_failed"
+        assert call_count == 1  # the failing commit was actually reached
+
+        purchased_sid = _fake_twilio_provisioner.purchased[-1]
+        assert alerted_sids == [purchased_sid]  # the loud, always-fires page
+        assert _fake_twilio_provisioner.released == [purchased_sid]  # compensated, never orphaned
+
+        # Restore the real commit before touching the session further --
+        # discard the never-actually-committed INSERT.
+        monkeypatch.setattr(session, "commit", real_commit)
+        await session.rollback()
+        count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM properties WHERE landlord_id = :lid "
+                    "AND label = 'Commit fails'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert count == 0
+    finally:
+        monkeypatch.setattr(session, "commit", real_commit)
         await _cleanup(session, landlord_id)

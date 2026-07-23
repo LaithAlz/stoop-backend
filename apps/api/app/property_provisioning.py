@@ -17,6 +17,19 @@ webhook router and ``app/integrations/twilio_send.py``. Two jobs:
    any failure here means the row is never inserted at all, and any
    failure in the router's OWN insert step (extremely unlikely — see
    :func:`release_number_best_effort`'s caller) releases the number too.
+   That "insert step" now also includes the router's OWN explicit,
+   in-handler ``session.commit()`` (#203 item 2, safety review on #204) —
+   previously, a ``require_landlord``/``get_session`` teardown-commit
+   failure ran entirely OUTSIDE the router's guarded ``try``, so a
+   purchased number could be silently orphaned with no page at all; the
+   router now commits before returning so that failure hits the SAME
+   :func:`alert_purchased_but_unrecorded` + release path as every other
+   post-purchase DB failure. Separately, a purchase that loses a genuine
+   concurrent same-address race (#203 item 1, migration 0013's
+   ``uq_properties_landlord_address_dedupe``) is released through this
+   SAME seam but does NOT call :func:`alert_purchased_but_unrecorded` —
+   see that router's own ``IntegrityError`` handling for why (an expected,
+   self-healing race, not a bug worth paging on).
 
 2. **Deprovisioning** (:func:`schedule_number_release` +
    :func:`sweep_pending_number_releases`, called from ``DELETE
