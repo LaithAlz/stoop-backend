@@ -290,12 +290,34 @@ async def release_number_best_effort(twilio_sid: str) -> None:
     rollback) never committed the row at all, so this guard is a no-op
     pass-through for all of them; only the narrow lost-ack case is caught.
     """
-    async with _acm(get_admin_session)() as session:
-        live_property = (
-            (await session.execute(_SELECT_LIVE_PROPERTY_FOR_SID_SQL, {"twilio_sid": twilio_sid}))
-            .mappings()
-            .one_or_none()
+    try:
+        async with _acm(get_admin_session)() as session:
+            guard_result = await session.execute(
+                _SELECT_LIVE_PROPERTY_FOR_SID_SQL, {"twilio_sid": twilio_sid}
+            )
+            live_property = guard_result.mappings().one_or_none()
+    except Exception as exc:
+        # L2 guard infra failure (safety re-review advisory A1, #203): the
+        # ownership SELECT itself failed, so we CANNOT tell whether a live
+        # property still references this SID. Fail SAFE -- skip the release
+        # (releasing a live property's number would sever its emergency
+        # line), never raise (this function's never-raises contract must
+        # hold so a guard-infra failure in provision_number's compensation
+        # path can't mask the ORIGINAL ProvisioningFailedError), and page
+        # loudly so ops reconciles a possibly-orphaned number by hand.
+        log.error(
+            "twilio_provisioning_compensation_release_skipped_guard_check_failed",
+            twilio_sid=twilio_sid,
+            exc_type=type(exc).__name__,
         )
+        sentry_sdk.capture_message(
+            "Twilio provisioning: compensation release SKIPPED -- the live-"
+            "property ownership guard could not run; a purchased number may "
+            "be orphaned and must be reconciled by hand",
+            level="error",
+            extras={"twilio_sid": twilio_sid, "exc_type": type(exc).__name__},
+        )
+        return
     if live_property is not None:
         log.error(
             "twilio_provisioning_compensation_release_skipped_live_property_owns_sid",

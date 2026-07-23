@@ -255,6 +255,40 @@ async def test_release_number_best_effort_never_raises_even_on_failure(
     assert fake_provisioner.released == []
 
 
+@pytest.mark.unit
+async def test_release_number_best_effort_guard_check_failure_fails_safe(
+    fake_provisioner: _FakeProvisioner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L2 guard infra failure (safety re-review advisory A1, #203): if the
+    ownership SELECT itself raises, we cannot tell whether a live property
+    still references the SID -- so the release is SKIPPED (never sever a
+    possibly-live property's emergency line), the never-raises contract
+    holds (a guard failure in ``provision_number``'s compensation path must
+    not mask the original ``ProvisioningFailedError``), and ops is paged."""
+    mock_capture = MagicMock()
+    monkeypatch.setattr(pp.sentry_sdk, "capture_message", mock_capture)
+
+    class _RaisingSession:
+        async def execute(self, *args: object, **kwargs: object) -> object:
+            raise RuntimeError("guard SELECT infra failure")
+
+    async def _fake_admin_session() -> AsyncGenerator[_RaisingSession, None]:
+        yield _RaisingSession()
+
+    monkeypatch.setattr(pp, "get_admin_session", _fake_admin_session)
+
+    await pp.release_number_best_effort("PN0001")  # must not raise
+
+    # Fail-safe: ownership is unknown, so the release was never even attempted.
+    assert fake_provisioner.release_calls == 0
+    assert fake_provisioner.released == []
+    # Ops paged with the distinct guard-failure message (not the "SKIPPED --
+    # live property owns" nor the "release failed" page).
+    mock_capture.assert_called_once()
+    assert "guard could not run" in mock_capture.call_args.args[0]
+
+
 # ---------------------------------------------------------------------------
 # A2P association — configured / unconfigured / configured-but-failing
 # ---------------------------------------------------------------------------
