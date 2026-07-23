@@ -23,6 +23,23 @@
   `fresh_draft_id`. Any such extra field is documented in that endpoint's
   own section, same as `fresh_draft_id` below; the three reserved keys
   always win on a naming collision (server-enforced, never client-supplied).
+- **v1.19 amendment (2026-07-23 — #219 implementation):** a request-body/
+  query/path-param Pydantic validation failure on ANY endpoint — not just
+  the endpoint-specific 4xx cases above — now ALSO uses this same envelope:
+  `422` with `code: "invalid_request"` and a static, generic `message`
+  (e.g. `"The request body or parameters failed validation."`). This is a
+  global `RequestValidationError` handler (`app/main.py`), registered
+  alongside the `AuthError`/`AppError` handlers, that supersedes FastAPI's
+  own default `{"detail": [...]}` 422 body everywhere in this API — that
+  default body's `"input"` key echoes the submitted value verbatim, which
+  can carry request-supplied PII (a tenant phone number, message-body
+  text, a push token) into the response (never-break rule #5); the
+  replacement message is deliberately static and never derived from
+  `exc.errors()` (not even the field `loc` paths — see `app/main.py`'s
+  `_validation_error_handler` docstring for the full reasoning). This
+  supersedes the Devices section's prior "standard FastAPI validation
+  envelope" note (v1.18) — that carve-out no longer applies; devices' 422s
+  now match every other endpoint's.
 - IDs are uuids as strings. Timestamps ISO-8601 UTC (`2026-06-11T14:02:00Z`).
 - **Pagination**: `?limit=` (default 25, max 100) + `?cursor=`; responses
   carry `"next_cursor": string|null`. Lists are newest-first.
@@ -718,7 +735,9 @@ at either the schema or the API layer.
   marked dead (`DeviceNotRegistered`) is trusted again the instant a real
   registration call proves it live once more.
 - 422 on a malformed body (missing/empty `token`, `platform` outside
-  `"ios"`/`"android"`) — standard FastAPI validation envelope.
+  `"ios"`/`"android"`) — the house error envelope, `code: "invalid_request"`
+  (Conventions section's v1.19 amendment, #219; supersedes this section's
+  prior "standard FastAPI validation envelope" note).
 
 `DELETE /v1/devices/{device_id}` → 200 `{ "status": "deleted" }` — the
 explicit sign-out/unregister surface. **Contract choice: delete by the
