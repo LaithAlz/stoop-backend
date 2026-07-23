@@ -112,9 +112,19 @@ the approve action carries the draft id; if that id is already stale, the
 send is rejected and the card refreshes ("Maria replied — draft updated").
 The 5-second undo window absorbs most of this race in practice.
 (Approve-by-SMS uses a 5-minute window, which widens this race ~60x —
-a message arriving after approval but before send does not supersede
-the approved draft. How the sender handles that gap is an open design
-point tracked on #122.)
+**decided on #122**: the sender re-checks, at claim time, for a newer
+TENANT message on the case since the SMS approval instant
+(`drafts.updated_at`, `approved_via = 'sms'` only) — a dashboard
+approval's 5s window keeps the ORIGINAL asymmetry above unchanged (never
+re-checked; "a landlord's approval is a human decision this codebase
+never reverses"). A newer tenant message found at SMS-claim time cancels
+the stale approved draft (`send_cancelled`/`superseded_by_newer_message`,
+the same vocabulary the auto-send guard below already uses) rather than
+sending it — the newer tenant message's own independent `run_graph` pass
+drafts the fresh replacement and re-notifies the landlord, exactly like
+any other stale-draft re-run. See `schema-v1.md`'s v1.16 amendment and
+`app/agent/draft_sender.py`/`app/agent/nodes/draft_response.py`'s own
+docstrings for the mechanics.)
 
 Auto-sent drafts (#60) get the OPPOSITE treatment from that
 landlord-approved gap: an auto-approved draft that has not yet been

@@ -189,7 +189,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent import emergency_chain, prefilter
+from app.agent import approve_by_sms, emergency_chain, prefilter
 from app.agent.emergency import fire_emergency_protocol
 from app.agent.graph_entry import enqueue_classification
 from app.agent.schemas import PrefilterResult
@@ -439,19 +439,32 @@ _INSERT_MESSAGE_SQL = text(
         body, twilio_sid, prefilter
     )
     VALUES (
-        :landlord_id, :property_id, :tenant_id, NULL, 'inbound', :party,
+        :landlord_id, :property_id, :tenant_id, :case_id, 'inbound', :party,
         :body, :twilio_sid, CAST(:prefilter AS jsonb)
     )
     ON CONFLICT (twilio_sid) DO NOTHING
     RETURNING id
     """
 )
+# `:case_id` (#122) is NULL for every tenant message (case identity isn't
+# known at insert time — #110 owns case attach, unchanged) and for a
+# landlord message with nothing to correlate against; it is the referenced
+# draft's case ONLY for a recognized approve-by-SMS token that correlates
+# to a real draft-ready notice (schema-v1.md v1.1's own "case_id = the
+# referenced draft's case" comment on `messages.party`). Set once, at
+# INSERT time, because `messages` is append-only and can never be
+# backfilled afterward — see `app/agent/approve_by_sms.py`'s own module
+# docstring "Two-phase design".
 
 # Used on the conflict path ONLY (no row came back from the INSERT above) to
 # recover the persisted row's authoritative routing/prefilter data — see
-# module docstring "Transaction design" point 3.
+# module docstring "Transaction design" point 3. `case_id` (#122) is
+# recovered too, so a REDELIVERED landlord reply's post-persist dispatch
+# uses the SAME case this exact message was originally correlated to,
+# never a freshly re-resolved (and potentially different) one — see
+# `app/agent/approve_by_sms.py::resolve_reply_for_recovered_case`.
 _SELECT_MESSAGE_FOR_RECOVERY_SQL = text(
-    "SELECT id, landlord_id, property_id, party, tenant_id, prefilter "
+    "SELECT id, landlord_id, property_id, party, tenant_id, case_id, prefilter "
     "FROM messages WHERE twilio_sid = :sid"
 )
 
@@ -535,11 +548,16 @@ async def _ensure_needs_eyes_notification(
     message_id: UUID,
     prefilter_result: PrefilterResult,
 ) -> bool:
-    """Landlord command-channel messages ALWAYS get a ``needs_eyes``
-    notification — #122 (approve-by-SMS 1/2/UNDO parsing) doesn't exist
-    yet, so today every landlord-authored reply surfaces here rather than
-    being silently dropped (api-contracts.md, "Webhooks": "never silently
-    dropped"). This applies whether or not Tier-0 fired: a Tier-0 HARD hit
+    """Landlord command-channel messages that are NOT a recognized,
+    correlatable approve-by-SMS reply (#122) get a ``needs_eyes``
+    notification here instead — "anything else replied → logged +
+    surfaced" (issue #122 AC), same fallback every landlord-authored
+    message got before #122 existed (api-contracts.md, "Webhooks": "never
+    silently dropped"). A RECOGNIZED token ("1"/"2"/"UNDO") that
+    correlates to a real draft-ready notice is dispatched to
+    ``app.agent.approve_by_sms.handle_reply`` instead (see the caller,
+    ``_run_post_persist_side_effects``) and never reaches this function at
+    all. This applies whether or not Tier-0 fired: a Tier-0 HARD hit
     on a landlord-authored message does NOT invoke the tenant emergency
     protocol (there is no tenant/case to act on) — it is recorded (the
     prefilter snapshot already lives on the ``messages`` row itself) and
@@ -709,6 +727,7 @@ async def _run_post_persist_side_effects(
     message_id: UUID,
     party: str,
     prefilter_result: PrefilterResult,
+    parsed_reply: approve_by_sms.ParsedReply | None,
 ) -> None:
     """The single shared post-persist path — called identically whether
     *this* request's INSERT just created the row (fresh delivery) or hit
@@ -719,6 +738,20 @@ async def _run_post_persist_side_effects(
     calling this twice (or a hundred times, concurrently) for the same
     ``message_id`` is always safe.
 
+    *parsed_reply* (#122) is ``None`` for every tenant message (unused);
+    for a landlord message it is whatever ``approve_by_sms.resolve_reply``/
+    ``resolve_reply_for_recovered_case`` already resolved BEFORE the
+    INSERT (module docstring "Tier-0 BEFORE the routing split" sibling —
+    see ``app.agent.approve_by_sms``'s own "Two-phase design"). A fully
+    -resolved reply (a recognized token that correlates to a real
+    draft-ready notice) dispatches to ``approve_by_sms.handle_reply``,
+    fail-open via ``_safe_step`` exactly like the needs_eyes side effect it
+    replaces for this one message — approve-by-SMS is a convenience
+    channel, never a path that can turn a webhook 200 into a 500. Anything
+    else (an unrecognized token, or nothing to correlate against) falls
+    back to the EXISTING ``_ensure_needs_eyes_notification`` side effect,
+    unchanged from before #122.
+
     Raises
     ------
     AppError
@@ -726,10 +759,22 @@ async def _run_post_persist_side_effects(
         ``_ensure_tenant_emergency_artifacts`` itself raises (safety
         review, 2026-07-12, finding 2) — see module docstring "Transaction
         design" point 2's exception. Never raised for the landlord/
-        ``needs_eyes`` side effect, which stays fail-open via
-        ``_safe_step``.
+        ``needs_eyes``/approve-by-SMS side effects, which stay fail-open
+        via ``_safe_step``.
     """
     if party == "landlord":
+        if (
+            parsed_reply is not None
+            and parsed_reply.command is not None
+            and parsed_reply.case_id is not None
+            and parsed_reply.draft_id is not None
+        ):
+            await _safe_step(
+                "landlord_approve_by_sms",
+                approve_by_sms.handle_reply(landlord_id=landlord_id, parsed=parsed_reply),
+            )
+            return
+
         await _safe_step(
             "landlord_needs_eyes_notification",
             _ensure_needs_eyes_notification(
@@ -739,8 +784,6 @@ async def _run_post_persist_side_effects(
                 prefilter_result=prefilter_result,
             ),
         )
-        # #122 (approve-by-SMS parsing) takes it from here — no case/graph
-        # to invoke for a landlord command-channel message.
         return
 
     if prefilter_result.hard_hit:
@@ -877,9 +920,20 @@ async def twilio_sms_webhook(
 
     party: str
     tenant_id: UUID | None
+    case_id: UUID | None = None
+    parsed_reply: approve_by_sms.ParsedReply | None = None
     if is_landlord_channel:
         party = "landlord"
         tenant_id = None
+        # #122 — resolve BEFORE the INSERT: a landlord row's case_id (if
+        # any) must be set at insert time (messages is append-only, never
+        # backfillable) — see app.agent.approve_by_sms's own module
+        # docstring "Two-phase design".
+        parsed_reply = await approve_by_sms.resolve_reply(
+            session, landlord_id=landlord_id, property_id=property_id, body=body
+        )
+        if parsed_reply.command is not None and parsed_reply.case_id is not None:
+            case_id = parsed_reply.case_id
     else:
         party = "tenant"
         tenant_id = await _lookup_active_tenant(session, property_id=property_id, phone=from_number)
@@ -892,6 +946,7 @@ async def twilio_sms_webhook(
                     "landlord_id": str(landlord_id),
                     "property_id": str(property_id),
                     "tenant_id": str(tenant_id) if tenant_id is not None else None,
+                    "case_id": str(case_id) if case_id is not None else None,
                     "party": party,
                     "body": body,
                     "twilio_sid": message_sid,
@@ -944,11 +999,23 @@ async def twilio_sms_webhook(
             landlord_id = existing["landlord_id"]
             property_id = existing["property_id"]
             party = existing["party"]
+            case_id = existing["case_id"]
             # tenant_id itself is not needed past this point (not a
             # parameter of _run_post_persist_side_effects) -- the recovery
             # SELECT still fetches it for completeness/debuggability,
             # deliberately unused.
             prefilter_result = PrefilterResult.model_validate(existing["prefilter"])
+            # #122 — re-derive the referenced draft_id, scoped to the
+            # ALREADY-DURABLY-STORED case_id (never re-resolved from
+            # scratch) — see app.agent.approve_by_sms.
+            # resolve_reply_for_recovered_case's own docstring.
+            parsed_reply = (
+                await approve_by_sms.resolve_reply_for_recovered_case(
+                    session, case_id=case_id, body=body
+                )
+                if party == "landlord"
+                else None
+            )
         except Exception as exc:
             log.error("twilio_sms_conflict_recovery_failed", exc_type=type(exc).__name__)
             raise AppError(
@@ -964,6 +1031,7 @@ async def twilio_sms_webhook(
         message_id=message_id,
         party=party,
         prefilter_result=prefilter_result,
+        parsed_reply=parsed_reply,
     )
 
     return _twiml_empty()

@@ -351,6 +351,58 @@ async def test_get_case_full_timeline_oldest_first_interleaved(session: AsyncSes
 
 
 @pytest.mark.integration
+async def test_get_case_timeline_excludes_landlord_command_channel_replies(
+    session: AsyncSession,
+) -> None:
+    """#122 regression: conversation-model.md's channel-vs-case design
+    ("landlord command-channel replies... are excluded from ALL
+    tenant-facing channel reads, including the dispute export") — a
+    landlord's approve-by-SMS reply ("1"/"2"/"UNDO") carries `case_id`
+    set directly (schema-v1.md's own comment on `messages.party`), unlike
+    every tenant message (`case_id` always NULL, correlated only via
+    `message_cases`). Before this fix, `_SELECT_MESSAGES_SQL`'s
+    `m.case_id = :case_id` branch would have picked up such a row; it
+    must never appear in this timeline."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        property_id, tenant_id, case_id = await _seed_case(
+            session, landlord_id=landlord_id, status="awaiting_approval"
+        )
+
+        message_id = await factories.insert_message(
+            session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="No heat since last night!",
+        )
+        await factories.insert_message_case(session, message_id=message_id, case_id=case_id)
+
+        # The landlord's OWN command-channel reply -- case_id set DIRECTLY
+        # (the real shape app/routers/webhooks/twilio.py's approve-by-SMS
+        # handler writes), never via message_cases.
+        await session.execute(
+            text(
+                "INSERT INTO messages (landlord_id, property_id, tenant_id, case_id, "
+                "direction, party, body) "
+                "VALUES (:landlord_id, :property_id, NULL, :case_id, 'inbound', 'landlord', '1')"
+            ),
+            {"landlord_id": landlord_id, "property_id": property_id, "case_id": case_id},
+        )
+        await session.commit()
+
+        detail = await get_case(uuid.UUID(case_id), (landlord, session))
+
+        message_entries = [entry for entry in detail.timeline if entry.kind == "message"]
+        assert len(message_entries) == 1
+        assert message_entries[0].body == "No heat since last night!"  # type: ignore[union-attr]
+        assert all(entry.party != "landlord" for entry in message_entries)  # type: ignore[union-attr]
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_get_case_with_vendor(session: AsyncSession) -> None:
     landlord_id = await factories.insert_landlord(session)
     landlord = Landlord(id=uuid.UUID(landlord_id))

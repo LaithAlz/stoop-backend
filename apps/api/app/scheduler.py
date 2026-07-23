@@ -31,7 +31,8 @@ sweep:
   design (the grace period is 24h), so it must never sit ahead of
   anything time-sensitive.
 - ``app/push_outbox.py::run_push_outbox_sweep`` (#210 M3 — drains the
-  landlord push-notification queue). Runs LAST, after ``number_release``:
+  landlord push-notification queue). Runs after ``number_release``, before
+  the landlord SMS drain sweep below:
   a push nudge is the LEAST time-sensitive/safety-relevant work this
   ticker does (push never carries the emergency path, CLAUDE.md rule #1,
   and push failure is invisible to the approval flow by design — see that
@@ -39,6 +40,19 @@ sweep:
   Like ``sender_tick``, it is wall-clock-bounded (safety review HIGH-1 —
   see "Bounding sender_tick's own worst-case duration" below) so an Expo
   outage can never starve the emergency sweep's NEXT run either.
+- ``app/agent/landlord_sms.py::run_landlord_sms_drain_sweep`` (#122,
+  approve-by-SMS — drains the draft-ready SMS + every reply confirmation).
+  Runs LAST: this is the THIRD sanctioned Twilio-send call site (see that
+  module's own docstring and ``tests/test_twilio_send_allowlist.py``), but
+  a landlord-facing convenience notice, same low-priority-ordering
+  rationale as push above — never ahead of anything emergency/approval
+  -relevant. No wall-clock deadline of its own (unlike ``sender_tick``/
+  push): it has no bounded backoff schedule to race against (mirrors
+  ``run_sms_drain_sweep``'s own "resend every tick until sent" shape, not
+  ``run_push_outbox_sweep``'s bounded-attempt design) and, being LAST in
+  the tick, a slow/hanging run here only ever delays the NEXT tick's
+  FIRST sweep by its own duration — never itself, unlike a sweep earlier
+  in this same ordering.
 
 Design choice (the campaign's "sender design menu" — (a) in-process
 asyncio periodic task, RECOMMENDED for v1; matches
@@ -147,6 +161,7 @@ import structlog
 from app.agent.degraded_mode_sweep import sweep_degraded_mode_retries
 from app.agent.draft_sender import sender_tick
 from app.agent.emergency_chain import run_emergency_chain_sweep, run_sms_drain_sweep
+from app.agent.landlord_sms import run_landlord_sms_drain_sweep
 from app.integrations.sms_sender import get_default_sms_sender
 from app.property_provisioning import sweep_pending_number_releases
 from app.push_outbox import run_push_outbox_sweep
@@ -231,6 +246,15 @@ async def _run_one_tick_body() -> None:
         _safe_report(
             "scheduler_push_outbox_sweep_failed",
             "scheduler: push outbox sweep tick raised",
+            exc,
+        )
+
+    try:
+        await run_landlord_sms_drain_sweep()
+    except Exception as exc:
+        _safe_report(
+            "scheduler_landlord_sms_drain_sweep_failed",
+            "scheduler: landlord sms drain sweep tick raised",
             exc,
         )
 

@@ -404,6 +404,7 @@ from app.agent.nodes.finalize_draft_decision import (
     apply_rejection,
     finalize_approval,
     finalize_rejection,
+    undo_window_and_approved_via,
 )
 from app.agent.nodes.identify_case import identify_case
 from app.agent.nodes.identify_property import identify_property
@@ -1025,6 +1026,12 @@ async def _finalize_never_paused_draft(
             # equivalent, still under the same lock as the write below.
             await session.execute(_ENSURE_CASE_AWAITING_APPROVAL_SQL, {"case_id": str(case_id)})
             edited_body = resume_value.get("body") if action == ACTION_EDIT_AND_SEND else None
+            # #122 — same resume_value["source"] vocabulary
+            # finalize_approval reads on the normal graph-resume path (see
+            # that module's own "#122 addition"); this never-paused
+            # fallback path needs the identical undo-window/approved_via
+            # selection.
+            undo_window, approved_via = undo_window_and_approved_via(resume_value)
             scheduled_send_at = await apply_approve_or_edit(
                 session,
                 landlord_id=landlord_id,
@@ -1032,6 +1039,8 @@ async def _finalize_never_paused_draft(
                 draft_id=draft_id,
                 action=action,
                 edited_body=edited_body,
+                undo_window=undo_window,
+                approved_via=approved_via,
             )
             if scheduled_send_at is None:  # pragma: no cover — see apply_approve_or_edit docstring
                 raise CaseNotAwaitingApprovalError(case_id=case_id, draft_id=draft_id)

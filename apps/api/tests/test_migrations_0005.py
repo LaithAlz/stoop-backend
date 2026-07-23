@@ -582,6 +582,20 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # sweep above; there is no HTTP request/landlord JWT for a
         # scheduled tick to resolve a GUC from.
         "app/push_outbox.py",
+        # #122: the landlord-facing SMS outbox (draft-ready notice + every
+        # approve-by-SMS reply confirmation) — enqueue is called from the
+        # graph (app/agent/nodes/await_approval.py) and the Twilio webhook
+        # (via app/agent/approve_by_sms.py), and its own drain sweep
+        # (run_landlord_sms_drain_sweep, scheduled by app/scheduler.py) is
+        # the same pre-identity background/scheduler context as every
+        # other sweep above.
+        "app/agent/landlord_sms.py",
+        # #122: the approve-by-SMS reply parser/dispatcher — called
+        # synchronously from the Twilio webhook (no landlord JWT) and
+        # funnels through app/agent/graph.py's resolve_draft_decision; its
+        # OWN reads/writes (draft status lookups, the UNDO revert) run on
+        # the same admin engine as the webhook that calls it.
+        "app/agent/approve_by_sms.py",
     }
 )
 

@@ -410,6 +410,28 @@ human decision this codebase never silently reverses; only
 own claim guard carries a SECOND, independent belt-and-braces check for
 the same condition — see that module's own docstring.
 
+...and an SMS-APPROVED draft too, but ONLY for the SMS channel's own
+widened race (#122, schema-v1.md v1.16 amendment 2)
+------------------------------------------------------------------------
+Approve-by-SMS's 5-minute undo window (vs. the dashboard's 5s) widens the
+approve-to-send gap ~60x — long enough for a genuinely new tenant message
+to arrive on the SAME case before the sender ever claims the SMS-approved
+row. Exactly the same shape as the auto-send gap above, extended to
+``approved_via = 'sms'`` drafts (schema-v1.md v1.16): :func:`_cancel_
+superseded_sms_approved_drafts`, called alongside
+:func:`_cancel_superseded_auto_send_drafts` at the top of
+:func:`_stale_then_insert_draft`, cancels any still-``'approved'``,
+``approved_via = 'sms'`` draft on the case (same ``send_cancelled``/
+``superseded_by_newer_message`` audit vocabulary) before the fresh draft
+is inserted. A DASHBOARD-approved draft (``approved_via = 'dashboard'``
+or ``NULL``) is deliberately left untouched — the dashboard's 5s window
+and "a landlord's approval is a human decision this codebase never
+reverses" precedent are unchanged by this amendment; only the SMS
+channel's OWN wider race gets this treatment.
+``app/agent/draft_sender.py``'s own claim guard carries a SECOND,
+independent belt-and-braces check for the identical condition — see that
+module's own docstring "The SMS approve/send race".
+
 20 s END-TO-END budget / retry
 ----------------------------------
 Same shared-deadline arithmetic as ``classify_intent.py`` /
@@ -789,6 +811,19 @@ _INSERT_AUTO_SEND_CANCELLED_AUDIT_SQL = text(
     "VALUES (:landlord_id, :case_id, 'agent', 'send_cancelled', CAST(:payload AS jsonb))"
 )
 
+# #122 (schema-v1.md v1.16 amendment 2) — same shape as the auto_send
+# cancel above, scoped to approve-by-SMS's own widened race instead. Never
+# touches a dashboard-approved draft (`approved_via` is 'dashboard' or NULL
+# there) -- this query's own predicate only ever matches
+# `approved_via = 'sms'` rows. A single UPDATE (not a SELECT-then-UPDATE)
+# -- safe against a concurrent sender claim racing this: whichever wins
+# the `status = 'approved'` predicate first, the other matches zero rows.
+_CANCEL_UNSENT_SMS_APPROVED_DRAFTS_SQL = text(
+    "UPDATE drafts SET status = 'cancelled', updated_at = now() "
+    "WHERE case_id = :case_id AND status = 'approved' AND approved_via = 'sms' "
+    "RETURNING id"
+)
+
 _MAX_DRAFT_INSERT_ATTEMPTS: int = 3
 """Bound on the stale-then-insert retry loop (see module docstring
 "Race-safety against a genuinely CONCURRENT insert") — high enough that a
@@ -853,6 +888,46 @@ async def _cancel_superseded_auto_send_drafts(
         )
 
 
+async def _cancel_superseded_sms_approved_drafts(
+    session: AsyncSession, *, landlord_id: UUID, case_id: UUID, reasoning_log: list[str]
+) -> None:
+    """#122 (schema-v1.md v1.16 amendment 2) — cancel any still-unsent
+    SMS-approved (``approved_via='sms'``, ``status='approved'``) draft on
+    *case_id* the moment a NEWER inbound message triggers a fresh draft.
+    Mirrors :func:`_cancel_superseded_auto_send_drafts` exactly, scoped to
+    the SMS channel's own widened approve-to-send race instead of
+    auto-send — see module docstring "...and an SMS-approved draft too".
+    Never touches a dashboard-approved draft (this query's own predicate
+    only ever matches ``approved_via = 'sms'`` rows).
+    """
+    cancelled_rows = (
+        (await session.execute(_CANCEL_UNSENT_SMS_APPROVED_DRAFTS_SQL, {"case_id": str(case_id)}))
+        .mappings()
+        .all()
+    )
+    for row in cancelled_rows:
+        cancelled_draft_id = row["id"]
+        await session.execute(
+            _INSERT_AUTO_SEND_CANCELLED_AUDIT_SQL,
+            {
+                "landlord_id": str(landlord_id),
+                "case_id": str(case_id),
+                "payload": json.dumps(
+                    {"draft_id": str(cancelled_draft_id), "reason": "superseded_by_newer_message"}
+                ),
+            },
+        )
+        reasoning_log.append(
+            "A new message came in before you replied to the earlier text, so I cancelled "
+            "that approval and I'm writing a fresh one instead."
+        )
+        log.info(
+            "draft_response_sms_approved_cancelled_superseded",
+            case_id=str(case_id),
+            draft_id=str(cancelled_draft_id),
+        )
+
+
 async def _stale_then_insert_draft(
     session: AsyncSession,
     *,
@@ -875,10 +950,15 @@ async def _stale_then_insert_draft(
     lets a unique-violation escape as an unhandled ``IntegrityError``.
 
     Also cancels any still-unsent AUTO-SENT draft on *case_id* (#60 safety
-    review MEDIUM-1 — see :func:`_cancel_superseded_auto_send_drafts`),
-    once, before the retry loop below.
+    review MEDIUM-1 — see :func:`_cancel_superseded_auto_send_drafts`) and
+    any still-unsent SMS-APPROVED draft (#122 — see
+    :func:`_cancel_superseded_sms_approved_drafts`), once each, before the
+    retry loop below.
     """
     await _cancel_superseded_auto_send_drafts(
+        session, landlord_id=landlord_id, case_id=case_id, reasoning_log=reasoning_log
+    )
+    await _cancel_superseded_sms_approved_drafts(
         session, landlord_id=landlord_id, case_id=case_id, reasoning_log=reasoning_log
     )
     for attempt in range(_MAX_DRAFT_INSERT_ATTEMPTS):

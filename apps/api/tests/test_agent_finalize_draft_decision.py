@@ -187,7 +187,7 @@ async def _draft_row(session: AsyncSession, *, draft_id: str) -> dict[str, Any]:
         (
             await session.execute(
                 text(
-                    "SELECT id, status, scheduled_send_at, edited, final_body, body "
+                    "SELECT id, status, scheduled_send_at, edited, final_body, body, approved_via "
                     "FROM drafts WHERE id = :did"
                 ),
                 {"did": draft_id},
@@ -343,6 +343,7 @@ async def test_approve_schedules_send_and_writes_approved_audit_row(
         assert draft["status"] == "approved"
         assert draft["edited"] is False
         assert draft["final_body"] is None
+        assert draft["approved_via"] == "dashboard"
         assert draft["scheduled_send_at"] is not None
         assert (
             before + timedelta(seconds=4)
@@ -362,6 +363,40 @@ async def test_approve_schedules_send_and_writes_approved_audit_row(
         snapshot = await case_graph.aget_state(config)
         assert snapshot.next == ()
         assert snapshot.interrupts == ()
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_approve_via_sms_source_schedules_5min_window_and_sets_approved_via(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#122 addition — ``resume_value["source"] == "sms"`` selects the
+    SMS undo window (+5min, api-contracts.md) and ``approved_via='sms'``
+    (schema-v1.md v1.16) instead of the dashboard's default +5s/
+    ``'dashboard'`` — the SAME shared writer (``apply_approve_or_edit``),
+    never a second one."""
+    landlord_id, case_id, draft_id = await _seed_paused_case(db_session, monkeypatch)
+    try:
+        before = datetime.now(UTC)
+        await resolve_draft_decision(
+            case_id=uuid.UUID(case_id),
+            draft_id=uuid.UUID(draft_id),
+            resume_value={"action": ACTION_APPROVE, "source": "sms"},
+        )
+
+        draft = await _draft_row(db_session, draft_id=draft_id)
+        assert draft["status"] == "approved"
+        assert draft["approved_via"] == "sms"
+        assert draft["scheduled_send_at"] is not None
+        assert (
+            before + timedelta(minutes=4)
+            <= draft["scheduled_send_at"]
+            <= before + timedelta(minutes=6)
+        )
+
+        actions = await _audit_actions(db_session, case_id=case_id)
+        assert "approved" in actions
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -563,6 +598,45 @@ async def test_degraded_path_pending_draft_is_approvable_via_fallback(
 
         actions = await _audit_actions(db_session, case_id=case_id)
         assert "approved" in actions
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_degraded_path_sms_source_still_gets_5min_window_via_fallback(
+    db_session: AsyncSession,
+) -> None:
+    """#122 — ``_finalize_never_paused_draft`` (``app/agent/graph.py``)
+    reads the SAME ``resume_value["source"]`` vocabulary
+    ``finalize_approval`` reads on the normal graph-resume path (see
+    ``undo_window_and_approved_via``'s own docstring) — exercised here via
+    the never-paused fallback entry, never a second, divergent
+    implementation."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await factories.insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="open",
+    )
+    draft_id = await factories.insert_draft(db_session, landlord_id=landlord_id, case_id=case_id)
+
+    try:
+        before = datetime.now(UTC)
+        await resolve_draft_decision(
+            case_id=uuid.UUID(case_id),
+            draft_id=uuid.UUID(draft_id),
+            resume_value={"action": ACTION_APPROVE, "source": "sms"},
+        )
+
+        draft = await _draft_row(db_session, draft_id=draft_id)
+        assert draft["status"] == "approved"
+        assert draft["approved_via"] == "sms"
+        assert draft["scheduled_send_at"] is not None
+        assert before + timedelta(minutes=4) <= draft["scheduled_send_at"]
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -1000,3 +1074,35 @@ async def test_await_approval_skip_branch_clears_stale_approval_resume(
         assert _route_after_await_approval(merged_state) == END
     finally:
         await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #122 — undo_window_and_approved_via (pure, no DB)
+# ---------------------------------------------------------------------------
+
+
+def test_undo_window_and_approved_via_defaults_to_dashboard() -> None:
+    from app.agent.nodes.finalize_draft_decision import (
+        UNDO_WINDOW,
+        undo_window_and_approved_via,
+    )
+
+    assert undo_window_and_approved_via(None) == (UNDO_WINDOW, "dashboard")
+    assert undo_window_and_approved_via({"action": ACTION_APPROVE}) == (UNDO_WINDOW, "dashboard")
+    # Any value other than exactly "sms" is treated as dashboard.
+    assert undo_window_and_approved_via({"action": ACTION_APPROVE, "source": "carrier_pigeon"}) == (
+        UNDO_WINDOW,
+        "dashboard",
+    )
+
+
+def test_undo_window_and_approved_via_selects_sms() -> None:
+    from app.agent.nodes.finalize_draft_decision import (
+        SMS_UNDO_WINDOW,
+        undo_window_and_approved_via,
+    )
+
+    assert undo_window_and_approved_via({"action": ACTION_APPROVE, "source": "sms"}) == (
+        SMS_UNDO_WINDOW,
+        "sms",
+    )

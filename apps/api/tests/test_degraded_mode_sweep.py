@@ -951,6 +951,65 @@ async def test_sweep_proceeds_normally_when_case_unchanged_and_no_newer_message(
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
+async def test_case_has_moved_on_ignores_landlord_authored_linked_message(
+    db_session: AsyncSession,
+) -> None:
+    """#122 safety-review pin (forward risk recorded on #40): a
+    LANDLORD-authored message (approve-by-SMS command-channel reply) must
+    NEVER count as "a newer inbound message exists" (Condition B) --
+    only a genuinely new TENANT message is evidence the case moved on.
+    Approve-by-SMS's own reply handler does not in fact link its messages
+    into ``message_cases`` (it sets ``messages.case_id`` directly instead
+    -- see ``app/agent/approve_by_sms.py``'s own module docstring), so this
+    is belt-and-braces against a future change, exercised directly here at
+    the ``_case_has_moved_on`` level (no Anthropic mocking needed)."""
+    import app.agent.degraded_mode_sweep as sweep_mod
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="m1: not sure what's going on",
+    )
+    await _link_message_to_case(db_session, message_id=message_id, case_id=case_id)
+
+    # A LANDLORD-authored message, linked into message_cases for the SAME
+    # case -- must be ignored by Condition B.
+    landlord_message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=None,
+        body="1",
+        party="landlord",
+    )
+    await _link_message_to_case(db_session, message_id=landlord_message_id, case_id=case_id)
+
+    candidate = sweep_mod.DegradedRetryCandidate(
+        notification_id=uuid.uuid4(),
+        message_id=uuid.UUID(message_id),
+        case_id=uuid.UUID(case_id),
+        landlord_id=uuid.UUID(landlord_id),
+        attempt=0,
+        failed_at=datetime.now(UTC) - timedelta(minutes=1),
+        case_status_at_failure="open",
+    )
+
+    try:
+        moved_on = await sweep_mod._case_has_moved_on(db_session, candidate)  # noqa: SLF001
+        assert moved_on is False  # the landlord's own reply must NOT count as "moved on"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 # ---------------------------------------------------------------------------
 # Exception handling never silently loops forever (safety HIGH + spec
 # MAJOR -- THE blocker finding)

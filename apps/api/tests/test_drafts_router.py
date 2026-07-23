@@ -270,6 +270,12 @@ async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
     await session.execute(
         text("DELETE FROM messages WHERE landlord_id = :lid"), {"lid": landlord_id}
     )
+    # #122: mark_awaiting_approval now ALSO enqueues a `notifications`
+    # (draft_ready/sms) row referencing `case_id` -- must clear it before
+    # `cases` (no ON DELETE CASCADE on that FK).
+    await session.execute(
+        text("DELETE FROM notifications WHERE landlord_id = :lid"), {"lid": landlord_id}
+    )
     await session.execute(text("DELETE FROM cases WHERE landlord_id = :lid"), {"lid": landlord_id})
     await session.execute(
         text("DELETE FROM tenants WHERE landlord_id = :lid"), {"lid": landlord_id}

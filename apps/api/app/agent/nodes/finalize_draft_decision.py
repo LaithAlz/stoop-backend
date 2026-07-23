@@ -21,6 +21,25 @@ router logs it as an anomaly and routes straight to ``END`` without
 reaching either node in this module, so an unrecognized resume can never
 approve or send anything.
 
+**#122 addition — an optional ``"source": "sms"`` key on
+``ACTION_APPROVE``/``ACTION_EDIT_AND_SEND``:** approve-by-SMS
+(``app/agent/approve_by_sms.py``) is a THIRD caller of the shared
+approve/reject writer below (alongside the dashboard's
+``resume_case_thread`` graph-resume path and the never-paused fallback,
+``app/agent/graph.py::_finalize_never_paused_draft`` — both already
+existed before #122). It sets ``resume_value["source"] = "sms"`` so
+:func:`finalize_approval` (and, for the never-paused path,
+``_finalize_never_paused_draft`` directly) can pass the SMS undo window
+(:data:`SMS_UNDO_WINDOW`, +5 minutes — api-contracts.md, "approve-by-SMS:
++5min") and ``approved_via='sms'`` (schema-v1.md v1.16) through to
+:func:`apply_approve_or_edit`, instead of the dashboard's default +5s/
+``'dashboard'``. Absent entirely (every OTHER caller, unchanged) means the
+ORIGINAL dashboard behavior exactly — this key is additive, never a
+behavior change for an existing caller that doesn't set it. Reject
+(``ACTION_REJECT``) needs no such key: the reject write itself
+(:func:`apply_rejection`) has no undo-window/approved_via concept at
+all, on either channel.
+
 What this module does NOT do
 -----------------------------
 It never calls an SMS-sending client. Approving/editing a draft here only
@@ -114,8 +133,16 @@ ACTION_REJECT = "reject"
 ACTION_EDIT_AND_SEND = "edit_and_send"
 
 UNDO_WINDOW = timedelta(seconds=5)
-"""Dashboard undo window (api-contracts.md: "+5s"; approve-by-SMS's own
-+5min window is #122's — a different call site entirely, not built here)."""
+"""Dashboard undo window (api-contracts.md: "+5s")."""
+
+SMS_UNDO_WINDOW = timedelta(minutes=5)
+"""Approve-by-SMS's own undo window (api-contracts.md: "+5min" — SMS has no
+undo bar, so the window is wider to give a landlord a realistic chance to
+reply ``UNDO``). Selected via ``resume_value["source"] == "sms"`` — see
+module docstring "#122 addition"."""
+
+_APPROVED_VIA_DASHBOARD = "dashboard"
+_APPROVED_VIA_SMS = "sms"
 
 # ---------------------------------------------------------------------------
 # SQL — shared by both the graph-node path and the non-graph fallback path
@@ -128,6 +155,7 @@ _SELECT_PENDING_DRAFT_FOR_CASE_SQL = text(
 
 _APPROVE_OR_EDIT_DRAFT_SQL = text(
     "UPDATE drafts SET status = 'approved', scheduled_send_at = :scheduled_send_at, "
+    "approved_via = :approved_via, "
     "edited = :edited, final_body = :final_body, updated_at = now() "
     "WHERE id = :draft_id AND status = 'pending' "
     "RETURNING id"
@@ -187,6 +215,8 @@ async def apply_approve_or_edit(
     action: str,
     edited_body: str | None,
     now: datetime | None = None,
+    undo_window: timedelta = UNDO_WINDOW,
+    approved_via: str = _APPROVED_VIA_DASHBOARD,
 ) -> datetime | None:
     """Mark *draft_id* ``approved`` + schedule its send — shared by
     :func:`finalize_approval` (graph node) and
@@ -202,9 +232,15 @@ async def apply_approve_or_edit(
     ``final_body=edited_body`` (the ORIGINAL ``drafts.body`` is never
     touched — "original + edit both retained", #45's own AC); any other
     action leaves both at their non-edited defaults.
+
+    *undo_window*/*approved_via* (#122) default to the dashboard's own
+    +5s/``'dashboard'`` — every pre-#122 caller is byte-for-byte unchanged.
+    Approve-by-SMS is the only caller that ever passes
+    ``undo_window=SMS_UNDO_WINDOW, approved_via='sms'`` (see module
+    docstring "#122 addition").
     """
     effective_now = now or datetime.now(UTC)
-    scheduled_send_at = effective_now + UNDO_WINDOW
+    scheduled_send_at = effective_now + undo_window
     edited = action == ACTION_EDIT_AND_SEND
 
     row = (
@@ -214,6 +250,7 @@ async def apply_approve_or_edit(
                 {
                     "draft_id": str(draft_id),
                     "scheduled_send_at": scheduled_send_at,
+                    "approved_via": approved_via,
                     "edited": edited,
                     "final_body": edited_body if edited else None,
                 },
@@ -313,16 +350,32 @@ async def apply_rejection(
 # ---------------------------------------------------------------------------
 
 
+def undo_window_and_approved_via(resume: dict[str, Any] | None) -> tuple[timedelta, str]:
+    """#122 addition — see module docstring "#122 addition". Public (not
+    module-private) because ``app/agent/graph.py``'s
+    ``_finalize_never_paused_draft`` also needs it, for the SAME
+    ``resume_value["source"]`` vocabulary, on its own never-paused-draft
+    entry path. Absent/anything-other-than-``"sms"`` ``resume["source"]``
+    is the ORIGINAL dashboard behavior, byte-for-byte: +5s /
+    ``'dashboard'``."""
+    source = resume.get("source") if isinstance(resume, dict) else None
+    if source == "sms":
+        return SMS_UNDO_WINDOW, _APPROVED_VIA_SMS
+    return UNDO_WINDOW, _APPROVED_VIA_DASHBOARD
+
+
 async def finalize_approval(state: AgentState) -> dict[str, Any]:
     """Handles BOTH ``ACTION_APPROVE`` and ``ACTION_EDIT_AND_SEND`` — the
     two actions differ only in whether a landlord-authored replacement
     body is recorded (see :func:`apply_approve_or_edit`); both schedule the
-    same 5s-delayed send."""
+    same undo-delayed send (dashboard: 5s; approve-by-SMS: 5min — see
+    :func:`undo_window_and_approved_via`)."""
     message_id = state["message_id"]
     case_context = state.get("case_context") or CaseContext()
     reasoning_log = list(state.get("reasoning_log") or [])
     resume = state.get("approval_resume")
     action = resume.get("action") if isinstance(resume, dict) else None
+    undo_window, approved_via = undo_window_and_approved_via(resume)
     case_id = case_context.case_id
     landlord_id = case_context.landlord_id
 
@@ -359,6 +412,8 @@ async def finalize_approval(state: AgentState) -> dict[str, Any]:
             draft_id=draft_id,
             action=action or ACTION_APPROVE,
             edited_body=edited_body,
+            undo_window=undo_window,
+            approved_via=approved_via,
         )
 
     if scheduled_send_at is None:  # pragma: no cover — see apply_approve_or_edit docstring
@@ -445,9 +500,11 @@ __all__: list[str] = [
     "ACTION_APPROVE",
     "ACTION_EDIT_AND_SEND",
     "ACTION_REJECT",
+    "SMS_UNDO_WINDOW",
     "UNDO_WINDOW",
     "apply_approve_or_edit",
     "apply_rejection",
     "finalize_approval",
     "finalize_rejection",
+    "undo_window_and_approved_via",
 ]
