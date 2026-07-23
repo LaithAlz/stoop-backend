@@ -1,5 +1,5 @@
 """Integration tests for the properties address-dedupe UNIQUE index
-(revision 0013, #203 item 1).
+(revision 0013, #203 item 2).
 
 Marker: ``integration`` — requires a running Postgres instance.
 Use ``docker compose up -d`` at the repo root before running locally.
