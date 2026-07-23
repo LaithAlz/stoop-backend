@@ -232,6 +232,7 @@ def _make_jwks_router(jwks: dict[str, Any]) -> respx.MockRouter:
 # doubles as a stand-in for the kind of tenant PII a validated field could
 # carry (never-break rule #5).
 _SENTINEL = "SENTINEL-4165551234-DO-NOT-ECHO"
+_CLIENT_KEY_LEAK = "CLIENT_KEY_LEAK_DO_NOT_ECHO"
 
 
 def _assert_house_envelope_422(body: dict[str, Any], response_text: str) -> None:
@@ -268,12 +269,24 @@ async def test_devices_malformed_body_returns_house_envelope(
             ) as client:
                 response = await client.post(
                     "/v1/devices",
-                    json={"token": "ExponentPushToken[abc]", "platform": _SENTINEL},
+                    json={
+                        "token": "ExponentPushToken[abc]",
+                        "platform": _SENTINEL,
+                        # A client-controlled extra KEY becomes a `loc` path
+                        # element in FastAPI's default error list. The house
+                        # handler must never surface `loc`, so this key must
+                        # not appear in the response either (safety review,
+                        # PII-key-leak vector).
+                        _CLIENT_KEY_LEAK: "x",
+                    },
                     headers={"Authorization": f"Bearer {token}"},
                 )
 
         assert response.status_code == 422
         _assert_house_envelope_422(response.json(), response.text)
+        assert _CLIENT_KEY_LEAK not in response.text, (
+            "a client-controlled body key leaked into the 422 response via loc"
+        )
     finally:
         await _cleanup_landlord(db_session, landlord_id)
 
