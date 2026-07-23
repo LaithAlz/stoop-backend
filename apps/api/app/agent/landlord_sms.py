@@ -99,6 +99,12 @@ _DRAFT_EXCERPT_CHARS = 200
 """plain-language-rules.md's "Approve-by-SMS" example: "first ~200 chars"
 of the draft body."""
 
+_ISSUE_SNIPPET_CHARS = 60
+"""plain-language-rules.md's "Approve-by-SMS" section (v1 mechanism): the
+issue line is a VERBATIM excerpt of the tenant's own triggering message —
+never an LLM paraphrase (that would be a prompt-version change + a paid
+eval run, out of scope here) — truncated to "first ~60 chars"."""
+
 
 # ---------------------------------------------------------------------------
 # Rendering — pure functions, no I/O. plain-language-rules.md's "Approve-by
@@ -116,6 +122,15 @@ def _truncate(text_value: str, limit: int) -> str:
     return stripped[:limit].rstrip() + "…"
 
 
+def _collapse_whitespace(text_value: str) -> str:
+    """A tenant's raw SMS body can carry newlines/multiple spaces (real
+    input, plain-language-rules.md rule #8 — never corrected, but a
+    single-line notice excerpt still needs to read as ONE line on the
+    landlord's own SMS). ``str.split()`` with no separator already treats
+    any run of whitespace (including newlines) as one boundary."""
+    return " ".join(text_value.split())
+
+
 def render_tenant_label(*, tenant_name: str | None, unit: str | None, property_label: str) -> str:
     """ "Maria (Unit 2, Palmerston)" — plain-language-rules.md's own
     example shape. Falls back to "Your tenant" when the tenant has no
@@ -128,11 +143,35 @@ def render_tenant_label(*, tenant_name: str | None, unit: str | None, property_l
     return f"{name} ({property_label})"
 
 
-def render_draft_ready_sms(*, tenant_label: str, draft_body: str) -> str:
+def render_draft_ready_sms(
+    *, tenant_label: str, draft_body: str, issue_snippet: str | None = None
+) -> str:
     """The draft-ready notice (issue #122 AC 1 / plain-language-rules.md).
     ``draft_body`` is truncated to the first ~200 chars per that doc's own
-    example."""
+    example.
+
+    ``issue_snippet`` (added for the founder-approved copy fix) is a
+    VERBATIM excerpt of the tenant's own most-recent message on this case
+    — never an LLM paraphrase (a paraphrase is a deliberate future
+    enhancement gated on a new prompt version + eval run, plain-language-
+    rules.md). When supplied (and non-blank once collapsed to a single
+    line), the notice reads:
+    ``Stoop: {tenant_label}: "{issue_snippet}". Draft ready: "{excerpt}" ...``.
+    When ``None`` — no tenant message body was available to quote — this
+    falls back GRACEFULLY to the original issue-less form so the notice
+    never breaks: ``Stoop: {tenant_label} — draft ready: "{excerpt}" ...``.
+    The snippet is collapsed to one line (newlines/whitespace runs ->
+    single spaces) and truncated to ~60 chars, same ellipsis convention as
+    the draft excerpt."""
     excerpt = _truncate(draft_body, _DRAFT_EXCERPT_CHARS)
+    snippet = ""
+    if issue_snippet:
+        snippet = _truncate(_collapse_whitespace(issue_snippet), _ISSUE_SNIPPET_CHARS)
+    if snippet:
+        return (
+            f'Stoop: {tenant_label}: "{snippet}". Draft ready: "{excerpt}" '
+            "Reply 1 to send · 2 to skip · or open the app to edit."
+        )
     return (
         f'Stoop: {tenant_label} — draft ready: "{excerpt}" '
         "Reply 1 to send · 2 to skip · or open the app to edit."

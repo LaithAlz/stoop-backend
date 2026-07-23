@@ -254,6 +254,18 @@ webhook's own reply parser (``app.agent.approve_by_sms``) reads back the
 landlord's MOST RECENT such notice to resolve which draft a bare "1"/"2"
 refers to (api-contracts.md).
 
+Founder-approved copy fix — the notice now also quotes the tenant's own
+issue line (a VERBATIM excerpt, never an LLM paraphrase — see
+:data:`_SELECT_DRAFT_READY_CONTEXT_SQL`'s own comment for how
+``tenant_issue_body`` is sourced, and
+``app.agent.landlord_sms.render_draft_ready_sms``'s own docstring for the
+render). Never-break rule #5: that message body now flows into the SMS
+body and the ``notifications.payload`` DB row (fine — it goes to this
+case's own landlord and to storage, never to logs), but it must NEVER
+reach a ``log.*``/Sentry call anywhere in this module, and it does not:
+every ``log.*``/``sentry_sdk`` call site above only ever carries
+uuids/booleans.
+
 DB access
 ---------
 Admin engine, same pattern as every other node in this package.
@@ -330,10 +342,33 @@ _ENQUEUE_PUSH_OUTBOX_SQL = text(
 # rows when there is no pending draft to reference (the rare
 # draft_response race-exhausted path) — no branching needed, same
 # "JOINs collapse to nothing" convention as the push_outbox INSERT.
+#
+# `tenant_issue_body` (founder-approved copy fix) — the "issue" quoted in
+# the notice is the tenant's own most-recent INBOUND message that landed
+# on THIS case, sourced via `message_cases` (the durable link table —
+# `messages.case_id` is NOT it: that column stays NULL for tenant messages
+# forever, since `messages` is append-only and case identity isn't known
+# at insert time; see app/agent/nodes/identify_case.py's own module
+# docstring "`messages` is append-only — case linkage goes through
+# `message_cases`"). A correlated subquery rather than a join against the
+# outer SELECT so a case with MULTIPLE linked messages (the future
+# multi-issue split) still yields exactly one context row here, same as
+# every other column in this query. Returns SQL NULL (-> Python None) when
+# no such message is linked -- render_draft_ready_sms's own `issue_snippet`
+# parameter treats that as "nothing to quote" and falls back to the
+# original issue-less notice, never a broken/blank one.
 _SELECT_DRAFT_READY_CONTEXT_SQL = text(
     """
     SELECT d.id AS draft_id, d.body AS draft_body, c.landlord_id AS landlord_id,
-           t.name AS tenant_name, t.unit AS unit, p.label AS property_label
+           t.name AS tenant_name, t.unit AS unit, p.label AS property_label,
+           (
+             SELECT m.body
+             FROM messages m
+             JOIN message_cases mc ON mc.message_id = m.id
+             WHERE mc.case_id = c.id AND m.party = 'tenant' AND m.direction = 'inbound'
+             ORDER BY m.created_at DESC
+             LIMIT 1
+           ) AS tenant_issue_body
     FROM cases c
     JOIN tenants t ON t.id = c.tenant_id
     JOIN properties p ON p.id = c.property_id
@@ -382,7 +417,9 @@ async def mark_awaiting_approval(state: AgentState) -> dict[str, Any]:
                 property_label=context_row["property_label"],
             )
             draft_ready_body = landlord_sms.render_draft_ready_sms(
-                tenant_label=tenant_label, draft_body=context_row["draft_body"]
+                tenant_label=tenant_label,
+                draft_body=context_row["draft_body"],
+                issue_snippet=context_row["tenant_issue_body"],
             )
             await landlord_sms.enqueue_landlord_sms(
                 session,

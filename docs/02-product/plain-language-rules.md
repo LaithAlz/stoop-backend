@@ -59,9 +59,19 @@ the flow is wrong.
 
 When a draft is ready, the landlord's notification SMS reads:
 
-> Stoop: Maria (Unit 2, Palmerston) reported no heat. Draft ready:
-> "Hi Maria — so sorry…[first 200 chars]…"
+> Stoop: Maria (Unit 2, Palmerston): "the heat isnt working since last
+> night". Draft ready: "Hi Maria — so sorry…[first 200 chars]…"
 > **Reply 1 to send · 2 to skip · or open the app to edit.**
+
+The issue line is a **verbatim excerpt of the tenant's own message**
+(first ~60 chars, collapsed to one line) — not a summary and not
+corrected for typos/grammar (rule #8 applies here too). When no tenant
+message is available to quote, the notice falls back to "Stoop: Maria
+(Unit 2, Palmerston) — draft ready: ..." rather than showing a blank or
+broken issue line. An LLM-summarized issue line (e.g. "reported no heat")
+is a deliberate future enhancement, gated on a new prompt version + a full
+eval run like any other rubric/prompt change — not part of this v1
+mechanism.
 
 - Reply `1` → same path as dashboard approve (5-min window to text
   `UNDO`, since SMS has no undo bar). Reply `2` → rejected, case stays

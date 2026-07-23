@@ -147,6 +147,68 @@ def test_render_draft_ready_sms_short_draft_not_truncated() -> None:
     assert "…" not in body
 
 
+def test_render_draft_ready_sms_no_issue_snippet_falls_back_to_original_form() -> None:
+    """``issue_snippet=None`` (the default) -- no tenant message body was
+    available to quote -- must render EXACTLY the original issue-less
+    notice, never a blank or broken issue line."""
+    body = landlord_sms.render_draft_ready_sms(
+        tenant_label="Maria (Unit 2, Palmerston)", draft_body="Hi Maria, sorry about that."
+    )
+    assert body == (
+        'Stoop: Maria (Unit 2, Palmerston) — draft ready: "Hi Maria, sorry about that." '
+        "Reply 1 to send · 2 to skip · or open the app to edit."
+    )
+
+
+def test_render_draft_ready_sms_quotes_the_tenants_issue_snippet() -> None:
+    """The founder-approved format (issue #122 copy fix): a verbatim
+    snippet of the tenant's own message, quoted ahead of the draft
+    excerpt."""
+    body = landlord_sms.render_draft_ready_sms(
+        tenant_label="Maria (Unit 2, Palmerston)",
+        draft_body="Hi Maria — so sorry to hear that, I'll get someone out…",
+        issue_snippet="the heat isnt working since last night",
+    )
+    assert body == (
+        'Stoop: Maria (Unit 2, Palmerston): "the heat isnt working since last night". '
+        'Draft ready: "Hi Maria — so sorry to hear that, I\'ll get someone out…" '
+        "Reply 1 to send · 2 to skip · or open the app to edit."
+    )
+
+
+def test_render_draft_ready_sms_collapses_whitespace_and_truncates_issue_snippet_to_60_chars() -> (
+    None
+):
+    """A tenant's raw message can carry newlines/runs of internal
+    whitespace (real input, plain-language-rules.md rule #8 -- never
+    corrected) -- the issue line must still read as ONE line, truncated to
+    ~60 chars with the same ellipsis convention as the draft excerpt."""
+    messy_snippet = "the   heat\n\nisnt working  since\tlast night and it is freezing in here too"
+    body = landlord_sms.render_draft_ready_sms(
+        tenant_label="Maria (Unit 2, Palmerston)",
+        draft_body="Hi Maria, sorry about that.",
+        issue_snippet=messy_snippet,
+    )
+    assert "\n" not in body
+    assert "  " not in body
+    assert '"the heat isnt working since last night and it is freezing in…"' in body
+
+
+def test_render_draft_ready_sms_blank_issue_snippet_falls_back_gracefully() -> None:
+    """A snippet that collapses to nothing (e.g. all whitespace) is treated
+    the same as ``None`` -- fall back rather than render an empty quoted
+    issue line."""
+    body = landlord_sms.render_draft_ready_sms(
+        tenant_label="Maria (Unit 2, Palmerston)",
+        draft_body="Hi Maria, sorry about that.",
+        issue_snippet="   \n  ",
+    )
+    assert body == (
+        'Stoop: Maria (Unit 2, Palmerston) — draft ready: "Hi Maria, sorry about that." '
+        "Reply 1 to send · 2 to skip · or open the app to edit."
+    )
+
+
 def test_render_stale_notice_uses_tenants_name() -> None:
     body = landlord_sms.render_stale_notice_sms(tenant_name="Maria")
     assert body == "Stoop: Maria sent a new message — fresh draft coming."

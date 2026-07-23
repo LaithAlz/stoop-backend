@@ -93,11 +93,27 @@ async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
     # (draft_ready/sms) row in the same transaction as the push_outbox
     # enqueue -- that row references `case_id`, so `notifications` must be
     # cleared before `cases` (no ON DELETE CASCADE on that FK).
+    #
+    # Founder-approved copy-fix tests below also seed a tenant `messages`
+    # row linked via `message_cases` (schema-v1.md's own case-linkage
+    # table, never `messages.case_id` -- see
+    # app/agent/nodes/identify_case.py's module docstring) -- both must be
+    # cleared before `cases` too, same FK-ordering convention every other
+    # test module here already follows (e.g.
+    # tests/test_agent_finalize_draft_decision.py's own `_cleanup`).
+    await session.execute(
+        text(
+            "DELETE FROM message_cases WHERE case_id IN "
+            "(SELECT id FROM cases WHERE landlord_id = :lid)"
+        ),
+        {"lid": landlord_id},
+    )
     for table in (
         "push_outbox",
         "push_tokens",
         "notifications",
         "drafts",
+        "messages",
         "cases",
         "tenants",
         "properties",
@@ -151,6 +167,42 @@ async def _outbox_rows(session: AsyncSession, landlord_id: str) -> list[dict[str
     # device_token_id comes back as a real uuid.UUID from asyncpg -- stringify
     # so callers can compare directly against the str ids factories.* return.
     return [{**dict(row), "device_token_id": str(row["device_token_id"])} for row in rows]
+
+
+async def _case_tenant_and_property(session: AsyncSession, case_id: str) -> tuple[str, str]:
+    """The founder-approved copy-fix tests below need to seed a tenant
+    `messages` row linked to this case via `message_cases` -- fetched here
+    rather than widening `_seed_open_case_with_pending_draft`'s own return
+    shape, which every OTHER test in this module already unpacks as a
+    3-tuple."""
+    row = (
+        (
+            await session.execute(
+                text("SELECT tenant_id, property_id FROM cases WHERE id = :id"), {"id": case_id}
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return str(row["tenant_id"]), str(row["property_id"])
+
+
+async def _draft_ready_sms_body(session: AsyncSession, landlord_id: str) -> str:
+    row = (
+        (
+            await session.execute(
+                text(
+                    "SELECT payload ->> 'body' AS body FROM notifications "
+                    "WHERE landlord_id = :lid AND type = 'draft_ready' AND channel = 'sms' "
+                    "AND payload ->> 'kind' = 'ready'"
+                ),
+                {"lid": landlord_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return str(row["body"])
 
 
 # ---------------------------------------------------------------------------
@@ -316,3 +368,76 @@ async def test_missing_case_id_skips_enqueue_entirely() -> None:
     }
     result = await mark_awaiting_approval(state)
     assert result == {"reasoning_log": ["existing line"]}
+
+
+# ---------------------------------------------------------------------------
+# 7. The draft-ready SMS's own tenant-issue-snippet sourcing (founder-
+#    approved copy fix): _SELECT_DRAFT_READY_CONTEXT_SQL's new
+#    `tenant_issue_body` column, threaded through to
+#    `render_draft_ready_sms`'s `issue_snippet` parameter.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_draft_ready_sms_quotes_the_tenants_most_recent_linked_message(
+    db_session: AsyncSession,
+) -> None:
+    landlord_id, case_id, _draft_id = await _seed_open_case_with_pending_draft(db_session)
+    try:
+        tenant_id, property_id = await _case_tenant_and_property(db_session, case_id)
+
+        # An older message on the same case -- must NOT be the one quoted;
+        # only the MOST RECENT inbound tenant message wins.
+        older_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="hey are you there",
+        )
+        await factories.insert_message_case(
+            db_session, message_id=older_message_id, case_id=case_id
+        )
+
+        newest_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="the heat isnt working since last night",
+        )
+        await factories.insert_message_case(
+            db_session, message_id=newest_message_id, case_id=case_id
+        )
+
+        await mark_awaiting_approval(_state_for(case_id))
+
+        body = await _draft_ready_sms_body(db_session, landlord_id)
+        assert '"the heat isnt working since last night"' in body
+        assert "hey are you there" not in body
+        assert "Draft ready:" in body
+        assert "Reply 1 to send · 2 to skip · or open the app to edit." in body
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_draft_ready_sms_falls_back_when_no_tenant_message_is_linked(
+    db_session: AsyncSession,
+) -> None:
+    """No `message_cases` row for this case at all (e.g. the case was
+    seeded directly, as every other test in this module does) -- the
+    notice must fall back to the original issue-less form, never a blank
+    or broken issue line."""
+    landlord_id, case_id, _draft_id = await _seed_open_case_with_pending_draft(db_session)
+    try:
+        await mark_awaiting_approval(_state_for(case_id))
+
+        body = await _draft_ready_sms_body(db_session, landlord_id)
+        # The original issue-less form (lowercase "draft ready") -- NOT the
+        # issue-snippet form (capitalized "Draft ready:", used only when a
+        # tenant_issue_body was found).
+        assert " — draft ready: " in body
+        assert "Draft ready:" not in body
+    finally:
+        await _cleanup(db_session, landlord_id)
