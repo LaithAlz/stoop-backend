@@ -811,6 +811,67 @@
 >    and still consumed a real slot) — same collision class as v1.11's own
 >    precedent above ("renumbered from v1.10 — PR #202 took that label
 >    first"), just resolved at rebase time instead of at merge time.
+>
+> **v1.16 amendment (2026-07-23)** — migration 0014 implements this (#122,
+> approve-by-SMS). **Numbering note, resolved:** this amendment originally
+> claimed `v1.15`/migration `0013`, but sibling lane #203 item 2 (directly
+> above) claimed that same slot first and merged as PR #227 — so this
+> amendment is renumbered to `v1.16`/migration `0014` here, resolved at
+> rebase time (same collision class as v1.11's own "renumbered from v1.10"
+> and v1.14's own "resolved at rebase time instead of merge time"
+> precedents above).
+> 1. **New nullable column `drafts.approved_via text CHECK (approved_via
+>    IN ('dashboard', 'sms'))`.** `NULL` for a draft that is not yet
+>    approved, or was auto-sent (trust ladder, #60 — a distinct mechanism
+>    from either of these two human-approval channels; `apply_auto_send`
+>    is NOT changed by this amendment and never sets this column). Set to
+>    `'dashboard'` by `POST /v1/drafts/{id}/approve`/`edit-and-send` (the
+>    pre-existing behavior, now labeled — no behavior change for that
+>    endpoint) and to `'sms'` by the approve-by-SMS reply handler (#122).
+>    The only readers are `app/agent/draft_sender.py`'s claim guard and
+>    `app/agent/nodes/draft_response.py`'s supersession fix (point 2 below)
+>    — not surfaced on any read endpoint in this amendment.
+> 2. **The SMS approve/send race — the open design point `conversation-
+>    model.md` tracked on #122, decided here:** approve-by-SMS's 5-minute
+>    undo window (vs. the dashboard's 5s) widens the approve-to-send gap
+>    ~60x, during which a genuinely new tenant message could arrive that
+>    the landlord never saw before approving. Decided: **the sender
+>    re-checks for a newer TENANT inbound message at claim time, for
+>    `approved_via = 'sms'` drafts only** — never for a dashboard approval,
+>    whose 5s window and "a landlord's approval is a human decision this
+>    codebase never reverses" precedent (`app/agent/draft_sender.py`'s own
+>    docstring) are entirely unchanged by this amendment.
+>    `app/agent/draft_sender.py`'s claim guard refuses (and cancels —
+>    `send_cancelled`/`superseded_by_newer_message`, the SAME audit
+>    vocabulary the existing `auto_send` guard already uses) an
+>    `approved_via = 'sms'` draft the instant a `party = 'tenant'` inbound
+>    message has landed on its case since the row's own `updated_at` (the
+>    approval instant — nothing else touches an `approved` row's
+>    `updated_at` before the claim itself touches it). `app/agent/nodes/
+>    draft_response.py` carries the matching PRIMARY-fix half, mirroring
+>    the belt-and-braces shape `#60` already established for
+>    `auto_send = true` drafts (see that module's own docstring for the
+>    two-layer rationale) — extended here to `approved_via = 'sms'` drafts
+>    too. A `party = 'tenant'` filter (not a bare `direction = 'inbound'`
+>    check) is required in BOTH places so the landlord's OWN reply/undo
+>    messages (also `direction = 'inbound'`, `party = 'landlord'`) can
+>    never trigger a false supersession of their own approval.
+> 3. **New CHECK constraint on `messages`**, closing a gap flagged during
+>    #122's implementation (PR #154 senior review, pinned forward on issue
+>    #122): the documented invariant "landlord command-channel rows carry
+>    `tenant_id`/`vendor_id` NULL" (v1.1 amendment above) had no DB-level
+>    enforcement and no test.
+>    ```sql
+>    ALTER TABLE messages ADD CONSTRAINT messages_landlord_party_null_check
+>      CHECK (party <> 'landlord' OR (tenant_id IS NULL AND vendor_id IS NULL));
+>    ```
+> 4. **No new `notifications.type` value needed** — `'draft_ready'` (the
+>    draft-ready SMS + every approve-by-SMS reply confirmation: ready /
+>    approved / rejected / stale / undo, distinguished by
+>    `payload->>'kind'`) and `channel = 'sms'` were already legal per the
+>    ORIGINAL `notifications` CHECK constraint (migration 0002) — #122 is
+>    simply the first writer of this combination. No migration needed for
+>    this part.
 
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
@@ -958,9 +1019,15 @@ CREATE TABLE messages (
                                                      --  Landlord rows carry tenant_id/vendor_id
                                                      --  NULL (structural exclusion from channel
                                                      --  queries — the channel index is on
-                                                     --  tenant_id), property_id = the property
+                                                     --  tenant_id; DB-enforced by the CHECK
+                                                     --  constraint below, v1.16/migration 0014),
+                                                     --  property_id = the property
                                                      --  whose number received the reply,
                                                      --  case_id = the referenced draft's case
+                                                     --  (set at INSERT time when the reply's
+                                                     --  token correlates to one; NULL otherwise
+                                                     --  — messages is append-only, so this can
+                                                     --  never be backfilled later)
   body            text NOT NULL,
   media           jsonb,                             -- [{url, content_type}] (#46)
   twilio_sid      text UNIQUE,                       -- idempotency key for webhooks
@@ -986,7 +1053,11 @@ CREATE TABLE messages (
                                                      --  `classification` above
   sms_cost_cents  numeric(10,4),                     -- DEPRECATED v1.12: never written; the
                                                      --  audit_log 'sent' payload is canonical
-  created_at      timestamptz NOT NULL DEFAULT now()
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  CHECK (party <> 'landlord' OR (tenant_id IS NULL AND vendor_id IS NULL))
+                                                     -- v1.16 (migration 0014, #122): DB-level
+                                                     --  enforcement of the landlord-row-NULL
+                                                     --  invariant documented on `party` above.
 );
 CREATE INDEX idx_messages_case    ON messages (case_id, created_at);
 CREATE INDEX idx_messages_channel ON messages (tenant_id, created_at);
@@ -1035,6 +1106,12 @@ CREATE TABLE drafts (
   auto_send         boolean NOT NULL DEFAULT false,  -- true only via trust ladder (#60)
   scheduled_send_at timestamptz,                     -- approve + 5s undo window
                                                      --  (#44; SMS approvals +5min, #122)
+  approved_via      text CHECK (approved_via IN ('dashboard','sms')),
+                                                     -- v1.16 (migration 0014, #122): NULL until
+                                                     --  approved, or for an auto-sent
+                                                     --  (auto_send=true) row, which never sets
+                                                     --  this column. Read only by the sender's
+                                                     --  SMS-window supersession guard.
   sent_message_id   uuid REFERENCES messages(id),
   edited            boolean NOT NULL DEFAULT false,
   final_body        text,                            -- body actually sent if edited

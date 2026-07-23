@@ -62,6 +62,47 @@ that refused draft (:data:`_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL`) and
 records a ``send_cancelled`` audit row, so it never sits stuck
 ``'approved'`` re-appearing as a "due" candidate forever.
 
+The SMS approve/send race (#122, schema-v1.md v1.16 amendment 2) — the
+SAME belt-and-braces layer, extended to SMS-approved drafts
+------------------------------------------------------------------------
+Approve-by-SMS's undo window is 5 MINUTES, not the dashboard's 5 seconds
+(api-contracts.md) — ~60x wider, long enough for a genuinely new tenant
+message to land on the case between the SMS approval and the sender's
+claim. `app/agent/nodes/draft_response.py`'s own stale-then-insert logic
+carries the PRIMARY fix for this too (:func:`_cancel_superseded_sms_
+approved_drafts`, the exact mirror of its own auto_send fix). This module
+carries the SECOND, independent layer, mirroring the shape above exactly:
+:data:`_CLAIM_DRAFT_SQL` refuses to claim an ``approved_via = 'sms'``
+draft if a newer TENANT inbound message (``party = 'tenant'`` — NOT a bare
+``direction = 'inbound'`` check; see below) has landed on its case since
+the row's own ``updated_at`` — the moment ``apply_approve_or_edit``
+approved it (nothing else touches an ``'approved'`` row's ``updated_at``
+before this claim statement itself does, so reading it inside the SAME
+UPDATE's WHERE clause is safe, identical to the auto_send guard's own use
+of ``drafts.created_at`` above). :func:`_claim_draft` then cancels that
+refused draft (:data:`_CANCEL_SUPERSEDED_SMS_APPROVED_DRAFT_SQL`) and
+records the SAME ``send_cancelled``/``superseded_by_newer_message`` audit
+row the auto_send path already uses.
+
+A DASHBOARD approval (``approved_via = 'dashboard'`` or ``NULL`` —
+pre-#122 rows) is NEVER subject to this guard — its 5s window and "a
+landlord's approval is a human decision this codebase never reverses"
+precedent (this module's own long-standing design) are completely
+unchanged by this amendment; only ``approved_via = 'sms'`` rows are ever
+in scope for either predicate below.
+
+``party = 'tenant'``, not a bare ``direction = 'inbound'`` check (safety
+review pin, forward risk recorded on #40, closed here): the landlord's
+OWN reply (the "1"/"UNDO" message that produced this exact approval) and
+any later "UNDO" reply are ALSO ``direction = 'inbound'`` —
+(``party = 'landlord'``). Without the ``party`` filter, either would
+trivially "supersede" the very approval it just created (the landlord's
+own reply is necessarily newer than — or, for the triggering reply,
+essentially concurrent with — the draft's pre-approval state), which
+would wrongly cancel every single SMS approval the instant it happened.
+Only a genuinely new TENANT message is evidence the world changed since
+approval.
+
 The undo window is data, not a sleep (schema-v1.md's own phrase) — this
 module never sleeps waiting for a specific draft; it only ever asks
 "which approved rows are due right now" and claims exactly those.
@@ -242,7 +283,7 @@ from uuid import UUID
 
 import sentry_sdk
 import structlog
-from sqlalchemy import text
+from sqlalchemy import TextClause, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -336,10 +377,35 @@ _NEWER_INBOUND_EXISTS_SQL = (
     ")"
 )
 
+# #122 (schema-v1.md v1.16 amendment 2) — the SMS-approval-window
+# counterpart to _NEWER_INBOUND_EXISTS_SQL above. TWO deliberate
+# differences from that query (see module docstring "party = 'tenant',
+# not a bare direction = 'inbound' check"):
+#   1. `m.party = 'tenant'` -- the landlord's OWN reply/undo messages are
+#      also `direction = 'inbound'` and must never count as "the world
+#      changed" evidence against their own approval.
+#   2. Compared against `drafts.updated_at` (the approval instant), not
+#      `drafts.created_at` (when the draft was first WRITTEN, which can
+#      predate approval by any amount) -- the race this guards against is
+#      specifically "arrived AFTER approval", not "arrived after drafting".
+_NEWER_TENANT_INBOUND_SINCE_APPROVAL_EXISTS_SQL = (
+    "EXISTS ("
+    "  SELECT 1 FROM messages m "
+    "  WHERE m.direction = 'inbound' AND m.party = 'tenant' "
+    "    AND m.created_at > drafts.updated_at "
+    "    AND (m.case_id = drafts.case_id OR EXISTS ("
+    "      SELECT 1 FROM message_cases mc "
+    "      WHERE mc.message_id = m.id AND mc.case_id = drafts.case_id"
+    "    ))"
+    ")"
+)
+
 _CLAIM_DRAFT_SQL = text(
     "UPDATE drafts SET status = 'sending', updated_at = now() "  # noqa: S608 -- static const interpolated below, no user input
     "WHERE id = :draft_id AND status = 'approved' AND scheduled_send_at <= now() "
     f"AND (auto_send = false OR NOT {_NEWER_INBOUND_EXISTS_SQL}) "
+    f"AND (approved_via IS DISTINCT FROM 'sms' "
+    f"OR NOT {_NEWER_TENANT_INBOUND_SINCE_APPROVAL_EXISTS_SQL}) "
     f"AND NOT {_CASE_RESOLVED_EXISTS_SQL} "
     "RETURNING id, case_id, recipient, body, final_body, edited, landlord_id"
 )
@@ -353,6 +419,16 @@ _CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL = text(
     "UPDATE drafts SET status = 'cancelled', updated_at = now() "  # noqa: S608 -- static const interpolated below, no user input
     "WHERE id = :draft_id AND status = 'approved' AND auto_send = true "
     f"AND {_NEWER_INBOUND_EXISTS_SQL} "
+    "RETURNING id, case_id, landlord_id"
+)
+
+# #122 companion write for the SMS-approval guard above — mirrors
+# _CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL exactly, scoped to
+# `approved_via = 'sms'` instead of `auto_send = true`.
+_CANCEL_SUPERSEDED_SMS_APPROVED_DRAFT_SQL = text(
+    "UPDATE drafts SET status = 'cancelled', updated_at = now() "  # noqa: S608 -- static const interpolated below, no user input
+    "WHERE id = :draft_id AND status = 'approved' AND approved_via = 'sms' "
+    f"AND {_NEWER_TENANT_INBOUND_SINCE_APPROVAL_EXISTS_SQL} "
     "RETURNING id, case_id, landlord_id"
 )
 
@@ -455,18 +531,49 @@ def _default_time_source() -> float:
     return asyncio.get_running_loop().time()
 
 
+async def _cancel_and_audit_superseded(
+    session: AsyncSession, *, sql: TextClause, draft_id: UUID, log_event: str
+) -> bool:
+    """Shared cancel-then-audit shape for BOTH the auto_send and SMS-approval
+    supersession guards below (#122) — a single UPDATE...RETURNING (*sql*),
+    followed by the SAME ``send_cancelled``/``superseded_by_newer_message``
+    audit row either guard already wrote inline before this helper existed.
+    Returns ``True`` iff *sql* actually cancelled a row (never on a lost
+    race — see each guard's own docstring)."""
+    cancelled_row = (
+        (await session.execute(sql, {"draft_id": str(draft_id)})).mappings().one_or_none()
+    )
+    if cancelled_row is None:
+        return False
+    await session.execute(
+        _INSERT_AUTO_SEND_SUPERSEDED_AUDIT_SQL,
+        {
+            "landlord_id": str(cancelled_row["landlord_id"]),
+            "case_id": str(cancelled_row["case_id"]),
+            "payload": json.dumps(
+                {"draft_id": str(draft_id), "reason": "superseded_by_newer_message"}
+            ),
+        },
+    )
+    log.info(log_event, draft_id=str(draft_id), case_id=str(cancelled_row["case_id"]))
+    return True
+
+
 async def _claim_draft(session: AsyncSession, draft_id: UUID) -> dict[str, Any] | None:
     """Claim *draft_id* for sending, or ``None`` if it can't be claimed
-    right now — FOUR distinct reasons collapse into that same ``None``:
+    right now — FIVE distinct reasons collapse into that same ``None``:
     lost the claim race (another tick/process already claimed it), not
     actually due yet, a superseded ``auto_send=true`` draft the claim's own
-    guard refused (#60 safety review MEDIUM-1), or (#206) its case has
+    guard refused (#60 safety review MEDIUM-1), a superseded
+    ``approved_via='sms'`` draft the claim's own guard refused (#122 — see
+    module docstring "The SMS approve/send race"), or (#206) its case has
     since become ``resolved`` (see module docstring "Resolved-case guard
-    belt-and-braces (#206)"). Only the THIRD case does anything further
-    here: :data:`_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL` cancels it (never
-    a landlord-approved row — see that query's own docstring) and records
-    a ``send_cancelled`` audit row, so it never sits stuck ``'approved'``
-    reappearing as "due" forever. The FOURTH case (resolved-case refusal)
+    belt-and-braces (#206)"). The THIRD and FOURTH cases do something
+    further here: :data:`_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL` /
+    :data:`_CANCEL_SUPERSEDED_SMS_APPROVED_DRAFT_SQL` cancel the row (never
+    a dashboard-approved row — see each query's own docstring) and record a
+    ``send_cancelled`` audit row, so it never sits stuck ``'approved'``
+    reappearing as "due" forever. The FIFTH case (resolved-case refusal)
     is NOT actively cancelled here on purpose — the primary fix
     (``app/routers/cases.py``'s resolve endpoint) already cancels the
     common case immediately; this guard is a pure safety net, so a draft
@@ -484,27 +591,20 @@ async def _claim_draft(session: AsyncSession, draft_id: UUID) -> dict[str, Any] 
     if row is not None:
         return dict(row)
 
-    cancelled_row = (
-        (await session.execute(_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL, {"draft_id": str(draft_id)}))
-        .mappings()
-        .one_or_none()
+    if await _cancel_and_audit_superseded(
+        session,
+        sql=_CANCEL_SUPERSEDED_AUTO_SEND_DRAFT_SQL,
+        draft_id=draft_id,
+        log_event="draft_sender_auto_send_cancelled_superseded",
+    ):
+        return None
+
+    await _cancel_and_audit_superseded(
+        session,
+        sql=_CANCEL_SUPERSEDED_SMS_APPROVED_DRAFT_SQL,
+        draft_id=draft_id,
+        log_event="draft_sender_sms_approved_cancelled_superseded",
     )
-    if cancelled_row is not None:
-        await session.execute(
-            _INSERT_AUTO_SEND_SUPERSEDED_AUDIT_SQL,
-            {
-                "landlord_id": str(cancelled_row["landlord_id"]),
-                "case_id": str(cancelled_row["case_id"]),
-                "payload": json.dumps(
-                    {"draft_id": str(draft_id), "reason": "superseded_by_newer_message"}
-                ),
-            },
-        )
-        log.info(
-            "draft_sender_auto_send_cancelled_superseded",
-            draft_id=str(draft_id),
-            case_id=str(cancelled_row["case_id"]),
-        )
     return None
 
 

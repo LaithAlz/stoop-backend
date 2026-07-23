@@ -88,6 +88,18 @@ async def dispose_app_engine() -> AsyncGenerator[None, None]:
 
 
 async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
+    # #122's own new tests link a message via message_cases (matching how a
+    # tenant message ACTUALLY gets linked in production, per app/agent/nodes/
+    # identify_case.py) -- must clear that join row before cases/messages can
+    # be deleted. No pre-#122 test in this file ever created one, so this is
+    # a strict, safe widening.
+    await session.execute(
+        text(
+            "DELETE FROM message_cases WHERE case_id IN "
+            "(SELECT id FROM cases WHERE landlord_id = :lid)"
+        ),
+        {"lid": landlord_id},
+    )
     await session.execute(
         text("DELETE FROM audit_log WHERE landlord_id = :lid"), {"lid": landlord_id}
     )
@@ -1400,3 +1412,190 @@ def test_sms_sender_protocol_is_a_runtime_checkable_shape() -> None:
 
     sender: SmsSender = _Impl()
     assert hasattr(sender, "send_sms")
+
+
+# ---------------------------------------------------------------------------
+# #122 — the SMS approve/send race: the sender's OWN claim-guard layer
+# (belt-and-braces, mirrors test_agent_auto_send.py's own
+# test_sender_cancels_auto_send_draft_when_newer_inbound_exists exactly,
+# scoped to approved_via='sms' instead of auto_send=true).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_sender_cancels_sms_approved_draft_when_newer_tenant_inbound_exists(
+    db_session: AsyncSession,
+) -> None:
+    """A tenant message landing on an SMS-approved draft's case AFTER the
+    approval instant (drafts.updated_at) must refuse the claim and cancel
+    the draft instead of sending it — the sender's OWN independent layer
+    of the design decided on #122 (schema-v1.md v1.16 amendment 2). A
+    dashboard-approved draft (approved_via='dashboard') in the identical
+    situation is UNTOUCHED (the pre-existing asymmetry is unchanged)."""
+    landlord_id, sms_case_id, sms_draft_id = await _seed_approved_draft(db_session)
+    await db_session.execute(
+        text("UPDATE drafts SET approved_via = 'sms' WHERE id = :id"), {"id": sms_draft_id}
+    )
+    await db_session.commit()
+
+    # A dashboard-approved draft on a DIFFERENT case, same shape otherwise
+    # -- must be sent normally, never cancelled by this guard.
+    tenant_id_row = (
+        await db_session.execute(
+            text("SELECT tenant_id FROM cases WHERE id = :id"), {"id": sms_case_id}
+        )
+    ).one()
+    tenant_id = str(tenant_id_row[0])
+    property_id_row = (
+        await db_session.execute(
+            text("SELECT property_id FROM cases WHERE id = :id"), {"id": sms_case_id}
+        )
+    ).one()
+    property_id = str(property_id_row[0])
+    dashboard_case_id = await factories.insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="awaiting_approval",
+        severity="urgent",
+    )
+    dashboard_draft_id = await factories.insert_draft(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=dashboard_case_id,
+        status="approved",
+        scheduled_send_at=datetime.now(UTC) - timedelta(seconds=1),
+        approved_via="dashboard",
+    )
+
+    try:
+        # A newer TENANT inbound message lands on the SMS-approved draft's
+        # OWN case (linked via message_cases -- the real production shape
+        # for a continuing tenant conversation, per app/agent/nodes/
+        # identify_case.py).
+        newer_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="one more thing",
+        )
+        await factories.insert_message_case(
+            db_session, message_id=newer_message_id, case_id=sms_case_id
+        )
+        # Same-shaped newer inbound on the dashboard-approved draft's case
+        # too, to prove that one is sent regardless.
+        newer_message_id_2 = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=tenant_id,
+            body="one more thing on the other case",
+        )
+        await factories.insert_message_case(
+            db_session, message_id=newer_message_id_2, case_id=dashboard_case_id
+        )
+
+        tenant_phone = await _tenant_phone(db_session, tenant_id)
+        sender = _FakeSmsSender()
+        claimed = await sender_tick(sender=sender)
+        assert claimed >= 1  # only the dashboard-approved draft, at minimum
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
+
+        sms_draft_after = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE id = :id"), {"id": sms_draft_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert sms_draft_after["status"] == "cancelled"
+
+        cancel_audit = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT actor, payload FROM audit_log "
+                        "WHERE case_id = :cid AND action = 'send_cancelled'"
+                    ),
+                    {"cid": sms_case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert cancel_audit["payload"]["reason"] == "superseded_by_newer_message"
+
+        dashboard_draft_after = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE id = :id"), {"id": dashboard_draft_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert dashboard_draft_after["status"] == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sender_ignores_landlords_own_reply_when_checking_sms_supersession(
+    db_session: AsyncSession,
+) -> None:
+    """A landlord's own inbound reply (party='landlord') must NEVER count
+    as "the world changed" evidence against its own approval — otherwise
+    every single SMS approval would immediately cancel itself the instant
+    it happened (safety review pin, forward risk recorded on #40)."""
+    landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
+    await db_session.execute(
+        text("UPDATE drafts SET approved_via = 'sms' WHERE id = :id"), {"id": draft_id}
+    )
+    await db_session.commit()
+
+    property_id_row = (
+        await db_session.execute(
+            text("SELECT property_id FROM cases WHERE id = :id"), {"id": case_id}
+        )
+    ).one()
+    property_id = str(property_id_row[0])
+
+    try:
+        # The landlord's own reply, linked to the SAME case directly via
+        # messages.case_id (the shape app/routers/webhooks/twilio.py's
+        # approve-by-SMS handler actually writes) -- newer than the
+        # draft's approval instant, but party='landlord'.
+        await db_session.execute(
+            text(
+                "INSERT INTO messages (landlord_id, property_id, tenant_id, case_id, "
+                "direction, party, body) "
+                "VALUES (:landlord_id, :property_id, NULL, :case_id, 'inbound', 'landlord', '1')"
+            ),
+            {"landlord_id": landlord_id, "property_id": property_id, "case_id": case_id},
+        )
+        await db_session.commit()
+
+        tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
+        sender = _FakeSmsSender()
+        claimed = await sender_tick(sender=sender)
+        assert claimed >= 1
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_calls) == 1
+
+        draft_after = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert draft_after["status"] == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)

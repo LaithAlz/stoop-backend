@@ -249,6 +249,7 @@ _SELECT_MESSAGES_SQL = text(
     SELECT m.direction, m.party, m.body, m.media, m.created_at
     FROM messages m
     WHERE m.landlord_id = :landlord_id
+      AND m.party != 'landlord'
       AND (
         m.case_id = :case_id
         OR EXISTS (
@@ -259,6 +260,17 @@ _SELECT_MESSAGES_SQL = text(
     ORDER BY m.created_at ASC
     """
 )
+# `m.party != 'landlord'` (#122 fix): approve-by-SMS's reply handler is the
+# first writer to ever set `messages.case_id` on a landlord-party row (the
+# referenced draft's case, schema-v1.md's own comment on `messages.party`) —
+# before #122, `m.case_id = :case_id` could never match a landlord row at
+# all (case_id was always NULL for one), so this predicate was never
+# reachable in practice. conversation-model.md's own channel-vs-case design
+# ("landlord command-channel replies... live on the landlord's own
+# notification thread, not a tenant channel, and are excluded from ALL
+# tenant-facing channel reads, including the dispute export") requires this
+# exclusion explicitly — a landlord's own "1"/"2"/"UNDO" texts are a
+# meta-command, never part of the tenant conversation this timeline shows.
 
 # `audit_log.case_id = :case_id` covers every action written WITH a case
 # already known (classified/drafted/draft_stale/degraded_mode/case_

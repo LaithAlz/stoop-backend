@@ -2460,3 +2460,165 @@ async def test_draft_response_returns_gracefully_when_insert_race_exhausted(
         assert count == 0
     finally:
         await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #122 — the SMS approve/send race: draft_response's own PRIMARY fix
+# (mirrors #60's auto_send supersession fix exactly, scoped to
+# approved_via='sms' instead of auto_send=true).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_cancel_superseded_sms_approved_drafts_cancels_only_sms_approved(
+    db_session: AsyncSession,
+) -> None:
+    """Direct unit-level test of ``node_mod._cancel_superseded_sms_approved_
+    drafts`` (same house convention as ``node_mod._check_hard_guards``/
+    ``_strip_mandated_templates`` above — a private helper tested directly
+    via module import). A still-``'approved'``, ``approved_via='sms'``
+    draft on the case is cancelled with a ``send_cancelled`` audit row; a
+    ``'dashboard'``-approved draft on a DIFFERENT case is left completely
+    untouched."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    sms_case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    dashboard_case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+
+    sms_draft_row = (
+        (
+            await db_session.execute(
+                text(
+                    "INSERT INTO drafts (landlord_id, case_id, recipient, body, prompt_version, "
+                    "status, approved_via) "
+                    "VALUES (:landlord_id, :case_id, 'tenant', 'old sms-approved draft', 'v1', "
+                    "'approved', 'sms') RETURNING id"
+                ),
+                {"landlord_id": landlord_id, "case_id": sms_case_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    sms_draft_id = str(sms_draft_row["id"])
+
+    dashboard_draft_row = (
+        (
+            await db_session.execute(
+                text(
+                    "INSERT INTO drafts (landlord_id, case_id, recipient, body, prompt_version, "
+                    "status, approved_via) "
+                    "VALUES (:landlord_id, :case_id, 'tenant', 'old dashboard-approved draft', "
+                    "'v1', 'approved', 'dashboard') RETURNING id"
+                ),
+                {"landlord_id": landlord_id, "case_id": dashboard_case_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    dashboard_draft_id = str(dashboard_draft_row["id"])
+    await db_session.commit()
+
+    try:
+        reasoning_log: list[str] = []
+        await node_mod._cancel_superseded_sms_approved_drafts(  # noqa: SLF001
+            db_session,
+            landlord_id=uuid.UUID(landlord_id),
+            case_id=uuid.UUID(sms_case_id),
+            reasoning_log=reasoning_log,
+        )
+        await db_session.commit()
+
+        sms_status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": sms_draft_id}
+            )
+        ).scalar_one()
+        assert sms_status == "cancelled"
+        assert reasoning_log  # a landlord-facing line was appended
+
+        cancel_audit = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT actor, payload FROM audit_log "
+                        "WHERE case_id = :cid AND action = 'send_cancelled'"
+                    ),
+                    {"cid": sms_case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert cancel_audit["actor"] == "agent"
+        assert cancel_audit["payload"]["reason"] == "superseded_by_newer_message"
+
+        # A DIFFERENT case's dashboard-approved draft is untouched -- the
+        # function above was only ever called for sms_case_id.
+        dashboard_status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": dashboard_draft_id}
+            )
+        ).scalar_one()
+        assert dashboard_status == "approved"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_cancel_superseded_sms_approved_drafts_never_touches_dashboard_approved(
+    db_session: AsyncSession,
+) -> None:
+    """Even called against the SAME case a dashboard-approved (not SMS
+    -approved) draft lives on, the helper must never touch it -- its own
+    predicate only ever matches ``approved_via = 'sms'`` rows (mirrors
+    #60's own auto_send-only guarantee for the analogous function)."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    draft_row = (
+        (
+            await db_session.execute(
+                text(
+                    "INSERT INTO drafts (landlord_id, case_id, recipient, body, prompt_version, "
+                    "status, approved_via) "
+                    "VALUES (:landlord_id, :case_id, 'tenant', 'old dashboard-approved draft', "
+                    "'v1', 'approved', 'dashboard') RETURNING id"
+                ),
+                {"landlord_id": landlord_id, "case_id": case_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    draft_id = str(draft_row["id"])
+    await db_session.commit()
+
+    try:
+        reasoning_log: list[str] = []
+        await node_mod._cancel_superseded_sms_approved_drafts(  # noqa: SLF001
+            db_session,
+            landlord_id=uuid.UUID(landlord_id),
+            case_id=uuid.UUID(case_id),
+            reasoning_log=reasoning_log,
+        )
+        await db_session.commit()
+
+        status = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+        assert status == "approved"
+        assert reasoning_log == []
+    finally:
+        await _cleanup(db_session, landlord_id)

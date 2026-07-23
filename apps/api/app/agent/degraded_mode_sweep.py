@@ -349,9 +349,24 @@ _INCREMENT_EXCEPTION_COUNT_SQL = text(
 _SELECT_CASE_STATUS_SQL = text("SELECT status FROM cases WHERE id = :case_id")
 
 # Condition B of the re-animation guard: is M1 (candidate.message_id)
-# still the case's most recent INBOUND message? Derived entirely from
-# existing data (message_cases + messages.created_at) -- no new column,
-# no need to separately track M1's own created_at anywhere.
+# still the case's most recent TENANT-authored INBOUND message? Derived
+# entirely from existing data (message_cases + messages.created_at) -- no
+# new column, no need to separately track M1's own created_at anywhere.
+#
+# `AND m.party = 'tenant'` (safety review pin, #122 approve-by-SMS PR --
+# forward risk recorded from the #40 safety review): approve-by-SMS
+# landlord replies also arrive `direction = 'inbound'` (`party =
+# 'landlord'`). Without this filter, a landlord's own reply to a DIFFERENT,
+# unrelated draft-ready notification could -- if it were ever linked into
+# `message_cases` for THIS case -- read as "a newer inbound message
+# exists" and wrongly supersede a still-unclassified TENANT message this
+# sweep is retrying, which fails safe (tenant was already acked, case
+# stays visible) but neither reclassifies nor escalates when it should
+# have. Approve-by-SMS's own reply handler does not in fact link its
+# messages into `message_cases` (it sets `messages.case_id` directly at
+# insert time instead), so this is belt-and-braces against a future
+# change, not a currently-reproduced bug -- cheap enough to fix outright
+# rather than merely document.
 _SELECT_NEWER_INBOUND_EXISTS_SQL = text(
     """
     SELECT EXISTS (
@@ -359,6 +374,7 @@ _SELECT_NEWER_INBOUND_EXISTS_SQL = text(
       JOIN messages m ON m.id = mc.message_id
       WHERE mc.case_id = :case_id
         AND m.direction = 'inbound'
+        AND m.party = 'tenant'
         AND m.id != :message_id
         AND m.created_at > (SELECT created_at FROM messages WHERE id = :message_id)
     ) AS newer_inbound_exists

@@ -89,7 +89,19 @@ async def dispose_app_engine() -> AsyncGenerator[None, None]:
 
 async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
     await session.rollback()
-    for table in ("push_outbox", "push_tokens", "drafts", "cases", "tenants", "properties"):
+    # #122: mark_awaiting_approval now ALSO enqueues a `notifications`
+    # (draft_ready/sms) row in the same transaction as the push_outbox
+    # enqueue -- that row references `case_id`, so `notifications` must be
+    # cleared before `cases` (no ON DELETE CASCADE on that FK).
+    for table in (
+        "push_outbox",
+        "push_tokens",
+        "notifications",
+        "drafts",
+        "cases",
+        "tenants",
+        "properties",
+    ):
         await session.execute(
             text(f"DELETE FROM {table} WHERE landlord_id = :lid"),  # noqa: S608
             {"lid": landlord_id},

@@ -342,17 +342,21 @@ async def insert_draft(
     edited: bool = False,
     final_body: str | None = None,
     auto_send: bool = False,
+    approved_via: str | None = None,
 ) -> str:
     """``auto_send`` added for #60's trust-ladder tests (default ``False``,
     matching the schema's own default and every existing caller's prior
-    behavior unchanged)."""
+    behavior unchanged). ``approved_via`` added for #122 (approve-by-SMS —
+    schema-v1.md v1.16/migration 0014); default ``None`` matches the
+    column's own default and every existing caller's prior behavior
+    unchanged."""
     draft_id = str(uuid.uuid4())
     await session.execute(
         text(
             "INSERT INTO drafts (id, landlord_id, case_id, recipient, body, prompt_version, "
-            "status, scheduled_send_at, edited, final_body, auto_send) "
+            "status, scheduled_send_at, edited, final_body, auto_send, approved_via) "
             "VALUES (:id, :landlord_id, :case_id, :recipient, :body, 'v1', :status, "
-            ":scheduled_send_at, :edited, :final_body, :auto_send)"
+            ":scheduled_send_at, :edited, :final_body, :auto_send, :approved_via)"
         ),
         {
             "id": draft_id,
@@ -365,6 +369,7 @@ async def insert_draft(
             "edited": edited,
             "final_body": final_body,
             "auto_send": auto_send,
+            "approved_via": approved_via,
         },
     )
     await session.commit()
