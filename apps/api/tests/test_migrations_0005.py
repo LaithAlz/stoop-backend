@@ -101,7 +101,14 @@ _ALL_RLS_TABLES: list[str] = [
 # than folded into _ALL_RLS_TABLES above, so these "state at head"
 # assertions stay accurate without conflating what migration 0005 itself
 # created with what a later migration independently added.
-_LATER_MIGRATION_RLS_TABLES: list[str] = ["push_outbox"]
+#
+# migration 0015 (#170) adds a SECOND later table, unrouted_inbound — but
+# unlike push_outbox, its one policy is an unconditional deny
+# (`USING (false) WITH CHECK (false)`), not a landlord_id-scoped allow, and
+# app_role gets NO grant on it at all (see that migration's own module
+# docstring). It still carries "exactly one policy" (the catalog-shape
+# these tests check), so it belongs in this list too.
+_LATER_MIGRATION_RLS_TABLES: list[str] = ["push_outbox", "unrouted_inbound"]
 
 # Ordinary tables: full CRUD for app_role.
 _ORDINARY_TABLES: list[str] = [

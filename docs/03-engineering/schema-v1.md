@@ -873,6 +873,114 @@
 >    simply the first writer of this combination. No migration needed for
 >    this part.
 
+> **v1.17 amendment (2026-07-24)** — migration 0015 implements this (#170,
+> from the #40 safety review): an inbound SMS whose `To` matches no
+> `properties.twilio_number` cannot be persisted to `messages` (`NOT NULL`
+> `landlord_id`/`property_id`) and was previously dropped with only a loud
+> Sentry alert (`twilio_sms_unknown_to_number`) — recoverable only via the
+> Twilio console. A misconfigured or format-mismatched number therefore ate
+> tenant messages, including emergencies, with no durable local record.
+> This amendment makes those messages durable and operator-recoverable
+> instead of merely alerted-and-lost.
+> 1. **New table `unrouted_inbound`** — a dead-letter table, deliberately
+>    NOT part of the append-only set (rule #2 does not apply here: an
+>    operator sets `resolved_at` once the underlying number/tenant mismatch
+>    is fixed, a genuine `UPDATE`; see point 3 for why this is still safe).
+>    ```sql
+>    CREATE TABLE unrouted_inbound (
+>      id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+>      twilio_sid    text UNIQUE,       -- idempotency key, same convention
+>                                        --  as messages.twilio_sid (v1.0)
+>      from_number   text NOT NULL,     -- raw Twilio `From` — ops-recovery
+>                                        --  only, see point 2 for why this
+>                                        --  is safe with no RLS coverage
+>      to_number     text NOT NULL,     -- raw Twilio `To` — the number
+>                                        --  nothing recognized
+>      payload       jsonb NOT NULL,    -- {"form": {...raw Twilio form
+>                                        --  fields, verbatim...},
+>                                        --  "prefilter": {...the Tier-0
+>                                        --  PrefilterResult, since Tier-0
+>                                        --  now runs before the property
+>                                        --  lookup too...}}. Nesting under
+>                                        --  "form"/"prefilter" (rather than
+>                                        --  a second column) is rule #6's
+>                                        --  existing evolution path for a
+>                                        --  derived signal riding along
+>                                        --  with a raw jsonb blob (same
+>                                        --  path v1.6 used for
+>                                        --  `audit_log.payload`)
+>      received_at   timestamptz NOT NULL DEFAULT now(),
+>      resolved_at   timestamptz        -- NULL = not yet reconciled by an
+>                                        --  operator; set manually once the
+>                                        --  number/tenant mismatch is fixed
+>    );
+>    ```
+> 2. **RLS: admin-only, reachable by neither `app_role` nor the Supabase
+>    Data API.** Unlike every OTHER table in this document,
+>    `unrouted_inbound` has no `landlord_id` and nothing to `EXISTS`-join
+>    through to reach one (no tenant, no case — the whole point of this
+>    table is that routing failed) — the `message_cases`/
+>    `message_status_events` `EXISTS`-join precedent (v1.2 amendments) does
+>    not apply; there is no parent row to join through. Migration 0015
+>    therefore does two things neither the `direct_landlord_id` nor the
+>    `exists_join` shape needed:
+>    - **No `GRANT` to `app_role` at all** — every other table in this
+>      schema grants `app_role` at least `SELECT, INSERT` (v1.2 amendments);
+>      `unrouted_inbound` grants it nothing, so a bare `SELECT` under
+>      `app_role` fails with "permission denied" before RLS is ever
+>      evaluated.
+>    - **`ENABLE ROW LEVEL SECURITY` plus exactly ONE policy that denies
+>      everything unconditionally** — `FOR ALL TO app_role USING (false)
+>      WITH CHECK (false)`, named `unrouted_inbound_isolation` (same naming
+>      convention as every other table's policy). This is defense-in-depth
+>      on top of the missing `GRANT` above (belt-and-braces, matching this
+>      migration's own precedent for the Supabase Data API closure) — even
+>      if a future migration mistakenly granted `app_role` a privilege on
+>      this table, no row would ever satisfy `USING (false)`. It also keeps
+>      `tests/test_rls_isolation_matrix.py`'s catalog-completeness gate
+>      (every table in `public` has RLS enabled AND exactly one policy)
+>      satisfied without a special case in that gate itself — only the
+>      per-table *behavior* differs (unconditional deny vs. GUC-scoped
+>      allow), not the *shape* of "RLS enabled, one policy."
+>    - The webhook's own write path (`app/routers/webhooks/twilio.py`) uses
+>      the ADMIN engine (`get_admin_session`, already allowlisted for this
+>      file — v1.2 amendments point 7 / migration 0005's module docstring),
+>      which bypasses RLS entirely (`rolbypassrls = TRUE` for
+>      `postgres`/`service_role`) and needs no `app_role` grant to write —
+>      exactly the same reason the webhook can insert `messages` rows for
+>      properties/landlords it has no session GUC for.
+>    - Operator reconciliation (setting `resolved_at`) is a manual,
+>      admin-engine-only operation (a one-off `psql`/Supabase-Studio
+>      statement, or a future internal tool) — there is no landlord-facing
+>      endpoint for this table in this amendment, and none is implied by
+>      it.
+> 3. **Idempotency**: `twilio_sid UNIQUE` (plain, nullable — same shape as
+>    `messages.twilio_sid`, not partial) is the `ON CONFLICT (twilio_sid) DO
+>    NOTHING RETURNING id` target for the webhook's dead-letter insert,
+>    mirroring `messages`' own dedupe exactly — a redelivered `MessageSid`
+>    for an unrouted message no-ops instead of creating a second row.
+> 4. **Tier-0 now runs before the property lookup, not just before the
+>    landlord/tenant routing split.** Before this amendment, an unrouted
+>    message never reached the Tier-0 prefilter at all (the `To`-lookup
+>    early-return preceded it) — a genuine emergency to a misconfigured
+>    number got no Tier-0 signal AND no durable record. `app/routers/
+>    webhooks/twilio.py` now computes `prefilter.check(body)` first, before
+>    the property `SELECT`, so an unrouted HARD hit is both dead-lettered
+>    (point 1) and surfaced at the loudest available level: a distinctly
+>    -labeled Sentry error (never a `needs_eyes` row — `notifications.
+>    landlord_id` is `NOT NULL` and there is no landlord to attach one to;
+>    inventing one is explicitly out of scope). This does not change Tier-0
+>    itself (`app/agent/prefilter.py` is untouched, pure functions, no I/O)
+>    or which category fires — only how much earlier in the handler it now
+>    runs.
+> 5. **Deferred, NOT part of this amendment**: normalized (E.164) phone
+>    matching across `properties`/`tenants`/`landlords` lookups (the #40
+>    safety review's second finding). The dead-letter net in this amendment
+>    catches a format-mismatch drop either way (the message is never lost
+>    regardless of why `To` failed to match) — canonicalizing the match
+>    itself is a separate, larger, riskier change (every phone-comparison
+>    call site) tracked as its own follow-up issue, not bundled here.
+
 ```sql
 -- ───────────────────────── landlords ─────────────────────────
 CREATE TABLE landlords (
@@ -1246,6 +1354,29 @@ CREATE TABLE push_outbox (
 CREATE INDEX idx_push_outbox_sweep    ON push_outbox (status, next_attempt_at);
 CREATE INDEX idx_push_outbox_landlord ON push_outbox (landlord_id);
 CREATE INDEX idx_push_outbox_device   ON push_outbox (device_token_id);
+
+-- ─────────────────────── unrouted_inbound ────────────────────
+-- Dead-letter recovery for the Twilio /sms webhook (#170, v1.17 amendment
+-- above): an inbound SMS whose `To` matches no properties.twilio_number
+-- cannot be persisted to `messages` (NOT NULL landlord_id/property_id) and
+-- would otherwise be silently dropped -- including a true emergency to a
+-- misconfigured/format-mismatched number. NOT append-only (rule #2 does
+-- not apply) -- resolved_at is set by a human operator, out-of-band, once
+-- the number/tenant mismatch is fixed. ADMIN-ONLY: no landlord_id and
+-- nothing to EXISTS-join through (no tenant, no case), so app_role gets
+-- NO grant at all here, plus one unconditional-deny RLS policy as
+-- defense-in-depth -- see the v1.17 amendments block above for the full
+-- rationale.
+CREATE TABLE unrouted_inbound (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  twilio_sid    text UNIQUE,
+  from_number   text NOT NULL,
+  to_number     text NOT NULL,
+  payload       jsonb NOT NULL,          -- {"form": {...raw Twilio form...},
+                                          --  "prefilter": {...PrefilterResult...}}
+  received_at   timestamptz NOT NULL DEFAULT now(),
+  resolved_at   timestamptz
+);
 
 -- LangGraph checkpoint tables: created by AsyncPostgresSaver.setup() (#24),
 -- service-role connection, thread_id = cases.langgraph_thread_id. They live
