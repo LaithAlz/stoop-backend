@@ -351,12 +351,23 @@ async def test_malformed_form_missing_body_returns_400(db_session: AsyncSession)
 
 
 # ---------------------------------------------------------------------------
-# Unknown To number
+# Unknown To number — dead-lettered into unrouted_inbound, never dropped (#170)
 # ---------------------------------------------------------------------------
 
 
+async def _cleanup_unrouted_inbound(session: AsyncSession, twilio_sid: str) -> None:
+    await session.execute(
+        text("DELETE FROM unrouted_inbound WHERE twilio_sid = :sid"), {"sid": twilio_sid}
+    )
+    await session.commit()
+
+
 @pytest.mark.integration
-async def test_unknown_to_number_returns_200_no_row_persisted() -> None:
+async def test_unknown_to_number_returns_200_no_row_persisted(db_session: AsyncSession) -> None:
+    """No `messages` row is ever created for an unrouted message (there is
+    no landlord/property to satisfy its NOT NULL columns) — the message is
+    dead-lettered into `unrouted_inbound` instead (separate test below),
+    never a `messages` row."""
     message_sid = f"SM{uuid.uuid4().hex}"
     params = _sms_params(
         message_sid=message_sid,
@@ -365,10 +376,199 @@ async def test_unknown_to_number_returns_200_no_row_persisted() -> None:
         body="hello",
     )
 
-    response = await _post_sms(params)
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/xml")
-    assert response.text == "<Response/>"
+    try:
+        response = await _post_sms(params)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/xml")
+        assert response.text == "<Response/>"
+
+        row = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM messages WHERE twilio_sid = :sid"),
+                {"sid": message_sid},
+            )
+        ).scalar_one()
+        assert row == 0
+    finally:
+        await _cleanup_unrouted_inbound(db_session, message_sid)
+
+
+@pytest.mark.integration
+async def test_unknown_to_number_dead_lettered_not_dropped(db_session: AsyncSession) -> None:
+    """#170: an unrouted inbound SMS is durably captured in
+    `unrouted_inbound` instead of merely alerted-and-lost — the raw form
+    payload (including From/To/Body) round-trips, and the Tier-0 prefilter
+    signal (a SOFT/no-hit case here) rides along under `payload["prefilter"]`."""
+    message_sid = f"SM{uuid.uuid4().hex}"
+    from_number = _fresh_phone()
+    to_number = _fresh_phone()  # matches no property
+    params = _sms_params(
+        message_sid=message_sid, from_number=from_number, to_number=to_number, body="hello"
+    )
+
+    try:
+        response = await _post_sms(params)
+        assert response.status_code == 200
+
+        row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT from_number, to_number, payload, resolved_at "
+                        "FROM unrouted_inbound WHERE twilio_sid = :sid"
+                    ),
+                    {"sid": message_sid},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["from_number"] == from_number
+        assert row["to_number"] == to_number
+        assert row["resolved_at"] is None
+        assert row["payload"]["form"]["Body"] == "hello"
+        assert row["payload"]["prefilter"]["hard_hit"] is False
+
+        # Still no `messages` row — there is no landlord/property to attach
+        # it to.
+        message_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM messages WHERE twilio_sid = :sid"),
+                {"sid": message_sid},
+            )
+        ).scalar_one()
+        assert message_count == 0
+    finally:
+        await _cleanup_unrouted_inbound(db_session, message_sid)
+
+
+@pytest.mark.integration
+async def test_unknown_to_number_redelivery_is_idempotent(db_session: AsyncSession) -> None:
+    """A redelivered MessageSid for an unrouted message no-ops on the
+    dead-letter table's own twilio_sid UNIQUE constraint — exactly one row,
+    same shape as the messages/notifications dedupe elsewhere in this
+    module."""
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid,
+        from_number=_fresh_phone(),
+        to_number=_fresh_phone(),
+        body="hello again",
+    )
+
+    try:
+        r1 = await _post_sms(params)
+        r2 = await _post_sms(params)  # identical redelivery
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+
+        count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM unrouted_inbound WHERE twilio_sid = :sid"),
+                {"sid": message_sid},
+            )
+        ).scalar_one()
+        assert count == 1
+    finally:
+        await _cleanup_unrouted_inbound(db_session, message_sid)
+
+
+@pytest.mark.integration
+async def test_injected_dead_letter_failure_returns_500_and_retry_recovers(
+    db_session: AsyncSession,
+) -> None:
+    """#170 (spec re-review coverage): a FAILURE writing the dead-letter
+    row must NOT fail-open to 200 — that would silently lose an unrouted
+    message (including a possible emergency), the exact bug this feature
+    closes. It surfaces as 500 so Twilio retries, and the retry (write no
+    longer failing) durably captures the message exactly once. Mirrors
+    ``test_i_injected_artifact_failure_...`` for the emergency-artifact path."""
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid,
+        from_number=_fresh_phone(),
+        to_number=_fresh_phone(),  # matches no property
+        body="hello",
+    )
+
+    try:
+        with patch(
+            "app.routers.webhooks.twilio._dead_letter_unrouted_inbound",
+            new=AsyncMock(side_effect=RuntimeError("simulated dead-letter failure")),
+        ):
+            failed = await _post_sms(params)
+        assert failed.status_code == 500
+        assert failed.json()["error"]["code"] == "unrouted_dead_letter_failed"
+
+        # Nothing durable was written on the failed attempt.
+        count_after_fail = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM unrouted_inbound WHERE twilio_sid = :sid"),
+                {"sid": message_sid},
+            )
+        ).scalar_one()
+        assert count_after_fail == 0
+
+        # Twilio's redelivery (same MessageSid, write no longer failing)
+        # recovers: 200 and exactly one dead-letter row.
+        recovered = await _post_sms(params)
+        assert recovered.status_code == 200
+        count_after_retry = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM unrouted_inbound WHERE twilio_sid = :sid"),
+                {"sid": message_sid},
+            )
+        ).scalar_one()
+        assert count_after_retry == 1
+    finally:
+        await _cleanup_unrouted_inbound(db_session, message_sid)
+
+
+@pytest.mark.integration
+async def test_unknown_to_number_hard_hit_dead_lettered_and_alerted_loudest(
+    db_session: AsyncSession,
+) -> None:
+    """#170: a Tier-0 HARD hit on a message addressed to an unrecognized
+    `To` is STILL dead-lettered (never silently dropped) AND surfaced at
+    the loudest available level — `_alert_unrouted_possible_emergency`
+    instead of the ordinary `_alert_unknown_to` — since there is no
+    landlord/case to attach a `needs_eyes` notification to."""
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid,
+        from_number=_fresh_phone(),
+        to_number=_fresh_phone(),  # matches no property
+        body="there is a fire!",
+    )
+
+    try:
+        with patch("app.routers.webhooks.twilio.sentry_sdk.capture_message") as mock_capture:
+            response = await _post_sms(params)
+
+        assert response.status_code == 200
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT payload FROM unrouted_inbound WHERE twilio_sid = :sid"),
+                    {"sid": message_sid},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["payload"]["prefilter"]["hard_hit"] is True
+
+        mock_capture.assert_called_once()
+        call_args = mock_capture.call_args
+        assert "EMERGENCY" in call_args.args[0]
+        assert call_args.kwargs["extras"]["twilio_sid"] == message_sid
+        # Never the raw phone number or message body.
+        assert params["To"] not in str(call_args)
+        assert params["From"] not in str(call_args)
+        assert params["Body"] not in str(call_args)
+    finally:
+        await _cleanup_unrouted_inbound(db_session, message_sid)
 
 
 # ---------------------------------------------------------------------------
@@ -1291,7 +1491,7 @@ async def test_iii_repeated_redeliveries_after_artifacts_exist_stay_exactly_once
 
 
 @pytest.mark.integration
-async def test_unknown_to_number_alerts_loudly() -> None:
+async def test_unknown_to_number_alerts_loudly(db_session: AsyncSession) -> None:
     """Consolidated review item 3: an unrecognized `To` number now goes
     LOUD (log.error + Sentry), not a quiet info log."""
     message_sid = f"SM{uuid.uuid4().hex}"
@@ -1302,16 +1502,19 @@ async def test_unknown_to_number_alerts_loudly() -> None:
         body="hello",
     )
 
-    with patch("app.routers.webhooks.twilio.sentry_sdk.capture_message") as mock_capture:
-        response = await _post_sms(params)
+    try:
+        with patch("app.routers.webhooks.twilio.sentry_sdk.capture_message") as mock_capture:
+            response = await _post_sms(params)
 
-    assert response.status_code == 200
-    mock_capture.assert_called_once()
-    call_kwargs = mock_capture.call_args.kwargs
-    assert call_kwargs["extras"]["twilio_sid"] == message_sid
-    # Never the raw phone number -- only a digest.
-    assert params["To"] not in str(mock_capture.call_args)
-    assert params["From"] not in str(mock_capture.call_args)
+        assert response.status_code == 200
+        mock_capture.assert_called_once()
+        call_kwargs = mock_capture.call_args.kwargs
+        assert call_kwargs["extras"]["twilio_sid"] == message_sid
+        # Never the raw phone number -- only a digest.
+        assert params["To"] not in str(mock_capture.call_args)
+        assert params["From"] not in str(mock_capture.call_args)
+    finally:
+        await _cleanup_unrouted_inbound(db_session, message_sid)
 
 
 @pytest.mark.integration

@@ -143,6 +143,34 @@ HMAC-keyed digest of the unrecognized ``To`` number only — NEVER the raw
 phone number or message body, rule #5) so a human actually sees these
 immediately too, independent of the sweeper's own cadence.
 
+**Unrouted inbound — dead-lettered, never dropped (#170).** An unrecognized
+``To`` used to be a dead end: ``messages`` cannot hold the row (``NOT
+NULL`` ``landlord_id``/``property_id``) and the alert above was the only
+trace it ever existed. Tier-0 (``prefilter.check``) now runs on the raw
+body BEFORE the property lookup too (not just before the landlord/tenant
+routing split) so an unrouted message's emergency signal, if any, is never
+lost either. ``_dead_letter_unrouted_inbound`` then durably inserts the raw
+form payload plus that Tier-0 signal into ``unrouted_inbound``
+(schema-v1.md v1.17, migration 0015) — idempotent on ``twilio_sid``, same
+``ON CONFLICT DO NOTHING`` shape as the ``messages`` insert itself — via
+its OWN isolated admin session (module docstring "Transaction design"
+point 2's pattern), and, like ``_ensure_tenant_emergency_artifacts``, is
+NOT wrapped in ``_safe_step``: a failure here is logged + paged and
+RE-RAISED as a 500, because this write is the ONLY durable record an
+unrouted message ever gets — silently swallowing a failure here would
+recreate the exact silent-loss bug this whole feature exists to close. A
+Tier-0 HARD hit on an unrouted message gets the LOUDEST available
+surfacing, ``_alert_unrouted_possible_emergency`` — there is no landlord to
+attach a ``needs_eyes`` notification to (``notifications.landlord_id`` is
+``NOT NULL``, and inventing a landlord row is explicitly out of scope), so
+a distinctly-labeled Sentry error is the surfacing, on top of the ordinary
+dead-letter row. Metadata only throughout — a digest of ``To``, the
+``twilio_sid``, and Tier-0 category NAMES, never the raw phone number,
+``From``, or message body (rule #5). E.164 phone-number canonicalization
+(the #40 safety review's OTHER finding — exact-string ``To``/``From``
+matching is fragile) is a deliberate, separate follow-up, not part of this
+change.
+
 Neither ``/sms`` nor ``/status`` calls Twilio's REST API (no outbound send
 anywhere in either handler) — both are inbound-only receivers.
 
@@ -343,6 +371,35 @@ def _alert_unknown_to(*, to_digest: str, twilio_sid: str) -> None:
     )
 
 
+def _alert_unrouted_possible_emergency(
+    *, to_digest: str, twilio_sid: str, categories: list[str]
+) -> None:
+    """#170: a Tier-0 HARD hit on a message that ALSO couldn't be routed to
+    any property — the loudest surfacing this codebase has, used in place
+    of (not in addition to) ``_alert_unknown_to`` for this one message.
+    There is no landlord/case to attach a ``needs_eyes`` notification to
+    (``notifications.landlord_id`` is ``NOT NULL`` — inventing a landlord
+    row to hang one off is explicitly out of scope, never done here), so a
+    distinctly-labeled Sentry error plus this log line, on top of the
+    ordinary ``unrouted_inbound`` dead-letter row
+    (``_dead_letter_unrouted_inbound``), is the entire surfacing an
+    operator gets until they reconcile that row by hand. Metadata only —
+    a digest of ``To``, the ``twilio_sid``, and Tier-0 category NAMES,
+    never the raw phone number, ``From``, or message body (rule #5)."""
+    log.error(
+        "twilio_sms_unrouted_possible_emergency",
+        to_digest=to_digest,
+        twilio_sid=twilio_sid,
+        categories=categories,
+    )
+    sentry_sdk.capture_message(
+        "POSSIBLE EMERGENCY: Tier-0 HARD hit on an inbound SMS addressed to "
+        "an unrecognized `To` number — dead-lettered, not delivered to any landlord",
+        level="error",
+        extras={"to_digest": to_digest, "twilio_sid": twilio_sid, "categories": categories},
+    )
+
+
 def _alert_tenant_hard_fire(*, message_id: UUID, property_id: UUID, categories: list[str]) -> None:
     """Consolidated review item 4: a tide-over until #108's escalation
     sweeper exists — a ``notifications`` row sitting at ``status=
@@ -426,6 +483,91 @@ async def _is_landlord_command_channel(
         session, property_id=property_id, phone=from_number
     )
     return active_tenant_id is None
+
+
+# ---------------------------------------------------------------------------
+# /sms — unrouted inbound dead-letter (#170)
+# ---------------------------------------------------------------------------
+
+_INSERT_UNROUTED_INBOUND_SQL = text(
+    """
+    INSERT INTO unrouted_inbound (twilio_sid, from_number, to_number, payload)
+    VALUES (:twilio_sid, :from_number, :to_number, CAST(:payload AS jsonb))
+    ON CONFLICT (twilio_sid) DO NOTHING
+    RETURNING id
+    """
+)
+# Same ON CONFLICT (twilio_sid) DO NOTHING shape as _INSERT_MESSAGE_SQL below
+# — a redelivered MessageSid for a message that could not be routed no-ops
+# instead of creating a second dead-letter row. `twilio_sid` is a plain
+# (nullable) UNIQUE column (schema-v1.md v1.17, migration 0015), exactly
+# like `messages.twilio_sid` — Postgres's own unique-index inference
+# resolves the ON CONFLICT target from the column list, no partial
+# predicate involved (unlike the notifications dedupe indexes).
+# DEDUPE INVARIANT (safety review, #170): this ON CONFLICT dedupe is only
+# correct because `twilio_sid` is always non-null here — Postgres treats
+# NULLs as distinct, so a NULL sid would silently bypass dedupe and create
+# duplicate rows. The sole writer is `_handle_sms`, which rejects a missing
+# `MessageSid` with a 400 BEFORE reaching this insert (the `if not
+# message_sid ...` guard). Any future writer of this table MUST preserve
+# that non-null guarantee (or make the column NOT NULL) to keep dead-letter
+# dedupe correct.
+
+
+async def _dead_letter_unrouted_inbound(
+    *,
+    twilio_sid: str,
+    from_number: str,
+    to_number: str,
+    raw_form: dict[str, str],
+    prefilter_result: PrefilterResult,
+) -> bool:
+    """Durably persist an inbound SMS whose ``To`` matched no property
+    (#170) instead of dropping it — the whole point of this issue. Runs on
+    its OWN isolated admin session (module docstring "Transaction design"
+    point 2's pattern — ``_isolated_session`` wraps ``get_admin_session``),
+    idempotent via ``unrouted_inbound``'s own ``twilio_sid`` UNIQUE
+    constraint (schema-v1.md v1.17, migration 0015).
+
+    ``payload`` nests the raw Twilio form fields verbatim under ``"form"``
+    (so nothing Twilio sent is ever lost) plus the Tier-0 ``PrefilterResult``
+    already computed for this message under ``"prefilter"`` — this message
+    never reaches ``messages.prefilter`` (there is no row to attach it to),
+    so this is the ONLY durable record of whether Tier-0 fired for it.
+
+    Deliberately NOT wrapped in ``_safe_step`` — unlike the ordinary
+    post-persist side effects below, a failure here means an unrouted
+    message gets NO durable record at all (the Sentry alert the caller
+    fires afterward is a page, not a database row), which would silently
+    recreate the exact message-loss bug this feature exists to close. The
+    caller re-raises any exception from this function as a 500 so Twilio
+    retries — see ``twilio_sms_webhook``'s own docstring.
+
+    Returns ``True`` if this call created a new row, ``False`` if one
+    already existed for this ``twilio_sid`` (idempotent no-op, e.g. a
+    genuine redelivery).
+    """
+    payload = {
+        "form": raw_form,
+        "prefilter": prefilter_result.model_dump(mode="json"),
+    }
+    async with _isolated_session() as session:
+        row = (
+            (
+                await session.execute(
+                    _INSERT_UNROUTED_INBOUND_SQL,
+                    {
+                        "twilio_sid": twilio_sid,
+                        "from_number": from_number,
+                        "to_number": to_number,
+                        "payload": json.dumps(payload),
+                    },
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    return row is not None
 
 
 # ---------------------------------------------------------------------------
@@ -856,16 +998,24 @@ async def twilio_sms_webhook(
     2. Extract + validate the minimal required Twilio fields (400 if
        missing) — still before any DB access. Both (1) and (2) are safe
        for Twilio to retry: nothing has been stored yet.
-    3. Resolve the property owning the ``To`` number. No match → 200,
-       loud metadata-only alert (contract addition — see module docstring
-       and the PR description for why this can't be a 4xx/5xx: there's no
-       ``landlord_id``/``property_id`` to satisfy ``messages``' NOT NULL
-       columns, and nothing actionable follows from a number we don't
-       recognize).
-    4. Tier-0 (``app.agent.prefilter.check``) on the raw body BEFORE the
-       routing split (landlord-channel vs tenant-channel) — contract
-       fidelity to "Tier-0 runs on every inbound SMS before any routing
-       split".
+    3. Tier-0 (``app.agent.prefilter.check``) on the raw body — a pure,
+       sub-millisecond function, run BEFORE even the property lookup
+       (#170) as well as before the routing split (landlord-channel vs
+       tenant-channel, point 5) — contract fidelity to "Tier-0 runs on
+       every inbound SMS before any routing split", extended to cover a
+       message whose ``To`` doesn't resolve to any property at all: an
+       unrouted message's emergency signal must never be lost either.
+    4. Resolve the property owning the ``To`` number. No match → dead
+       -letter into ``unrouted_inbound`` (schema-v1.md v1.17, migration
+       0015) instead of dropping — idempotent on ``twilio_sid``, carries
+       the Tier-0 result from point 3 — then 200, plus a loud
+       metadata-only alert: the ordinary one, or, if Tier-0 fired, the
+       LOUDEST one this codebase has (``_alert_unrouted_possible_
+       emergency`` — see module docstring and ``_dead_letter_unrouted_
+       inbound``'s own docstring for why this can't be a 4xx/5xx: there's
+       no ``landlord_id``/``property_id`` to satisfy ``messages``' NOT
+       NULL columns, and nothing actionable follows from a number we
+       don't recognize).
     5. Resolve routing, then ``INSERT ... ON CONFLICT (twilio_sid) DO
        NOTHING RETURNING id`` and COMMIT IMMEDIATELY — the row is durably
        on disk before anything else runs (module docstring point 1).
@@ -893,6 +1043,13 @@ async def twilio_sms_webhook(
             message="Missing required Twilio fields.",
         )
 
+    # Tier-0 BEFORE the property lookup AND before the routing split
+    # (#170; contract fidelity, consolidated review item 6): a pure,
+    # sub-millisecond function on the raw body, independent of whether
+    # `To` resolves to a known property at all or who the routing
+    # predicate would decide the sender is.
+    prefilter_result: PrefilterResult = prefilter.check(body)
+
     property_row = (
         (await session.execute(_SELECT_PROPERTY_BY_TO_SQL, {"to_number": to_number}))
         .mappings()
@@ -900,16 +1057,47 @@ async def twilio_sms_webhook(
     )
 
     if property_row is None:
-        _alert_unknown_to(to_digest=_digest(to_number), twilio_sid=message_sid)
+        try:
+            await _dead_letter_unrouted_inbound(
+                twilio_sid=message_sid,
+                from_number=from_number,
+                to_number=to_number,
+                raw_form=params,
+                prefilter_result=prefilter_result,
+            )
+        except Exception as exc:
+            # See _dead_letter_unrouted_inbound's own docstring: this write
+            # is the ONLY durable record an unrouted message ever gets, so
+            # a failure here must NOT be swallowed into a 200 — that would
+            # silently recreate the exact message-loss bug #170 exists to
+            # close. A 5xx tells Twilio to retry, which is the recovery
+            # mechanism (same shape as the conflict-path recovery failure
+            # below and the tenant emergency-artifact failure in
+            # _run_post_persist_side_effects).
+            log.error("twilio_sms_unrouted_dead_letter_failed", exc_type=type(exc).__name__)
+            sentry_sdk.capture_message(
+                "Twilio inbound webhook: unrouted dead-letter write failed",
+                level="error",
+                extras={"exc_type": type(exc).__name__, "twilio_sid": message_sid},
+            )
+            raise AppError(
+                status_code=500,
+                code="unrouted_dead_letter_failed",
+                message="Temporary delivery failure -- please retry.",
+            ) from exc
+
+        if prefilter_result.hard_hit:
+            _alert_unrouted_possible_emergency(
+                to_digest=_digest(to_number),
+                twilio_sid=message_sid,
+                categories=prefilter_result.categories,
+            )
+        else:
+            _alert_unknown_to(to_digest=_digest(to_number), twilio_sid=message_sid)
         return _twiml_empty()
 
     property_id: UUID = property_row["id"]
     landlord_id: UUID = property_row["landlord_id"]
-
-    # Tier-0 BEFORE the routing split (contract fidelity, consolidated
-    # review item 6): a pure, sub-millisecond function on the raw body,
-    # independent of who the routing predicate decides the sender is.
-    prefilter_result: PrefilterResult = prefilter.check(body)
 
     is_landlord_channel = await _is_landlord_command_channel(
         session,

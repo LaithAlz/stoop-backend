@@ -2,17 +2,20 @@
 
 ``tests/test_rls_isolation.py`` (#22) proves the RLS enforcement
 *mechanism* once per scoping SHAPE (direct ``landlord_id``, ``id``-keyed,
-and both ``EXISTS``-join tables). This file proves the same enforcement
-EXHAUSTIVELY, for every one of the 14 tables in
-``docs/03-engineering/schema-v1.md`` (all but ``alembic_version`` —
-``push_outbox`` added #210 M3, migration 0012, the first migration since
-0005 to add a genuinely new table), across the full operations matrix
-(SELECT / UPDATE / DELETE / INSERT), plus the structural gates a senior
-review would ask for on top of that:
+both ``EXISTS``-join tables, and — added by #170 — the ``admin_only``
+shape). This file proves the same enforcement EXHAUSTIVELY, for every one
+of the 15 tables in ``docs/03-engineering/schema-v1.md`` (all but
+``alembic_version`` — ``push_outbox`` added #210 M3/migration 0012, the
+first migration since 0005 to add a genuinely new table;
+``unrouted_inbound`` added #170/migration 0015, the first ADMIN-ONLY table
+— no landlord_id, no GRANT to app_role at all, one unconditional-deny
+policy), across the full operations matrix (SELECT / UPDATE / DELETE /
+INSERT), plus the structural gates a senior review would ask for on top of
+that:
 
 1. **The full per-table operations matrix** (this file's main body) —
    generated PROGRAMMATICALLY from ``TABLE_DESCRIPTORS`` below, not
-   hand-duplicated per table. Adding a 15th table to a future migration
+   hand-duplicated per table. Adding a 16th table to a future migration
    without adding a matching ``TableDescriptor`` here fails
    ``test_descriptor_table_set_matches_public_schema_catalog`` (reads the
    live catalog, not a hardcoded list) — "a failing policy is impossible
@@ -164,7 +167,13 @@ async def db(_migrate_once: None) -> AsyncGenerator[AsyncEngine, None]:
 
 
 # ---------------------------------------------------------------------------
-# Seed — one row per landlord (A, B) in every one of the 14 tables.
+# Seed — one row per landlord (A, B) in every one of the 14 landlord-owned
+# tables, plus two arbitrary (landlord-less) unrouted_inbound rows — #170's
+# admin_only table has no landlord to seed "per landlord," so its two seed
+# rows are just two distinct dead-letter rows, used as row_a/row_b purely
+# to keep this file's generic two-row matrix shape; app_role can see
+# NEITHER regardless of which is "A" or "B" (see the admin_only-specific
+# test branches below).
 # ---------------------------------------------------------------------------
 
 
@@ -201,6 +210,10 @@ class _MatrixSeed:
     # fields for descriptor clarity.
     message_cases_case_a: str
     message_cases_case_b: str
+    # #170: unrouted_inbound has no landlord at all — two arbitrary
+    # dead-letter rows, not "landlord A's row" / "landlord B's row".
+    unrouted_inbound_a: str
+    unrouted_inbound_b: str
 
 
 async def _insert_landlord(conn: AsyncConnection) -> str:
@@ -393,10 +406,27 @@ async def _insert_push_outbox(conn: AsyncConnection, landlord_id: str, device_to
     return push_outbox_id
 
 
+async def _insert_unrouted_inbound(conn: AsyncConnection) -> str:
+    """#170: no landlord_id at all — an arbitrary dead-letter row, inserted
+    by the superuser connection (the ONLY writer path this table has;
+    app_role gets no grant on it — see migration 0015's own module
+    docstring)."""
+    row_id = str(uuid.uuid4())
+    await conn.execute(
+        text(
+            "INSERT INTO unrouted_inbound (id, twilio_sid, from_number, to_number, payload) "
+            "VALUES (:id, :twilio_sid, '+14165550100', '+14165550199', '{}'::jsonb)"
+        ),
+        {"id": row_id, "twilio_sid": f"SM{uuid.uuid4().hex}"},
+    )
+    return row_id
+
+
 @pytest_asyncio.fixture
 async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
-    """Two landlords, each with one row in every one of the 14 tables,
-    committed (not rolled back) so later, separate role-switched
+    """Two landlords, each with one row in every one of the 14 landlord
+    -owned tables, plus two arbitrary landlord-less unrouted_inbound rows
+    (#170), committed (not rolled back) so later, separate role-switched
     transactions can see them — same pattern as ``test_rls_isolation.py``'s
     ``seed`` fixture, extended to cover every table."""
     async with db.connect() as connection:
@@ -429,6 +459,8 @@ async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
         push_token_b = await _insert_push_token(connection, landlord_b)
         push_outbox_a = await _insert_push_outbox(connection, landlord_a, push_token_a)
         push_outbox_b = await _insert_push_outbox(connection, landlord_b, push_token_b)
+        unrouted_inbound_a = await _insert_unrouted_inbound(connection)
+        unrouted_inbound_b = await _insert_unrouted_inbound(connection)
         await trans.commit()
 
     seeded = _MatrixSeed(
@@ -460,6 +492,8 @@ async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
         message_status_event_b=event_b,
         message_cases_case_a=case_a,
         message_cases_case_b=case_b,
+        unrouted_inbound_a=unrouted_inbound_a,
+        unrouted_inbound_b=unrouted_inbound_b,
     )
     try:
         yield seeded
@@ -472,6 +506,12 @@ async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
         # here is ever attempted as app_role.
         async with db.connect() as connection:
             trans = await connection.begin()
+            # #170: landlord-less, cleaned up independently of the
+            # per-landlord loop below.
+            await connection.execute(
+                text("DELETE FROM unrouted_inbound WHERE id IN (:a, :b)"),
+                {"a": unrouted_inbound_a, "b": unrouted_inbound_b},
+            )
             for landlord_id in (landlord_a, landlord_b):
                 await connection.execute(
                     text(
@@ -529,14 +569,20 @@ async def matrix_seed(db: AsyncEngine) -> AsyncGenerator[_MatrixSeed, None]:
 # ---------------------------------------------------------------------------
 # Table descriptors — the programmatic matrix generator.
 #
-# Every one of the 14 schema-v1.md tables (all but alembic_version) gets
+# Every one of the 15 schema-v1.md tables (all but alembic_version) gets
 # exactly one ``TableDescriptor``. ``TABLE_DESCRIPTORS`` is asserted equal
-# to the live public-schema catalog below — a 15th table added to a future
+# to the live public-schema catalog below — a 16th table added to a future
 # migration without a matching descriptor here fails that assertion, which
 # is exactly the enforcement issue #23 asks for.
 # ---------------------------------------------------------------------------
 
-_ScopingShape = Literal["direct_landlord_id", "id_keyed", "exists_join"]
+# "admin_only" (#170): no landlord_id, no GRANT to app_role at all, and one
+# unconditional-deny RLS policy (`USING (false) WITH CHECK (false)`) —
+# unlike every other shape, app_role can reach this table under NO
+# circumstances, regardless of any GUC. Only ``unrouted_inbound`` uses this
+# shape today (migration 0015). See the per-test admin_only branches below
+# for how this differs from the other three shapes.
+_ScopingShape = Literal["direct_landlord_id", "id_keyed", "exists_join", "admin_only"]
 
 
 @dataclass(frozen=True)
@@ -545,7 +591,9 @@ class TableDescriptor:
 
     ``row_a_id``/``row_b_id`` extract the value used to identify each
     landlord's seeded row (``id`` for most tables; ``case_id`` for
-    ``message_cases``, which has no single-column id of its own).
+    ``message_cases``, which has no single-column id of its own; for the
+    ``admin_only`` shape, two arbitrary landlord-less rows — see
+    ``_MatrixSeed``'s own comment).
     ``update_sql``/``delete_sql`` target ``:row_id`` against that same
     column, with a harmless self-assigning ``SET`` clause for UPDATE (the
     isolation proof is that the WHERE clause matches zero rows once RLS
@@ -555,7 +603,10 @@ class TableDescriptor:
     is landlord B's while every OTHER foreign key in the row is also
     consistently landlord B's own data — isolating the failure to the
     ONE thing under test (the row's own landlord scoping vs. the
-    session's GUC), never an incidental FK/logical mismatch.
+    session's GUC), never an incidental FK/logical mismatch. For the
+    ``admin_only`` shape there is no landlord to mismatch — ANY insert
+    attempt is rejected (no grant at all), so these two fields just need to
+    be a syntactically valid insert.
     """
 
     name: str
@@ -811,20 +862,39 @@ TABLE_DESCRIPTORS: list[TableDescriptor] = [
             "device_token_id": s.push_token_b,
         },
     ),
+    TableDescriptor(
+        name="unrouted_inbound",
+        scoping="admin_only",
+        append_only=False,
+        id_column="id",
+        row_a_id=lambda s: s.unrouted_inbound_a,
+        row_b_id=lambda s: s.unrouted_inbound_b,
+        update_sql="UPDATE unrouted_inbound SET resolved_at = resolved_at WHERE id = :row_id",
+        delete_sql="DELETE FROM unrouted_inbound WHERE id = :row_id",
+        insert_mismatch_sql=(
+            "INSERT INTO unrouted_inbound (from_number, to_number, payload) "
+            "VALUES (:from_number, :to_number, '{}'::jsonb)"
+        ),
+        insert_mismatch_params=lambda _s: {
+            "from_number": "+14165550100",
+            "to_number": "+14165550199",
+        },
+    ),
 ]
 
 _DESCRIPTOR_IDS = [d.name for d in TABLE_DESCRIPTORS]
 
 
 @pytest.mark.unit
-def test_table_descriptors_cover_exactly_fourteen_tables() -> None:
-    """Cheap, DB-free sanity pin: schema-v1.md lists 14 tables besides
+def test_table_descriptors_cover_exactly_fifteen_tables() -> None:
+    """Cheap, DB-free sanity pin: schema-v1.md lists 15 tables besides
     ``alembic_version`` (the original 13 enumerated by the doc's v1.2
     amendments block and migration 0005's module docstring, plus
     ``push_outbox`` — added by the v1.13 amendments block / migration
-    0012, #210 M3)."""
-    assert len(TABLE_DESCRIPTORS) == 14
-    assert len({d.name for d in TABLE_DESCRIPTORS}) == 14, "descriptor names must be unique"
+    0012, #210 M3 — plus ``unrouted_inbound`` — added by the v1.17
+    amendments block / migration 0015, #170)."""
+    assert len(TABLE_DESCRIPTORS) == 15
+    assert len({d.name for d in TABLE_DESCRIPTORS}) == 15, "descriptor names must be unique"
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +1004,7 @@ async def test_no_tables_outside_descriptor_set_exist_in_public_schema(db: Async
 
 # ---------------------------------------------------------------------------
 # 3. The operations matrix — SELECT / UPDATE / DELETE / INSERT, generated
-# from TABLE_DESCRIPTORS. 14 tables x 4 operations = 56 parametrized cases.
+# from TABLE_DESCRIPTORS. 15 tables x 4 operations = 60 parametrized cases.
 # ---------------------------------------------------------------------------
 
 
@@ -943,7 +1013,13 @@ async def test_no_tables_outside_descriptor_set_exist_in_public_schema(db: Async
 async def test_select_matrix_landlord_a_sees_only_own_row(
     db: AsyncEngine, matrix_seed: _MatrixSeed, descriptor: TableDescriptor
 ) -> None:
-    """SELECT, every table: landlord A's session sees A's row and not B's."""
+    """SELECT, every table: landlord A's session sees A's row and not B's.
+
+    ``admin_only`` (#170) is different in KIND, not just outcome: app_role
+    has no GRANT on this table at all, so a bare SELECT fails at the
+    privilege-check level ("permission denied for table") before RLS is
+    ever evaluated — there is no "landlord A's row" to see in the first
+    place, since the table has no landlord."""
     row_a = descriptor.row_a_id(matrix_seed)
     row_b = descriptor.row_b_id(matrix_seed)
 
@@ -954,8 +1030,8 @@ async def test_select_matrix_landlord_a_sees_only_own_row(
             await connection.execute(
                 _set_landlord_guc_sql(), {"landlord_id": matrix_seed.landlord_a}
             )
-            visible = (
-                (
+            if descriptor.scoping == "admin_only":
+                with pytest.raises(DBAPIError, match="permission denied"):
                     await connection.execute(
                         text(
                             f"SELECT {descriptor.id_column} FROM {descriptor.name} "  # noqa: S608
@@ -963,13 +1039,23 @@ async def test_select_matrix_landlord_a_sees_only_own_row(
                         ),
                         {"a": row_a, "b": row_b},
                     )
+            else:
+                visible = (
+                    (
+                        await connection.execute(
+                            text(
+                                f"SELECT {descriptor.id_column} FROM {descriptor.name} "  # noqa: S608
+                                f"WHERE {descriptor.id_column} IN (:a, :b)"
+                            ),
+                            {"a": row_a, "b": row_b},
+                        )
+                    )
+                    .scalars()
+                    .all()
                 )
-                .scalars()
-                .all()
-            )
-            assert [str(v) for v in visible] == [str(row_a)], (
-                f"{descriptor.name}: expected only landlord A's row visible, got {visible}"
-            )
+                assert [str(v) for v in visible] == [str(row_a)], (
+                    f"{descriptor.name}: expected only landlord A's row visible, got {visible}"
+                )
         finally:
             await trans.rollback()
 
@@ -980,9 +1066,10 @@ async def test_update_matrix_landlord_a_cannot_touch_landlord_b_row(
     db: AsyncEngine, matrix_seed: _MatrixSeed, descriptor: TableDescriptor
 ) -> None:
     """UPDATE of landlord B's row, every table, under landlord A's GUC:
-    append-only tables reject outright (permission denied, rule #2);
-    every other table's UPDATE matches zero rows (RLS hides B's row from
-    the WHERE clause entirely — not an error)."""
+    append-only tables AND the admin_only table (#170) both reject outright
+    (permission denied — rule #2 for the former, no GRANT at all for the
+    latter); every other table's UPDATE matches zero rows (RLS hides B's
+    row from the WHERE clause entirely — not an error)."""
     row_b = descriptor.row_b_id(matrix_seed)
 
     async with db.connect() as connection:
@@ -992,7 +1079,7 @@ async def test_update_matrix_landlord_a_cannot_touch_landlord_b_row(
             await connection.execute(
                 _set_landlord_guc_sql(), {"landlord_id": matrix_seed.landlord_a}
             )
-            if descriptor.append_only:
+            if descriptor.append_only or descriptor.scoping == "admin_only":
                 with pytest.raises(DBAPIError, match="permission denied"):
                     await connection.execute(text(descriptor.update_sql), {"row_id": row_b})
             else:
@@ -1011,7 +1098,8 @@ async def test_delete_matrix_landlord_a_cannot_touch_landlord_b_row(
     db: AsyncEngine, matrix_seed: _MatrixSeed, descriptor: TableDescriptor
 ) -> None:
     """DELETE of landlord B's row, every table, under landlord A's GUC —
-    same shape as the UPDATE matrix above."""
+    same shape as the UPDATE matrix above (including the admin_only
+    special case, #170)."""
     row_b = descriptor.row_b_id(matrix_seed)
 
     async with db.connect() as connection:
@@ -1021,7 +1109,7 @@ async def test_delete_matrix_landlord_a_cannot_touch_landlord_b_row(
             await connection.execute(
                 _set_landlord_guc_sql(), {"landlord_id": matrix_seed.landlord_a}
             )
-            if descriptor.append_only:
+            if descriptor.append_only or descriptor.scoping == "admin_only":
                 with pytest.raises(DBAPIError, match="permission denied"):
                     await connection.execute(text(descriptor.delete_sql), {"row_id": row_b})
             else:
@@ -1042,7 +1130,12 @@ async def test_insert_matrix_mismatched_landlord_rejected(
     """INSERT with landlord B's owning key while the GUC says landlord A,
     every table: rejected by WITH CHECK regardless of append-only status
     (append-only tables still get INSERT — rule #2 only revokes UPDATE/
-    DELETE — so WITH CHECK still applies to their INSERTs)."""
+    DELETE — so WITH CHECK still applies to their INSERTs). The
+    ``admin_only`` table (#170) is rejected for a DIFFERENT reason — no
+    GRANT to app_role at all, so ANY insert attempt fails at the
+    privilege-check level ("permission denied"), never reaching WITH
+    CHECK evaluation; there is no "landlord B's owning key" to mismatch in
+    the first place."""
     params = descriptor.insert_mismatch_params(matrix_seed)
 
     async with db.connect() as connection:
@@ -1052,8 +1145,12 @@ async def test_insert_matrix_mismatched_landlord_rejected(
             await connection.execute(
                 _set_landlord_guc_sql(), {"landlord_id": matrix_seed.landlord_a}
             )
-            with pytest.raises(DBAPIError, match="row-level security|row level security"):
-                await connection.execute(text(descriptor.insert_mismatch_sql), params)
+            if descriptor.scoping == "admin_only":
+                with pytest.raises(DBAPIError, match="permission denied"):
+                    await connection.execute(text(descriptor.insert_mismatch_sql), params)
+            else:
+                with pytest.raises(DBAPIError, match="row-level security|row level security"):
+                    await connection.execute(text(descriptor.insert_mismatch_sql), params)
         finally:
             await trans.rollback()
 

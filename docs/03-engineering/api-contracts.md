@@ -805,8 +805,11 @@ that changes.
 
 ## Webhooks (no auth header; signature-verified)
 
-- `POST /webhooks/twilio/sms` — form-encoded from Twilio. Always 200 fast;
-  persist before process; dedupe on `MessageSid`. (#40) **Approve-by-SMS
+- `POST /webhooks/twilio/sms` — form-encoded from Twilio. 200 fast on the
+  normal path (durability-critical-write failures — the unrouted
+  dead-letter below and the tenant-emergency artifacts — return 500 so
+  Twilio retries a write that can succeed on a later attempt); persist
+  before process; dedupe on `MessageSid`. (#40) **Approve-by-SMS
   (#122):**
   - Tier-0 (`emergency-prefilter.md`) runs on **every** inbound SMS
     before any routing split. A Tier-0 hard trigger on a
@@ -837,15 +840,22 @@ that changes.
     `tenant_id` NULL) and **never** forwarded to a tenant or vendor.
   - Unrecognized replies are recorded in `messages` and surfaced —
     never routed to app logs, never silently dropped.
-  - **Unknown `To` number** (#40 contract addition — the contract was
-    previously silent on this): if the `To` number matches no
-    `properties.twilio_number`, persistence is structurally impossible
-    (there is no `landlord_id`/`property_id` to satisfy `messages`' NOT
-    NULL columns) — the handler answers 200 with a metadata-only log (no
-    phone number) and stores nothing. Not a 500 (Twilio would retry a
-    request that can never succeed) and not a silent no-op (the log line
-    exists). Covers a number that isn't provisioned yet or has been
-    released.
+  - **Unknown `To` number** (#40 contract addition; dead-letter behavior
+    revised by #170): if the `To` number matches no
+    `properties.twilio_number`, the message cannot go in `messages` (no
+    `landlord_id`/`property_id` to satisfy its NOT NULL columns), so it is
+    **dead-lettered** into `unrouted_inbound` (schema-v1.md v1.17,
+    migration 0015) — the raw Twilio form payload plus the Tier-0
+    prefilter result, idempotent on `MessageSid` (`ON CONFLICT DO
+    NOTHING`), written via the admin engine. That row is admin-only (RLS
+    deny-all for `app_role`) and operator-recoverable (`resolved_at`). A
+    metadata-only Sentry alert fires (no phone/body); a Tier-0 hard
+    trigger gets the loudest "possible unrouted emergency" page. The
+    message is **never silently dropped** (rule #1). If the dead-letter
+    write itself fails, the handler returns 500 so Twilio retries —
+    unlike the old "stores nothing" rationale, the durable write is the
+    point and a retry can succeed. Covers a number that isn't provisioned
+    yet or has been released.
   - **Out-of-order delivery / timestamp ordering** (#40 contract note):
     the inbound SMS webhook payload Twilio sends carries no per-message
     timestamp field to order by, and `messages` has no `sent_at` column
