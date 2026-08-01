@@ -894,6 +894,29 @@ async def _run_post_persist_side_effects(
     back to the EXISTING ``_ensure_needs_eyes_notification`` side effect,
     unchanged from before #122.
 
+    **Approve-by-SMS failure no longer dead-ends (safety review, #186
+    follow-up round, BLOCKING)**: an earlier revision called ``_safe_step``
+    for ``handle_reply`` with its default ``alert_on_failure=False`` and
+    then unconditionally ``return``ed — a caught exception there (e.g. a
+    lock-pool checkout ``TimeoutError`` under load, #186 item 1) was logged
+    ONLY (``log.error`` alone never reaches Sentry — this process's
+    ``LoggingIntegration`` has ``event_level=None``, breadcrumbs only) and
+    the webhook still 200'd, with NEITHER a Sentry page NOR a ``needs_eyes``
+    fallback notification — the landlord's "1"/"2" reply would silently
+    vanish. Fixed: this call now passes ``alert_on_failure=True`` (pages
+    Sentry the same way the tenant-emergency-artifact path already does)
+    AND, when ``_safe_step`` reports failure, falls through to the SAME
+    ``_ensure_needs_eyes_notification`` fallback an unrecognized/
+    uncorrelated token already gets — a landlord who tried to act still
+    gets a durable, queryable surfacing of "something needs your attention
+    here," even though the specific approve/reject/undo it attempted did
+    not go through. ``handle_reply`` itself only ever returns ``False`` on
+    inputs this call site's own guard above already rules out (dead,
+    ``pragma: no cover`` branches in that function) — so at THIS call site,
+    a ``False`` result from ``_safe_step`` always means "the awaitable
+    raised," never a genuine, expected ``False`` from ``handle_reply``
+    itself.
+
     Raises
     ------
     AppError
@@ -911,11 +934,19 @@ async def _run_post_persist_side_effects(
             and parsed_reply.case_id is not None
             and parsed_reply.draft_id is not None
         ):
-            await _safe_step(
+            handled = await _safe_step(
                 "landlord_approve_by_sms",
                 approve_by_sms.handle_reply(landlord_id=landlord_id, parsed=parsed_reply),
+                alert_on_failure=True,
             )
-            return
+            if handled:
+                return
+            # Fell through: _safe_step caught an exception (see this
+            # function's own docstring, "Approve-by-SMS failure no longer
+            # dead-ends") — Sentry has already been paged above; still give
+            # the landlord a durable, queryable surfacing rather than a
+            # silent 200, via the SAME fallback an unrecognized/uncorrelated
+            # token already gets below.
 
         await _safe_step(
             "landlord_needs_eyes_notification",
