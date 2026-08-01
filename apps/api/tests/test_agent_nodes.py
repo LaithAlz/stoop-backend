@@ -32,7 +32,9 @@ from app.agent.case_lifecycle import (
     STATUS_OPEN,
     STATUS_RESOLVED,
     RoutingSignal,
+    sweep_cases,
 )
+from app.agent.draft_sender import sender_tick
 from app.agent.nodes import identify_case as identify_case_mod
 from app.agent.nodes.identify_case import identify_case
 from app.agent.nodes.identify_property import MessageNotFoundError, identify_property
@@ -254,6 +256,81 @@ async def _insert_case(
     return case_id
 
 
+async def _insert_draft(
+    session: AsyncSession,
+    *,
+    landlord_id: str,
+    case_id: str,
+    status: str = "pending",
+    scheduled_send_at: datetime | None = None,
+) -> str:
+    """#212 — sweep_cases()'s tenant-confirmed/auto-stale draft-cancellation
+    tests. Same minimal shape as ``tests/factories.py``'s own
+    ``insert_draft`` (not imported — see this module's own docstring,
+    "self-contained... helpers duplicated, not imported")."""
+    draft_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO drafts (id, landlord_id, case_id, recipient, body, prompt_version, "
+            "status, scheduled_send_at) "
+            "VALUES (:id, :landlord_id, :case_id, 'tenant', "
+            "'Thanks for letting me know, I will look into it.', 'v1', :status, "
+            ":scheduled_send_at)"
+        ),
+        {
+            "id": draft_id,
+            "landlord_id": landlord_id,
+            "case_id": case_id,
+            "status": status,
+            "scheduled_send_at": scheduled_send_at,
+        },
+    )
+    await session.commit()
+    return draft_id
+
+
+async def _draft_status(session: AsyncSession, draft_id: str) -> str:
+    return str(
+        (
+            await session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+    )
+
+
+async def _send_cancelled_audit_rows(
+    session: AsyncSession, *, case_id: str
+) -> list[dict[str, object]]:
+    rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT actor, payload FROM audit_log WHERE case_id = :cid "
+                    "AND action = 'send_cancelled' ORDER BY id"
+                ),
+                {"cid": case_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return [dict(r) for r in rows]
+
+
+class _FakeSmsSender:
+    """Records every call; never touches a network — same shape as
+    ``tests/test_agent_draft_sender.py``'s own fake (duplicated, not
+    imported, per this module's own "self-contained" convention)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def send_sms(self, *, to_e164: str, from_e164: str, body: str) -> str:
+        self.calls.append({"to_e164": to_e164, "from_e164": from_e164, "body": body})
+        return f"SM{uuid.uuid4().hex}"
+
+
 def _open_case_entry(
     *, case_id: str, last_activity_at: datetime, status: str = STATUS_OPEN
 ) -> dict[str, object]:
@@ -304,6 +381,12 @@ async def _cleanup(session: AsyncSession, landlord_id: str) -> None:
     await session.execute(
         text("DELETE FROM notifications WHERE landlord_id = :lid"), {"lid": landlord_id}
     )
+    # drafts.case_id REFERENCES cases(id) ON DELETE RESTRICT (schema-v1.md)
+    # -- must go before the cases DELETE below, same ordering constraint
+    # every other FK-RESTRICT'd child table here already respects. Added
+    # for #212's sweep_cases() draft-cancellation tests (this module never
+    # seeded a draft before that work).
+    await session.execute(text("DELETE FROM drafts WHERE landlord_id = :lid"), {"lid": landlord_id})
     await session.execute(text("DELETE FROM cases WHERE landlord_id = :lid"), {"lid": landlord_id})
     await session.execute(
         text("DELETE FROM messages WHERE landlord_id = :lid"), {"lid": landlord_id}
@@ -1112,8 +1195,6 @@ async def test_identify_case_trusts_state_open_cases_over_a_resolved_db_row(
 async def test_sweep_cases_auto_stales_inactive_case_in_the_real_database(
     db_session: AsyncSession,
 ) -> None:
-    from app.agent.case_lifecycle import sweep_cases
-
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -1317,8 +1398,6 @@ async def test_new_message_before_deadline_contradicts_and_clears_pending(
 async def test_sweep_cases_applies_tenant_confirmed_resolution_past_deadline(
     db_session: AsyncSession,
 ) -> None:
-    from app.agent.case_lifecycle import sweep_cases
-
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -1380,8 +1459,6 @@ async def test_sweep_cases_applies_tenant_confirmed_resolution_past_deadline(
 async def test_sweep_cases_leaves_pending_resolution_untouched_before_deadline(
     db_session: AsyncSession,
 ) -> None:
-    from app.agent.case_lifecycle import sweep_cases
-
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -1422,8 +1499,6 @@ async def test_sweep_cases_pending_resolution_prevents_auto_stale_interplay(
     even though its last_activity_at is far past the 14-day threshold —
     precedence: pending-resolution wins (case_lifecycle.py's module
     docstring)."""
-    from app.agent.case_lifecycle import sweep_cases
-
     landlord_id = await _insert_landlord(db_session)
     property_id = await _insert_property(db_session, landlord_id)
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
@@ -1629,5 +1704,301 @@ async def test_sweep_toctou_new_message_between_select_and_update_prevents_auto_
             )
         ).scalar_one()
         assert notification_count == 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# sweep_cases() draft cancellation (#212 fix) — the armed trap #206's spec
+# review surfaced: the tenant-confirmed leg used to resolve a case WITHOUT
+# cancelling its still-pending/approved draft, unlike the resolve endpoint
+# (#206) — inert while the case stayed 'resolved' (app/agent/draft_sender.
+# py's own belt-and-braces guard caught it), but a stuck draft would become
+# claimable again the instant a later message REOPENED the case (the guard
+# only matches status = 'resolved'). See app/agent/case_lifecycle.py's own
+# sweep_cases()/_apply_sweep_action docstrings for the fix.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_sweep_cases_tenant_confirmed_cancels_pending_draft(
+    db_session: AsyncSession,
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    now = datetime.now(UTC)
+    case_id = await _insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="awaiting_approval",
+        pending_resolved_at=now - timedelta(minutes=1),
+    )
+    draft_id = await _insert_draft(
+        db_session, landlord_id=landlord_id, case_id=case_id, status="pending"
+    )
+
+    try:
+        actions = await sweep_cases(now=now)
+        assert case_id in {str(a.case_id) for a in actions}
+
+        assert await _draft_status(db_session, draft_id) == "cancelled"
+
+        cancelled_audit = await _send_cancelled_audit_rows(db_session, case_id=case_id)
+        assert len(cancelled_audit) == 1
+        assert cancelled_audit[0]["actor"] == "system"
+        assert cancelled_audit[0]["payload"]["draft_id"] == draft_id
+        assert cancelled_audit[0]["payload"]["reason"] == "case_resolved"
+        assert cancelled_audit[0]["payload"]["leg"] == "tenant_confirmed"
+
+        all_actions = (
+            (
+                await db_session.execute(
+                    text("SELECT action FROM audit_log WHERE case_id = :cid ORDER BY id"),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        assert [r["action"] for r in all_actions] == ["case_resolved", "send_cancelled"]
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sweep_cases_tenant_confirmed_cancels_approved_draft(
+    db_session: AsyncSession,
+) -> None:
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    now = datetime.now(UTC)
+    case_id = await _insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="awaiting_approval",
+        pending_resolved_at=now - timedelta(minutes=1),
+    )
+    draft_id = await _insert_draft(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        status="approved",
+        scheduled_send_at=now - timedelta(seconds=1),
+    )
+
+    try:
+        actions = await sweep_cases(now=now)
+        assert case_id in {str(a.case_id) for a in actions}
+
+        assert await _draft_status(db_session, draft_id) == "cancelled"
+
+        cancelled_audit = await _send_cancelled_audit_rows(db_session, case_id=case_id)
+        assert len(cancelled_audit) == 1
+        assert cancelled_audit[0]["payload"]["draft_id"] == draft_id
+        assert cancelled_audit[0]["payload"]["reason"] == "case_resolved"
+        assert cancelled_audit[0]["payload"]["leg"] == "tenant_confirmed"
+
+        # The safety edge, proven end-to-end: a sender tick AFTER the sweep
+        # must claim (and therefore send) nothing for this draft.
+        tenant_phone = (
+            await db_session.execute(
+                text("SELECT phone FROM tenants WHERE id = :id"), {"id": tenant_id}
+            )
+        ).scalar_one()
+        sender = _FakeSmsSender()
+        await sender_tick(sender=sender)
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert own_calls == []
+        assert await _draft_status(db_session, draft_id) == "cancelled"  # never claimed
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sweep_cases_tenant_confirmed_leaves_sending_draft_alone(
+    db_session: AsyncSession,
+) -> None:
+    """A draft the sender ticker already claimed ('sending') at sweep time
+    is genuinely mid-flight — mirrors POST /v1/cases/{id}/resolve's own
+    "sending" race exception (#206). Must be left untouched, never force-
+    cancelled out from under an in-flight send."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    now = datetime.now(UTC)
+    case_id = await _insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="awaiting_approval",
+        pending_resolved_at=now - timedelta(minutes=1),
+    )
+    draft_id = await _insert_draft(
+        db_session, landlord_id=landlord_id, case_id=case_id, status="sending"
+    )
+
+    try:
+        actions = await sweep_cases(now=now)
+        assert case_id in {str(a.case_id) for a in actions}
+
+        assert await _draft_status(db_session, draft_id) == "sending"  # untouched
+        assert await _send_cancelled_audit_rows(db_session, case_id=case_id) == []
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sweep_cases_tenant_confirmed_reopen_trap_closed(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE regression #212 exists for — the exact trap sequence: approve ->
+    tenant-confirm sweep resolves -> a later tenant message REOPENS the
+    case -> the sender's own belt-and-braces guard (``status = 'resolved'``)
+    no longer matches a ``'reopened'`` case, so nothing but THIS fix's
+    draft cancellation stood between a stuck landlord-approved draft and a
+    stale send once the case reopened. After this fix, sweep_cases()
+    itself cancels the draft at resolve time (proven by the two tests
+    above) — this test proves the END-TO-END consequence: after reopening,
+    a real sender_tick claims nothing at all for this case."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    now = datetime.now(UTC)
+    case_id = await _insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="awaiting_approval",
+        pending_resolved_at=now - timedelta(minutes=1),
+    )
+    draft_id = await _insert_draft(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        status="approved",
+        scheduled_send_at=now - timedelta(seconds=1),
+    )
+
+    try:
+        # 1. Approve -> tenant-confirm sweep resolves (and, per this fix,
+        #    cancels the draft in the same transaction).
+        actions = await sweep_cases(now=now)
+        assert case_id in {str(a.case_id) for a in actions}
+        assert await _draft_status(db_session, draft_id) == "cancelled"
+
+        # 2. A later tenant message reopens the SAME case (within the
+        #    30-day reopen window) via the real production path —
+        #    identify_case's own signals-driven reopen (matching
+        #    test_identify_case_reopen_within_30_days's own harness).
+        message_id = await _insert_message(
+            db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+        )
+
+        def _fake_signals(state: AgentState) -> list[RoutingSignal]:
+            return [RoutingSignal(is_new_issue=False, matched_case_id=uuid.UUID(case_id))]
+
+        monkeypatch.setattr(identify_case_mod, "_extract_signals", _fake_signals)
+
+        state: AgentState = {"message_id": uuid.UUID(message_id), "reasoning_log": []}
+        update = await identify_case(state)
+        assert str(update["case_context"].case_id) == case_id
+
+        reopened_row = (
+            (
+                await db_session.execute(
+                    text("SELECT status FROM cases WHERE id = :cid"), {"cid": case_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert reopened_row["status"] == "reopened"
+
+        # 3. THE regression: a sender tick after the reopen must claim
+        #    NOTHING for this case — the draft was already cancelled in
+        #    step 1, long before app/agent/draft_sender.py's own
+        #    resolved-case guard would have stopped matching.
+        tenant_phone = (
+            await db_session.execute(
+                text("SELECT phone FROM tenants WHERE id = :id"), {"id": tenant_id}
+            )
+        ).scalar_one()
+        sender = _FakeSmsSender()
+        await sender_tick(sender=sender)
+        own_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert own_calls == []
+        assert await _draft_status(db_session, draft_id) == "cancelled"  # never re-claimed
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_sweep_cases_auto_stale_also_cancels_a_leftover_draft(
+    db_session: AsyncSession,
+) -> None:
+    """Belt-and-braces (#212): the auto-stale leg cancels a case's
+    outstanding draft too, via the SAME shared code path as the tenant-
+    confirmed leg (``app/agent/case_lifecycle.py``'s ``_apply_sweep_action``
+    docstring, "draft cancellation"). Structurally,
+    ``AUTO_STALE_ELIGIBLE_STATUSES`` already excludes ``awaiting_approval``
+    — the only status an outstanding draft can exist under in production
+    (``cases.status`` never becomes ``awaiting_tenant`` until the draft
+    actually SENDS) — so this leg never actually encounters one in
+    practice; this test seeds the otherwise-unreachable-in-production case
+    directly to prove the defensive code itself works, in case that
+    structural invariant is ever loosened."""
+    landlord_id = await _insert_landlord(db_session)
+    property_id = await _insert_property(db_session, landlord_id)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    now = datetime.now(UTC)
+    case_id = await _insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="reopened",
+        last_activity_at=now - timedelta(days=20),
+    )
+    draft_id = await _insert_draft(
+        db_session,
+        landlord_id=landlord_id,
+        case_id=case_id,
+        status="approved",
+        scheduled_send_at=now - timedelta(seconds=1),
+    )
+
+    try:
+        actions = await sweep_cases(now=now)
+        assert case_id in {str(a.case_id) for a in actions}
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT status, resolved_reason FROM cases WHERE id = :cid"),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["status"] == STATUS_RESOLVED
+        assert row["resolved_reason"] == "auto_stale"
+
+        assert await _draft_status(db_session, draft_id) == "cancelled"
+
+        cancelled_audit = await _send_cancelled_audit_rows(db_session, case_id=case_id)
+        assert len(cancelled_audit) == 1
+        assert cancelled_audit[0]["actor"] == "system"
+        assert cancelled_audit[0]["payload"]["draft_id"] == draft_id
+        assert cancelled_audit[0]["payload"]["reason"] == "case_resolved"
+        assert cancelled_audit[0]["payload"]["leg"] == "auto_stale"
     finally:
         await _cleanup(db_session, landlord_id)

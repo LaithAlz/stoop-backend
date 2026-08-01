@@ -675,10 +675,14 @@ async def resolve_case(
     `resolved` (see that module's own docstring, "Resolved-case guard
     belt-and-braces (#206)") — a second, independent layer protecting
     against any OTHER code path that might ever resolve a case without
-    running this endpoint's own cancellation (e.g. ``sweep_cases()``'s
-    tenant-confirmed leg, which is NOT excluded from ``awaiting_approval``
-    the way its auto-stale leg is — a pre-existing, out-of-scope gap this
-    guard also happens to close).
+    running this endpoint's own cancellation. ``sweep_cases()``'s
+    tenant-confirmed leg used to be exactly such a path (it was NOT
+    excluded from ``awaiting_approval`` the way its auto-stale leg is) —
+    root-caused and closed directly in ``app/agent/case_lifecycle.py``
+    (#212: both sweep legs now cancel a case's outstanding drafts
+    themselves, in the same transaction as their own resolve ``UPDATE``,
+    mirroring this endpoint's own cancellation below). This guard remains
+    in place as defense-in-depth for any other path.
 
     Emergency chain — untouched by construction
     -----------------------------------------------
