@@ -288,6 +288,20 @@ async def enqueue_landlord_sms(
 # Negligible at current scale; add a composite index if `notifications`
 # ever grows large enough for this to show up in practice. Deliberately no
 # migration here -- see this issue's own scope note.
+# ``AND n.status = 'sent'`` (safety re-review, blocking finding 3,
+# 2026-08-01, CLAUDE.md rule 3: "nothing sends to a tenant/vendor without
+# landlord approval" -- this is the landlord-approval SIDE of that rule).
+# WITHOUT this filter, a draft-ready notice this landlord was NEVER
+# actually shown (still 'pending', transiently 'failed', or terminally
+# 'exhausted' -- issue #229 item 4's own attempt cap) could still win
+# "most recent" correlation purely by being NEWER in ``created_at`` than
+# the notice the landlord actually received and is replying to -- letting
+# a bare "1" reply approve-and-send a DIFFERENT draft the landlord never
+# saw, laid out in a case a text message never referenced. Scoping to
+# ``'sent'`` makes this query answer its own docstring's question
+# correctly: "the most recent draft-ready notification" necessarily means
+# one that was actually delivered -- a landlord cannot be replying to a
+# text that never reached their phone.
 _SELECT_MOST_RECENT_READY_DRAFT_SQL = text(
     """
     SELECT n.payload ->> 'draft_id' AS draft_id, n.case_id AS case_id
@@ -296,6 +310,7 @@ _SELECT_MOST_RECENT_READY_DRAFT_SQL = text(
     WHERE n.landlord_id = :landlord_id
       AND n.type = 'draft_ready' AND n.channel = 'sms'
       AND n.payload ->> 'kind' = 'ready'
+      AND n.status = 'sent'
       AND c.property_id = :property_id
     ORDER BY n.created_at DESC
     LIMIT 1
@@ -321,7 +336,15 @@ async def most_recent_ready_draft(
     properties also have pending drafts. Returns ``None`` when this
     landlord has never had a draft-ready notice for this property (an
     honest "nothing to correlate against" — callers fall back to the
-    existing needs_eyes surfacing, never a 500/silently-dropped reply)."""
+    existing needs_eyes surfacing, never a 500/silently-dropped reply).
+
+    Only ``status = 'sent'`` notices are eligible (safety re-review,
+    blocking finding 3, 2026-08-01 — see :data:`
+    _SELECT_MOST_RECENT_READY_DRAFT_SQL`'s own comment): a landlord can
+    only be replying to a text that actually reached their phone, so a
+    notice this landlord was never shown (``'pending'``/``'failed'``/
+    ``'exhausted'``) must never win "most recent" correlation just for
+    sorting newer than the one they actually received."""
     row = (
         (
             await session.execute(

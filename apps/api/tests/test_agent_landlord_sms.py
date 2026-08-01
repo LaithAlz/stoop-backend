@@ -304,13 +304,30 @@ async def test_most_recent_ready_draft_scoped_to_property(db_session: AsyncSessi
         )
         assert none_yet is None
 
-        await landlord_sms.enqueue_landlord_sms(
+        notification_id = await landlord_sms.enqueue_landlord_sms(
             db_session,
             landlord_id=uuid.UUID(landlord_id),
             case_id=uuid.UUID(case_id),
             draft_id=uuid.UUID(draft_id),
             kind=landlord_sms.KIND_READY,
             body="Draft ready...",
+        )
+        await db_session.commit()
+        assert notification_id is not None
+
+        # BLOCKING-3 (safety re-review, 2026-08-01): still 'pending' --
+        # never actually delivered to this landlord's phone -- must NOT
+        # correlate yet. See test_most_recent_ready_draft_only_correlates
+        # _to_sent_notices below for the full pending/failed/exhausted
+        # matrix.
+        still_pending = await landlord_sms.most_recent_ready_draft(
+            db_session, landlord_id=uuid.UUID(landlord_id), property_id=uuid.UUID(property_id)
+        )
+        assert still_pending is None
+
+        await db_session.execute(
+            text("UPDATE notifications SET status = 'sent' WHERE id = :id"),
+            {"id": str(notification_id)},
         )
         await db_session.commit()
 
@@ -328,6 +345,86 @@ async def test_most_recent_ready_draft_scoped_to_property(db_session: AsyncSessi
             db_session, landlord_id=uuid.UUID(landlord_id), property_id=uuid.UUID(other_property_id)
         )
         assert none_for_other_property is None
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("never_delivered_status", ["pending", "failed", "exhausted"])
+async def test_most_recent_ready_draft_only_correlates_to_sent_notices(
+    db_session: AsyncSession, never_delivered_status: str
+) -> None:
+    """Safety re-review, blocking finding 3, 2026-08-01 — reproduces the
+    PoC'd approve-by-SMS correlation bug: WITHOUT the ``status = 'sent'``
+    filter on ``_SELECT_MOST_RECENT_READY_DRAFT_SQL``, a NEWER draft-ready
+    notice this landlord was never actually shown (``'pending'``,
+    transiently ``'failed'``, or terminally ``'exhausted'`` — issue #229
+    item 4's own attempt cap) could out-rank an OLDER notice that genuinely
+    reached their phone, purely by sorting newer in ``created_at`` — a bare
+    "1" reply would then approve-and-send a DIFFERENT draft, on a
+    DIFFERENT case, the landlord never saw or referenced. This directly
+    touches ``app/agent/approve_by_sms.py``'s reply-correlation call site
+    (``most_recent_ready_draft`` is its sole disambiguation mechanism, per
+    api-contracts.md)."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+
+    # Case A: the notice the landlord ACTUALLY received (older, 'sent').
+    case_id_a = await factories.insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    draft_id_a = await factories.insert_draft(
+        db_session, landlord_id=landlord_id, case_id=case_id_a
+    )
+    notification_id_a = await landlord_sms.enqueue_landlord_sms(
+        db_session,
+        landlord_id=uuid.UUID(landlord_id),
+        case_id=uuid.UUID(case_id_a),
+        draft_id=uuid.UUID(draft_id_a),
+        kind=landlord_sms.KIND_READY,
+        body="A ready",
+    )
+    await db_session.commit()
+    await db_session.execute(
+        text("UPDATE notifications SET status = 'sent' WHERE id = :id"),
+        {"id": str(notification_id_a)},
+    )
+    await db_session.commit()
+
+    # Case B: a NEWER notice the landlord was NEVER shown.
+    case_id_b = await factories.insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    draft_id_b = await factories.insert_draft(
+        db_session, landlord_id=landlord_id, case_id=case_id_b
+    )
+    notification_id_b = await landlord_sms.enqueue_landlord_sms(
+        db_session,
+        landlord_id=uuid.UUID(landlord_id),
+        case_id=uuid.UUID(case_id_b),
+        draft_id=uuid.UUID(draft_id_b),
+        kind=landlord_sms.KIND_READY,
+        body="B ready",
+    )
+    await db_session.commit()
+    if never_delivered_status != "pending":
+        await db_session.execute(
+            text("UPDATE notifications SET status = :status WHERE id = :id"),
+            {"status": never_delivered_status, "id": str(notification_id_b)},
+        )
+        await db_session.commit()
+
+    try:
+        referenced = await landlord_sms.most_recent_ready_draft(
+            db_session, landlord_id=uuid.UUID(landlord_id), property_id=uuid.UUID(property_id)
+        )
+        assert referenced is not None
+        # Correlation must resolve to A (actually delivered), NEVER to B
+        # (newer, but never shown to this landlord) -- regardless of
+        # whether B is 'pending', 'failed', or 'exhausted'.
+        assert str(referenced.draft_id) == draft_id_a
+        assert str(referenced.case_id) == case_id_a
     finally:
         await _cleanup(db_session, landlord_id)
 
