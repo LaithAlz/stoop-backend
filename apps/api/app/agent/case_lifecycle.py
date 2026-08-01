@@ -746,10 +746,18 @@ async def _apply_sweep_action(
     draft actually SENDS — see ``app/agent/nodes/finalize_draft_decision.py``
     and ``app/agent/draft_sender.py``'s own ``_MARK_CASE_AWAITING_TENANT_SQL``
     — and ``AUTO_STALE_ELIGIBLE_STATUSES`` already excludes
-    ``awaiting_approval`` entirely), so the auto-stale leg's own cancel call
-    is structurally a no-op (0 rows) in every reachable state; it costs one
-    extra rowcount-gated UPDATE per resolve and future-proofs the invariant
-    without duplicating logic per leg.
+    ``awaiting_approval`` entirely), so in every NORMAL state the auto-stale
+    leg's cancel call matches 0 rows. It is NOT unreachable, though — the
+    documented crash window between ``draft_response``'s own commit and
+    ``mark_awaiting_approval``'s separate transaction (see
+    ``app/agent/graph_entry.py``'s docstring) can leave a committed
+    ``pending`` draft on a case still ``open``/``reopened``/
+    ``awaiting_tenant`` (all auto-stale eligible), and an ``approved`` row
+    with ``scheduled_send_at IS NULL`` is invisible to the sender's due
+    query forever. Those orphans are exactly what this cancel exists to
+    sweep up; do not delete this branch on the strength of the normal-state
+    argument alone. It costs one extra rowcount-gated UPDATE per resolve
+    and future-proofs the invariant without duplicating logic per leg.
     """
     is_tenant_confirmed = action.transition.resolved_reason == RESOLVED_REASON_TENANT_CONFIRMED
     update_sql = _UPDATE_TENANT_CONFIRMED_SQL if is_tenant_confirmed else _UPDATE_AUTO_STALE_SQL

@@ -873,6 +873,21 @@
 >    simply the first writer of this combination. No migration needed for
 >    this part.
 
+> **v1.18 amendment (2026-08-01)** — no migration required (#212; same
+> payload-only, doc-first path as v1.6/v1.7/v1.12/v1.14). The `audit_log`
+> `send_cancelled` payload gains an OPTIONAL **`leg`** key
+> (`"tenant_confirmed" | "auto_stale"`) on rows written by
+> `app/agent/case_lifecycle.py::_apply_sweep_action` — both `sweep_cases()`
+> resolve legs now cancel outstanding `pending`/`approved`-unsent drafts on
+> the case they resolve (the #212 reopen-trap fix), mirroring
+> `POST /v1/cases/{id}/resolve`'s v1.14 cancellation semantics exactly
+> (`{draft_id, reason: "case_resolved"}`), with `actor='system'` (the
+> sweep's own convention) and `leg` identifying which resolve path fired.
+> Rows written by the endpoint carry no `leg` key — readers treat it as
+> absent-means-endpoint. `sweep_cases()` still has zero scheduler call
+> sites; this key first appears in production whenever that wiring lands
+> (its own issue, with its own founder gates).
+
 > **v1.17 amendment (2026-07-24)** — migration 0015 implements this (#170,
 > from the #40 safety review): an inbound SMS whose `To` matches no
 > `properties.twilio_number` cannot be persisted to `messages` (`NOT NULL`

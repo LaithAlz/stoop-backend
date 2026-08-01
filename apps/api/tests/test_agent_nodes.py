@@ -130,14 +130,16 @@ async def _insert_property(
     backup_contact: dict[str, object] | None = None,
     lat: float | None = None,
     lon: float | None = None,
+    twilio_number: str | None = None,
 ) -> str:
     property_id = str(uuid.uuid4())
     await session.execute(
         text(
             "INSERT INTO properties "
-            "(id, landlord_id, label, address_line1, city, house_rules, backup_contact, lat, lon) "
+            "(id, landlord_id, label, address_line1, city, house_rules, backup_contact, lat, lon, "
+            "twilio_number) "
             "VALUES (:id, :landlord_id, 'Test Property', '123 Test St', 'Toronto', "
-            ":house_rules, CAST(:backup_contact AS jsonb), :lat, :lon)"
+            ":house_rules, CAST(:backup_contact AS jsonb), :lat, :lon, :twilio_number)"
         ),
         {
             "id": property_id,
@@ -146,6 +148,7 @@ async def _insert_property(
             "backup_contact": json.dumps(backup_contact) if backup_contact is not None else None,
             "lat": lat,
             "lon": lon,
+            "twilio_number": twilio_number,
         },
     )
     await session.commit()
@@ -1773,7 +1776,7 @@ async def test_sweep_cases_tenant_confirmed_cancels_approved_draft(
     db_session: AsyncSession,
 ) -> None:
     landlord_id = await _insert_landlord(db_session)
-    property_id = await _insert_property(db_session, landlord_id)
+    property_id = await _insert_property(db_session, landlord_id, twilio_number="+16475550281")
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
     now = datetime.now(UTC)
     case_id = await _insert_case(
@@ -1868,7 +1871,7 @@ async def test_sweep_cases_tenant_confirmed_reopen_trap_closed(
     above) — this test proves the END-TO-END consequence: after reopening,
     a real sender_tick claims nothing at all for this case."""
     landlord_id = await _insert_landlord(db_session)
-    property_id = await _insert_property(db_session, landlord_id)
+    property_id = await _insert_property(db_session, landlord_id, twilio_number="+16475550282")
     tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
     now = datetime.now(UTC)
     case_id = await _insert_case(
