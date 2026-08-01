@@ -249,6 +249,8 @@ pre-existing ``awaiting_approval`` label back to something accurate (e.g.
 genuine status-semantics change — touches what the dashboard/queue query
 (``app/routers/queue.py``) treats as "actionable," and deserves its own
 review rather than riding in unilaterally on this issue's narrower scope.
+
+The push-notification enqueue seam (#210 M3)
 ---------------------------------------------
 ``mark_awaiting_approval`` is the ONE place ``cases.status`` flips to
 ``'awaiting_approval'`` (see ``app/routers/queue.py``'s own module
