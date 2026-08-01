@@ -32,6 +32,7 @@ function makeItem(overrides: Partial<QueueItem> = {}): QueueItem {
     refusal_flags: [],
     has_media: false,
     media_note: null,
+    notification_id: null,
     ...overrides,
   };
 }

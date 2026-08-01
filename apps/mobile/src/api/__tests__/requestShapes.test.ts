@@ -11,6 +11,7 @@ import { deleteProperty, createProperty } from "@/api/properties";
 import { createTenant, updateTenant } from "@/api/tenants";
 import { revokeTrust } from "@/api/trust";
 import { updateMe } from "@/api/me";
+import { ackNotification } from "@/api/notifications";
 
 jest.mock("@/api/client", () => ({
   apiRequest: jest.fn(),
@@ -104,6 +105,27 @@ describe("tenants — the sub-resource route shape (Tenants & Vendors section)",
       method: "PATCH",
       body: { unit: "2" },
     });
+  });
+});
+
+describe("ackNotification (POST /v1/notifications/{id}/ack, v1.15)", () => {
+  it("POSTs the notification's own ack path — no body", async () => {
+    await ackNotification("notif-1");
+    expect(mockApiRequest).toHaveBeenCalledWith("/v1/notifications/notif-1/ack", {
+      method: "POST",
+    });
+  });
+
+  it("idempotent repeat calls are passed straight through — no client-side short circuit", async () => {
+    const stored = { acknowledged_at: "2026-07-18T12:00:00Z" };
+    mockApiRequest.mockResolvedValue(stored);
+
+    const first = await ackNotification("notif-1");
+    const second = await ackNotification("notif-1");
+
+    expect(first).toEqual(stored);
+    expect(second).toEqual(stored);
+    expect(mockApiRequest).toHaveBeenCalledTimes(2);
   });
 });
 

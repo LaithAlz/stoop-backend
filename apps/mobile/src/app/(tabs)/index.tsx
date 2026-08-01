@@ -34,7 +34,12 @@ import {
   type QueueViewRow,
 } from "@/features/queue/queueEntries";
 import { useDraftActions } from "@/features/queue/useDraftActions";
-import { emergencyHeadline, emergencySubtext } from "@/features/emergency/emergencyBanner";
+import {
+  emergencyHeadline,
+  emergencySubtext,
+  hasAcknowledgeableNotification,
+} from "@/features/emergency/emergencyBanner";
+import { useAcknowledge } from "@/features/emergency/useAcknowledge";
 import { EditDraftModal } from "@/features/queue/EditDraftModal";
 
 function timeOfDayGreeting(date: Date): string {
@@ -55,6 +60,7 @@ export default function HomeScreen() {
   const onSettled = useCallback(() => void queueQuery.refetch(), [queueQuery]);
   const draftActions = useDraftActions({ onNotice, onSettled });
   const { entries } = draftActions;
+  const acknowledge = useAcknowledge({ onNotice });
 
   const openCase = useCallback(
     (caseId: string) => {
@@ -195,6 +201,16 @@ export default function HomeScreen() {
                   headline={emergencyHeadline(item)}
                   subtext={emergencySubtext(item)}
                   onPress={() => openCase(item.case_id)}
+                  onAcknowledge={
+                    hasAcknowledgeableNotification(item)
+                      ? () => acknowledge.acknowledge(item.notification_id)
+                      : undefined
+                  }
+                  acknowledging={
+                    hasAcknowledgeableNotification(item)
+                      ? acknowledge.isAcknowledging(item.notification_id)
+                      : false
+                  }
                 />
               ))}
               {emergencyItems.length > 0 ? <View style={styles.headerGap} /> : null}
