@@ -1360,15 +1360,18 @@ async def test_sms_drain_sweep_marks_failed_and_retries_on_the_next_tick(
 
     try:
         fake_sender.fail_sms = True
-        first_outcomes = await emergency_chain.run_sms_drain_sweep()
+        now = datetime.now(UTC)
+        first_outcomes = await emergency_chain.run_sms_drain_sweep(now=now)
         assert first_outcomes[0].outcome == "failed"
 
         notif = await _fetch_notification(db_session, notification_id)
         assert notif["status"] == "failed"
         assert notif["attempt"] == 1
 
+        # Past the tenant_ack backoff window (issue #229 safety re-review
+        # round 2 -- capped at 1 hour).
         fake_sender.fail_sms = False
-        second_outcomes = await emergency_chain.run_sms_drain_sweep()
+        second_outcomes = await emergency_chain.run_sms_drain_sweep(now=now + timedelta(hours=2))
         assert second_outcomes[0].outcome == "sent"
 
         notif_after = await _fetch_notification(db_session, notification_id)
@@ -1567,7 +1570,13 @@ async def test_sms_drain_sweep_emergency_sms_not_starved_by_poisoned_tenant_ack_
     very FIRST sweep call regardless of how many poisoned ``tenant_ack``
     rows sort ahead of it in ``created_at`` order, and regardless of how
     tiny *deadline_seconds* is (the deadline only ever bounds the
-    ``tenant_ack`` pass, which runs second)."""
+    ``tenant_ack`` pass, which runs second).
+
+    Note (reviewer advisory): this test does not itself pin WHICH pass
+    runs first -- that ordering is a LATENCY property (which row type gets
+    attempted soonest within a tick), not a safety one; the actual safety
+    guarantee under test is that emergency_sms is never starved, which
+    holds regardless of pass order."""
     landlord_id, property_id, safe_tenant_id = await _seed(db_session)
 
     poison_notification_ids: list[str] = []
@@ -1631,5 +1640,94 @@ async def test_sms_drain_sweep_emergency_sms_not_starved_by_poisoned_tenant_ack_
         notif = await _fetch_notification(db_session, emergency_notification_id)
         assert notif["status"] == "sent"
         assert notif["attempt"] == 1
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Exponential backoff on tenant_ack's next_attempt_at (issue #229 safety
+# re-review round 2, blocking finding, 2026-08-01 -- SYMMETRY with the
+# identical landlord_sms.py fix); emergency_sms is explicitly PINNED to have
+# NO backoff filter at all -- it must keep its unconditional every-tick
+# retry forever (see module docstring "TWO PASSES").
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("attempt", "expected_seconds"),
+    [
+        (1, 60.0),
+        (2, 120.0),
+        (3, 240.0),
+        (4, 480.0),
+        (5, 960.0),
+        (6, 1920.0),
+        (7, 3600.0),  # 60 * 2**6 = 3840, capped
+        (8, 3600.0),  # stays capped for every further attempt
+    ],
+)
+def test_tenant_ack_backoff_progression(attempt: int, expected_seconds: float) -> None:
+    """Pins the exact progression -- same formula and constants as
+    ``app/agent/landlord_sms.py``'s own ``_landlord_sms_backoff_seconds``
+    (issue #229 safety re-review round 2's reviewer-specified formula):
+    ``60s * 2**(attempt - 1)``, capped at 3600s."""
+    assert (
+        emergency_chain._tenant_ack_backoff_seconds(attempt)  # noqa: SLF001
+        == expected_seconds
+    )
+
+
+@pytest.mark.unit
+def test_emergency_sms_pass_select_has_no_backoff_filter() -> None:
+    """Structural pin (per the reviewer's own advisory): a future
+    "cleanup" harmonizing the two drain-pass SELECTs must never add a
+    ``next_attempt_at`` filter to the ``emergency_sms`` pass -- that row
+    type must retry EVERY tick, unconditionally (see
+    ``_SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL``'s own comment). Doing so would
+    silently reopen blocking finding 1's own starvation direction (a stuck
+    emergency_sms candidate quietly backing off instead of being retried
+    every tick -- the one non-redundant tenant-facing message in the whole
+    chain)."""
+    assert "next_attempt_at" not in str(
+        emergency_chain._SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL  # noqa: SLF001
+    )
+
+
+@pytest.mark.integration
+async def test_emergency_sms_pass_retries_every_tick_with_no_backoff(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    """Behavioral pin, complementing the structural one above: an
+    ``emergency_sms`` row that keeps failing is retried on EVERY call, even
+    when ``now`` never advances at all between calls -- proving no
+    backoff/``next_attempt_at`` window ever gates it, unlike ``tenant_ack``
+    (contrast
+    ``test_sms_drain_sweep_marks_failed_and_retries_on_the_next_tick``
+    above, which DOES need ``now`` to advance past its own backoff before
+    a retry succeeds)."""
+    landlord_id, property_id, tenant_id = await _seed(db_session)
+    message_id = await factories.insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    category, body = emergency_chain.render_tenant_safety_sms(["fire"])
+    notification_id = await _insert_emergency_sms_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        category=category,
+        body=body,
+    )
+
+    try:
+        fake_sender.fail_sms = True
+        now = datetime.now(UTC)  # deliberately the SAME `now` every call
+        for expected_attempt in range(1, 4):
+            outcomes = await emergency_chain.run_sms_drain_sweep(now=now)
+            assert [o.outcome for o in outcomes] == ["failed"]
+            notif = await _fetch_notification(db_session, notification_id)
+            assert notif["status"] == "failed"
+            assert notif["attempt"] == expected_attempt
     finally:
         await _cleanup(db_session, landlord_id)

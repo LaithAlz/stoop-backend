@@ -16,6 +16,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -515,7 +516,8 @@ async def test_drain_sweep_marks_failed_on_send_exception_and_retries_next_tick(
     monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: failing_sender)
 
     try:
-        await landlord_sms.run_landlord_sms_drain_sweep()
+        now = datetime.now(UTC)
+        await landlord_sms.run_landlord_sms_drain_sweep(now=now)
 
         status = (
             await db_session.execute(
@@ -528,10 +530,11 @@ async def test_drain_sweep_marks_failed_on_send_exception_and_retries_next_tick(
         ).scalar_one()
         assert status == "failed"  # transient -- retried, never exhausted
 
-        # Next tick, with a working sender, actually delivers it.
+        # Next tick, with a working sender, actually delivers it -- past
+        # the backoff window (issue #229 safety re-review round 2).
         working_sender = _FakeTwilioSender()
         monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: working_sender)
-        await landlord_sms.run_landlord_sms_drain_sweep()
+        await landlord_sms.run_landlord_sms_drain_sweep(now=_far_future(now))
 
         status_after_retry = (
             await db_session.execute(
@@ -649,6 +652,15 @@ async def _row_status_and_attempt(db_session: AsyncSession, landlord_id: str) ->
     return row["status"], row["attempt"]
 
 
+def _far_future(current: datetime) -> datetime:
+    """Advance well past ANY possible landlord-SMS backoff window (issue
+    #229 safety re-review round 2 -- capped at
+    ``_LANDLORD_SMS_BACKOFF_CAP_SECONDS``, 1 hour) so a test unrelated to
+    backoff PACING can call ``run_landlord_sms_drain_sweep`` repeatedly,
+    back-to-back, without waiting on it for real."""
+    return current + timedelta(hours=2)
+
+
 @pytest.mark.integration
 async def test_drain_sweep_exhausts_after_max_attempts_despite_valid_phone(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
@@ -666,9 +678,14 @@ async def test_drain_sweep_exhausts_after_max_attempts_despite_valid_phone(
     max_attempts = landlord_sms._LANDLORD_SMS_MAX_ATTEMPTS  # noqa: SLF001
 
     try:
+        # `now` advances past the backoff window before every call (issue
+        # #229 safety re-review round 2) -- this test is about the
+        # attempt-cap, not backoff pacing.
+        now = datetime.now(UTC)
         last_outcomes: list[landlord_sms.LandlordSmsOutcome] = []
         for _ in range(max_attempts):
-            last_outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+            last_outcomes = await landlord_sms.run_landlord_sms_drain_sweep(now=now)
+            now = _far_future(now)
 
         assert [o.outcome for o in last_outcomes] == ["exhausted"]
 
@@ -679,7 +696,7 @@ async def test_drain_sweep_exhausts_after_max_attempts_despite_valid_phone(
         # A further tick must be a true no-op -- 'exhausted' rows are
         # excluded from the sweep's own retry set (status IN ('pending',
         # 'failed')).
-        further_outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+        further_outcomes = await landlord_sms.run_landlord_sms_drain_sweep(now=now)
         assert further_outcomes == []
         status_after, attempt_after = await _row_status_and_attempt(db_session, landlord_id)
         assert status_after == "exhausted"
@@ -707,11 +724,16 @@ async def test_drain_sweep_kind_ready_never_exhausts(
     max_attempts = landlord_sms._LANDLORD_SMS_MAX_ATTEMPTS  # noqa: SLF001
 
     try:
-        # THREE TIMES the cap -- still never exhausted.
+        # THREE TIMES the cap -- still never exhausted. `now` advances past
+        # the backoff window before every call (issue #229 safety
+        # re-review round 2) -- this test is about the KIND_READY
+        # exhaustion EXEMPTION, not backoff pacing.
+        now = datetime.now(UTC)
         last_outcomes: list[landlord_sms.LandlordSmsOutcome] = []
         for _ in range(max_attempts * 3):
-            last_outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+            last_outcomes = await landlord_sms.run_landlord_sms_drain_sweep(now=now)
             assert [o.outcome for o in last_outcomes] == ["failed"]
+            now = _far_future(now)
 
         status, attempt = await _row_status_and_attempt(db_session, landlord_id)
         assert status == "failed"  # never 'exhausted', however many attempts
@@ -719,7 +741,7 @@ async def test_drain_sweep_kind_ready_never_exhausts(
 
         working_sender = _FakeTwilioSender()
         monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: working_sender)
-        outcomes_after = await landlord_sms.run_landlord_sms_drain_sweep()
+        outcomes_after = await landlord_sms.run_landlord_sms_drain_sweep(now=now)
         assert [o.outcome for o in outcomes_after] == ["sent"]
         status_after, _ = await _row_status_and_attempt(db_session, landlord_id)
         assert status_after == "sent"
@@ -742,16 +764,18 @@ async def test_drain_sweep_below_max_attempts_stays_failed_and_still_retries(
     assert max_attempts > 1, "test assumes at least one non-terminal failed attempt"
 
     try:
-        outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+        now = datetime.now(UTC)
+        outcomes = await landlord_sms.run_landlord_sms_drain_sweep(now=now)
         assert [o.outcome for o in outcomes] == ["failed"]
 
         status, attempt = await _row_status_and_attempt(db_session, landlord_id)
         assert status == "failed"  # transient -- stays in the retry set
         assert attempt == 1
 
+        # Past the backoff window (issue #229 safety re-review round 2).
         working_sender = _FakeTwilioSender()
         monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: working_sender)
-        outcomes_after = await landlord_sms.run_landlord_sms_drain_sweep()
+        outcomes_after = await landlord_sms.run_landlord_sms_drain_sweep(now=_far_future(now))
         assert [o.outcome for o in outcomes_after] == ["sent"]
 
         status_after, _attempt_after = await _row_status_and_attempt(db_session, landlord_id)
@@ -780,8 +804,12 @@ async def test_drain_sweep_exhaustion_pages_sentry_distinct_from_per_attempt_fai
     max_attempts = landlord_sms._LANDLORD_SMS_MAX_ATTEMPTS  # noqa: SLF001
 
     try:
+        # `now` advances past the backoff window before every call (issue
+        # #229 safety re-review round 2).
+        now = datetime.now(UTC)
         for _ in range(max_attempts):
-            await landlord_sms.run_landlord_sms_drain_sweep()
+            await landlord_sms.run_landlord_sms_drain_sweep(now=now)
+            now = _far_future(now)
 
         # One "send failed" page per attempt, PLUS one distinct "exhausted"
         # page on the last -- never a phone number/message body in either.
@@ -851,19 +879,25 @@ async def test_drain_sweep_cancellation_never_burns_send_failures_only_genuine_f
 
         # NOW a single genuine Twilio failure -- the FIRST one this row has
         # ever actually observed -- must be transient ('failed'), never
-        # exhausted, even though `attempt` is already at the cap.
+        # exhausted, even though `attempt` is already at the cap. The
+        # cancellations above never touched `next_attempt_at` (they never
+        # reach the mark-outcome SQL at all), so this row is still
+        # immediately due -- no `now=` override needed for THIS call.
         failing_sender = _FakeTwilioSender(fail=True)
         monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: failing_sender)
-        outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+        now = datetime.now(UTC)
+        outcomes = await landlord_sms.run_landlord_sms_drain_sweep(now=now)
         assert [o.outcome for o in outcomes] == ["failed"]
         status_after_one_real_failure, _ = await _row_status_and_attempt(db_session, landlord_id)
         assert status_after_one_real_failure == "failed"
 
-        # A fully healthy sender still delivers it -- the cancellations
-        # never counted against the row at all.
+        # A fully healthy sender still delivers it, past the backoff
+        # window the one genuine failure above just set (issue #229 safety
+        # re-review round 2) -- the cancellations never counted against
+        # the row at all.
         working_sender = _FakeTwilioSender()
         monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: working_sender)
-        outcomes_after = await landlord_sms.run_landlord_sms_drain_sweep()
+        outcomes_after = await landlord_sms.run_landlord_sms_drain_sweep(now=_far_future(now))
         assert [o.outcome for o in outcomes_after] == ["sent"]
         status_final, _ = await _row_status_and_attempt(db_session, landlord_id)
         assert status_final == "sent"
@@ -960,3 +994,203 @@ async def test_drain_sweep_stops_claiming_after_deadline_then_resumes_next_tick(
     finally:
         await _cleanup(db_session, landlord_id_a)
         await _cleanup(db_session, landlord_id_b)
+
+
+# ---------------------------------------------------------------------------
+# Exponential backoff on next_attempt_at (issue #229 safety re-review round
+# 2, blocking finding, 2026-08-01 -- the A1+A2 interaction: KIND_READY never
+# exhausts (advisory 1) + ORDER BY created_at LIMIT 100 with no backoff let
+# a stuck landlord's rows permanently occupy the entire candidate window).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("send_failures", "expected_seconds"),
+    [
+        (1, 60.0),
+        (2, 120.0),
+        (3, 240.0),
+        (4, 480.0),
+        (5, 960.0),
+        (6, 1920.0),
+        (7, 3600.0),  # 60 * 2**6 = 3840, capped
+        (8, 3600.0),  # stays capped for every further failure
+    ],
+)
+def test_landlord_sms_backoff_progression(send_failures: int, expected_seconds: float) -> None:
+    """Pins the exact progression (60s, 120s, 240s, 480s, 960s, 1920s, then
+    capped at 3600s from the 7th genuine failure onward) — issue #229
+    safety re-review round 2's reviewer-specified formula:
+    ``60s * 2**(send_failures - 1)``, capped at 3600s."""
+    assert (
+        landlord_sms._landlord_sms_backoff_seconds(send_failures)  # noqa: SLF001
+        == expected_seconds
+    )
+
+
+async def _seed_kind_ready_row_for_landlord(
+    db_session: AsyncSession,
+    *,
+    landlord_id: str,
+    property_id: str,
+    tenant_id: str,
+    age_minutes: float = 0,
+) -> str:
+    """Seed one MORE case/draft/KIND_READY notification row for an
+    ALREADY-SEEDED landlord/property/tenant — used to build a backlog of
+    many rows belonging to the SAME landlord (issue #229 safety re-review
+    round 2's own PoC shape: 100 stuck rows for one landlord)."""
+    case_id = await factories.insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    draft_id = await factories.insert_draft(db_session, landlord_id=landlord_id, case_id=case_id)
+    notification_id = await landlord_sms.enqueue_landlord_sms(
+        db_session,
+        landlord_id=uuid.UUID(landlord_id),
+        case_id=uuid.UUID(case_id),
+        draft_id=uuid.UUID(draft_id),
+        kind=landlord_sms.KIND_READY,
+        body="ready",
+    )
+    await db_session.commit()
+    assert notification_id is not None
+    if age_minutes:
+        await db_session.execute(
+            text(
+                "UPDATE notifications SET created_at = now() - (:age || ' minutes')::interval "
+                "WHERE id = :id"
+            ),
+            {"id": str(notification_id), "age": str(age_minutes)},
+        )
+        await db_session.commit()
+    return str(notification_id)
+
+
+async def _status_and_attempt_by_notification_id(
+    db_session: AsyncSession, notification_id: str
+) -> tuple[str, int]:
+    row = (
+        (
+            await db_session.execute(
+                text("SELECT status, attempt FROM notifications WHERE id = :id"),
+                {"id": notification_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return row["status"], row["attempt"]
+
+
+class _PoisonAwareTwilioSender:
+    """Fails (raising) for every send to *poison_phone*; succeeds for
+    anything else -- mirrors the PoC's own ``Sender`` class exactly."""
+
+    def __init__(self, *, poison_phone: str) -> None:
+        self._poison_phone = poison_phone
+        self.calls: list[str] = []
+
+    async def send_sms(self, *, to: str, from_: str, body: str) -> str:
+        self.calls.append(to)
+        if to == self._poison_phone:
+            raise RuntimeError("simulated twilio 21610 -- landlord opted out (STOP)")
+        return f"SM{uuid.uuid4().hex}"
+
+
+@pytest.mark.integration
+async def test_drain_sweep_backoff_frees_the_limit_window_for_a_different_landlord(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safety re-review round 2, blocking finding, 2026-08-01 (the A1+A2
+    interaction) -- regression for the reviewer's own PoC
+    (``poc_a1a2.py``): ``KIND_READY`` never exhausts (advisory 1) +
+    ``_SELECT_DUE_LANDLORD_SMS_SQL`` is ``ORDER BY created_at LIMIT 100``
+    with no backoff meant up to 100 permanently-failing ``KIND_READY`` rows
+    for ONE landlord (e.g. someone who texted STOP -- Twilio error 21610,
+    forever) could permanently occupy the ENTIRE candidate window, so a
+    DIFFERENT, newer landlord's draft-ready notice was never even
+    SELECTED again, silently, cluster-wide.
+
+    Fixed with exponential backoff on ``next_attempt_at`` (see
+    :data:`landlord_sms._LANDLORD_SMS_BACKOFF_BASE_SECONDS`): a
+    genuinely-stuck row falls OUT of the LIMIT 100 window's head after its
+    FIRST failure, instead of permanently occupying a slot -- freeing room
+    for the next landlord's row well before real wall-clock time would
+    otherwise force it out. Uses the injectable ``now=`` (scripted clock)
+    to advance past the backoff window deterministically, never a real
+    sleep."""
+    poison_phone = factories.fresh_phone()
+    victim_phone = factories.fresh_phone()
+
+    landlord_a = await factories.insert_landlord(db_session, phone=poison_phone)
+    property_a = await factories.insert_property(
+        db_session, landlord_a, twilio_number=factories.fresh_phone()
+    )
+    tenant_a = await factories.insert_tenant(db_session, landlord_a, property_a)
+
+    landlord_b = await factories.insert_landlord(db_session, phone=victim_phone)
+    property_b = await factories.insert_property(
+        db_session, landlord_b, twilio_number=factories.fresh_phone()
+    )
+    tenant_b = await factories.insert_tenant(db_session, landlord_b, property_b)
+
+    limit = landlord_sms._LANDLORD_SMS_SELECT_BATCH_LIMIT  # noqa: SLF001
+    for _ in range(limit):
+        await _seed_kind_ready_row_for_landlord(
+            db_session,
+            landlord_id=landlord_a,
+            property_id=property_a,
+            tenant_id=tenant_a,
+            age_minutes=120,  # OLDER -- sorts first in ORDER BY created_at
+        )
+    victim_notification_id = await _seed_kind_ready_row_for_landlord(
+        db_session,
+        landlord_id=landlord_b,
+        property_id=property_b,
+        tenant_id=tenant_b,
+        age_minutes=1,  # NEWER -- sorts after all of landlord A's rows
+    )
+
+    sender = _PoisonAwareTwilioSender(poison_phone=poison_phone)
+    monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: sender)
+
+    try:
+        # Tick 1: the LIMIT-100 window is ENTIRELY landlord A's older,
+        # poisoned rows -- landlord B's fresher row is not even reached.
+        # deadline_seconds is deliberately enormous so the wall-clock
+        # bound (issue #229 advisory 2 territory) is NOT what's under test
+        # here -- only the LIMIT/backoff interaction is.
+        now = datetime.now(UTC)
+        await landlord_sms.run_landlord_sms_drain_sweep(now=now, deadline_seconds=1e9)
+        status_tick_1, _ = await _status_and_attempt_by_notification_id(
+            db_session, victim_notification_id
+        )
+        assert status_tick_1 == "pending"
+        assert victim_phone not in sender.calls
+
+        # Tick 2: advance the clock by a SMALL step -- deliberately LESS
+        # than landlord A's own just-set backoff (60s after their first
+        # failure), not a large jump. This is the actual mechanism (also
+        # how the reviewer's own PoC demonstrates it, calling ticks
+        # back-to-back with real wall-clock time barely moving between
+        # them): landlord A's 100 rows are now excluded (`next_attempt_at
+        # > now`), so the SELECT reaches past them to landlord B's row
+        # (never having failed, always immediately due) and sends it.
+        # A LARGER jump -- e.g. past A's full backoff window -- would make
+        # A's rows due again TOO, and since they still sort first by
+        # `created_at` regardless of `next_attempt_at`, they would simply
+        # re-fill the entire LIMIT 100 window a second time and B would
+        # STILL never be reached (discovered running this test's first
+        # draft, which used a multi-hour jump and failed for exactly this
+        # reason).
+        now = now + timedelta(seconds=1)
+        await landlord_sms.run_landlord_sms_drain_sweep(now=now, deadline_seconds=1e9)
+        status_tick_2, _ = await _status_and_attempt_by_notification_id(
+            db_session, victim_notification_id
+        )
+        assert status_tick_2 == "sent"
+        assert victim_phone in sender.calls
+    finally:
+        await _cleanup(db_session, landlord_a)
+        await _cleanup(db_session, landlord_b)

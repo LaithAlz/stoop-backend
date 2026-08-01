@@ -72,6 +72,7 @@ import json
 from collections.abc import Callable
 from contextlib import asynccontextmanager as _acm
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
@@ -491,17 +492,80 @@ how many times a still-``'failed'`` (never ``'exhausted'``) ``KIND_READY``
 row has been retried, so an un-capped retry-forever row can never win
 "most recent" correlation it wouldn't otherwise have won."""
 
+# Safety re-review round 2, blocking finding, 2026-08-01 -- the A1+A2
+# interaction: KIND_READY never exhausts (advisory 1) + _SELECT_DUE_
+# LANDLORD_SMS_SQL is `ORDER BY created_at LIMIT 100` with NO backoff ->
+# up to 100 permanently-failing KIND_READY rows (one landlord who texted
+# STOP -- Twilio error 21610, forever) permanently occupy the ENTIRE
+# candidate window, oldest-first, so no OTHER landlord's draft-ready
+# notice is ever even SELECTED again, silently, cluster-wide. The SAME
+# root cause makes the per-attempt error-level Sentry page unbounded (100
+# stuck rows x 1 tick/min = up to 144k pages/day). Reproduced with a PoC
+# (100 stuck KIND_READY rows for landlord A + 1 fresh for landlord B ->
+# landlord B never told a draft awaits, ever).
+#
+# Fixed with EXPONENTIAL BACKOFF on ``next_attempt_at`` (schema-v1.md:
+# ``notifications.next_attempt_at`` + ``idx_notifications_sweep(status,
+# next_attempt_at)`` already exist -- no migration) -- a genuinely-stuck
+# row falls OUT of the LIMIT 100 window's head after its first failure,
+# instead of permanently occupying a slot: :data:`
+# _LANDLORD_SMS_BACKOFF_BASE_SECONDS` (60s) doubled per GENUINE send
+# failure (:attr:`LandlordSmsCandidate.send_failures` -- NEVER the claim/
+# CAS ``attempt`` counter, same distinction issue #229 blocking finding 2
+# already established), capped at :data:`_LANDLORD_SMS_BACKOFF_CAP_SECONDS`
+# (3600s, 1 hour). KIND_READY's own retry-forever intent (advisory 1) is
+# UNCHANGED -- it still eventually retries, just no longer every single
+# tick once it is clearly, repeatedly failing; the confirmation kinds'
+# 5-attempt exhaustion cap is also unaffected (a capped row simply reaches
+# 'exhausted' a bit more slowly in wall-clock time, never differently in
+# outcome). Sentry per-attempt page volume drops proportionally with the
+# retry rate -- no separate alerting change needed.
+_LANDLORD_SMS_BACKOFF_BASE_SECONDS: float = 60.0
+"""Base interval for :func:`_landlord_sms_backoff_seconds` -- one
+scheduler tick (``app/scheduler.py::TICK_INTERVAL_SECONDS``), so the
+FIRST genuine failure's backoff is indistinguishable from "just try again
+next tick" (this sweep's own pre-existing behavior), and only repeated
+failures actually widen the gap."""
+
+_LANDLORD_SMS_BACKOFF_CAP_SECONDS: float = 3600.0
+"""Backoff ceiling (1 hour) -- mirrors this codebase's other bounded
+-retry ceilings in SHAPE (a cap exists at all — e.g.
+``app/property_provisioning.py``'s 15-minute fixed interval,
+``app/push_outbox.py``'s 5-minute fixed interval) even though those are
+flat, not exponential; a genuinely-stuck KIND_READY row (which never
+exhausts, advisory 1) must still be retried at some bounded worst-case
+cadence forever, never allowed to drift to "practically never" as
+``send_failures`` grows unbounded over the row's lifetime."""
+
+
+def _landlord_sms_backoff_seconds(send_failures: int) -> float:
+    """Pure: exponential backoff for the Nth genuine send failure
+    (1-indexed — ``send_failures=1`` is the FIRST observed failure).
+    ``60s * 2**(send_failures - 1)``, capped at 3600s -- e.g. 60s, 120s,
+    240s, 480s, 960s, 1920s, then capped at 3600s from the 7th failure
+    onward. See the module comment above :data:`
+    _LANDLORD_SMS_BACKOFF_BASE_SECONDS` for the full rationale (issue
+    #229 safety re-review round 2)."""
+    uncapped = _LANDLORD_SMS_BACKOFF_BASE_SECONDS * float(2 ** (send_failures - 1))
+    return min(uncapped, _LANDLORD_SMS_BACKOFF_CAP_SECONDS)
+
+
 # Deferred (issue #229 item 3, PR #228 senior-review advisory 3): this
 # query filters on (type, channel, status) with no supporting composite
 # index -- only idx_notifications_sweep(status, next_attempt_at) exists.
 # Negligible at current scale; add a composite index if `notifications`
 # ever grows large enough for this to show up in practice. Deliberately no
-# migration here -- see this issue's own scope note.
+# migration here -- see this issue's own scope note. (The `next_attempt_at`
+# backoff added below, safety re-review round 2, means `idx_notifications_
+# sweep`'s own `next_attempt_at` half is now at least partially useful for
+# this query too -- still not a composite match on `(type, channel,
+# status)`, so the deferral above stands unchanged.)
 _SELECT_DUE_LANDLORD_SMS_SQL = text(
     """
     SELECT id, landlord_id, case_id, attempt, payload
     FROM notifications
     WHERE type = 'draft_ready' AND channel = 'sms' AND status IN ('pending', 'failed')
+      AND (next_attempt_at IS NULL OR next_attempt_at <= :now)
     ORDER BY created_at
     LIMIT :limit
     """
@@ -565,11 +629,19 @@ _MARK_LANDLORD_SMS_EXHAUSTED_SQL = text(
 # AS ...)`` is the house-standard escape for this class of bug -- see
 # ``app/agent/emergency_chain.py``'s own ``_CLAIM_STEP_SQL`` comment for
 # the identical ``IndeterminateDatatypeError`` story with a bare literal.
+# ``next_attempt_at`` (safety re-review round 2, 2026-08-01 -- see the
+# module comment above _LANDLORD_SMS_BACKOFF_BASE_SECONDS): written on
+# EVERY genuine send failure, exponential per :func:
+# `_landlord_sms_backoff_seconds`. An 'exhausted' row's `next_attempt_at`
+# is harmless dead data (the row is excluded from _SELECT_DUE_LANDLORD_SMS_
+# SQL's own `status IN ('pending', 'failed')` regardless, same as every
+# other column on a terminal row) -- no separate NULL-out branch needed.
 _MARK_LANDLORD_SMS_SEND_OUTCOME_SQL = text(
     """
     UPDATE notifications
     SET status = :status,
         updated_at = now(),
+        next_attempt_at = :next_attempt_at,
         payload = jsonb_set(
           COALESCE(payload, '{}'::jsonb), '{send_failures}',
           to_jsonb(CAST(:send_failures AS integer)), true
@@ -637,7 +709,7 @@ def _candidate_from_row(row: dict[str, Any]) -> LandlordSmsCandidate | None:
     )
 
 
-async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
+async def _process_candidate(candidate: LandlordSmsCandidate, *, effective_now: datetime) -> str:
     # `new_attempt` remains a PURE claim/CAS guard (issue #229 blocking
     # finding 2) -- it must still advance on every successful claim so two
     # overlapping ticks/processes can never both win the same row, but it
@@ -714,6 +786,15 @@ async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
         is_last_attempt = (
             candidate.kind != KIND_READY and new_send_failures >= _LANDLORD_SMS_MAX_ATTEMPTS
         )
+        # Safety re-review round 2: exponential backoff on EVERY genuine
+        # failure (not gated on is_last_attempt -- an eventually-exhausted
+        # confirmation-kind row still benefits from not hammering a
+        # visibly-broken Twilio path on every remaining tick before it
+        # exhausts, and an un-exhausted KIND_READY row is EXACTLY the row
+        # this fix exists to back off).
+        next_attempt_at = effective_now + timedelta(
+            seconds=_landlord_sms_backoff_seconds(new_send_failures)
+        )
         log.error(
             "landlord_sms_send_failed",
             notification_id=str(candidate.notification_id),
@@ -734,6 +815,7 @@ async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
                     "id": str(candidate.notification_id),
                     "status": "exhausted" if is_last_attempt else "failed",
                     "send_failures": new_send_failures,
+                    "next_attempt_at": next_attempt_at,
                 },
             )
         if is_last_attempt:
@@ -764,14 +846,16 @@ async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
     return "sent"
 
 
-async def _process_candidate_safely(candidate: LandlordSmsCandidate) -> str:
+async def _process_candidate_safely(
+    candidate: LandlordSmsCandidate, *, effective_now: datetime
+) -> str:
     """Never-raises wrapper — same rationale as
     ``app/agent/emergency_chain.py``'s own SMS-drain safety wrapper: a
     row's own claim (or lack thereof) is the only durable state this sweep
     depends on, so there is no "stuck forever" risk from one candidate's
     exception blocking others."""
     try:
-        return await _process_candidate(candidate)
+        return await _process_candidate(candidate, effective_now=effective_now)
     except Exception as exc:
         log.error(
             "landlord_sms_candidate_processing_failed",
@@ -791,6 +875,7 @@ async def _process_candidate_safely(candidate: LandlordSmsCandidate) -> str:
 
 async def run_landlord_sms_drain_sweep(
     *,
+    now: datetime | None = None,
     deadline_seconds: float = DEFAULT_TICK_DEADLINE_SECONDS,
     time_source: Callable[[], float] = _default_time_source,
 ) -> list[LandlordSmsOutcome]:
@@ -799,6 +884,13 @@ async def run_landlord_sms_drain_sweep(
     genuinely delivered or terminally un-deliverable (module docstring).
     Wire into ``app/scheduler.py``'s 60s ticker alongside the other
     sweeps.
+
+    ``now`` is an injectable override purely for tests (mirrors
+    ``run_emergency_chain_sweep(*, now=...)``/
+    ``run_push_outbox_sweep(*, now=...)``) — the DB-side "what's due"
+    clock (issue #229 safety re-review round 2's backoff window), unrelated
+    to *time_source* below. Production callers never pass it; the default
+    is genuine wall-clock time.
 
     *deadline_seconds*/*time_source* bound this call's own wall-clock
     duration (issue #229 — see "Wall-clock tick deadline" above);
@@ -809,12 +901,14 @@ async def run_landlord_sms_drain_sweep(
     advisory 2) so the budget covers the SELECT's own duration too, not
     just the claim/send loop.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     start = time_source()
     async with _acm(get_admin_session)() as session:
         rows = (
             (
                 await session.execute(
-                    _SELECT_DUE_LANDLORD_SMS_SQL, {"limit": _LANDLORD_SMS_SELECT_BATCH_LIMIT}
+                    _SELECT_DUE_LANDLORD_SMS_SQL,
+                    {"limit": _LANDLORD_SMS_SELECT_BATCH_LIMIT, "now": effective_now},
                 )
             )
             .mappings()
@@ -838,7 +932,7 @@ async def run_landlord_sms_drain_sweep(
                 remaining_candidates=len(candidates) - index,
             )
             break
-        outcome = await _process_candidate_safely(candidate)
+        outcome = await _process_candidate_safely(candidate, effective_now=effective_now)
         outcomes.append(
             LandlordSmsOutcome(notification_id=candidate.notification_id, outcome=outcome)
         )
