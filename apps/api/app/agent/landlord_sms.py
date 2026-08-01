@@ -430,6 +430,17 @@ DEFAULT_TICK_DEADLINE_SECONDS: float = 25.0
 ``app/push_outbox.py::DEFAULT_TICK_DEADLINE_SECONDS`` /
 ``app/agent/emergency_chain.py::DEFAULT_TICK_DEADLINE_SECONDS``."""
 
+_LANDLORD_SMS_SELECT_BATCH_LIMIT: int = 100
+"""Per-tick cap on how many due ``draft_ready``/``sms`` candidates one
+sweep call reads (issue #229, PR #228 senior-review advisory 2) --
+mirrors ``app/push_outbox.py``'s own ``_PUSH_OUTBOX_SWEEP_BATCH_LIMIT``
+and ``app/agent/emergency_chain.py``'s own
+``_SMS_DRAIN_SELECT_BATCH_LIMIT`` (same "bounded work per tick"
+discipline, same chosen value, 100 — large enough that a single property's
+worth of pending confirmations never legitimately hits it, small enough
+that even a full-batch SELECT stays cheap); anything left over is still
+due and is picked up on the NEXT tick."""
+
 
 def _default_time_source() -> float:
     """The real, monotonic clock :func:`run_landlord_sms_drain_sweep`
@@ -492,6 +503,7 @@ _SELECT_DUE_LANDLORD_SMS_SQL = text(
     FROM notifications
     WHERE type = 'draft_ready' AND channel = 'sms' AND status IN ('pending', 'failed')
     ORDER BY created_at
+    LIMIT :limit
     """
 )
 
@@ -792,13 +804,24 @@ async def run_landlord_sms_drain_sweep(
     duration (issue #229 — see "Wall-clock tick deadline" above);
     *time_source* defaults to the real event loop clock
     (:func:`_default_time_source`) — tests inject a fake, monotonically
-    -advanceable callable instead of sleeping for real seconds.
+    -advanceable callable instead of sleeping for real seconds. *start* is
+    taken BEFORE the candidate SELECT (issue #229, PR #228 senior-review
+    advisory 2) so the budget covers the SELECT's own duration too, not
+    just the claim/send loop.
     """
+    start = time_source()
     async with _acm(get_admin_session)() as session:
-        rows = (await session.execute(_SELECT_DUE_LANDLORD_SMS_SQL)).mappings().all()
+        rows = (
+            (
+                await session.execute(
+                    _SELECT_DUE_LANDLORD_SMS_SQL, {"limit": _LANDLORD_SMS_SELECT_BATCH_LIMIT}
+                )
+            )
+            .mappings()
+            .all()
+        )
         candidates = [c for row in rows if (c := _candidate_from_row(dict(row))) is not None]
 
-    start = time_source()
     outcomes: list[LandlordSmsOutcome] = []
     for index, candidate in enumerate(candidates):
         if time_source() - start >= deadline_seconds:
