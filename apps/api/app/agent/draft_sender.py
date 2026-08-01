@@ -127,13 +127,25 @@ tick but never winning the claim). This is deliberate: the primary fix
 (``cases.py``) already cancels the common case immediately, so this guard
 almost never fires in practice; it exists purely to make "never sends
 after resolve" true even against a code path (present or future) this
-module's authors didn't anticipate — e.g. ``app/agent/case_lifecycle.py``'s
-own ``sweep_cases()`` tenant-confirmed leg, which (unlike its auto-stale
-leg) is NOT excluded from ``awaiting_approval`` and could in principle
-auto-resolve a case with a still-approved draft sitting on it. A stuck-
-forever-``'approved'``-but-never-sent row is a strictly SAFER failure mode
-than a send after resolve, and is a pre-existing, out-of-scope gap in
-``sweep_cases()`` itself (not fixed here — only insured against).
+module's authors didn't anticipate. A stuck-forever-``'approved'``-but-
+never-sent row is a strictly SAFER failure mode than a send after resolve.
+
+``app/agent/case_lifecycle.py``'s own ``sweep_cases()`` tenant-confirmed
+leg used to be exactly such an unanticipated path: unlike its auto-stale
+leg, it was NOT excluded from ``awaiting_approval`` and could resolve a
+case with a still-approved draft sitting on it — inert while the case
+stayed ``resolved`` (this guard caught it), but a stuck draft would have
+become claimable again the instant a later tenant message REOPENED the
+case (``status = 'reopened'`` no longer matches this guard's own
+``status = 'resolved'`` predicate) — a pre-existing, root-caused gap
+closed by that module directly (#212: both sweep legs now cancel a case's
+outstanding drafts in the same transaction as the case's own resolve
+``UPDATE``, mirroring this file's own primary-fix precedent above). This
+guard's belt-and-braces role for ``sweep_cases()`` specifically is
+therefore now purely defense-in-depth, exactly like its role for
+``cases.py``'s resolve endpoint always has been — it remains load-bearing
+for any OTHER path (present or future) this module's authors haven't
+anticipated.
 
 Batch-starvation guard (#206 follow-up, safety review MEDIUM-2, the
 starvation half only)
@@ -152,9 +164,16 @@ ever wired to a scheduler (today nothing calls it — see that module's own
 not yet observable in production). The COMPANION half of that finding —
 actually cancelling/paging on a resolved-case zombie instead of merely
 excluding it from candidate selection — is DELIBERATELY DEFERRED, a hard
-blocker on #212 wiring ``sweep_cases()`` to a real cadence (there is no
-value in adding observability for a state this codebase cannot yet
-produce end-to-end).
+blocker on whichever future issue wires ``sweep_cases()`` to a real
+cadence (there is no value in adding observability for a state this
+codebase cannot yet produce end-to-end). NOTE: #212 closed a DIFFERENT,
+narrower gap — the ROOT cause of most resolved-case zombies, namely
+``sweep_cases()``'s tenant-confirmed leg not cancelling a case's
+outstanding draft on resolve at all (see "Resolved-case guard
+belt-and-braces (#206)" above) — but #212 was scoped to defusing that
+trap only, NOT to wiring ``sweep_cases()`` to a scheduler; this
+starvation-window companion piece remains open, deferred work for
+whichever issue does the wiring.
 
 The in-flight claim vs. resolve race — the case-status flip is
 self-guarding (#206 follow-up, safety review MEDIUM-1, reproduced

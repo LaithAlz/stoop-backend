@@ -501,17 +501,33 @@ async def test_post_send_write_failure_pages_dedicated_sentry_and_leaves_draft_s
     )
 
     landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
+    tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     sender = _FakeSmsSender()
     try:
         with pytest.raises(Exception):  # noqa: B017 -- re-raised on purpose, see module docstring
             await sender_tick(sender=sender)
 
-        assert len(sender.calls) == 1  # the send itself DID go out -- irreversible
+        # Scoped to THIS test's own tenant phone / draft_id (#212 item 1) --
+        # see _tenant_phone_for_case's docstring. Every claimed row's
+        # write-transaction fails identically under the monkeypatched
+        # broken SQL above, so a stray already-due 'approved' draft
+        # elsewhere in a dirty database would ALSO produce a Sentry capture
+        # here -- filtering by our own draft_id (rather than indexing
+        # calls[0]/asserting len(calls) == 1) means such a stray can add
+        # noise but never flip this test's own result.
+        own_sms_calls = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_sms_calls) == 1  # the send itself DID go out -- irreversible
 
-        assert len(calls) == 1
-        assert calls[0]["message"] == "draft_sender: send delivered but recording failed"
-        assert calls[0]["level"] == "error"
-        extras = calls[0]["extras"]
+        own_captures = [
+            c
+            for c in calls
+            if c["extras"] is not None and c["extras"].get("draft_id") == draft_id  # type: ignore[union-attr]
+        ]
+        assert len(own_captures) == 1
+        own_capture = own_captures[0]
+        assert own_capture["message"] == "draft_sender: send delivered but recording failed"
+        assert own_capture["level"] == "error"
+        extras = own_capture["extras"]
         assert extras is not None
         assert extras["draft_id"] == draft_id
         assert extras["case_id"] == case_id
@@ -534,10 +550,21 @@ async def test_post_send_write_failure_pages_dedicated_sentry_and_leaves_draft_s
         # No double-send on the very next tick -- the row is 'sending', not
         # 'approved', so the claim SQL's own WHERE clause matches nothing.
         # This assertion is the point of this test: the claim CAS alone
-        # (pre-existing, untouched by this fix) already prevents it.
-        claimed_again = await sender_tick(sender=sender)
-        assert claimed_again == 0
-        assert len(sender.calls) == 1  # never sent a second time
+        # (pre-existing, untouched by this fix) already rules it out.
+        # Re-querying THIS draft's own row (#212 item 1) rather than
+        # asserting a raw global `claimed_again == 0`: a stray due draft
+        # elsewhere becoming claimable between the two ticks could
+        # otherwise inflate that count without indicating anything wrong
+        # with OUR row.
+        await sender_tick(sender=sender)
+        status_after_second_tick = (
+            await db_session.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+        assert status_after_second_tick == "sending"  # never re-claimed
+        own_sms_calls_after_second_tick = [c for c in sender.calls if c["to_e164"] == tenant_phone]
+        assert len(own_sms_calls_after_second_tick) == 1  # never sent a second time
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -582,8 +609,18 @@ async def test_edited_draft_with_empty_final_body_never_sends_original_text(
         ).scalar_one()
         assert status == "sending"  # stuck, visible -- never silently re-attempted
 
-        assert len(calls) == 1
-        assert calls[0]["level"] == "error"
+        # Scoped to THIS test's own draft_id (#212 item 1) rather than
+        # indexing calls[0]/asserting len(calls) == 1: a stray edited-with-
+        # empty-final_body draft left over from an earlier killed run of
+        # THIS SAME test would trigger the identical capture for a
+        # DIFFERENT draft_id.
+        own_captures = [
+            c
+            for c in calls
+            if c["extras"] is not None and c["extras"].get("draft_id") == draft_id  # type: ignore[union-attr]
+        ]
+        assert len(own_captures) == 1
+        assert own_captures[0]["level"] == "error"
 
         message_count = (
             await db_session.execute(
@@ -785,9 +822,14 @@ async def test_sender_tick_missing_case_severity_pages_sentry_and_skips_trust_me
         )
         assert trust_row is None  # no severity -> no (property, severity) key to upsert
 
-        assert len(captured) == 1
-        assert captured[0]["level"] == "error"
-        assert case_id in str(captured[0]["extras"])
+        # Scoped to THIS test's own case_id (#212 item 1) rather than
+        # indexing captured[0]/asserting len(captured) == 1: a stray
+        # severity-NULL draft claimed alongside ours in a dirty database
+        # would trigger the SAME "missing severity" Sentry capture for a
+        # DIFFERENT case, which must add noise, never flip this result.
+        own_captures = [c for c in captured if case_id in str(c["extras"])]
+        assert len(own_captures) == 1
+        assert own_captures[0]["level"] == "error"
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -1271,11 +1313,11 @@ async def test_claim_refuses_draft_on_resolved_case_leaves_it_approved(
     db_session: AsyncSession,
 ) -> None:
     """Simulates a case resolved by a path OTHER than app/routers/cases.py's
-    own resolve endpoint (which already cancels the draft itself) — e.g.
-    the pre-existing app/agent/case_lifecycle.py sweep_cases() gap this
-    guard's own docstring flags. Even with nothing having cancelled the
-    draft, the claim's own belt-and-braces predicate must still refuse to
-    send it."""
+    resolve endpoint or app/agent/case_lifecycle.py's sweep_cases() (both of
+    which already cancel the draft themselves, as of #206/#212) — a
+    still-hypothetical future path this guard's own docstring says it
+    exists for. Even with nothing having cancelled the draft, the claim's
+    own belt-and-braces predicate must still refuse to send it."""
     landlord_id, case_id, draft_id = await _seed_approved_draft(db_session)
     tenant_phone = await _tenant_phone_for_case(db_session, case_id=case_id)
     await db_session.execute(

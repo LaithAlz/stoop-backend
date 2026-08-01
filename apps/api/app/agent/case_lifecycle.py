@@ -602,11 +602,12 @@ def apply_time_transitions(cases: list[CaseSnapshot], now: datetime) -> list[Swe
 # only guards on `id`. Fixed with a SELF-GUARDING UPDATE per leg: the WHERE
 # clause re-asserts, against the row's CURRENT state (not the stale
 # snapshot), the SAME condition apply_time_transitions used to decide this
-# case was eligible. Every side effect (the audit entry, the auto-stale
-# notification) is gated on that UPDATE having matched EXACTLY one row
-# (``rowcount == 1``) — a lost race (rowcount == 0) is a deliberate, silent
-# no-op: no audit trail is invented for a transition that didn't actually
-# happen, and the case is left exactly as the concurrent write left it.
+# case was eligible. Every side effect (the audit entry, the draft
+# cancellation + its own audit entries (#212), the auto-stale notification)
+# is gated on that UPDATE having matched EXACTLY one row (``rowcount ==
+# 1``) — a lost race (rowcount == 0) is a deliberate, silent no-op: no
+# audit trail is invented for a transition that didn't actually happen,
+# and the case is left exactly as the concurrent write left it.
 # ---------------------------------------------------------------------------
 
 # Built from the fixed, internal ``OPEN_STATUSES``/``AUTO_STALE_ELIGIBLE_
@@ -671,6 +672,48 @@ _INSERT_AUTO_STALE_NOTIFICATION_SQL = text(
     "FROM cases WHERE id = :case_id"
 )
 
+# #212 fix — the draft-cancellation safety edge, mirrored from
+# ``app/routers/cases.py``'s ``POST /v1/cases/{id}/resolve`` (#206):
+# EITHER leg resolving a case must not leave a still-``pending``/
+# ``approved`` draft behind for ``app/agent/draft_sender.py``'s ticker to
+# pick up later (see that module's own "Resolved-case guard belt-and-braces
+# (#206)" docstring for the exact trap this closes at the root — a landlord
+# -approved draft surviving a resolve, then becoming claimable again the
+# instant the case REOPENS, because the sender's own belt-and-braces guard
+# only matches ``status = 'resolved'``, not ``'reopened'``). Identical
+# predicate to ``app/routers/cases.py``'s own ``_CANCEL_OPEN_DRAFTS_SQL``
+# (``status IN ('pending', 'approved')``, ``sent_message_id IS NULL`` —
+# never a ``'sending'`` row, which is genuinely mid-flight and left alone,
+# exactly like that endpoint's own "The 'sending' race" section) — scoped
+# by ``case_id`` only (not also ``landlord_id``, unlike the router's belt-
+# and-braces predicate) because this module runs on the admin engine with
+# no landlord/request context to scope by, matching every other statement
+# in this section.
+_CANCEL_OPEN_DRAFTS_SQL = text(
+    "UPDATE drafts SET status = 'cancelled', updated_at = now() "
+    "WHERE case_id = :case_id AND status IN ('pending', 'approved') "
+    "AND sent_message_id IS NULL "
+    "RETURNING id"
+)
+
+# One ``send_cancelled`` row per cancelled draft, mirroring
+# ``app/routers/cases.py``'s own audit shape (``{"draft_id": ...,
+# "reason": "case_resolved"}``) with one addition: a ``"leg"`` key
+# (``"tenant_confirmed"`` or ``"auto_stale"``) distinguishing which sweep
+# leg triggered it — useful since, unlike the resolve endpoint, either
+# leg can produce this row (module docstring "match the house shape, don't
+# invent" — same action/reason vocabulary, an additive payload key only).
+# ``actor='system'`` (not ``'landlord'``, unlike the endpoint's row) —
+# this cancellation is a sweep decision, not a human action, matching this
+# module's OWN case-resolved audit row (:data:`_INSERT_SWEEP_AUDIT_SQL`)
+# immediately above, which already uses ``actor='system'`` for the exact
+# same reason.
+_INSERT_DRAFT_CANCELLED_AUDIT_SQL = text(
+    "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
+    "SELECT landlord_id, :case_id, 'system', 'send_cancelled', CAST(:payload AS jsonb) "
+    "FROM cases WHERE id = :case_id"
+)
+
 
 async def _apply_sweep_action(
     session: AsyncSession,
@@ -680,10 +723,11 @@ async def _apply_sweep_action(
     stale_threshold: datetime,
 ) -> bool:
     """Apply ONE sweep action via its leg's self-guarding UPDATE, gating the
-    audit entry (and, for auto_stale, the notification) on the UPDATE having
-    matched EXACTLY one row. Returns ``True`` if it actually applied,
-    ``False`` if the guard lost the race — see ``sweep_cases``'s own
-    docstring and this section's header comment for the TOCTOU rationale.
+    audit entry (the draft cancellation, and, for auto_stale, the
+    notification) on the UPDATE having matched EXACTLY one row. Returns
+    ``True`` if it actually applied, ``False`` if the guard lost the race —
+    see ``sweep_cases``'s own docstring and this section's header comment
+    for the TOCTOU rationale.
 
     Factored out of ``sweep_cases`` specifically so the race it closes can
     be exercised directly in a test: seed a due case, compute a now-STALE
@@ -692,6 +736,28 @@ async def _apply_sweep_action(
     call this function with the stale action and assert it safely no-ops
     (``False``, case unchanged, no audit row) — see
     ``tests/test_case_lifecycle.py``'s TOCTOU regression test.
+
+    #212 fix — draft cancellation: EITHER leg's successful resolve also
+    cancels any still-``pending``/``approved`` draft left on the case (see
+    :data:`_CANCEL_OPEN_DRAFTS_SQL`'s own comment for the exact trap this
+    closes). Applying this to BOTH legs, not just tenant-confirmed, is
+    belt-and-braces: today only ``awaiting_approval`` cases can carry such
+    a draft (``cases.status`` never becomes ``awaiting_tenant`` until the
+    draft actually SENDS — see ``app/agent/nodes/finalize_draft_decision.py``
+    and ``app/agent/draft_sender.py``'s own ``_MARK_CASE_AWAITING_TENANT_SQL``
+    — and ``AUTO_STALE_ELIGIBLE_STATUSES`` already excludes
+    ``awaiting_approval`` entirely), so in every NORMAL state the auto-stale
+    leg's cancel call matches 0 rows. It is NOT unreachable, though — the
+    documented crash window between ``draft_response``'s own commit and
+    ``mark_awaiting_approval``'s separate transaction (see
+    ``app/agent/graph_entry.py``'s docstring) can leave a committed
+    ``pending`` draft on a case still ``open``/``reopened``/
+    ``awaiting_tenant`` (all auto-stale eligible), and an ``approved`` row
+    with ``scheduled_send_at IS NULL`` is invisible to the sender's due
+    query forever. Those orphans are exactly what this cancel exists to
+    sweep up; do not delete this branch on the strength of the normal-state
+    argument alone. It costs one extra rowcount-gated UPDATE per resolve
+    and future-proofs the invariant without duplicating logic per leg.
     """
     is_tenant_confirmed = action.transition.resolved_reason == RESOLVED_REASON_TENANT_CONFIRMED
     update_sql = _UPDATE_TENANT_CONFIRMED_SQL if is_tenant_confirmed else _UPDATE_AUTO_STALE_SQL
@@ -727,6 +793,27 @@ async def _apply_sweep_action(
         },
     )
 
+    # #212 fix — see this function's own docstring "draft cancellation" and
+    # _CANCEL_OPEN_DRAFTS_SQL's own comment. Gated on the case UPDATE above
+    # having matched exactly one row (we're already past that check here),
+    # so this never fires for a lost-race no-op.
+    leg = "tenant_confirmed" if is_tenant_confirmed else "auto_stale"
+    cancelled_draft_rows = (
+        (await session.execute(_CANCEL_OPEN_DRAFTS_SQL, {"case_id": str(action.case_id)}))
+        .mappings()
+        .all()
+    )
+    for draft_row in cancelled_draft_rows:
+        await session.execute(
+            _INSERT_DRAFT_CANCELLED_AUDIT_SQL,
+            {
+                "case_id": str(action.case_id),
+                "payload": json.dumps(
+                    {"draft_id": str(draft_row["id"]), "reason": "case_resolved", "leg": leg}
+                ),
+            },
+        )
+
     if not is_tenant_confirmed:
         await session.execute(
             _INSERT_AUTO_STALE_NOTIFICATION_SQL,
@@ -755,6 +842,26 @@ async def sweep_cases(*, now: datetime | None = None) -> list[SweepAction]:
     exactly the failure mode this exists to prevent. The tenant-confirmed
     leg does NOT create one: the landlord already saw the proposal
     (``reasoning_log``) when it was made.
+
+    Draft cancellation (#212 fix, the armed trap #206's review surfaced)
+    ------------------------------------------------------------------------
+    Either leg's successful resolve ALSO cancels any still-``pending``/
+    ``approved`` draft left on the case, mirroring ``POST
+    /v1/cases/{id}/resolve``'s own safety edge (#206) exactly (see
+    :func:`_apply_sweep_action`'s own docstring and
+    :data:`_CANCEL_OPEN_DRAFTS_SQL`'s comment). Before this fix, the
+    tenant-confirmed leg could resolve an ``awaiting_approval`` case
+    (the only status an outstanding draft can exist under) WITHOUT
+    cancelling that draft; ``app/agent/draft_sender.py``'s own resolved-
+    case claim guard (``c.status = 'resolved'``) kept it safely unclaimable
+    right up until a later tenant message REOPENED the case
+    (``status = 'reopened'``), at which point the guard stopped matching
+    and the stuck, landlord-approved draft became claimable and sendable
+    again — nothing else would have caught it (landlord-approved drafts are
+    never auto-staled). Closed at the root here; ``draft_sender.py``'s own
+    guard remains as a second, independent layer for any OTHER path that
+    might resolve a case without going through this module or the resolve
+    endpoint.
 
     Returns only the actions that ACTUALLY applied (guard matched,
     ``rowcount == 1``) — an action whose guard lost the race is silently
