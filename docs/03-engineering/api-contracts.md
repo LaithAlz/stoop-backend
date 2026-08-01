@@ -40,6 +40,22 @@
   supersedes the Devices section's prior "standard FastAPI validation
   envelope" note (v1.18) — that carve-out no longer applies; devices' 422s
   now match every other endpoint's.
+- **v1.21 amendment (2026-08-01 — #186 follow-up safety-review round, NEW-1;
+  next available slot — v1.20 is already the Properties section's #203
+  item 2 amendment):** an UNHANDLED exception on ANY endpoint (anything
+  that reaches neither the `AuthError`/`AppError`/`RequestValidationError`
+  handlers above nor any endpoint-specific `try`/`except`) now ALSO uses
+  this same envelope: `500` with `code: "internal_error"` and a static,
+  generic `message` — never the exception's own type/message/args/
+  traceback, same never-derive-from-the-failure discipline the v1.19
+  amendment established for validation failures. This is a global
+  catch-all `Exception` handler (`app/main.py`), registered alongside the
+  other three, that supersedes Starlette's own default response for an
+  unhandled exception — verified directly: a plain, un-enveloped
+  `"Internal Server Error"` (`text/plain`, not JSON) for this installed
+  Starlette version. **Supersedes nothing** — extends the v1.19 precedent
+  to the one remaining gap (a genuinely unexpected server-side failure)
+  rather than replacing any existing documented behavior.
 - IDs are uuids as strings. Timestamps ISO-8601 UTC (`2026-06-11T14:02:00Z`).
 - **Pagination**: `?limit=` (default 25, max 100) + `?cursor=`; responses
   carry `"next_cursor": string|null`. Lists are newest-first.
