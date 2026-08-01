@@ -43,26 +43,130 @@ admin engine, not invented larger
 1-CPU/1-GB machine against Supabase's free-tier connection cap (~60 total):
 "5 per process is safe across multiple machines/processes". Doubling that
 budget with an unboundedly large second pool here would quietly undermine
-that reasoning. Instead, :data:`_LOCK_POOL_SIZE` / :data:`_LOCK_MAX_OVERFLOW`
-mirror the admin engine's OWN shape (5 base + 5 overflow = 10 total) — the
-same concurrency ceiling this codebase already reasoned about and pinned
-in the admin engine's own docstring, just now serving ONLY lock-holding
-connections instead of being shared with node checkouts. This is not a
-capacity increase; it is the SAME 10-concurrent-case budget, decoupled from
-the pool the in-span nodes also need.
+that reasoning. :data:`_LOCK_POOL_SIZE` / :data:`_LOCK_MAX_OVERFLOW` keep
+this pool's PEAK ceiling in that same 10-concurrent-case class this
+codebase already reasoned about — decoupled from the pool the in-span
+nodes also need, never a capacity increase over what the admin pool alone
+used to bound.
+
+Full per-process connection-budget accounting (safety review, #186
+follow-up round, ADVISORY — do the math explicitly rather than reason
+about each pool in isolation)
+------------------------------------------------------------------------
+Four pools now exist per process: the admin engine (``app/db/session.py``,
+``pool_size=5, max_overflow=5`` — 10 peak), the request engine (SAME
+object as the admin engine, and so SAME connections, until the #22
+operator step sets ``APP_DATABASE_URL`` — at which point it becomes a
+genuinely SEPARATE 5+5=10 peak), the checkpointer's dedicated psycopg pool
+(``app/agent/checkpointer.py``, ``min_size=1, max_size=5`` — 5 peak), and
+THIS pool. Worst case (role separation flipped in production): 10 + 10 +
+5 + this pool's peak. At this pool's ORIGINAL 5+5=10, that is 35 per
+process — two Fly machines under simultaneous burst would want up to 70
+connections, against Supabase's free-tier ~60 cap the admin engine's own
+docstring already budgets against. This pool's connections are also the
+LONGEST-lived of the four in practice: a lock HOLDER sits genuinely
+idle-in-transaction at the Postgres level for the ENTIRE LLM-bound span
+(the advisory-lock transaction does no further DB work of its own while
+Python awaits the Anthropic call) — the most expensive kind of connection
+to leave provisioned. Fixed: :data:`_LOCK_POOL_SIZE` drops to 2 (from 5)
+while :data:`_LOCK_MAX_OVERFLOW` rises to 8 (from 5) — the PEAK ceiling
+stays the identical 10 (no reduction in how many concurrent case-locks
+this process can hold at once, so the "Bounded try-lock retries" fix above
+is unaffected), but the STEADY-STATE idle footprint drops from 5
+always-open connections to 2: SQLAlchemy's ``QueuePool`` keeps ``pool_size``
+connections open indefinitely as a floor, while ``max_overflow`` connections
+above that are opened only under genuine demand and closed promptly once
+the burst subsides (``app/db/session.py``'s own module docstring, same
+wording, for the admin engine's identical overflow semantics). Bringing
+the worst-case per-process total down to 32 (10 + 10 + 5 + 2-to-10
+depending on load) narrows, though does not eliminate, the two-machine
+headroom question above — a genuine capacity-planning item for whoever
+provisions the first Fly scale-out, not something a pool-sizing constant
+alone can fully resolve.
+
+**A discovered trade-off, honestly flagged, not silently absorbed**: a
+small ``pool_size`` interacts with ``app/agent/graph.py``'s bounded
+try-lock retry loop (module docstring there, "Bounded try-lock retries,
+not a blocking wait") in a way worth naming explicitly.
+``QueuePool._do_return_conn`` only keeps a returned connection idle for
+reuse if the pool's internal idle queue (capacity exactly
+``pool_size`` — here, 2) isn't already full; a returned OVERFLOW
+connection beyond that is physically closed rather than kept
+(``sqlalchemy/pool/impl.py``, confirmed by direct inspection of the
+installed version). Combined with the retry loop's own pattern (release
+back to the pool on every LOSING non-blocking attempt, re-checkout on the
+next retry), more than 2 concurrent attempts against ONE hot, contended
+case means most retries pay a FRESH physical-connection-establishment
+cost (empirically several hundred ms against a local Docker Postgres in
+this repo's own test environment — see ``tests/test_agent_case_lock_
+retry.py``) rather than reusing an already-open one. This does NOT
+reopen the head-of-line-blocking bug (BLOCKING-2) — waiting still never
+PINS a pool slot, so unrelated cases are never starved — but it DOES mean
+a genuinely busy/chatty case's own backlog can drain more slowly than a
+larger steady-state pool would allow, purely from repeated
+connection-establishment overhead rather than actual lock contention.
+Accepted here per this round's explicit sizing directive (the
+Supabase-connection-budget concern above); a future revision could widen
+:data:`_LOCK_POOL_SIZE` again (trading idle footprint back for retry
+throughput) if chatty-case latency under real production load turns out
+to matter more than the two-machine connection-budget headroom does.
 
 :data:`_LOCK_POOL_TIMEOUT` is deliberately SHORTER than SQLAlchemy's default
 (30s, still used by the admin engine) — the #186 issue's own prescribed
 safe failure direction: once genuine demand exceeds this pool's capacity, a
-checkout should fail FAST (``sqlalchemy.exc.TimeoutError``, propagating up
-through :func:`app.agent.graph.run_graph` /
-:func:`app.agent.graph.resume_case_thread` to their existing callers —
-``app/agent/graph_entry.py::enqueue_classification`` already wraps
-``run_graph`` in a try/except that pages Sentry and attempts a last-resort
-``needs_eyes`` notification) rather than blocking a tenant-facing request
-for up to 30s before that same safe fallback fires. The Tier-0 prefilter
-still runs pre-graph regardless (``app/routers/webhooks/twilio.py``), so a
-saturated lock pool never gates the emergency path.
+checkout should fail FAST (``sqlalchemy.exc.TimeoutError``) rather than
+block a tenant- or landlord-facing request for up to 30s. That
+``TimeoutError`` propagates up through :func:`app.agent.graph.run_graph` /
+:func:`app.agent.graph.resume_case_thread` /
+:func:`app.agent.graph.resolve_draft_decision` to whichever of THREE
+different callers happened to be waiting on this pool — named here
+honestly (safety review, #186 follow-up round) because they land
+DIFFERENTLY, not identically:
+
+1. **The Twilio SMS webhook's background classification task**
+   (``app/agent/graph_entry.py::enqueue_classification``, calling
+   ``run_graph``) — already wraps that call in a try/except that pages
+   Sentry (``sentry_sdk.capture_message``, metadata only) AND attempts a
+   last-resort ``needs_eyes`` notification insert
+   (:func:`app.agent.graph_entry._attempt_last_resort_needs_eyes`). This is
+   the ONLY one of the three with a purpose-built fallback notification —
+   a ``BackgroundTasks`` callback has no HTTP caller left to surface
+   anything to otherwise.
+2. **The dashboard approve/reject/edit-and-send endpoints**
+   (``app/routers/drafts.py``, calling ``resolve_draft_decision``) — catch
+   only :class:`app.agent.graph.DraftStaleError` /
+   :class:`app.agent.graph.CaseNotAwaitingApprovalError`; a bare
+   ``TimeoutError`` is NOT one of those, so it propagates past this
+   router's own handling entirely. ``app/main.py`` registers exception
+   handlers for ``AuthError``/``AppError``/``RequestValidationError``
+   only — a ``TimeoutError`` matches none of them, so it surfaces as
+   Starlette's own default response: a PLAIN ``500`` (``"Internal Server
+   Error"``, ``text/plain`` — verified against this installed Starlette
+   version — never the house JSON error envelope
+   ``{"error": {"code", ...}}`` every OTHER error path in this codebase
+   returns). Sentry's ``FastApiIntegration``/``StarletteIntegration``
+   (``app/observability.py::init_sentry``) auto-captures any exception
+   that reaches that default handler, so this path DOES still page ops —
+   just without a matching envelope shape or a ``needs_eyes`` fallback;
+   the draft simply stays ``pending`` for the landlord to retry from a
+   reloaded dashboard.
+3. **Approve-by-SMS** (``app/agent/approve_by_sms.py``, calling
+   ``resolve_draft_decision`` from inside the SAME Twilio webhook request
+   as (1) above, for a landlord's "1"/"2"/"UNDO" reply) — safety review,
+   #186 follow-up round, BLOCKING finding: this path used to swallow the
+   exception via ``app/routers/webhooks/twilio.py``'s ``_safe_step`` with
+   its default ``alert_on_failure=False`` (log-only — ``log.error`` alone
+   never reaches Sentry, ``LoggingIntegration(event_level=None)``) and
+   then unconditionally return, leaving NEITHER a Sentry page NOR a
+   ``needs_eyes`` fallback — the landlord's reply would silently vanish.
+   Fixed: that call site now passes ``alert_on_failure=True`` and, on
+   failure, falls through to the SAME ``_ensure_needs_eyes_notification``
+   fallback an unrecognized/uncorrelated approve-by-SMS token already gets
+   — see ``_run_post_persist_side_effects``'s own docstring in that module.
+
+The Tier-0 prefilter still runs pre-graph regardless of all three
+(``app/routers/webhooks/twilio.py``), so a saturated lock pool never gates
+the emergency path.
 
 Why NOT reuse ``app/db/session.py``'s ``_build_engine``/``engine`` directly
 ------------------------------------------------------------------------
@@ -126,13 +230,21 @@ from app.db.session import _ASYNCPG_POOLER_CONNECT_ARGS
 # Pool sizing — see module docstring "Pool sizing" for the full rationale.
 # ---------------------------------------------------------------------------
 
-_LOCK_POOL_SIZE = 5
-"""Mirrors ``app/db/session.py``'s admin-engine ``pool_size`` — same
-connection-budget class, a SEPARATE pool, not a larger one."""
+_LOCK_POOL_SIZE = 2
+"""Steady-state floor — deliberately SMALLER than the admin engine's own
+``pool_size=5`` (see module docstring "Full per-process connection-budget
+accounting"): this pool's connections are the longest-lived/most
+idle-in-transaction-prone of the four per-process pools, so keeping fewer
+of them open by default (with ``max_overflow`` covering genuine bursts)
+narrows this process's total connection footprint against Supabase's
+free-tier cap."""
 
-_LOCK_MAX_OVERFLOW = 5
-"""Mirrors the admin engine's ``max_overflow`` — burst to 10 total, same as
-today's admin-pool ceiling, now serving ONLY lock-holding connections."""
+_LOCK_MAX_OVERFLOW = 8
+"""Burst capacity above :data:`_LOCK_POOL_SIZE` — 2 + 8 = 10 peak,
+UNCHANGED from before (still the same concurrency ceiling the "Bounded
+try-lock retries" fix in ``app/agent/graph.py`` assumes), opened only
+under genuine demand and closed promptly once the burst subsides
+(``app/db/session.py``'s own documented overflow semantics)."""
 
 _LOCK_POOL_TIMEOUT = 10
 """Seconds. Deliberately shorter than SQLAlchemy's 30s default (still used

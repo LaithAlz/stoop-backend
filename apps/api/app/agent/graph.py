@@ -358,11 +358,14 @@ whatever the CURRENT interrupt happens to be (which may by then be the
 FRESH one from the concurrent re-run) with a value meant for the OLD
 draft, and two truly concurrent resumes for the same draft could both
 pass the check and both call ``Command(resume=...)`` (a double-send once
-#44 exists). Fixed with :func:`_case_lock`: a Postgres
-``pg_advisory_xact_lock`` keyed on a stable pair of int4 values derived
-directly from ``case_id``'s own bits (see :func:`_case_lock_keys` — no
-``hashtext()`` needed, the UUID already has plenty of entropy), held for
-the FULL DURATION of both critical sections — :func:`run_graph`'s
+#44 exists). Fixed with :func:`_case_lock`: a transaction-scoped Postgres
+advisory lock (acquired via a bounded ``pg_try_advisory_xact_lock`` retry
+loop, see "Bounded try-lock retries, not a blocking wait" below — an
+implementation detail of HOW it's acquired; the SEMANTICS here are
+unaffected) keyed on a stable pair of int4 values derived directly from
+``case_id``'s own bits (see :func:`_case_lock_keys` — no ``hashtext()``
+needed, the UUID already has plenty of entropy), held for the FULL
+DURATION of both critical sections — :func:`run_graph`'s
 ``case_graph.ainvoke(...)`` span AND :func:`resume_case_thread`'s entire
 check-then-resume span (the pending-draft re-read happens INSIDE the
 lock, immediately before ``Command(resume=...)``). Two callers for the
@@ -389,17 +392,98 @@ the lock's session from :func:`app.agent.case_lock_pool.get_case_lock_session`
 for the full pool-sizing/timeout rationale) built the same way
 ``app/agent/checkpointer.py``'s dedicated psycopg pool keeps checkpoint I/O
 off the admin pool, adapted to this lock's actual driver (plain SQL over
-SQLAlchemy/asyncpg, not psycopg). The lock itself is still
-``pg_advisory_xact_lock`` — transaction-scoped, released when the
-DEDICATED pool's session's transaction ends — and still spans the exact
-same two critical sections (:func:`run_graph`'s case-graph invoke,
-:func:`resume_case_thread`'s check-then-resume); only WHICH pool the
-lock-holding connection comes from changed, never the lock's semantics or
-scope.
+SQLAlchemy/asyncpg, not psycopg). The lock is still transaction-scoped,
+released when the DEDICATED pool's session's transaction ends, and still
+spans the exact same two critical sections (:func:`run_graph`'s
+case-graph invoke, :func:`resume_case_thread`'s check-then-resume); only
+WHICH pool the lock-holding connection comes from changed, never the
+lock's scope. (The lock's OWN acquisition mechanics changed too — see the
+next section — but the invariant "once acquired, the lock spans the
+entire critical section" is unchanged by either fix.)
+
+Bounded try-lock retries, not a blocking wait (safety review, #186
+follow-up round, BLOCKING — head-of-line blocking reproduced live)
+------------------------------------------------------------------------
+Item 1's fix (above) separates lock-holding connections from node-checkout
+connections, but a SEPARATE, second pool-starvation shape survived it,
+reproduced live in review: the ORIGINAL acquisition was a single
+``pg_advisory_xact_lock(...)`` call — the BLOCKING form — issued AFTER a
+connection was already checked out of the dedicated lock pool
+(:func:`app.agent.case_lock_pool.get_case_lock_session`). A connection
+checked out to run a BLOCKING statement stays checked out for however
+long that statement blocks — which, for a caller waiting behind a HOT,
+contended case, is bounded only by how long the CURRENT holder's entire
+``run_graph``/``resume_case_thread`` span takes (seconds to tens of
+seconds), not by anything this module controls. Reproduced: 12 messages
+racing for the SAME case_id (all genuinely waiting their serialized turn,
+correctly) plus 8 unrelated, uncontended cases' OWN locks — the 12
+same-case waiters alone can pin every connection the dedicated pool has,
+leaving the 8 UNRELATED cases (which have nothing to do with the hot
+case's contention) unable to even ATTEMPT their own, otherwise-instant
+acquisition; three of them observed the pool's own :data:`app.agent.
+case_lock_pool._LOCK_POOL_TIMEOUT` checkout timeout and were permanently
+abandoned. This is a HEAD-OF-LINE blocking failure, distinct from item 1's
+original deadlock: waiting itself, not holding the lock, was pinning the
+pool.
+
+Two shapes were on the table (both preserve "once acquired, the lock
+spans the whole critical section" — neither ever re-enters
+``run_graph``'s or ``resume_case_thread``'s span mid-way):
+
+(a) **A bounded, non-blocking retry loop (CHOSEN)** —
+    ``pg_try_advisory_xact_lock(...)`` (returns ``true``/``false``
+    immediately, never blocks) instead of the blocking form. On ``false``,
+    the ATTEMPT's session/connection is released back to the pool
+    immediately (a no-op commit — nothing was ever locked) and the loop
+    sleeps OUTSIDE the pool entirely (holding no connection at all) before
+    retrying, bounded by :data:`_CASE_LOCK_MAX_WAIT_SECONDS` total. Only
+    the instant of TRYING ever touches the pool; waiting never does — a
+    deep backlog on one hot case now costs that case's OWN waiters brief,
+    repeated, cheap pool checkouts (milliseconds each) instead of pinning
+    a connection apiece for the ENTIRE wait, so unrelated cases' own
+    (uncontended, near-instant) acquisitions are never crowded out by a
+    hot case's backlog. Exceeding the bound raises
+    :class:`CaseLockAcquisitionTimeoutError` — landing in the SAME safe
+    failure paths a dedicated-pool checkout ``TimeoutError`` already does
+    (see ``app/agent/case_lock_pool.py``'s docstring for all three
+    callers' actual landing spots) — never a silent drop, and never an
+    indefinite wait either.
+(b) ``SET LOCAL lock_timeout`` on the lock-holding session, so the
+    ORIGINAL blocking ``pg_advisory_xact_lock`` call fails outright (a
+    Postgres error, not a Python-level retry) once a single bounded
+    window elapses. Rejected in favor of (a): a single bound with no
+    retry means EVERY message queued behind more than one typical-duration
+    prior run on a busy/chatty case would routinely fail outright (falling
+    into the same degraded/needs_eyes paths far more often than
+    necessary) rather than eventually succeeding once its turn genuinely
+    comes — (a)'s repeated, cheap attempts let a moderately-queued case
+    still succeed normally, only truly pathological backlogs (or genuine
+    pool exhaustion) hit the bound. (b) also depends on session-level GUC
+    state surviving for the statement immediately following it on the
+    SAME physical connection — true here (one dedicated-pool connection
+    per attempt, no cross-connection replay), but avoiding that dependency
+    entirely, in a codebase that already treats Supavisor transaction
+    -pooler session-parameter handling as a documented caveat elsewhere
+    (``app/agent/checkpointer.py``'s own "Known caveat" section), was
+    judged the more robust default.
+
+:data:`_CASE_LOCK_MAX_WAIT_SECONDS` (30s) is deliberately LONGER than the
+dedicated pool's own 10s checkout timeout (a genuinely UNCONTENDED
+acquisition — the overwhelmingly common case — still resolves on its
+FIRST attempt, in well under either bound) but bounded enough to stay in
+the same "fail fast, page the existing safe fallback" class as every
+other timeout in this module rather than blocking indefinitely.
+:data:`_CASE_LOCK_RETRY_BASE_SECONDS` / :data:`_CASE_LOCK_RETRY_JITTER_
+SECONDS` add randomized jitter to each retry's delay specifically so a
+whole cohort of same-case waiters (the 12-message repro above) does not
+settle into lockstep, all retrying at the exact same instant forever.
 """
 
 from __future__ import annotations
 
+import asyncio
+import random
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, cast
@@ -766,7 +850,24 @@ async def _resolve_thread_id(*, message_id: UUID, case_id: UUID | None) -> str:
 # no extra hashing step).
 # ---------------------------------------------------------------------------
 
-_ADVISORY_LOCK_SQL = text("SELECT pg_advisory_xact_lock(:part1, :part2)")
+_TRY_ADVISORY_LOCK_SQL = text("SELECT pg_try_advisory_xact_lock(:part1, :part2)")
+"""Non-blocking form — see module docstring "Bounded try-lock retries, not
+a blocking wait" for why this replaced the original blocking
+``pg_advisory_xact_lock`` call."""
+
+_CASE_LOCK_MAX_WAIT_SECONDS = 30.0
+"""Total bound across every retry attempt — see module docstring for the
+full rationale (deliberately longer than the dedicated pool's own 10s
+checkout timeout, since an uncontended acquisition always resolves on its
+first attempt regardless)."""
+
+_CASE_LOCK_RETRY_BASE_SECONDS = 0.1
+"""Base delay between failed acquisition attempts — held OUTSIDE the pool
+entirely (no connection checked out while sleeping)."""
+
+_CASE_LOCK_RETRY_JITTER_SECONDS = 0.1
+"""Random jitter added to each retry delay — see module docstring, so a
+cohort of same-case waiters never settles into lockstep retries."""
 
 _UINT32_UPPER_BOUND = 0xFFFFFFFF
 _INT32_OVERFLOW_THRESHOLD = 0x80000000
@@ -775,7 +876,10 @@ _UINT32_RANGE_SIZE = 0x100000000
 
 def _case_lock_keys(case_id: UUID) -> tuple[int, int]:
     """Two independent Postgres ``int4`` (signed 32-bit) values derived
-    from *case_id* for ``pg_advisory_xact_lock``'s two-argument overload.
+    from *case_id* for ``pg_try_advisory_xact_lock``'s two-argument
+    overload (same signature, same key space as the blocking
+    ``pg_advisory_xact_lock`` form it replaced — see module docstring
+    "Bounded try-lock retries, not a blocking wait").
     ``UUID.int`` is a 128-bit unsigned integer; the low and high 32 bits
     are each masked out and re-interpreted as signed (Postgres ``int4``
     range) — deterministic, same case_id always yields the same pair,
@@ -792,30 +896,90 @@ def _case_lock_keys(case_id: UUID) -> tuple[int, int]:
     return part1, part2
 
 
+class CaseLockAcquisitionTimeoutError(RuntimeError):
+    """Raised by :func:`_case_lock` when the bounded try-lock retry loop
+    (module docstring "Bounded try-lock retries, not a blocking wait")
+    exhausts :data:`_CASE_LOCK_MAX_WAIT_SECONDS` without ever observing
+    ``pg_try_advisory_xact_lock`` return ``true``. Lands in the SAME safe
+    failure paths a dedicated-pool checkout ``sqlalchemy.exc.TimeoutError``
+    already does — see ``app/agent/case_lock_pool.py``'s docstring for
+    exactly where each of the three callers' failures surface. Distinct
+    from a pool-exhaustion ``TimeoutError``: this means the KEY itself
+    stayed contended (another holder never released it in time), not that
+    the pool ran out of connections to even attempt with."""
+
+    def __init__(self, *, case_id: UUID, attempts: int, elapsed_seconds: float) -> None:
+        self.case_id = case_id
+        self.attempts = attempts
+        self.elapsed_seconds = elapsed_seconds
+        super().__init__(
+            f"could not acquire the advisory lock for case {case_id} after "
+            f"{attempts} attempt(s) over {elapsed_seconds:.1f}s"
+        )
+
+
 @asynccontextmanager
 async def _case_lock(case_id: UUID) -> AsyncIterator[AsyncSession]:
-    """Hold a Postgres ``pg_advisory_xact_lock`` keyed on *case_id* for the
-    duration of the ``async with`` block — see module docstring "Per-case
-    serialization". Any OTHER caller (another ``run_graph`` invocation for
-    the SAME case, or a concurrent :func:`resume_case_thread` call) trying
-    to acquire the SAME key blocks at the DATABASE level until this block
-    exits (commit on clean exit, rollback on exception — either way the
-    lock releases with the transaction, via
-    :func:`app.agent.case_lock_pool.get_case_lock_session` — a DEDICATED
-    pool, deliberately separate from the admin pool every in-span node
-    checks out its own connection from; see module docstring "A dedicated
-    pool for the lock, not the admin pool (#186 item 1)"). Yields the
-    lock-holding session so a caller can perform a read INSIDE the locked
-    span using the SAME connection (see :func:`resume_case_thread`'s
-    staleness re-read) without an extra pool checkout, though this is not
-    required — any other session's reads/writes made while this lock is
-    held are still fully serialized against other holders of this same
-    key, regardless of which connection performs them.
+    """Acquire a Postgres advisory lock keyed on *case_id* and hold it for
+    the duration of the ``async with`` block — see module docstring
+    "Per-case serialization". Any OTHER caller (another ``run_graph``
+    invocation for the SAME case, or a concurrent
+    :func:`resume_case_thread` call) trying to acquire the SAME key is
+    made to wait, bounded, via the retry loop below — see module docstring
+    "Bounded try-lock retries, not a blocking wait" for why this is a
+    non-blocking ``pg_try_advisory_xact_lock`` retry loop rather than a
+    single blocking ``pg_advisory_xact_lock`` call.
+
+    ACQUISITION (this loop) and HOLDING (the ``yield`` below) are
+    structurally distinct: every attempt that does NOT acquire the lock
+    releases its session/connection immediately (a no-op commit — nothing
+    was ever locked) and sleeps OUTSIDE the pool entirely before retrying,
+    so waiting never pins a connection from
+    :func:`app.agent.case_lock_pool.get_case_lock_session`'s DEDICATED
+    pool (see that invariant's own module docstring, "A dedicated pool for
+    the lock, not the admin pool (#186 item 1)"). The loop yields (and
+    returns) EXACTLY ONCE, on the ONE attempt that actually acquires the
+    lock — it never re-enters or restarts the caller's own critical
+    section; once acquired, the lock is held (commit on clean exit,
+    rollback on exception — either way it releases with that ONE session's
+    transaction) for the FULL DURATION of the ``async with`` block, same
+    as before this fix. Yields the lock-holding session so a caller can
+    perform a read INSIDE the locked span using the SAME connection (see
+    :func:`resume_case_thread`'s staleness re-read) without an extra pool
+    checkout, though this is not required — any other session's
+    reads/writes made while this lock is held are still fully serialized
+    against other holders of this same key, regardless of which connection
+    performs them.
+
+    Raises :class:`CaseLockAcquisitionTimeoutError` if
+    :data:`_CASE_LOCK_MAX_WAIT_SECONDS` elapses without ever acquiring —
+    see that class's own docstring for where this lands for each caller.
     """
     part1, part2 = _case_lock_keys(case_id)
-    async with get_case_lock_session() as session:
-        await session.execute(_ADVISORY_LOCK_SQL, {"part1": part1, "part2": part2})
-        yield session
+    started_at = time.monotonic()
+    deadline = started_at + _CASE_LOCK_MAX_WAIT_SECONDS
+    attempts = 0
+    while True:
+        attempts += 1
+        async with get_case_lock_session() as session:
+            acquired = (
+                await session.execute(_TRY_ADVISORY_LOCK_SQL, {"part1": part1, "part2": part2})
+            ).scalar_one()
+            if acquired:
+                yield session
+                return
+        # Not acquired -- the session above already exited cleanly (a
+        # no-op commit; nothing was ever locked), releasing this attempt's
+        # connection back to the dedicated pool BEFORE the sleep below, so
+        # waiting itself never pins a pool slot (module docstring "Bounded
+        # try-lock retries, not a blocking wait").
+        now = time.monotonic()
+        if now >= deadline:
+            raise CaseLockAcquisitionTimeoutError(
+                case_id=case_id, attempts=attempts, elapsed_seconds=now - started_at
+            )
+        jitter = random.uniform(0, _CASE_LOCK_RETRY_JITTER_SECONDS)  # noqa: S311 -- timing jitter, not security
+        await asyncio.sleep(_CASE_LOCK_RETRY_BASE_SECONDS + jitter)
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1386,7 @@ __all__: list[str] = [
     "NODE_IDENTIFY_PROPERTY",
     "NODE_LOAD_CONTEXT",
     "NODE_MARK_AWAITING_APPROVAL",
+    "CaseLockAcquisitionTimeoutError",
     "CaseNotAwaitingApprovalError",
     "DraftStaleError",
     "build_case_graph",
