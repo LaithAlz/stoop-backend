@@ -9,6 +9,7 @@ tests are plain ``unit`` (no DB, no network).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
@@ -646,6 +647,80 @@ async def test_drain_sweep_exhaustion_pages_sentry_distinct_from_per_attempt_fai
         for call in calls:
             for value in call.kwargs.get("extras", {}).values():
                 assert value is None or "+1" not in str(value)
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+class _CancellingTwilioSender:
+    """Simulates the scheduler task being cancelled mid-Twilio-send (Fly
+    deploy / machine restart / ``stop_scheduler()``) — ``CancelledError``
+    is a ``BaseException``, not an ``Exception``, so
+    ``except Exception`` in ``_process_candidate`` never sees it and it
+    propagates out of the sweep call entirely (matching real asyncio task
+    -cancellation semantics — see safety re-review, blocking finding 2,
+    2026-08-01)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def send_sms(self, *, to: str, from_: str, body: str) -> str:
+        self.calls.append(to)
+        raise asyncio.CancelledError
+
+
+@pytest.mark.integration
+async def test_drain_sweep_cancellation_never_burns_send_failures_only_genuine_failures_do(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safety re-review, blocking finding 2, 2026-08-01 -- regression for a
+    reproduced attempt-burn bug: the claim/CAS ``attempt`` column used to
+    ALSO gate exhaustion, so five crashes/``CancelledError``s between a
+    successful claim and the Twilio call -- each of which burns one
+    ``attempt`` via the claim itself but NEVER reaches ``send_sms``'s own
+    outcome -- could exhaust a row that placed ZERO real Twilio calls.
+    Fixed by tracking genuine send failures separately in
+    ``payload.send_failures`` (see :data:`landlord_sms.
+    _MARK_LANDLORD_SMS_SEND_OUTCOME_SQL`), incremented ONLY from the
+    ``except Exception`` block around the actual ``sender.send_sms(...)``
+    call — never from a claim, and never from a ``CancelledError`` (a
+    ``BaseException``, not caught by that ``except Exception`` at all)."""
+    landlord_id = await _seed_draft_ready_row(db_session)
+    canceller = _CancellingTwilioSender()
+    monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: canceller)
+
+    max_attempts = landlord_sms._LANDLORD_SMS_MAX_ATTEMPTS  # noqa: SLF001
+
+    try:
+        # Five cancellations -- MORE than _LANDLORD_SMS_MAX_ATTEMPTS worth
+        # of claims -- yet the row must never be exhausted: no genuine send
+        # failure has ever been observed.
+        for _ in range(max_attempts):
+            with pytest.raises(asyncio.CancelledError):
+                await landlord_sms.run_landlord_sms_drain_sweep()
+
+        status, attempt = await _row_status_and_attempt(db_session, landlord_id)
+        assert status == "pending"  # never marked 'failed'/'exhausted' by a cancellation
+        assert attempt == max_attempts  # the claim CAS still advanced every time
+        assert canceller.calls, "the sender was genuinely invoked each time"
+
+        # NOW a single genuine Twilio failure -- the FIRST one this row has
+        # ever actually observed -- must be transient ('failed'), never
+        # exhausted, even though `attempt` is already at the cap.
+        failing_sender = _FakeTwilioSender(fail=True)
+        monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: failing_sender)
+        outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+        assert [o.outcome for o in outcomes] == ["failed"]
+        status_after_one_real_failure, _ = await _row_status_and_attempt(db_session, landlord_id)
+        assert status_after_one_real_failure == "failed"
+
+        # A fully healthy sender still delivers it -- the cancellations
+        # never counted against the row at all.
+        working_sender = _FakeTwilioSender()
+        monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: working_sender)
+        outcomes_after = await landlord_sms.run_landlord_sms_drain_sweep()
+        assert [o.outcome for o in outcomes_after] == ["sent"]
+        status_final, _ = await _row_status_and_attempt(db_session, landlord_id)
+        assert status_final == "sent"
     finally:
         await _cleanup(db_session, landlord_id)
 

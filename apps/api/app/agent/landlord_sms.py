@@ -421,12 +421,15 @@ def _default_time_source() -> float:
 
 
 _LANDLORD_SMS_MAX_ATTEMPTS: int = 5
-"""After this many failed send attempts, a landlord-facing ``draft_ready``/
-``sms`` row (the draft-ready notice, or any approve-by-SMS reply
-confirmation — this sweep drains every ``payload.kind`` uniformly, see
-module docstring) is marked ``'exhausted'`` instead of retried forever
-(issue #229 item 4, PR #228 senior-review advisory 4). The SAME numeric
-constant ``app/push_outbox.py::_PUSH_MAX_ATTEMPTS`` and
+"""After this many GENUINE send failures (``payload.send_failures`` --
+DISTINCT from the claim/CAS ``attempt`` column, see
+:data:`_MARK_LANDLORD_SMS_SEND_OUTCOME_SQL`'s own comment, issue #229
+blocking finding 2), a landlord-facing ``draft_ready``/``sms`` row (the
+draft-ready notice, or any approve-by-SMS reply confirmation — this sweep
+drains every ``payload.kind`` uniformly, see module docstring) is marked
+``'exhausted'`` instead of retried forever (issue #229 item 4, PR #228
+senior-review advisory 4). The SAME numeric constant
+``app/push_outbox.py::_PUSH_MAX_ATTEMPTS`` and
 ``app/property_provisioning.py::_NUMBER_RELEASE_MAX_ATTEMPTS`` already
 use. Unlike those two sweeps' ``next_attempt_at``-scheduled backoff, this
 module has none (mirrors ``run_sms_drain_sweep``'s own "resend every tick
@@ -460,20 +463,63 @@ _MARK_LANDLORD_SMS_SENT_SQL = text(
     "UPDATE notifications SET status = 'sent', updated_at = now() WHERE id = :id"
 )
 
-_MARK_LANDLORD_SMS_FAILED_SQL = text(
-    "UPDATE notifications SET status = 'failed', updated_at = now() WHERE id = :id"
-)
-
 # Terminal -- reached two ways: (1) mirrors app/agent/emergency_chain.py's
 # own 'no_tenant_phone' precedent below (no amount of retrying supplies a
-# phone number/twilio_number this row never had), or (2) issue #229 item 4:
-# _LANDLORD_SMS_MAX_ATTEMPTS consecutive send failures despite a valid
+# phone number/twilio_number this row never had) -- used AS-IS, no counter
+# involved, since no send was ever attempted; or (2) issue #229 item 4:
+# `payload.send_failures` (see :data:`_MARK_LANDLORD_SMS_SEND_OUTCOME_SQL`
+# below) reaching _LANDLORD_SMS_MAX_ATTEMPTS despite a valid
 # phone/twilio_number -- a permanently-failing Twilio path, not a missing
 # contact fact. 'exhausted' is excluded from the SELECT above's
 # `status IN ('pending', 'failed')`, so a row marked this way is never
 # re-attempted.
 _MARK_LANDLORD_SMS_EXHAUSTED_SQL = text(
     "UPDATE notifications SET status = 'exhausted', updated_at = now() WHERE id = :id"
+)
+
+# Safety re-review, blocking finding 2, 2026-08-01 -- `attempt` (the column
+# _CLAIM_LANDLORD_SMS_SQL's CAS advances) is a CLAIM guard, not a count of
+# genuine send failures: a crash/CancelledError/context_missing return
+# between a successful claim and the Twilio call never reaches send_sms at
+# all, yet used to still burn one of _LANDLORD_SMS_MAX_ATTEMPTS against
+# `attempt` -- five such claims (a machine restart mid-tick, repeated)
+# could exhaust a row that NEVER placed a single real Twilio call. Fixed
+# by tracking genuine send failures SEPARATELY, in `payload.send_failures`
+# (a payload key, not a new column -- payload shapes are code-owned here,
+# no migration/doc-first note needed, same convention every other
+# notifications payload key in this codebase already follows). This
+# statement is reached ONLY from the `except` block around the actual
+# `sender.send_sms(...)` call in :func:`_process_candidate` -- never from
+# a claim, a crash, or a context_missing/no_phone return -- so
+# `send_failures` only ever increments on a real, observed Twilio failure.
+# `jsonb_set(..., true)` creates the key on its first use (a pre-#229 row's
+# payload has none yet) and overwrites it thereafter; `COALESCE` guards a
+# defensively-impossible NULL payload the same way schema-v1.md's NOT NULL
+# constraint on this column already should.
+#
+# ``CAST(:send_failures AS integer)``, not ``:send_failures::int`` -- same
+# discipline every other raw-SQL bind param in this codebase already
+# follows (``app/audit.py``'s ``CAST(:payload AS jsonb)`` etc.): asyncpg
+# needs an explicit wire type for a bind param before it can send the
+# (binary) protocol message, and SQLAlchemy's ``text()`` bind-param scanner
+# does not treat a Postgres ``::`` cast suffix immediately following
+# ``:send_failures`` as part of that same bind param -- it silently leaves
+# the placeholder unexpanded instead (discovered running this fix's own
+# tests: a ``ProgrammingError`` on every send-failure branch). ``CAST(...
+# AS ...)`` is the house-standard escape for this class of bug -- see
+# ``app/agent/emergency_chain.py``'s own ``_CLAIM_STEP_SQL`` comment for
+# the identical ``IndeterminateDatatypeError`` story with a bare literal.
+_MARK_LANDLORD_SMS_SEND_OUTCOME_SQL = text(
+    """
+    UPDATE notifications
+    SET status = :status,
+        updated_at = now(),
+        payload = jsonb_set(
+          COALESCE(payload, '{}'::jsonb), '{send_failures}',
+          to_jsonb(CAST(:send_failures AS integer)), true
+        )
+    WHERE id = :id
+    """
 )
 
 _SELECT_LANDLORD_SMS_CONTEXT_SQL = text(
@@ -494,6 +540,12 @@ class LandlordSmsCandidate:
     case_id: UUID
     attempt: int
     body: str
+    send_failures: int
+    """Genuine Twilio ``send_sms`` failures observed for this row so far —
+    ``payload.send_failures``, DISTINCT from :attr:`attempt` (the claim/CAS
+    guard). See :data:`_MARK_LANDLORD_SMS_SEND_OUTCOME_SQL`'s own comment
+    (issue #229 blocking finding 2). Defaults to 0 for a pre-#229 row whose
+    payload has no such key yet."""
 
 
 @dataclass(frozen=True)
@@ -507,18 +559,24 @@ def _candidate_from_row(row: dict[str, Any]) -> LandlordSmsCandidate | None:
     body = payload.get("body")
     if body is None:  # pragma: no cover — invariant: enqueue_landlord_sms always sets it
         return None
+    send_failures_raw = payload.get("send_failures")
     return LandlordSmsCandidate(
         notification_id=cast("UUID", row["id"]),
         landlord_id=cast("UUID", row["landlord_id"]),
         case_id=cast("UUID", row["case_id"]),
         attempt=cast("int", row["attempt"]),
         body=str(body),
+        send_failures=int(send_failures_raw) if send_failures_raw is not None else 0,
     )
 
 
 async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
+    # `new_attempt` remains a PURE claim/CAS guard (issue #229 blocking
+    # finding 2) -- it must still advance on every successful claim so two
+    # overlapping ticks/processes can never both win the same row, but it
+    # is NEVER used to decide exhaustion any more. See
+    # _MARK_LANDLORD_SMS_SEND_OUTCOME_SQL's own comment.
     new_attempt = candidate.attempt + 1
-    is_last_attempt = new_attempt >= _LANDLORD_SMS_MAX_ATTEMPTS
 
     async with _acm(get_admin_session)() as session:
         claim_row = (
@@ -572,6 +630,17 @@ async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
     try:
         await sender.send_sms(to=landlord_phone, from_=twilio_number, body=candidate.body)
     except Exception as exc:
+        # Only a genuine, OBSERVED failure of THIS call reaches here --
+        # never a claim, a crash before this point, or a context_missing
+        # return -- so `send_failures` (issue #229 blocking finding 2,
+        # DISTINCT from `attempt`/the claim CAS above) only ever counts a
+        # real Twilio failure. `except Exception`, not `except
+        # BaseException`: a `CancelledError` (scheduler shutdown mid-send —
+        # BaseException, not Exception, in Python 3.8+) is NOT caught here
+        # and therefore never increments this counter either -- exactly the
+        # PoC'd crash scenario this fix closes.
+        new_send_failures = candidate.send_failures + 1
+        is_last_attempt = new_send_failures >= _LANDLORD_SMS_MAX_ATTEMPTS
         log.error(
             "landlord_sms_send_failed",
             notification_id=str(candidate.notification_id),
@@ -585,11 +654,15 @@ async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
                 "exc_type": type(exc).__name__,
             },
         )
-        mark_sql = (
-            _MARK_LANDLORD_SMS_EXHAUSTED_SQL if is_last_attempt else _MARK_LANDLORD_SMS_FAILED_SQL
-        )
         async with _acm(get_admin_session)() as session:
-            await session.execute(mark_sql, {"id": str(candidate.notification_id)})
+            await session.execute(
+                _MARK_LANDLORD_SMS_SEND_OUTCOME_SQL,
+                {
+                    "id": str(candidate.notification_id),
+                    "status": "exhausted" if is_last_attempt else "failed",
+                    "send_failures": new_send_failures,
+                },
+            )
         if is_last_attempt:
             # Issue #229 item 4: distinct from the per-attempt "send
             # failed" page above (which already fired for THIS attempt) —
