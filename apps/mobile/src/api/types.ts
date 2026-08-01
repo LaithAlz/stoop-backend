@@ -289,10 +289,6 @@ export interface QueueCounts {
  * One card per case needing action. `case_id` drives navigation/full-view;
  * `draft_id` drives approve/undo/reject/edit-and-send — the doc is explicit
  * these must never be conflated.
- *
- * No notification id anywhere on this shape (checked against the doc's own
- * JSON example and every v1.1 amendment bullet) — see the mobile M1 report
- * for what that means for the emergency banner's acknowledge action.
  */
 export interface QueueItem {
   case_id: string;
@@ -316,6 +312,19 @@ export interface QueueItem {
   refusal_flags: string[];
   has_media: boolean;
   media_note: string | null;
+  /**
+   * v1.15 amendment: always present, nullable uuid. Non-null ONLY when
+   * this case has an unacknowledged `emergency_call` notification — the
+   * id to `POST /v1/notifications/{id}/ack` for the emergency banner's
+   * acknowledge action (src/features/emergency/useAcknowledge.ts). Null
+   * when no emergency call was ever triggered for this case, or one was
+   * but it's already acknowledged (dashboard, the SMS ack link, or
+   * press-1 on the call itself), or the card's severity isn't
+   * emergency-related at all — the amendment's "latest wins" rule means
+   * this is always the single most-recent unacknowledged notification
+   * when more than one could apply.
+   */
+  notification_id: string | null;
 }
 
 /** GET /v1/queue response. Deliberately unpaginated (see the doc's own

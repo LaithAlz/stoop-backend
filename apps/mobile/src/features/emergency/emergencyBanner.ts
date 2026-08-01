@@ -30,3 +30,32 @@ export function emergencyHeadline(
 export function emergencySubtext(item: Pick<QueueItem, "property_label">): string {
   return `${item.property_label} · tap to see what's happening`;
 }
+
+// ---------------------------------------------------------------------------
+// Acknowledge action copy (v1.15 amendment — `notification_id` +
+// `POST /v1/notifications/{id}/ack`; src/features/emergency/
+// useAcknowledge.ts owns the mutation, src/components/clarity/
+// EmergencyBanner.tsx renders these). Only ever shown when a card carries
+// a non-null `notification_id` — see that field's own comment.
+//
+// The sub-line states exactly what acknowledging does per
+// emergency-prefilter.md's escalation-chain section — "it stops the chain"
+// — and nothing more: it never claims the case is handled, resolved, or
+// that anyone has actually been reached, none of which acknowledging does.
+// ---------------------------------------------------------------------------
+
+export const EMERGENCY_ACK_LABEL = "I'm on it";
+
+export const EMERGENCY_ACK_PENDING_LABEL = "Stopping the calls…";
+
+export const EMERGENCY_ACK_SUBLABEL = "Stops the calls.";
+
+/** Home's own gate for whether a card gets the acknowledge affordance —
+ *  pulled out as a pure predicate (rather than an inline null-check at the
+ *  call site) so "ack shown iff `notification_id` non-null" is directly
+ *  unit-testable. */
+export function hasAcknowledgeableNotification(
+  item: Pick<QueueItem, "notification_id">,
+): item is Pick<QueueItem, "notification_id"> & { notification_id: string } {
+  return item.notification_id !== null;
+}

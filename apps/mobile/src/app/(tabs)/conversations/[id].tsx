@@ -167,6 +167,14 @@ export default function CaseDetailScreen() {
           contentContainerStyle={styles.listContent}
           ListHeaderComponent={
             caseDetail.severity === "emergency" && caseIsOpen ? (
+              // No `onAcknowledge` here on purpose: `GET /v1/cases/{id}`
+              // carries no `notification_id` (api-contracts.md's Queue
+              // section v1.15 amendment scopes that field to the queue
+              // card only) — inventing one here would mean acking against
+              // an id this endpoint never gave us. This banner stays
+              // informational; the acknowledge action lives on Home
+              // (src/app/(tabs)/index.tsx), the only surface the contract
+              // actually wires it to.
               <EmergencyBanner
                 headline={
                   caseDetail.title ?? `${tenantFirst} needs you now — ${caseDetail.property.label}`
