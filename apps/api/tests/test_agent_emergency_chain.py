@@ -1418,3 +1418,104 @@ async def test_sms_drain_sweep_no_tenant_phone_is_terminal_exhausted(
         assert notif_after["attempt"] == notif["attempt"], "a no-op tick must not re-claim the row"
     finally:
         await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock tick deadline (issue #229, PR #228 senior-review advisory 1) --
+# mirrors tests/test_agent_draft_sender.py's / tests/test_push_outbox_sweep
+# .py's own deadline test pattern exactly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_sms_drain_sweep_default_deadline_is_25_seconds() -> None:
+    assert emergency_chain.DEFAULT_TICK_DEADLINE_SECONDS == 25.0
+
+
+class _FakeClock:
+    """A mutable, injectable time source for the sweep's deadline check —
+    advanced explicitly by the fake sender below rather than sleeping for
+    real seconds. Mirrors ``tests/test_agent_draft_sender.py``'s own
+    ``_FakeClock``."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _DeadlineBlowingSmsSender:
+    """Implements just the ``send_sms`` half of ``TwilioSender`` -- records
+    every call (by recipient phone) and advances a shared :class:`_FakeClock`
+    past the tick's deadline on its FIRST send, simulating a slow/hanging
+    Twilio round-trip that must not be allowed to also delay claiming the
+    OTHER due row in the same tick."""
+
+    def __init__(self, clock: _FakeClock, *, advance_by: float) -> None:
+        self._clock = clock
+        self._advance_by = advance_by
+        self.calls: list[str] = []
+
+    async def send_sms(self, *, to: str, from_: str, body: str) -> str:
+        self.calls.append(to)
+        self._clock.now += self._advance_by
+        return f"SM{uuid.uuid4().hex}"
+
+
+@pytest.mark.integration
+async def test_sms_drain_sweep_stops_claiming_after_deadline_then_resumes_next_tick(
+    db_session: AsyncSession,
+) -> None:
+    """Two due ``tenant_ack`` rows; the first send blows the (tiny,
+    test-only) deadline. The SECOND due row must NOT be claimed in the same
+    tick -- it stays 'pending' and due, claimed whole by the very next tick
+    call. Nothing lost; never abandoned mid-claim -- this is what stops a
+    hung Twilio call chain here from delaying the NEXT tick's
+    ``run_emergency_chain_sweep``."""
+    landlord_id, property_id, tenant_id = await _seed(db_session)
+    message_id_a = await factories.insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id_b = await factories.insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    notification_id_a = await _insert_tenant_ack_notification(
+        db_session, landlord_id=landlord_id, message_id=message_id_a, body="Got your message A"
+    )
+    notification_id_b = await _insert_tenant_ack_notification(
+        db_session, landlord_id=landlord_id, message_id=message_id_b, body="Got your message B"
+    )
+    clock = _FakeClock(start=0.0)
+    sender = _DeadlineBlowingSmsSender(clock, advance_by=10.0)
+    set_twilio_sender_for_tests(sender)
+
+    try:
+        outcomes = await emergency_chain.run_sms_drain_sweep(
+            deadline_seconds=5.0, time_source=clock
+        )
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "sent"
+        assert len(sender.calls) == 1  # bounded: NOT both due rows attempted this tick
+
+        notif_a = await _fetch_notification(db_session, notification_id_a)
+        notif_b = await _fetch_notification(db_session, notification_id_b)
+        statuses = {notif_a["status"], notif_b["status"]}
+        assert statuses == {"sent", "pending"}  # exactly one sent, one left due
+
+        # The next tick call (clock already past the first deadline window,
+        # but the sweep recomputes its OWN start from time_source() every
+        # call) claims and sends the leftover row.
+        outcomes_second_tick = await emergency_chain.run_sms_drain_sweep(
+            deadline_seconds=5.0, time_source=clock
+        )
+        assert len(outcomes_second_tick) == 1
+        assert outcomes_second_tick[0].outcome == "sent"
+        assert len(sender.calls) == 2
+
+        notif_a_after = await _fetch_notification(db_session, notification_id_a)
+        notif_b_after = await _fetch_notification(db_session, notification_id_b)
+        assert notif_a_after["status"] == "sent"
+        assert notif_b_after["status"] == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)

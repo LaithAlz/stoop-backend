@@ -189,8 +189,10 @@ machine-enforced by ``tests/test_twilio_send_allowlist.py``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
+from collections.abc import Callable
 from contextlib import asynccontextmanager as _acm
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -1256,6 +1258,50 @@ async def run_emergency_chain_sweep(*, now: datetime | None = None) -> list[Emer
 # terminal value ``degraded_retry`` uses) so a second tick is a true
 # no-op for that row, never an infinite, silently-repeating no-op send
 # attempt.
+#
+# Wall-clock tick deadline (issue #229, PR #228 senior-review advisory 1)
+# --------------------------------------------------------------------------
+# This sweep shares the SAME single scheduler ticker task
+# (``app/scheduler.py``) as ``run_emergency_chain_sweep`` (which runs
+# BEFORE it, unchanged/out of scope for #229) and every other sweep that
+# tick -- an unbounded run here, one ``send_sms`` per due row with no
+# per-tick cap, could otherwise delay the NEXT tick's emergency chain
+# sweep. Bounded the identical way ``app/agent/draft_sender.py::sender_tick``
+# / ``app/push_outbox.py::run_push_outbox_sweep`` already are: a wall-clock
+# budget (:data:`DEFAULT_TICK_DEADLINE_SECONDS`, 25s by default, computed
+# from an injectable *time_source*) checked BEFORE each candidate is
+# claimed-and-sent. Once exceeded, :func:`run_sms_drain_sweep` stops
+# CLAIMING new candidates for the rest of the tick -- a candidate already
+# claimed and mid-send always finishes (this loop awaits each one to
+# completion, never abandoning a claimed row mid-flight); any leftover due
+# rows simply stay 'pending'/'failed' and due, picked up whole by the very
+# next tick. Nothing is lost -- this sweep already retries every tick until
+# genuinely delivered (see "Idempotency" above), so a candidate merely
+# waiting one extra tick is indistinguishable from its ordinary retry
+# behavior.
+
+DEFAULT_TICK_DEADLINE_SECONDS: float = 25.0
+"""Wall-clock budget for one :func:`run_sms_drain_sweep` call (issue #229,
+PR #228 senior-review advisory 1) -- same value and rationale as
+``app/agent/draft_sender.py::DEFAULT_TICK_DEADLINE_SECONDS`` /
+``app/push_outbox.py::DEFAULT_TICK_DEADLINE_SECONDS``: this sweep shares
+the single scheduler ticker task with ``run_emergency_chain_sweep``, which
+must run promptly every tick. Once exceeded, :func:`run_sms_drain_sweep`
+stops CLAIMING new candidates for the rest of that tick -- a candidate
+already claimed and mid-send always finishes; any leftover due rows simply
+remain due, picked up whole by the very next tick."""
+
+
+def _default_time_source() -> float:
+    """The real, monotonic clock :func:`run_sms_drain_sweep` budgets its
+    wall-clock deadline against -- mirrors
+    ``app/agent/draft_sender.py::_default_time_source`` /
+    ``app/push_outbox.py::_default_time_source`` exactly
+    (``asyncio.get_running_loop().time()``). Injectable so tests can
+    advance a fake clock deterministically instead of sleeping for real
+    seconds."""
+    return asyncio.get_running_loop().time()
+
 
 _SELECT_DUE_SMS_DRAIN_SQL = text(
     """
@@ -1451,14 +1497,26 @@ async def _run_sms_drain_candidate_safely(candidate: SmsDrainCandidate) -> str:
         return "processing_error"
 
 
-async def run_sms_drain_sweep(*, now: datetime | None = None) -> list[SmsDrainOutcome]:
+async def run_sms_drain_sweep(
+    *,
+    now: datetime | None = None,
+    deadline_seconds: float = DEFAULT_TICK_DEADLINE_SECONDS,
+    time_source: Callable[[], float] = _default_time_source,
+) -> list[SmsDrainOutcome]:
     """DB entrypoint for one SMS-drain sweep tick — drains every
     ``pending``/``failed`` ``tenant_ack``/``emergency_sms`` row, resending
     until genuinely delivered. Called by ``app/scheduler.py``'s 60-second
     ticker, in the SAME tick as :func:`run_emergency_chain_sweep` and
     ``app/agent/degraded_mode_sweep.py::sweep_degraded_mode_retries``.
     ``now`` is accepted for call-site symmetry with the other sweeps but
-    unused — there is no schedule here, only "not yet sent"."""
+    unused — there is no schedule here, only "not yet sent".
+
+    *deadline_seconds*/*time_source* bound this call's own wall-clock
+    duration (issue #229 — see "Wall-clock tick deadline" above);
+    *time_source* defaults to the real event loop clock
+    (:func:`_default_time_source`) — tests inject a fake, monotonically
+    -advanceable callable instead of sleeping for real seconds.
+    """
     del now
     async with _acm(get_admin_session)() as session:
         rows = (await session.execute(_SELECT_DUE_SMS_DRAIN_SQL)).mappings().all()
@@ -1466,8 +1524,23 @@ async def run_sms_drain_sweep(*, now: datetime | None = None) -> list[SmsDrainOu
             c for row in rows if (c := _sms_drain_candidate_from_row(dict(row))) is not None
         ]
 
+    start = time_source()
     outcomes: list[SmsDrainOutcome] = []
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
+        if time_source() - start >= deadline_seconds:
+            # Wall-clock budget exceeded (issue #229) -- stop CLAIMING new
+            # candidates for the rest of this tick. Every candidate claimed
+            # above already finished processing (this loop awaits each one
+            # in turn, never abandoning a claimed row mid-send); the
+            # remaining candidates stay 'pending'/'failed' and due, claimed
+            # whole by the very next tick -- nothing lost, see
+            # DEFAULT_TICK_DEADLINE_SECONDS's own docstring.
+            log.info(
+                "sms_drain_sweep_tick_deadline_reached",
+                claimed_this_tick=len(outcomes),
+                remaining_candidates=len(candidates) - index,
+            )
+            break
         outcome = await _run_sms_drain_candidate_safely(candidate)
         outcomes.append(
             SmsDrainOutcome(
@@ -1638,6 +1711,7 @@ async def acknowledge_by_token(token: str, *, channel: str) -> tuple[UUID, datet
 
 
 __all__: list[str] = [
+    "DEFAULT_TICK_DEADLINE_SECONDS",
     "ESCALATION_FIXED_OFFSETS_MINUTES",
     "ESCALATION_REPEAT_INTERVAL_MINUTES",
     "TENANT_STATUS_TEMPLATE",

@@ -491,3 +491,137 @@ async def test_drain_sweep_exhausts_when_landlord_has_no_phone(
         assert fake_sender.calls == []
     finally:
         await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock tick deadline (issue #229, PR #228 senior-review advisory 1) --
+# mirrors tests/test_agent_draft_sender.py's / tests/test_push_outbox_sweep
+# .py's own deadline test pattern exactly.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_draft_ready_row(db_session: AsyncSession) -> str:
+    """Seed one full has-phone landlord/property/tenant/case/draft chain
+    plus a pending KIND_READY ``draft_ready``/``sms`` row -- the shared
+    shape every drain-sweep test in this module needs."""
+    landlord_phone = factories.fresh_phone()
+    landlord_id = await factories.insert_landlord(db_session, phone=landlord_phone)
+    twilio_number = factories.fresh_phone()
+    property_id = await factories.insert_property(
+        db_session, landlord_id, twilio_number=twilio_number
+    )
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await factories.insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    draft_id = await factories.insert_draft(db_session, landlord_id=landlord_id, case_id=case_id)
+    await landlord_sms.enqueue_landlord_sms(
+        db_session,
+        landlord_id=uuid.UUID(landlord_id),
+        case_id=uuid.UUID(case_id),
+        draft_id=uuid.UUID(draft_id),
+        kind=landlord_sms.KIND_READY,
+        body="Draft ready — reply 1 to send.",
+    )
+    await db_session.commit()
+    return landlord_id
+
+
+async def _row_status_and_attempt(db_session: AsyncSession, landlord_id: str) -> tuple[str, int]:
+    row = (
+        (
+            await db_session.execute(
+                text(
+                    "SELECT status, attempt FROM notifications WHERE landlord_id = :lid "
+                    "AND type = 'draft_ready' AND channel = 'sms'"
+                ),
+                {"lid": landlord_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return row["status"], row["attempt"]
+
+
+@pytest.mark.unit
+def test_landlord_sms_drain_sweep_default_deadline_is_25_seconds() -> None:
+    assert landlord_sms.DEFAULT_TICK_DEADLINE_SECONDS == 25.0
+
+
+class _FakeClock:
+    """A mutable, injectable time source for the sweep's deadline check —
+    advanced explicitly by the fake sender below rather than sleeping for
+    real seconds. Mirrors ``tests/test_agent_draft_sender.py``'s own
+    ``_FakeClock``."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _DeadlineBlowingTwilioSender:
+    """Records every call (by recipient phone); advances a shared
+    :class:`_FakeClock` past the tick's deadline on its FIRST send,
+    simulating a slow/hanging Twilio round-trip that must not be allowed to
+    also delay claiming every OTHER due row in the same tick."""
+
+    def __init__(self, clock: _FakeClock, *, advance_by: float) -> None:
+        self._clock = clock
+        self._advance_by = advance_by
+        self.calls: list[str] = []
+
+    async def send_sms(self, *, to: str, from_: str, body: str) -> str:
+        self.calls.append(to)
+        self._clock.now += self._advance_by
+        return f"SM{uuid.uuid4().hex}"
+
+
+@pytest.mark.integration
+async def test_drain_sweep_stops_claiming_after_deadline_then_resumes_next_tick(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two due rows; the first send blows the (tiny, test-only) deadline.
+    The SECOND due row must NOT be claimed in the same tick -- it stays
+    'pending' and due, claimed whole by the very next tick call. Nothing
+    lost -- this is what stops a hung Twilio call chain here (this sweep
+    runs LAST in the tick) from delaying the NEXT tick's emergency chain
+    sweep."""
+    landlord_id_a = await _seed_draft_ready_row(db_session)
+    landlord_id_b = await _seed_draft_ready_row(db_session)
+    clock = _FakeClock(start=0.0)
+    sender = _DeadlineBlowingTwilioSender(clock, advance_by=10.0)
+    monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: sender)
+
+    try:
+        outcomes = await landlord_sms.run_landlord_sms_drain_sweep(
+            deadline_seconds=5.0, time_source=clock
+        )
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "sent"
+        assert len(sender.calls) == 1  # bounded: NOT both due rows attempted this tick
+
+        status_a, _ = await _row_status_and_attempt(db_session, landlord_id_a)
+        status_b, _ = await _row_status_and_attempt(db_session, landlord_id_b)
+        statuses = {status_a, status_b}
+        assert statuses == {"sent", "pending"}  # exactly one sent, one left due
+
+        # The next tick call (clock already past the first deadline window,
+        # but the sweep recomputes its OWN start from time_source() every
+        # call) claims and sends the leftover row.
+        outcomes_second_tick = await landlord_sms.run_landlord_sms_drain_sweep(
+            deadline_seconds=5.0, time_source=clock
+        )
+        assert len(outcomes_second_tick) == 1
+        assert outcomes_second_tick[0].outcome == "sent"
+        assert len(sender.calls) == 2
+
+        status_a_after, _ = await _row_status_and_attempt(db_session, landlord_id_a)
+        status_b_after, _ = await _row_status_and_attempt(db_session, landlord_id_b)
+        assert status_a_after == "sent"
+        assert status_b_after == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id_a)
+        await _cleanup(db_session, landlord_id_b)

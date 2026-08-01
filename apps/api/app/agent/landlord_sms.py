@@ -67,7 +67,9 @@ Allowlisted in ``tests/test_migrations_0005.py::_ADMIN_SESSION_ALLOWLIST``.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Callable
 from contextlib import asynccontextmanager as _acm
 from dataclasses import dataclass
 from typing import Any, cast
@@ -371,7 +373,46 @@ async def ready_draft_for_case(session: AsyncSession, *, case_id: UUID) -> UUID 
 # ---------------------------------------------------------------------------
 # Drain sweep — the THIRD sanctioned Twilio-send call site (module
 # docstring "A NEW sanctioned Twilio-send call site").
+#
+# Wall-clock tick deadline (issue #229, PR #228 senior-review advisory 1)
+# --------------------------------------------------------------------------
+# This sweep runs LAST in ``app/scheduler.py``'s tick (see that module's own
+# docstring), but an unbounded run here -- one ``send_sms`` per due row,
+# no per-tick cap -- would still delay the NEXT tick's FIRST sweep (the
+# emergency chain). Bounded the identical way ``app/agent/draft_sender.py::
+# sender_tick`` / ``app/push_outbox.py::run_push_outbox_sweep`` /
+# ``app/agent/emergency_chain.py::run_sms_drain_sweep`` already are: a
+# wall-clock budget (:data:`DEFAULT_TICK_DEADLINE_SECONDS`, 25s by default,
+# computed from an injectable *time_source*) checked BEFORE each candidate
+# is claimed-and-sent. Once exceeded, :func:`run_landlord_sms_drain_sweep`
+# stops CLAIMING new candidates for the rest of the tick -- a candidate
+# already claimed and mid-send always finishes; any leftover due rows
+# simply stay 'pending'/'failed' and due, picked up whole by the very next
+# tick. Nothing is lost -- this sweep already retries every tick until
+# genuinely delivered (see ``run_sms_drain_sweep``'s own "resend every tick
+# until sent" shape), so a candidate merely waiting one extra tick is
+# indistinguishable from its ordinary retry behavior.
 # ---------------------------------------------------------------------------
+
+DEFAULT_TICK_DEADLINE_SECONDS: float = 25.0
+"""Wall-clock budget for one :func:`run_landlord_sms_drain_sweep` call
+(issue #229) -- same value and rationale as
+``app/agent/draft_sender.py::DEFAULT_TICK_DEADLINE_SECONDS`` /
+``app/push_outbox.py::DEFAULT_TICK_DEADLINE_SECONDS`` /
+``app/agent/emergency_chain.py::DEFAULT_TICK_DEADLINE_SECONDS``."""
+
+
+def _default_time_source() -> float:
+    """The real, monotonic clock :func:`run_landlord_sms_drain_sweep`
+    budgets its wall-clock deadline against -- mirrors
+    ``app/agent/draft_sender.py::_default_time_source`` /
+    ``app/push_outbox.py::_default_time_source`` /
+    ``app/agent/emergency_chain.py::_default_time_source`` exactly
+    (``asyncio.get_running_loop().time()``). Injectable so tests can
+    advance a fake clock deterministically instead of sleeping for real
+    seconds."""
+    return asyncio.get_running_loop().time()
+
 
 _SELECT_DUE_LANDLORD_SMS_SQL = text(
     """
@@ -552,18 +593,44 @@ async def _process_candidate_safely(candidate: LandlordSmsCandidate) -> str:
         return "processing_error"
 
 
-async def run_landlord_sms_drain_sweep() -> list[LandlordSmsOutcome]:
+async def run_landlord_sms_drain_sweep(
+    *,
+    deadline_seconds: float = DEFAULT_TICK_DEADLINE_SECONDS,
+    time_source: Callable[[], float] = _default_time_source,
+) -> list[LandlordSmsOutcome]:
     """DB entrypoint for one sweep tick — drains every ``pending``/
     ``failed`` landlord-facing ``draft_ready``/``sms`` row, resending until
     genuinely delivered or terminally un-deliverable (module docstring).
     Wire into ``app/scheduler.py``'s 60s ticker alongside the other
-    sweeps."""
+    sweeps.
+
+    *deadline_seconds*/*time_source* bound this call's own wall-clock
+    duration (issue #229 — see "Wall-clock tick deadline" above);
+    *time_source* defaults to the real event loop clock
+    (:func:`_default_time_source`) — tests inject a fake, monotonically
+    -advanceable callable instead of sleeping for real seconds.
+    """
     async with _acm(get_admin_session)() as session:
         rows = (await session.execute(_SELECT_DUE_LANDLORD_SMS_SQL)).mappings().all()
         candidates = [c for row in rows if (c := _candidate_from_row(dict(row))) is not None]
 
+    start = time_source()
     outcomes: list[LandlordSmsOutcome] = []
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
+        if time_source() - start >= deadline_seconds:
+            # Wall-clock budget exceeded (issue #229) -- stop CLAIMING new
+            # candidates for the rest of this tick. Every candidate claimed
+            # above already finished processing (this loop awaits each one
+            # in turn, never abandoning a claimed row mid-send); the
+            # remaining candidates stay 'pending'/'failed' and due, claimed
+            # whole by the very next tick -- nothing lost, see
+            # DEFAULT_TICK_DEADLINE_SECONDS's own docstring.
+            log.info(
+                "landlord_sms_drain_sweep_tick_deadline_reached",
+                claimed_this_tick=len(outcomes),
+                remaining_candidates=len(candidates) - index,
+            )
+            break
         outcome = await _process_candidate_safely(candidate)
         outcomes.append(
             LandlordSmsOutcome(notification_id=candidate.notification_id, outcome=outcome)
@@ -574,6 +641,7 @@ async def run_landlord_sms_drain_sweep() -> list[LandlordSmsOutcome]:
 
 
 __all__: list[str] = [
+    "DEFAULT_TICK_DEADLINE_SECONDS",
     "KIND_APPROVED",
     "KIND_READY",
     "KIND_REJECTED",
