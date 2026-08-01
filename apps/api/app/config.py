@@ -317,8 +317,8 @@ class Settings(BaseSettings):
         A blank/placeholder Fly secret (``APP_DATABASE_URL="   "``, or one
         accidentally set to the empty string) would otherwise be truthy
         (a non-empty Python string) and sail past the boot gate below,
-        then fail later at ``create_async_engine`` with an obscure parse
-        error instead of this module's clear, intentional message.
+        then fail later when the engine is constructed, with an obscure
+        parse error instead of this module's clear, intentional message.
         Normalizing here means every consumer of ``settings.app_database_url``
         (this boot gate, ``app/db/session.py``'s fallback branch, the
         startup role-separation self-check) sees a single consistent
