@@ -619,19 +619,69 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # module deliberately, not by accident of it never having called
         # get_admin_session in the first place.
         "app/agent/case_lock_pool.py",
+        # #186 follow-up round, ADVISORY-2 (second pass): GET /healthz
+        # imports the raw admin `engine` directly (`from app.db.session
+        # import engine`) for a lightweight `engine.connect()` liveness
+        # probe -- no landlord JWT, no GUC to scope by, the same
+        # pre-identity rationale every other allowlisted caller shares,
+        # just via the bare engine object instead of get_admin_session's
+        # session wrapper (health.py's own module docstring).
+        "app/routers/health.py",
+        # #186 follow-up round, ADVISORY-2 (second pass): imports
+        # `verify_request_engine_role_separation` -- not itself an
+        # RLS-bypassing call (it's a startup SELF-CHECK that PROVES role
+        # separation, never a data read/write), but its name matches the
+        # broadened "engine" substring in the import-line pattern below.
+        # Named here deliberately rather than narrowing the pattern back
+        # down to miss it.
+        "app/main.py",
     }
 )
 
 _ADMIN_SESSION_OR_RAW_ENGINE_PATTERN = re.compile(
-    r"get_admin_session|get_case_lock_session|CaseLockSessionFactory|create_async_engine"
+    r"get_admin_session"
+    r"|get_case_lock_session"
+    r"|CaseLockSessionFactory"
+    r"|AsyncSessionFactory"
+    r"|RequestSessionFactory"
+    r"|create_async_engine\("
+    r"|from app\.db\.session import[^\n]*engine"
 )
-"""Broadened (#186 follow-up round, ADVISORY-2) from a plain
-``"get_admin_session" in content`` substring check: that check alone is
-blind to a file that bypasses RLS via a raw, directly-constructed engine
-(``create_async_engine(settings.database_url, ...)``, exactly
-``app/agent/case_lock_pool.py``'s OWN shape) without ever calling
-``get_admin_session``. The RLS-bypass audit below must catch BOTH shapes,
-not just the original one, to stay a complete list."""
+"""Broadened TWICE now (#186 follow-up round, ADVISORY-2, both passes)
+from a plain ``"get_admin_session" in content`` substring check:
+
+1. First pass: that check alone was blind to a file that bypasses RLS via
+   a raw, directly-constructed engine
+   (``create_async_engine(settings.database_url, ...)``, exactly
+   ``app/agent/case_lock_pool.py``'s OWN shape) without ever calling
+   ``get_admin_session``.
+2. Second pass (safety re-review — a synthetic file using
+   ``AsyncSessionFactory`` directly, or importing the raw ``engine``/
+   ``request_engine`` objects from ``app/db/session.py`` WITHOUT going
+   through ``create_async_engine(...)`` itself, both ALSO bypass RLS the
+   same way and were BOTH still invisible to pass 1's pattern): added
+   ``AsyncSessionFactory``/``RequestSessionFactory`` (the admin/request
+   session factories ``app/db/session.py`` itself exports — a future
+   caller importing one of THOSE directly, instead of through
+   ``get_session``/``get_admin_session``, would bypass the exact same
+   audit) and ``from app.db.session import ...engine...`` (catches
+   ``app/routers/health.py``'s own ``from app.db.session import engine``
+   AND ``app/main.py``'s ``from app.db.session import
+   verify_request_engine_role_separation`` — deliberately a plain
+   substring match on "engine" within the import line, not a stricter
+   word-boundary one, so any future import NAMING an engine-flavored
+   symbol from that module gets caught, not just the exact ``engine``
+   name).
+
+Also anchored ``create_async_engine`` on the literal CALL
+(``create_async_engine(``, WITH the open paren) rather than the bare
+word — the bare word alone made ANY docstring/comment merely discussing
+``create_async_engine`` (never calling it) tax future edits with a false
+positive (this is what previously forced a purely cosmetic reword in
+``app/config.py``, reverted in this same pass now that the anchor makes
+it unnecessary). The RLS-bypass audit below must catch every ACTUAL
+bypass shape, not just the original one, to stay a complete list —
+without taxing prose that merely talks about one."""
 
 
 @pytest.mark.unit
