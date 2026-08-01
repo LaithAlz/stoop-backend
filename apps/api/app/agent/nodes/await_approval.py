@@ -197,6 +197,33 @@ never a message body or phone number. The ``reasoning_log`` line is
 landlord-facing copy (approval-card, CLAUDE.md rule #8): warm, plain
 English, no ids.
 
+Skip-path shape — the status flip is gated on draft existence (#186 item 3)
+------------------------------------------------------------------------
+An earlier revision flipped ``cases.status`` to ``'awaiting_approval'``
+UNCONDITIONALLY whenever ``case_id`` was known, before ``await_approval``
+(the very next node) ever checked whether a pending draft actually exists.
+``await_approval``'s own ``draft_id is None`` skip path (see "draft_id
+unexpectedly None at pause time" above) already handles the rare
+``draft_response`` race-exhausted case gracefully from ITS OWN
+perspective — logs, appends a landlord-facing note, skips the pause — but
+the case was left sitting in ``'awaiting_approval'`` with NO pending draft
+and NO live interrupt: not a stuck pause (the run reaches ``END``
+unpaused, same as always), but a genuinely nothing-to-approve case
+label that looks, from the dashboard/queue side, like a live approval is
+pending. ``mark_awaiting_approval`` now runs the IDENTICAL pending-draft
+lookup ``await_approval`` runs (:data:`_SELECT_PENDING_DRAFT_ID_SQL`,
+shared by both nodes) FIRST, inside the same transaction, and skips the
+status flip (and, naturally, the push_outbox/landlord-SMS enqueues below,
+which were already gated on the same join and now simply never run) when
+no pending draft exists — mirroring the existing ``case_id is None``
+early-return immediately above it in shape: log the anomaly, return the
+reasoning_log unchanged, touch nothing else. No reasoning_log line is
+appended here for this condition (same as the ``case_id is None`` branch)
+— ``await_approval``'s OWN ``draft_id is None`` branch (which always runs
+next, same session-per-node convention as everywhere else in this module)
+is still the ONE place that appends the landlord-facing "I couldn't find a
+reply..." note, so the two nodes never double-narrate the same anomaly.
+
 The push-notification enqueue seam (#210 M3)
 ---------------------------------------------
 ``mark_awaiting_approval`` is the ONE place ``cases.status`` flips to
@@ -397,6 +424,20 @@ async def mark_awaiting_approval(state: AgentState) -> dict[str, Any]:
         return {"reasoning_log": reasoning_log}
 
     async with asynccontextmanager(get_admin_session)() as session:
+        # #186 item 3 — gate the status flip on draft existence (module
+        # docstring "Skip-path shape"). Same lookup await_approval itself
+        # runs immediately after this node; checked here FIRST so the
+        # (rare) no-pending-draft case never sets 'awaiting_approval' with
+        # nothing behind it.
+        pending_row = (
+            (await session.execute(_SELECT_PENDING_DRAFT_ID_SQL, {"case_id": str(case_id)}))
+            .mappings()
+            .one_or_none()
+        )
+        if pending_row is None:
+            log.error("mark_awaiting_approval_no_pending_draft_skipping_flip", case_id=str(case_id))
+            return {"reasoning_log": reasoning_log}
+
         await session.execute(_MARK_AWAITING_APPROVAL_SQL, {"case_id": str(case_id)})
         # #210 M3 — same transaction as the status flip above; see module
         # docstring "The push-notification enqueue seam".
