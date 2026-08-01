@@ -19,6 +19,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -31,7 +32,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 import app.agent.graph_entry as graph_entry_mod
 import app.db.session as db_mod
 from app.agent.checkpointer import close_checkpointer, setup_checkpointer
+from app.agent.degraded_mode_sweep import sweep_degraded_mode_retries
+from app.agent.graph import CaseLockAcquisitionTimeoutError
 from app.agent.graph_entry import enqueue_classification
+from app.agent.nodes.degraded_mode import RETRY_SCHEDULE
 from app.integrations import anthropic as anthropic_mod
 from tests import factories
 
@@ -450,5 +454,143 @@ async def test_enqueue_classification_pages_sentry_and_writes_last_resort_needs_
         assert notif_row["case_id"] is None
         assert notif_row["payload"]["message_id"] == str(message_id)
         assert notif_row["payload"]["reason"] == "run_graph_failed"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# CaseLockAcquisitionTimeoutError -- a TRANSIENT resource failure gets a
+# durable retry, not a one-shot needs_eyes (safety review, #186 follow-up
+# round, NEW-2).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_enqueue_classification_queues_degraded_retry_on_lock_timeout_and_sweep_resolves_it(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A message shed by ``CaseLockAcquisitionTimeoutError`` (#186's
+    bounded try-lock retry loop exhausting under genuine contention) must
+    NOT dead-end in a one-shot ``needs_eyes`` push nobody ever retries --
+    it gets the SAME durable ``degraded_retry`` marker the
+    classification-failed "no keywords" leg writes, so
+    ``app/agent/degraded_mode_sweep.py``'s existing 1/5/15-minute
+    retry-then-escalate ladder becomes the terminal path.
+
+    Three phases: (1) shed the message twice (simulating a Twilio
+    redelivery) and assert exactly ONE ``degraded_retry`` row exists
+    (dedupe-idempotent) with the expected payload shape and a Sentry page
+    each time; (2) NO one-shot ``needs_eyes`` was written for this
+    exception type; (3) the sweep -- with the burst now over (a working
+    fake Anthropic client) -- actually picks the row up and resolves it,
+    mirroring ``tests/test_degraded_mode_sweep.py::
+    test_sweep_resolves_when_reclassification_succeeds``'s own shape.
+    """
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    case_id = await factories.insert_case(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="the heat has been out since this morning",
+    )
+
+    captured: list[dict[str, Any]] = []
+
+    def _fake_capture_message(message: str, **kwargs: Any) -> None:
+        captured.append({"message": message, **kwargs})
+
+    monkeypatch.setattr(graph_entry_mod.sentry_sdk, "capture_message", _fake_capture_message)
+
+    async def _raise_lock_timeout(_message_id: uuid.UUID) -> Any:
+        raise CaseLockAcquisitionTimeoutError(
+            case_id=uuid.UUID(case_id), attempts=42, elapsed_seconds=30.0
+        )
+
+    try:
+        # Phase 1 -- shed twice (a Twilio redelivery of the same message,
+        # both times landing in the SAME lock-contention window).
+        monkeypatch.setattr(graph_entry_mod, "run_graph", _raise_lock_timeout)
+        await enqueue_classification(uuid.UUID(message_id), uuid.UUID(landlord_id))
+        await enqueue_classification(uuid.UUID(message_id), uuid.UUID(landlord_id))
+
+        assert len(captured) == 2, "Sentry pages on EVERY failed attempt, never deduped"
+
+        retry_rows = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT status, case_id, next_attempt_at, payload FROM notifications "
+                        "WHERE landlord_id = :lid AND type = 'degraded_retry'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        assert len(retry_rows) == 1, "the dedupe index must absorb the redelivered second attempt"
+        retry_row = retry_rows[0]
+        assert retry_row["status"] == "pending"
+        assert str(retry_row["case_id"]) == case_id
+        assert retry_row["next_attempt_at"] is not None
+        assert retry_row["payload"]["message_id"] == message_id
+        assert retry_row["payload"]["case_id"] == case_id
+        assert retry_row["payload"]["reasons"] == ["case_lock_acquisition_timeout"]
+        assert retry_row["payload"]["case_status_at_failure"] == "open"
+
+        # Phase 2 -- never the one-shot needs_eyes fallback for THIS
+        # exception type (that path is reserved for genuine logic
+        # failures -- see the generic branch's own existing test above).
+        needs_eyes_count = (
+            await db_session.execute(
+                text(
+                    "SELECT COUNT(*) FROM notifications WHERE landlord_id = :lid "
+                    "AND type = 'needs_eyes'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert needs_eyes_count == 0
+
+        # Phase 3 -- the burst has drained; the sweep re-attempts
+        # run_graph for real (the REAL function, not the monkeypatched
+        # one above -- degraded_mode_sweep.py imports its own reference)
+        # against a healthy fake Anthropic client, and resolves the row.
+        _patch_client(monkeypatch, _full_success_fake_messages())
+        sweep_now = datetime.now(UTC) + RETRY_SCHEDULE[0] + timedelta(seconds=5)
+        outcomes = await sweep_degraded_mode_retries(now=sweep_now)
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "resolved"
+
+        resolved_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT status, next_attempt_at, payload FROM notifications "
+                        "WHERE landlord_id = :lid AND type = 'degraded_retry'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert resolved_row["status"] == "exhausted"
+        assert resolved_row["next_attempt_at"] is None
+        assert resolved_row["payload"]["outcome"] == "resolved"
+
+        draft_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM drafts WHERE landlord_id = :lid"), {"lid": landlord_id}
+            )
+        ).scalar_one()
+        assert draft_count == 1
     finally:
         await _cleanup(db_session, landlord_id)

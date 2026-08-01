@@ -189,6 +189,25 @@ def _reset_checkpointer_pool() -> Iterator[None]:
 
 
 @pytest_asyncio.fixture(autouse=True)
+async def _reset_case_lock_pool() -> AsyncIterator[None]:
+    """Recreate ``app.agent.case_lock_pool``'s dedicated advisory-lock engine
+    pool before every test (#186 item 1) — same cross-loop hazard class as
+    ``_reset_checkpointer_pool`` / ``_reset_admin_engine_pool`` above: a
+    pooled asyncpg connection binds to the event loop that created it, and
+    each test runs its own loop. This engine is a plain SQLAlchemy
+    ``AsyncEngine`` (like the admin/request engines, not the checkpointer's
+    raw psycopg pool), so it follows ``_reset_admin_engine_pool``'s
+    ``dispose(close=False)`` mechanics rather than ``_reset_checkpointer_
+    pool``'s "drop the reference" one: de-references the old pool only,
+    never asks a possibly-dead-loop connection to close itself.
+    """
+    import app.agent.case_lock_pool as case_lock_pool_mod
+
+    await case_lock_pool_mod.case_lock_engine.dispose(close=False)
+    yield
+
+
+@pytest_asyncio.fixture(autouse=True)
 async def _reset_admin_engine_pool() -> AsyncIterator[None]:
     """Recreate ``app.db.session``'s admin/request connection pool(s)
     before every test — same cross-loop hazard class as

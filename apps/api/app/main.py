@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import fastapi
+import sentry_sdk
 import structlog
 import structlog.contextvars
 from fastapi.exceptions import RequestValidationError
@@ -192,6 +193,73 @@ def _validation_error_handler(_request: Request, exc: RequestValidationError) ->
     )
 
 
+def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all ``500`` handler (issue #186 follow-up safety-review round,
+    NEW-1) — converts ANY exception that reaches here (nothing more
+    specific matched — see ``starlette._exception_handler._lookup_
+    exception_handler``'s MRO walk: ``AuthError``/``AppError``/
+    ``RequestValidationError`` registered above always win for their own
+    exact types regardless of registration order) into the house error
+    envelope instead of Starlette's own default response.
+
+    Verified directly against this installed Starlette version: an
+    unhandled exception with NO registered handler produces a plain
+    ``"Internal Server Error"`` (``text/plain``, status 500) — never the
+    house JSON envelope every OTHER error path in this codebase returns.
+    ``app/agent/case_lock_pool.py``'s own docstring first named this gap
+    concretely (the dashboard drafts endpoints, under a dedicated
+    -lock-pool checkout timeout) — this handler closes it for every
+    endpoint, not just that one call site. See api-contracts.md's
+    Conventions v1.21 amendment (doc-first, same commit).
+
+    Security (rule #5, mirrors ``_validation_error_handler``'s own
+    precedent): ``message`` is a STATIC, generic string — NEVER derived
+    from ``exc`` (its ``str()``/``args``/traceback could carry
+    request-derived data from a poorly-scoped f-string raised somewhere
+    deep in the stack; the discipline this codebase already applies to
+    every ``AppError``/log line applies here too, enforced once, centrally,
+    rather than re-auditing every possible unhandled exception site).
+    Only the exception TYPE NAME (never its message or traceback) reaches
+    Sentry or the local log — via an EXPLICIT ``sentry_sdk.capture_message``
+    call, the same shape every other Sentry call in this codebase uses
+    (never ``capture_exception`` — that would serialize the exception's own
+    ``str()``/args, the same risk this handler's ``message`` field already
+    avoids). Explicit, not implicit: registering a custom handler for
+    ``Exception`` means this exception is now "handled" as far as
+    Starlette's ``ExceptionMiddleware`` is concerned, so it is caught
+    BEFORE it would otherwise propagate to ``ServerErrorMiddleware`` —
+    the boundary Sentry's ``StarletteIntegration``/``FastApiIntegration``
+    ordinarily hooks for automatic capture. Paging explicitly here removes
+    any dependency on that implicit behavior still firing once a handler
+    intercepts the exception first, matching every OTHER failure path in
+    this codebase (``app/agent/graph_entry.py``,
+    ``app/routers/webhooks/twilio.py``, ...), none of which rely on
+    Sentry's automatic capture either.
+    """
+    request_id: str | None = structlog.contextvars.get_contextvars().get("request_id")
+    log.error(
+        "unhandled_exception",
+        exc_type=type(exc).__name__,
+        path=request.url.path,
+        request_id=request_id,
+    )
+    sentry_sdk.capture_message(
+        "Unhandled exception reached the catch-all 500 handler",
+        level="error",
+        extras={"exc_type": type(exc).__name__, "request_id": request_id},
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "internal_error",
+                "message": "Something went wrong on our end. Please try again.",
+                "request_id": request_id,
+            }
+        },
+    )
+
+
 def create_app() -> fastapi.FastAPI:
     """App factory — returns a fully configured FastAPI application.
 
@@ -210,6 +278,14 @@ def create_app() -> fastapi.FastAPI:
           envelope, code ``invalid_request`` — #219; supersedes every
           Pydantic-validated router's previous fallback onto FastAPI's own
           default 422 body)
+      4d. register a catch-all Exception exception handler (500 → standard
+          envelope, code ``internal_error`` — #186 follow-up round, NEW-1;
+          api-contracts.md v1.21). Registered LAST among the four handlers,
+          but registration order does not matter for correctness — Starlette
+          resolves the MOST SPECIFIC registered handler for each exception's
+          own MRO (see ``_unhandled_exception_handler``'s own docstring), so
+          AuthError/AppError/RequestValidationError still take priority for
+          their own exact types regardless of where this is added.
       5. include health router (always)
       5a. include properties/tenants/vendors/cases/queue routers (#54/#55/
           #56 — always, landlord-scoped via require_landlord), the drafts
@@ -269,6 +345,18 @@ def create_app() -> fastapi.FastAPI:
     application.add_exception_handler(
         RequestValidationError,
         _validation_error_handler,  # type: ignore[arg-type]
+    )
+
+    # Register the catch-all Exception handler (#186 follow-up round,
+    # NEW-1) so ANY unhandled exception on any endpoint gets the standard
+    # 500 envelope instead of Starlette's own plain-text default — see
+    # _unhandled_exception_handler's own docstring for why this is safe to
+    # register alongside the three more specific handlers above (Starlette
+    # always resolves the most specific match, never this one, for an
+    # AuthError/AppError/RequestValidationError instance).
+    application.add_exception_handler(
+        Exception,
+        _unhandled_exception_handler,
     )
 
     application.include_router(health.router)

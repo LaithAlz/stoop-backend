@@ -391,6 +391,12 @@ async def test_debug_error_endpoint_returns_500() -> None:
 
     We set ``raise_app_exceptions=False`` so the exception is converted to a
     500 response instead of being re-raised into the test.
+
+    Since #186 follow-up round NEW-1, that 500 is the house JSON error
+    envelope (``app/main.py``'s catch-all ``Exception`` handler), not
+    Starlette's own plain-text default — this test only pins the status
+    code either way; ``tests/test_main_error_envelope.py`` pins the
+    envelope shape itself.
     """
     from app.main import app
 
@@ -405,7 +411,7 @@ async def test_debug_error_endpoint_returns_500() -> None:
 
 @pytest.mark.unit
 async def test_debug_error_sentry_capture_offline() -> None:
-    """When a DSN is set, Sentry's FastAPI integration captures the error event.
+    """When a DSN is set, an unhandled exception still reaches Sentry.
 
     We provide a custom in-memory transport that records envelopes without
     hitting the network.  After the request, we flush and assert at least one
@@ -413,6 +419,17 @@ async def test_debug_error_sentry_capture_offline() -> None:
 
     ``raise_app_exceptions=False`` on ASGITransport converts the propagated
     RuntimeError into a 500 response instead of crashing the test.
+
+    Note (#186 follow-up round, NEW-1): ``app/main.py``'s catch-all
+    ``Exception`` handler now intercepts this ``RuntimeError`` and returns
+    the house error envelope instead of letting it propagate to
+    Starlette's ``ServerErrorMiddleware`` — the boundary Sentry's OWN
+    ``FastApiIntegration``/``StarletteIntegration`` auto-capture ordinarily
+    hooks. The captured event below now comes from that handler's own
+    EXPLICIT ``sentry_sdk.capture_message`` call (see its docstring), not
+    from the SDK's auto-capture — this test still proves the thing that
+    actually matters (an unhandled exception reaches Sentry, without any
+    PII), just via a different, more deterministic mechanism than before.
     """
     import sentry_sdk
     from sentry_sdk.transport import Transport

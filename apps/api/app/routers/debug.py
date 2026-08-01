@@ -8,6 +8,16 @@ Endpoints:
   GET /_debug/log   — emits a structlog line; visible on stdout as JSON.
   GET /_debug/error — raises an unhandled exception; Sentry captures it
                       when a DSN is configured.
+
+Note (#186 follow-up round, NEW-1): ``app/main.py``'s catch-all
+``Exception`` handler now intercepts this endpoint's ``RuntimeError``
+before it would otherwise reach Starlette's ``ServerErrorMiddleware`` —
+the SDK's own ``FastApiIntegration``/``StarletteIntegration`` auto-capture
+hooks that boundary, so this endpoint no longer smoke-tests THAT specific
+mechanism. The exception is still paged to Sentry, via that handler's own
+EXPLICIT ``sentry_sdk.capture_message`` call — see its docstring — so this
+endpoint still proves "an unhandled exception reaches Sentry," just via a
+different, more deterministic code path than before.
 """
 
 from __future__ import annotations

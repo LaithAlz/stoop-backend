@@ -14,6 +14,15 @@
    TWO different validated routers (``devices.py``, ``drafts.py``) so the
    fix is demonstrably global, not router-specific.
 
+3. Unit tests (marker ``unit`` — ``/_debug/error`` needs no DB/auth) for
+   the global catch-all ``Exception`` handler (#186 follow-up round,
+   NEW-1): a genuinely unhandled exception must return the house envelope
+   with ``code: "internal_error"``, never Starlette's own plain-text
+   default, and never the exception's own type/message/traceback anywhere
+   in the response body — plus a regression proof that this handler never
+   shadows the MORE SPECIFIC ``AuthError``/``AppError``/
+   ``RequestValidationError`` handlers registered alongside it.
+
 Harness for the integration tests mirrors ``tests/test_me.py`` /
 ``tests/test_drafts_router.py`` exactly (in-test ES256 keypair, respx
 -mocked JWKS, ``httpx.AsyncClient`` with ``ASGITransport`` against the
@@ -425,3 +434,66 @@ async def test_missing_auth_still_returns_401_not_422() -> None:
     assert response.status_code == 401
     body = response.json()
     assert body["error"]["code"] == "missing_token"
+
+
+# ---------------------------------------------------------------------------
+# Global catch-all Exception handler (#186 follow-up round, NEW-1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_unhandled_exception_returns_house_envelope_with_internal_error_code() -> None:
+    """A genuinely unhandled exception (``/_debug/error``'s deliberate
+    ``RuntimeError`` — same endpoint ``tests/test_observability.py``'s own
+    Sentry-capture tests use) must return the house error envelope --
+    ``code: "internal_error"``, a static generic ``message``, and a real
+    ``request_id`` -- never Starlette's own plain-text default 500, and
+    never the exception's own type/message/traceback anywhere in the
+    response body (rule #5: never derive a response from the failure
+    itself).
+
+    ``raise_app_exceptions=False`` (matching ``tests/test_observability.py``'s
+    own established convention for this exact endpoint): ``BaseHTTPMiddleware``
+    (``RequestIDMiddleware``) re-surfaces an exception that was ALREADY
+    handled deeper in the stack via its own background-task-based
+    ``call_next()`` machinery -- a documented Starlette/httpx test-harness
+    interaction, not a production behavior difference (verified directly:
+    the actual ASGI response sent is the correct envelope either way)."""
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
+    ) as client:
+        response = await client.get("/_debug/error")
+
+    assert response.status_code == 500
+    body = response.json()
+    assert "detail" not in body, "FastAPI's default 500 shape leaked ('detail' key present)"
+    assert "error" in body
+    error = body["error"]
+    assert error["code"] == "internal_error"
+    assert isinstance(error["message"], str) and error["message"]
+    assert "RuntimeError" not in error["message"]
+    assert "debug_error" not in error["message"]  # the endpoint's own exception text
+    assert "request_id" in error
+    assert isinstance(error["request_id"], str)
+    # Never the raw exception text anywhere in the response, not just the
+    # message field -- the whole body must be free of it.
+    assert "intentional exception for Sentry smoke-test" not in response.text
+
+
+@pytest.mark.unit
+async def test_unhandled_exception_handler_never_shadows_more_specific_handlers() -> None:
+    """The catch-all ``Exception`` handler must never shadow
+    ``AuthError``/``AppError``/``RequestValidationError`` -- a request with
+    no ``Authorization`` header still gets the 401 envelope (``AuthError``'s
+    own code), never a 500 ``internal_error``. Mirrors
+    ``test_missing_auth_still_returns_401_not_422``'s own regression shape
+    for the ``RequestValidationError`` handler, applied to this one."""
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/devices", json={"token": "x", "platform": "ios"})
+
+    assert response.status_code == 401
+    body = response.json()
+    assert body["error"]["code"] == "missing_token"
+    assert body["error"]["code"] != "internal_error"

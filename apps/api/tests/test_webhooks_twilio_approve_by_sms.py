@@ -38,9 +38,12 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
+import app.agent.approve_by_sms as approve_by_sms_mod
 import app.db.session as db_mod
+import app.routers.webhooks.twilio as twilio_webhook_mod
 from app.agent.checkpointer import close_checkpointer, setup_checkpointer
 from app.config import settings
 from app.integrations.twilio import compute_signature
@@ -908,6 +911,106 @@ async def test_reply_on_different_property_number_does_not_correlate(
         assert draft_a_after["status"] == "pending"
 
         # Falls back to needs_eyes -- nothing to correlate against on B.
+        needs_eyes_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT status FROM notifications "
+                        "WHERE landlord_id = :lid AND type = 'needs_eyes'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert needs_eyes_row["status"] == "pending"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# BLOCKING-1 (#186 follow-up round) — a raised exception on the
+# approve-by-SMS dispatch path (e.g. a dedicated lock-pool checkout
+# ``sqlalchemy.exc.TimeoutError`` under #186 item/BLOCKING-2 load) must
+# page Sentry AND fall back to needs_eyes, never a silent 200. This
+# monkeypatches ``handle_reply`` to raise the EXACT exception type a
+# genuinely exhausted dedicated lock pool raises (proven independently by
+# ``tests/test_agent_case_lock_pool.py::
+# test_saturating_the_dedicated_pool_raises_sqlalchemy_timeout_error``) —
+# deterministic and fast, rather than re-deriving genuine pool exhaustion
+# through the full HTTP stack here too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_reply_1_when_handle_reply_raises_pages_sentry_and_falls_back_to_needs_eyes(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safety review, #186 follow-up round, BLOCKING-1: before this fix,
+    ``_run_post_persist_side_effects`` swallowed any exception from
+    ``approve_by_sms.handle_reply`` via ``_safe_step``'s DEFAULT
+    ``alert_on_failure=False`` (log-only, never Sentry) and then
+    unconditionally returned — no page, no ``needs_eyes`` fallback, and the
+    landlord's "1" reply vanished with the webhook still 200ing. Fixed:
+    that call site now passes ``alert_on_failure=True`` and falls through
+    to the SAME ``_ensure_needs_eyes_notification`` fallback an
+    unrecognized/uncorrelated reply already gets."""
+    landlord_phone = _fresh_phone()
+    landlord_id = await _insert_landlord(db_session, phone=landlord_phone)
+    to_number = _fresh_phone()
+    property_id = await _insert_property(db_session, landlord_id, twilio_number=to_number)
+    tenant_id = await _insert_tenant(db_session, landlord_id, property_id)
+    case_id = await _insert_case(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        status="awaiting_approval",
+    )
+    draft_id = await _insert_draft(
+        db_session, landlord_id=landlord_id, case_id=case_id, status="pending"
+    )
+    await _insert_ready_notification(
+        db_session, landlord_id=landlord_id, case_id=case_id, draft_id=draft_id
+    )
+
+    async def _raise_lock_pool_timeout(**_kwargs: Any) -> bool:
+        raise SQLATimeoutError(
+            "QueuePool limit of size 2 overflow 8 reached, connection timed out, timeout 10.00"
+        )
+
+    monkeypatch.setattr(approve_by_sms_mod, "handle_reply", _raise_lock_pool_timeout)
+
+    captured_sentry: list[dict[str, Any]] = []
+
+    def _fake_capture_message(message: str, **kwargs: Any) -> None:
+        captured_sentry.append({"message": message, **kwargs})
+
+    monkeypatch.setattr(twilio_webhook_mod.sentry_sdk, "capture_message", _fake_capture_message)
+
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid, from_number=landlord_phone, to_number=to_number, body="1"
+    )
+
+    try:
+        response = await _post_sms(params)
+        assert response.status_code == 200  # never a 500 -- fail-open, per module docstring
+
+        # The draft was never touched -- handle_reply raised before any
+        # write, so nothing was approved.
+        draft = await _fetch_draft(db_session, draft_id)
+        assert draft["status"] == "pending"
+
+        # Paged Sentry (alert_on_failure=True, the fix) -- metadata only.
+        assert len(captured_sentry) == 1
+        assert captured_sentry[0]["extras"]["stage"] == "landlord_approve_by_sms"
+        assert captured_sentry[0]["extras"]["exc_type"] == "TimeoutError"
+
+        # AND fell back to the same needs_eyes surfacing an unrecognized
+        # reply already gets -- the landlord still learns something needs
+        # their attention, even though the specific approve attempt failed.
         needs_eyes_row = (
             (
                 await db_session.execute(

@@ -305,7 +305,9 @@ async def test_revoked_device_is_never_enqueued(db_session: AsyncSession) -> Non
 
 # ---------------------------------------------------------------------------
 # 4. No pending draft -> zero rows even with an active device (the rare
-#    draft_response race-exhausted path — see that module's docstring)
+#    draft_response race-exhausted path — see that module's docstring), AND
+#    (#186 item 3) the status flip itself is gated on the same condition —
+#    a case must never land in 'awaiting_approval' with nothing pending.
 # ---------------------------------------------------------------------------
 
 
@@ -324,6 +326,39 @@ async def test_no_pending_draft_enqueues_zero_rows(db_session: AsyncSession) -> 
         await mark_awaiting_approval(_state_for(case_id))
 
         assert await _outbox_rows(db_session, landlord_id) == []
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_no_pending_draft_does_not_flip_case_status(db_session: AsyncSession) -> None:
+    """#186 item 3 regression: the earlier revision flipped ``cases.status``
+    to ``'awaiting_approval'`` UNCONDITIONALLY whenever ``case_id`` was
+    known, before checking whether a pending draft actually exists —
+    leaving a case in ``'awaiting_approval'`` with no draft to approve and
+    no live interrupt (module docstring "Skip-path shape"). The status must
+    now stay whatever it already was (``'open'`` here) when there is
+    nothing pending to gate the flip on."""
+    landlord_id, case_id, draft_id = await _seed_open_case_with_pending_draft(db_session)
+    try:
+        await db_session.execute(
+            text("UPDATE drafts SET status = 'stale' WHERE id = :id"), {"id": draft_id}
+        )
+        await db_session.commit()
+
+        result = await mark_awaiting_approval(_state_for(case_id))
+
+        # No reasoning_log line appended for this skip (mirrors the
+        # case_id-is-None branch) -- await_approval's OWN draft_id-is-None
+        # branch is the one that narrates the anomaly to the landlord.
+        assert result == {"reasoning_log": []}
+
+        status = (
+            await db_session.execute(
+                text("SELECT status FROM cases WHERE id = :id"), {"id": case_id}
+            )
+        ).scalar_one()
+        assert status == "open"
     finally:
         await _cleanup(db_session, landlord_id)
 

@@ -187,6 +187,49 @@ reachable node). That helper is idempotent (same
 ITSELF wrapped so a failure inside it (e.g. no real ``landlord_id`` to
 satisfy the table's FK) is logged and swallowed, never raised — there is
 nothing further downstream to catch it.
+
+A transient failure gets a RETRY, not just a page (safety review, #186
+follow-up round, NEW-2)
+------------------------------------------------------------------------
+The generic handling above treats every ``run_graph`` failure identically
+— a single immediate ``needs_eyes`` page, with no automatic follow-up.
+That is the right floor for a genuine LOGIC failure (a bug, a malformed
+row), but :class:`app.agent.graph.CaseLockAcquisitionTimeoutError`
+(#186's bounded try-lock retry loop, ``app/agent/graph.py``, exhausting
+its own bounded wait under genuine same-case contention) is a TRANSIENT
+RESOURCE condition, not a logic one — the SAME message retried a few
+minutes later, once the contention/burst has drained, will very likely
+classify normally. Discovered gap: before this fix, a message shed by
+this exception landed in the SAME one-shot ``needs_eyes`` push as every
+other failure, with nothing ever retrying it — an LLM-only emergency
+buried in message #5 of a burst could be silently dropped for good (the
+landlord's push notification is easy to miss, and nothing else ever
+re-attempts classification for that message).
+
+Fixed: this exception type is now caught SPECIFICALLY (before the generic
+``except Exception`` below) and, instead of the one-shot last-resort
+``needs_eyes``, calls :func:`app.agent.nodes.degraded_mode.
+queue_degraded_retry` — the SAME durable ``degraded_retry`` marker
+(``notifications`` row, schema-v1.md v1.8) the classification-failed
+"no keywords" leg already writes, reusing its EXACT payload shape/dedupe
+index (never a new one — see that function's own docstring). This means
+``app/agent/degraded_mode_sweep.py``'s existing, already-scheduled
+1/5/15-minute retry-then-escalate ladder becomes the terminal path: it
+re-attempts ``run_graph`` (by which point the contention/burst has almost
+certainly cleared) and, only if genuinely still failing after all three
+attempts, escalates to a real ``needs_eyes`` — the SAME sweep this
+codebase already relies on for the classification-failure case, now also
+catching this resource-failure case. The Sentry page (metadata only,
+same shape as every other ``run_graph`` failure) is UNCHANGED — ops still
+learns immediately; only the LANDLORD-facing path changes, from "paged
+once, nothing else ever happens" to "durably retried, escalated only if
+still failing."
+
+:attr:`app.agent.graph.CaseLockAcquisitionTimeoutError.case_id` (set at
+raise time inside ``app/agent/graph.py::_case_lock``) is used directly —
+no extra lookup needed; ``run_graph`` never reaches ``_case_lock`` at all
+unless ``identify_case`` already attached the message to a real case, so
+this is always the correct, already-resolved case for this message.
 """
 
 from __future__ import annotations
@@ -200,7 +243,8 @@ import structlog
 from langchain_core.runnables import RunnableConfig
 from sqlalchemy import text
 
-from app.agent.graph import compile_case_graph, run_graph
+from app.agent.graph import CaseLockAcquisitionTimeoutError, compile_case_graph, run_graph
+from app.agent.nodes.degraded_mode import REASON_CASE_LOCK_ACQUISITION_TIMEOUT, queue_degraded_retry
 from app.db.session import get_admin_session
 
 log = structlog.get_logger(__name__)
@@ -299,6 +343,34 @@ async def _attempt_last_resort_needs_eyes(*, message_id: UUID, landlord_id: UUID
         )
 
 
+async def _queue_degraded_retry_for_lock_timeout(
+    *, message_id: UUID, landlord_id: UUID, case_id: UUID
+) -> None:
+    """``CaseLockAcquisitionTimeoutError``-specific fallback (safety
+    review, #186 follow-up round, NEW-2) — see module docstring "A
+    transient failure gets a RETRY, not just a page". Best-effort and
+    itself fully guarded, same shape as
+    :func:`_attempt_last_resort_needs_eyes`: a failure here is logged and
+    swallowed, never raised — there is nothing left downstream to catch
+    it.
+    """
+    try:
+        async with asynccontextmanager(get_admin_session)() as session:
+            await queue_degraded_retry(
+                session,
+                message_id=message_id,
+                landlord_id=landlord_id,
+                case_id=case_id,
+                reasons=[REASON_CASE_LOCK_ACQUISITION_TIMEOUT],
+            )
+    except Exception as exc:
+        log.error(
+            "graph_entry_degraded_retry_queue_failed",
+            message_id=str(message_id),
+            exc_type=type(exc).__name__,
+        )
+
+
 async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
     """Background-task entry point (#34) — invokes the real LangGraph
     pipeline (``app/agent/graph.py::run_graph``) for a persisted inbound
@@ -358,6 +430,29 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
 
     try:
         await run_graph(message_id)
+    except CaseLockAcquisitionTimeoutError as exc:
+        # Transient resource failure, not a logic one -- see module
+        # docstring "A transient failure gets a RETRY, not just a page"
+        # (#186 follow-up round, NEW-2). Sentry page UNCHANGED (below,
+        # same shape as the generic branch); only the fallback differs:
+        # a durable degraded_retry marker instead of a one-shot needs_eyes.
+        log.error(
+            "graph_entry_run_graph_failed",
+            message_id=str(message_id),
+            exc_type=type(exc).__name__,
+        )
+        sentry_sdk.capture_message(
+            "graph_entry: run_graph failed -- message may be stuck with no draft/notification",
+            level="error",
+            extras={
+                "message_id": str(message_id),
+                "landlord_id": str(landlord_id),
+                "exc_type": type(exc).__name__,
+            },
+        )
+        await _queue_degraded_retry_for_lock_timeout(
+            message_id=message_id, landlord_id=landlord_id, case_id=exc.case_id
+        )
     except Exception as exc:
         log.error(
             "graph_entry_run_graph_failed",

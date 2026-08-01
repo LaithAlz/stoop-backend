@@ -477,10 +477,17 @@ def test_guc_setter_pattern_catches_every_shape(snippet: str) -> None:
     assert _GUC_SETTER_PATTERN.search(snippet), f"pattern should catch: {snippet!r}"
 
 
-# Files allowed to reference get_admin_session (#22 safety review item 12):
-# its definition (app/db/session.py) and its callers, each a genuine
-# pre-identity/service-path admin-engine use (see that module's docstring).
-# EXTEND THIS DELIBERATELY, not by loosening the grep.
+# Files allowed to reference get_admin_session (#22 safety review item 12)
+# OR construct/name a raw, RLS-bypassing engine/session-factory of their own
+# (#186 follow-up round, ADVISORY-2 — the audit was a blind spot until
+# app/agent/case_lock_pool.py added a SECOND way to bypass RLS,
+# ``create_async_engine(settings.database_url, ...)`` directly, without ever
+# calling get_admin_session itself): its definition (app/db/session.py) and
+# its callers, each a genuine pre-identity/service-path admin-engine use
+# (see that module's docstring), PLUS any file naming
+# get_case_lock_session/CaseLockSessionFactory (app/agent/case_lock_pool.py's
+# own dedicated-engine equivalent) or literally constructing an engine via
+# create_async_engine. EXTEND THIS DELIBERATELY, not by loosening the grep.
 _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
     {
         "app/db/session.py",
@@ -603,29 +610,104 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # OWN reads/writes (draft status lookups, the UNDO revert) run on
         # the same admin engine as the webhook that calls it.
         "app/agent/approve_by_sms.py",
+        # #186 item 1: the dedicated advisory-lock connection pool —
+        # bypasses RLS the SAME way the admin engine does (always built
+        # from settings.database_url), but through its OWN engine/session
+        # factory (get_case_lock_session/CaseLockSessionFactory), never by
+        # calling get_admin_session itself. Named here so the broadened
+        # grep below (ADVISORY-2, #186 follow-up round) still catches this
+        # module deliberately, not by accident of it never having called
+        # get_admin_session in the first place.
+        "app/agent/case_lock_pool.py",
+        # #186 follow-up round, ADVISORY-2 (second pass): GET /healthz
+        # imports the raw admin `engine` directly (`from app.db.session
+        # import engine`) for a lightweight `engine.connect()` liveness
+        # probe -- no landlord JWT, no GUC to scope by, the same
+        # pre-identity rationale every other allowlisted caller shares,
+        # just via the bare engine object instead of get_admin_session's
+        # session wrapper (health.py's own module docstring).
+        "app/routers/health.py",
+        # #186 follow-up round, ADVISORY-2 (second pass): imports
+        # `verify_request_engine_role_separation` -- not itself an
+        # RLS-bypassing call (it's a startup SELF-CHECK that PROVES role
+        # separation, never a data read/write), but its name matches the
+        # broadened "engine" substring in the import-line pattern below.
+        # Named here deliberately rather than narrowing the pattern back
+        # down to miss it.
+        "app/main.py",
     }
 )
+
+_ADMIN_SESSION_OR_RAW_ENGINE_PATTERN = re.compile(
+    r"get_admin_session"
+    r"|get_case_lock_session"
+    r"|CaseLockSessionFactory"
+    r"|AsyncSessionFactory"
+    r"|RequestSessionFactory"
+    r"|create_async_engine\("
+    r"|from app\.db\.session import[^\n]*engine"
+)
+"""Broadened TWICE now (#186 follow-up round, ADVISORY-2, both passes)
+from a plain ``"get_admin_session" in content`` substring check:
+
+1. First pass: that check alone was blind to a file that bypasses RLS via
+   a raw, directly-constructed engine
+   (``create_async_engine(settings.database_url, ...)``, exactly
+   ``app/agent/case_lock_pool.py``'s OWN shape) without ever calling
+   ``get_admin_session``.
+2. Second pass (safety re-review — a synthetic file using
+   ``AsyncSessionFactory`` directly, or importing the raw ``engine``/
+   ``request_engine`` objects from ``app/db/session.py`` WITHOUT going
+   through ``create_async_engine(...)`` itself, both ALSO bypass RLS the
+   same way and were BOTH still invisible to pass 1's pattern): added
+   ``AsyncSessionFactory``/``RequestSessionFactory`` (the admin/request
+   session factories ``app/db/session.py`` itself exports — a future
+   caller importing one of THOSE directly, instead of through
+   ``get_session``/``get_admin_session``, would bypass the exact same
+   audit) and ``from app.db.session import ...engine...`` (catches
+   ``app/routers/health.py``'s own ``from app.db.session import engine``
+   AND ``app/main.py``'s ``from app.db.session import
+   verify_request_engine_role_separation`` — deliberately a plain
+   substring match on "engine" within the import line, not a stricter
+   word-boundary one, so any future import NAMING an engine-flavored
+   symbol from that module gets caught, not just the exact ``engine``
+   name).
+
+Also anchored ``create_async_engine`` on the literal CALL
+(``create_async_engine(``, WITH the open paren) rather than the bare
+word — the bare word alone made ANY docstring/comment merely discussing
+``create_async_engine`` (never calling it) tax future edits with a false
+positive (this is what previously forced a purely cosmetic reword in
+``app/config.py``, reverted in this same pass now that the anchor makes
+it unnecessary). The RLS-bypass audit below must catch every ACTUAL
+bypass shape, not just the original one, to stay a complete list —
+without taxing prose that merely talks about one."""
 
 
 @pytest.mark.unit
 def test_get_admin_session_referenced_only_by_allowlisted_files() -> None:
-    """Machine-enforced admin-session allowlist (#22 safety review item
-    12): ``get_admin_session`` bypasses RLS entirely, so every file that
-    references it must be an intentional, reviewed choice — not an
+    """Machine-enforced admin-session / raw-engine allowlist (#22 safety
+    review item 12; broadened #186 follow-up round, ADVISORY-2):
+    ``get_admin_session`` bypasses RLS entirely, and so does any file that
+    constructs its OWN engine/session factory directly from
+    ``settings.database_url`` (``get_case_lock_session``/
+    ``CaseLockSessionFactory``/``create_async_engine``) — every file
+    matching EITHER shape must be an intentional, reviewed choice, not an
     accidental import by some future landlord-scoped endpoint (#53+)
     reaching for the wrong session dependency instead of
-    ``require_landlord``. Red-fails the instant a new file mentions
-    ``get_admin_session`` without the allowlist above being updated to
-    match, forcing that update to be a deliberate, visible diff.
+    ``require_landlord``. Red-fails the instant a new file matches without
+    the allowlist above being updated to match, forcing that update to be
+    a deliberate, visible diff.
     """
     referencing: set[str] = set()
     for path in _APP_DIR.rglob("*.py"):
         content = path.read_text()
-        if "get_admin_session" in content:
+        if _ADMIN_SESSION_OR_RAW_ENGINE_PATTERN.search(content):
             referencing.add(str(path.relative_to(_APP_DIR.parent)))
 
     assert referencing == set(_ADMIN_SESSION_ALLOWLIST), (
-        f"files referencing get_admin_session changed: {referencing} != "
+        f"files referencing get_admin_session (or a raw RLS-bypassing engine) "
+        f"changed: {referencing} != "
         f"{set(_ADMIN_SESSION_ALLOWLIST)} — update the allowlist deliberately "
         "if this is an intentional new caller (e.g. #40's webhook ingestion), "
         "with a comment explaining why"

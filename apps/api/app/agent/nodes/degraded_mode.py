@@ -199,6 +199,7 @@ import sentry_sdk
 import structlog
 from pydantic import ValidationError
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.schemas import CaseContext, PrefilterResult, Severity
 from app.agent.state import AgentState
@@ -211,6 +212,19 @@ REASON_DRAFT_GUARD_FAILED = "draft_guard_failed"
 REASON_SEVERITY_EMERGENCY = "severity_emergency"
 """An LLM-classified EMERGENCY Tier-0 itself missed — see module docstring.
 Interim trigger until #108's real escalation chain exists."""
+
+REASON_CASE_LOCK_ACQUISITION_TIMEOUT = "case_lock_acquisition_timeout"
+"""NOT one of the three ``degraded_mode`` node routing triggers above (this
+value is never produced by :func:`_resolve_reasons` — nothing routes the
+GRAPH to this node for it). Used only as a ``payload.reasons`` value by
+``app/agent/graph_entry.py``'s direct call to :func:`queue_degraded_retry`
+when ``run_graph`` itself never got far enough to reach this node at all
+— a :class:`app.agent.graph.CaseLockAcquisitionTimeoutError` (#186
+follow-up round, NEW-2) is a TRANSIENT lock-pool contention failure, not
+a classification-content one. Defined here (not in ``graph_entry.py``)
+so every value this codebase ever writes to ``notifications.payload.
+reasons`` for a ``degraded_retry``/``needs_eyes`` row stays in ONE
+discoverable vocabulary."""
 
 _REASON_UNKNOWN = "unknown"
 """Defensive-only fallback (see :func:`_resolve_reasons`) — should never
@@ -454,6 +468,89 @@ async def _handle_generic_degraded(
     return "I couldn't finish this one on my own, so I've sent you a notification to take a look."
 
 
+async def queue_degraded_retry(
+    session: AsyncSession,
+    *,
+    message_id: UUID,
+    landlord_id: UUID,
+    case_id: UUID | None,
+    reasons: list[str],
+    extra_payload: dict[str, Any] | None = None,
+) -> bool:
+    """Insert a ``degraded_retry`` notification row scheduling
+    re-classification at ``RETRY_SCHEDULE[0]`` from now — the SAME durable
+    marker :func:`_handle_classification_failed`'s own "no keywords at
+    all" leg writes (below), factored out here so OTHER callers whose
+    failure is a TRANSIENT, non-classification-content condition can
+    reuse the IDENTICAL payload shape / dedupe index / sweep contract
+    instead of re-deriving it (safety review, #186 follow-up round,
+    NEW-2 — ``app/agent/graph_entry.py``'s handling of
+    :class:`app.agent.graph.CaseLockAcquisitionTimeoutError`, a lock-pool
+    contention failure, not a classification failure, but one
+    ``app/agent/degraded_mode_sweep.py``'s existing 1/5/15-minute retry
+    -then-escalate ladder is equally the right terminal path for: the
+    burst that caused the contention will very likely have drained by the
+    time the sweep re-attempts ``run_graph``).
+
+    ``reasons`` is informational/audit-only here — see
+    ``app/agent/degraded_mode_sweep.py``'s own ``_process_candidate``:
+    the sweep re-attempts ``run_graph`` and reads ITS outcome to decide
+    resolve/reschedule/escalate, never branching on ``payload["reasons"]``
+    itself — so a caller describing a genuinely different failure class
+    (anything other than :data:`REASON_CLASSIFICATION_FAILED`) is safe and
+    handled identically by the sweep. ``extra_payload`` (used by
+    :func:`_handle_classification_failed`'s own #208 cost-accounting keys)
+    is merged in BEFORE the fixed ``leg``/``failed_at``/
+    ``case_status_at_failure`` keys, matching this shape's existing
+    precedence (those three can never be overridden by a caller).
+
+    Idempotent via ``uq_notifications_degraded_retry_dedupe`` (schema-v1.md
+    v1.8, migration 0009) — returns ``True`` if this call created a new
+    row, ``False`` if one already existed for *message_id* (redelivery
+    -safe). Runs on the CALLER's own session/transaction (unlike this
+    module's other entry points, which each open their own — this
+    function is a plain, reusable DB helper, not a node-shaped seam).
+    """
+    now = datetime.now(UTC)
+    case_status_at_failure: str | None = None
+    if case_id is not None:
+        case_status_row = (
+            (await session.execute(_SELECT_CASE_STATUS_SQL, {"case_id": str(case_id)}))
+            .mappings()
+            .one_or_none()
+        )
+        case_status_at_failure = case_status_row["status"] if case_status_row is not None else None
+
+    retry_payload = {
+        "message_id": str(message_id),
+        "case_id": str(case_id) if case_id is not None else None,
+        "reasons": reasons,
+        **(extra_payload or {}),
+        "leg": "queued_for_retry",
+        "failed_at": now.isoformat(),
+        "case_status_at_failure": case_status_at_failure,
+    }
+    # attempt count lives in the real `notifications.attempt` column
+    # (schema default 0) -- app/agent/degraded_mode_sweep.py owns every
+    # advance from there; no need to duplicate it in payload.
+    retry_row = (
+        (
+            await session.execute(
+                _INSERT_DEGRADED_RETRY_SQL,
+                {
+                    "landlord_id": str(landlord_id),
+                    "case_id": str(case_id) if case_id is not None else None,
+                    "payload": json.dumps(retry_payload),
+                    "next_attempt_at": now + RETRY_SCHEDULE[0],
+                },
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return retry_row is not None
+
+
 async def _handle_classification_failed(
     *,
     message_id: UUID,
@@ -558,50 +655,27 @@ async def _handle_classification_failed(
             )
         else:
             leg = "queued_for_retry"
-            now = datetime.now(UTC)
-
-            # Re-animation guard (safety review, this round): snapshot the
-            # case's CURRENT status so app/agent/degraded_mode_sweep.py can
-            # later detect "this case moved on since the failure was
-            # recorded" by comparing, never by re-deriving from a
-            # hardcoded 'open' check -- see that module's own docstring
-            # "Re-animation guard".
-            case_status_at_failure: str | None = None
-            if case_id is not None:
-                case_status_row = (
-                    (await session.execute(_SELECT_CASE_STATUS_SQL, {"case_id": str(case_id)}))
-                    .mappings()
-                    .one_or_none()
-                )
-                case_status_at_failure = (
-                    case_status_row["status"] if case_status_row is not None else None
-                )
-
-            retry_payload = {
-                **payload,
-                "leg": leg,
-                "failed_at": now.isoformat(),
-                "case_status_at_failure": case_status_at_failure,
+            # Re-animation guard (safety review, this round): the case's
+            # CURRENT status is snapshotted (inside queue_degraded_retry
+            # below) so app/agent/degraded_mode_sweep.py can later detect
+            # "this case moved on since the failure was recorded" by
+            # comparing, never by re-deriving from a hardcoded 'open'
+            # check -- see that module's own docstring "Re-animation
+            # guard". #208's own cost-accounting keys (folded into
+            # `payload` above, when present) ride along as extra_payload
+            # exactly as they always have.
+            extra_payload = {
+                k: v for k, v in payload.items() if k not in {"message_id", "case_id", "reasons"}
             }
-            # attempt count lives in the real `notifications.attempt` column
-            # (schema default 0) -- app/agent/degraded_mode_sweep.py owns
-            # every advance from there; no need to duplicate it in payload.
-            retry_row = (
-                (
-                    await session.execute(
-                        _INSERT_DEGRADED_RETRY_SQL,
-                        {
-                            "landlord_id": str(landlord_id),
-                            "case_id": str(case_id) if case_id is not None else None,
-                            "payload": json.dumps(retry_payload),
-                            "next_attempt_at": now + RETRY_SCHEDULE[0],
-                        },
-                    )
-                )
-                .mappings()
-                .one_or_none()
+            retry_created = await queue_degraded_retry(
+                session,
+                message_id=message_id,
+                landlord_id=landlord_id,
+                case_id=case_id,
+                reasons=payload["reasons"],
+                extra_payload=extra_payload,
             )
-            any_created = tenant_ack_created or retry_row is not None
+            any_created = tenant_ack_created or retry_created
             reasoning_line = (
                 "I couldn't classify this one right away, so I let the tenant know someone's "
                 "on it and I'll keep trying in the background."
@@ -715,10 +789,12 @@ async def degraded_mode(state: AgentState) -> dict[str, Any]:
 
 __all__: list[str] = [
     "HOLDING_ACK_TEMPLATE",
+    "REASON_CASE_LOCK_ACQUISITION_TIMEOUT",
     "REASON_CLASSIFICATION_FAILED",
     "REASON_DRAFT_GUARD_FAILED",
     "REASON_SEVERITY_EMERGENCY",
     "RETRY_SCHEDULE",
     "degraded_mode",
+    "queue_degraded_retry",
     "render_holding_ack",
 ]
