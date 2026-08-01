@@ -10,7 +10,10 @@ You check Stoop's customer-facing words. The rules, in priority order:
 1. Banned: "triage", "founding", "cohort", spot counts, "AI agent" in
    tenant-facing text, legal/LTB/RTA mentions on marketing surfaces.
 2. Prices exactly: free Emergency Line · $10/month Full Plan ·
-   $5/month early-access "locked for life" · $1.50/door property managers.
+   $5/month early-access "locked in for as long as you stay" (NEVER
+   "locked for life" — the ToS grants the lock only while the
+   subscription stays active; PR #142 removed the old phrasing) ·
+   $1.50/door property managers.
 3. Tenant-facing SMS: grade-5 reading level, sentences ≤15 words,
    emergencies = max 3 numbered steps, no idioms, concrete times
    (docs/02-product/plain-language-rules.md).
