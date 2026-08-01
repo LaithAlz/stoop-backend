@@ -10,6 +10,7 @@ tests are plain ``unit`` (no DB, no network).
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import subprocess
@@ -1190,6 +1191,196 @@ async def test_drain_sweep_backoff_frees_the_limit_window_for_a_different_landlo
             db_session, victim_notification_id
         )
         assert status_tick_2 == "sent"
+        assert victim_phone in sender.calls
+    finally:
+        await _cleanup(db_session, landlord_a)
+        await _cleanup(db_session, landlord_b)
+
+
+# ---------------------------------------------------------------------------
+# Bounded delay AT the backoff cap (issue #240 -- the #229 safety review's
+# own final round, "worth an issue, not a merge blocker"): the shipped
+# window test directly above proves backoff frees the LIMIT-100 window once,
+# at a cohort's FIRST failure -- not the STEADY-STATE property that actually
+# keeps the fleet safe over time: once an entire cohort of permanently
+# -failing rows has already been failing long enough that every row sits at
+# the 1h backoff cap and comes due again SIMULTANEOUSLY, a FRESH, different
+# landlord's draft-ready notice must still deliver within a bounded number
+# of ticks -- never be shadowed indefinitely.
+#
+# Scale-trigger derivation (issue #240 AC 3, verbatim from the issue body):
+# "Silent shadowing re-arms at >=6000 permanently-stuck rows
+# (ceil(N/100)*60s >= cap)" -- once a single landlord's permanently-failing
+# cohort is large enough that ceil(N/100) sweep ticks (60s apiece,
+# app/scheduler.py's own TICK_INTERVAL_SECONDS) take at least as long to
+# cycle through as the 1h backoff cap itself
+# (_LANDLORD_SMS_BACKOFF_CAP_SECONDS, 3600s), the cohort re-fills the
+# LIMIT-100 window continuously again, before its own earliest rows ever
+# become due a second time -- the exact cluster-wide shadowing shape the
+# original A1+A2 backoff fix (this module's next_attempt_at write) exists to
+# prevent, just re-arming at a larger N.
+# ---------------------------------------------------------------------------
+
+_STUCK_COHORT_SEND_FAILURES = 10
+"""Comfortably past the point :func:`landlord_sms._landlord_sms_backoff_seconds`
+caps at :data:`landlord_sms._LANDLORD_SMS_BACKOFF_CAP_SECONDS` (the 7th
+genuine failure onward -- see ``test_landlord_sms_backoff_progression``
+above) -- models a row that has ALREADY been failing long enough to sit
+pinned at the 1h cap, not one still on its first few, still-growing backoff
+steps."""
+
+
+@pytest.mark.integration
+async def test_drain_sweep_delivers_fresh_landlord_within_bounded_ticks_when_cohort_is_capped(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #240 -- pins the STEADY-STATE bound the shipped window test
+    above (``test_drain_sweep_backoff_frees_the_limit_window_for_a_
+    different_landlord``) does not cover: a cohort of N=250
+    permanently-failing ``KIND_READY`` rows for ONE landlord (A), ALL
+    already pinned at the 1h backoff cap and due at the EXACT SAME instant
+    (simulating the real steady state after a stuck cohort has already been
+    failing for a while -- not just its first failure), must still let a
+    FRESH, different landlord's (B) draft-ready notice deliver within
+    ``ceil(N/100)+1`` = 4 ticks (the reviewer's own manually-probed bound:
+    100 stuck rows -> 2 ticks, 250 -> 3 ticks; the "+1" is this test's
+    safety margin, not a claim that the bound is tight).
+
+    Kills TWO mutants (house convention -- naming each):
+
+    MUTANT 1 -- "the backoff write stops RE-applying on repeat failures":
+    if :data:`landlord_sms._MARK_LANDLORD_SMS_SEND_OUTCOME_SQL` stopped
+    writing ``next_attempt_at`` (or wrote a value that leaves a just-failed
+    row immediately due again), tick 1's 100 processed A-rows would still
+    be selected AGAIN on the very next tick instead of yielding the window
+    to A's next 100 -- caught DIRECTLY by the post-tick-1 assertion below
+    (exactly ``_LANDLORD_SMS_SELECT_BATCH_LIMIT`` of A's rows must show
+    ``next_attempt_at`` pushed past ``t0`` immediately after tick 1; this
+    mutation leaves that count at 0).
+
+    MUTANT 2 -- "the SELECT's backoff gate is removed" (the
+    ``next_attempt_at IS NULL OR next_attempt_at <= :now`` clause in
+    :data:`landlord_sms._SELECT_DUE_LANDLORD_SMS_SQL`): even with
+    ``next_attempt_at`` written correctly (mutant 1's own assertion still
+    passes), a SELECT that no longer FILTERS on it keeps re-picking the
+    SAME oldest-by-``created_at`` 100 A-rows tick after tick (``ORDER BY
+    created_at`` is untouched by this mutation) -- B is never reached at
+    all within the tick budget below. Caught by the "B sent within
+    max_ticks" assertion further down (which mutant 1 also fails, as a
+    redundant backstop).
+    """
+    poison_phone = factories.fresh_phone()
+    victim_phone = factories.fresh_phone()
+
+    landlord_a = await factories.insert_landlord(db_session, phone=poison_phone)
+    property_a = await factories.insert_property(
+        db_session, landlord_a, twilio_number=factories.fresh_phone()
+    )
+    tenant_a = await factories.insert_tenant(db_session, landlord_a, property_a)
+
+    landlord_b = await factories.insert_landlord(db_session, phone=victim_phone)
+    property_b = await factories.insert_property(
+        db_session, landlord_b, twilio_number=factories.fresh_phone()
+    )
+    tenant_b = await factories.insert_tenant(db_session, landlord_b, property_b)
+
+    cohort_size = 250  # >=100 (issue #240 AC 1); NOT a multiple of 100 --
+    # exercises a genuinely partial final batch, distinct from the shipped
+    # window test's exact-100 cohort above.
+    for _ in range(cohort_size):
+        await _seed_kind_ready_row_for_landlord(
+            db_session,
+            landlord_id=landlord_a,
+            property_id=property_a,
+            tenant_id=tenant_a,
+            age_minutes=120,  # older than B -- sorts first, ORDER BY created_at
+        )
+    victim_notification_id = await _seed_kind_ready_row_for_landlord(
+        db_session,
+        landlord_id=landlord_b,
+        property_id=property_b,
+        tenant_id=tenant_b,
+        age_minutes=1,  # fresher -- sorts after the entire cohort
+    )
+
+    t0 = datetime.now(UTC)
+    # Pin the ENTIRE cohort at the 1h cap, due at the EXACT SAME instant
+    # (issue #240 AC 1) -- rather than letting real per-tick failures
+    # accumulate it there, which is what the shipped window test above
+    # already exercises (its own cohort is pinned by age, not by a direct
+    # next_attempt_at/send_failures write).
+    await db_session.execute(
+        text(
+            "UPDATE notifications SET next_attempt_at = :t0, "
+            "payload = jsonb_set(COALESCE(payload, '{}'::jsonb), '{send_failures}', "
+            "to_jsonb(CAST(:send_failures AS integer)), true) "
+            "WHERE landlord_id = :lid AND type = 'draft_ready' AND channel = 'sms'"
+        ),
+        {"t0": t0, "send_failures": _STUCK_COHORT_SEND_FAILURES, "lid": landlord_a},
+    )
+    await db_session.commit()
+
+    sender = _PoisonAwareTwilioSender(poison_phone=poison_phone)
+    monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: sender)
+
+    max_ticks = math.ceil(cohort_size / 100) + 1  # issue #240 AC 1's own bound
+    assert max_ticks == 4  # pins the reviewer's own manually-probed 250-row bound
+
+    try:
+        # Deliberately tiny per-tick step -- see
+        # test_drain_sweep_backoff_frees_the_limit_window_for_a_different_
+        # landlord's own comment above on why a LARGE jump defeats this
+        # test: a jump anywhere near the 1h cap would make the WHOLE cohort
+        # due again together, re-filling the window a second time instead
+        # of yielding it.
+        tick_delta = timedelta(seconds=1)
+        victim_sent_on_tick: int | None = None
+        now = t0
+        for tick in range(1, max_ticks + 1):
+            outcomes = await landlord_sms.run_landlord_sms_drain_sweep(
+                now=now, deadline_seconds=1e9
+            )
+
+            if tick == 1:
+                # MUTANT 1 pin (see docstring) -- exactly one LIMIT-100
+                # batch of the cohort's rows must have been pushed PAST t0
+                # by THIS tick's own backoff write.
+                backed_off_count = (
+                    await db_session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM notifications WHERE landlord_id = :lid "
+                            "AND type = 'draft_ready' AND channel = 'sms' "
+                            "AND next_attempt_at > :t0"
+                        ),
+                        {"lid": landlord_a, "t0": t0},
+                    )
+                ).scalar_one()
+                assert (
+                    backed_off_count == landlord_sms._LANDLORD_SMS_SELECT_BATCH_LIMIT  # noqa: SLF001
+                )
+
+            victim_outcome = next(
+                (o for o in outcomes if o.notification_id == uuid.UUID(victim_notification_id)),
+                None,
+            )
+            if victim_outcome is not None:
+                assert victim_outcome.outcome == "sent"
+                victim_sent_on_tick = tick
+                break
+            now = now + tick_delta
+
+        # MUTANT 2 pin (see docstring; also a backstop for mutant 1) -- B
+        # must have been reached and sent within the bounded tick budget,
+        # never starved indefinitely by A's ever-refilling cohort.
+        assert victim_sent_on_tick is not None, (
+            f"landlord B's draft-ready notice was never sent within {max_ticks} ticks"
+        )
+        assert victim_sent_on_tick <= max_ticks
+
+        status_b, _ = await _status_and_attempt_by_notification_id(
+            db_session, victim_notification_id
+        )
+        assert status_b == "sent"
         assert victim_phone in sender.calls
     finally:
         await _cleanup(db_session, landlord_a)
