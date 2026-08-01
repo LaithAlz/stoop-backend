@@ -1360,15 +1360,18 @@ async def test_sms_drain_sweep_marks_failed_and_retries_on_the_next_tick(
 
     try:
         fake_sender.fail_sms = True
-        first_outcomes = await emergency_chain.run_sms_drain_sweep()
+        now = datetime.now(UTC)
+        first_outcomes = await emergency_chain.run_sms_drain_sweep(now=now)
         assert first_outcomes[0].outcome == "failed"
 
         notif = await _fetch_notification(db_session, notification_id)
         assert notif["status"] == "failed"
         assert notif["attempt"] == 1
 
+        # Past the tenant_ack backoff window (issue #229 safety re-review
+        # round 2 -- capped at 1 hour).
         fake_sender.fail_sms = False
-        second_outcomes = await emergency_chain.run_sms_drain_sweep()
+        second_outcomes = await emergency_chain.run_sms_drain_sweep(now=now + timedelta(hours=2))
         assert second_outcomes[0].outcome == "sent"
 
         notif_after = await _fetch_notification(db_session, notification_id)
@@ -1416,5 +1419,315 @@ async def test_sms_drain_sweep_no_tenant_phone_is_terminal_exhausted(
         notif_after = await _fetch_notification(db_session, notification_id)
         assert notif_after["status"] == "exhausted"
         assert notif_after["attempt"] == notif["attempt"], "a no-op tick must not re-claim the row"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock tick deadline (issue #229, PR #228 senior-review advisory 1) --
+# mirrors tests/test_agent_draft_sender.py's / tests/test_push_outbox_sweep
+# .py's own deadline test pattern exactly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_sms_drain_sweep_default_deadline_is_25_seconds() -> None:
+    assert emergency_chain.DEFAULT_TICK_DEADLINE_SECONDS == 25.0
+
+
+class _FakeClock:
+    """A mutable, injectable time source for the sweep's deadline check —
+    advanced explicitly by the fake sender below rather than sleeping for
+    real seconds. Mirrors ``tests/test_agent_draft_sender.py``'s own
+    ``_FakeClock``."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _DeadlineBlowingSmsSender:
+    """Implements just the ``send_sms`` half of ``TwilioSender`` -- records
+    every call (by recipient phone) and advances a shared :class:`_FakeClock`
+    past the tick's deadline on its FIRST send, simulating a slow/hanging
+    Twilio round-trip that must not be allowed to also delay claiming the
+    OTHER due row in the same tick."""
+
+    def __init__(self, clock: _FakeClock, *, advance_by: float) -> None:
+        self._clock = clock
+        self._advance_by = advance_by
+        self.calls: list[str] = []
+
+    async def send_sms(self, *, to: str, from_: str, body: str) -> str:
+        self.calls.append(to)
+        self._clock.now += self._advance_by
+        return f"SM{uuid.uuid4().hex}"
+
+
+@pytest.mark.integration
+async def test_sms_drain_sweep_stops_claiming_after_deadline_then_resumes_next_tick(
+    db_session: AsyncSession,
+) -> None:
+    """Two due ``tenant_ack`` rows; the first send blows the (tiny,
+    test-only) deadline. The SECOND due row must NOT be claimed in the same
+    tick -- it stays 'pending' and due, claimed whole by the very next tick
+    call. Nothing lost; never abandoned mid-claim -- this is what stops a
+    hung Twilio call chain here from delaying the NEXT tick's
+    ``run_emergency_chain_sweep``."""
+    landlord_id, property_id, tenant_id = await _seed(db_session)
+    message_id_a = await factories.insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    message_id_b = await factories.insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    notification_id_a = await _insert_tenant_ack_notification(
+        db_session, landlord_id=landlord_id, message_id=message_id_a, body="Got your message A"
+    )
+    notification_id_b = await _insert_tenant_ack_notification(
+        db_session, landlord_id=landlord_id, message_id=message_id_b, body="Got your message B"
+    )
+    clock = _FakeClock(start=0.0)
+    sender = _DeadlineBlowingSmsSender(clock, advance_by=10.0)
+    set_twilio_sender_for_tests(sender)
+
+    try:
+        outcomes = await emergency_chain.run_sms_drain_sweep(
+            deadline_seconds=5.0, time_source=clock
+        )
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome == "sent"
+        assert len(sender.calls) == 1  # bounded: NOT both due rows attempted this tick
+
+        notif_a = await _fetch_notification(db_session, notification_id_a)
+        notif_b = await _fetch_notification(db_session, notification_id_b)
+        statuses = {notif_a["status"], notif_b["status"]}
+        assert statuses == {"sent", "pending"}  # exactly one sent, one left due
+
+        # The next tick call (clock already past the first deadline window,
+        # but the sweep recomputes its OWN start from time_source() every
+        # call) claims and sends the leftover row.
+        outcomes_second_tick = await emergency_chain.run_sms_drain_sweep(
+            deadline_seconds=5.0, time_source=clock
+        )
+        assert len(outcomes_second_tick) == 1
+        assert outcomes_second_tick[0].outcome == "sent"
+        assert len(sender.calls) == 2
+
+        notif_a_after = await _fetch_notification(db_session, notification_id_a)
+        notif_b_after = await _fetch_notification(db_session, notification_id_b)
+        assert notif_a_after["status"] == "sent"
+        assert notif_b_after["status"] == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# TWO PASSES -- emergency_sms is never starved by a poisoned tenant_ack
+# backlog (safety re-review, blocking finding 1, 2026-08-01).
+# ---------------------------------------------------------------------------
+
+
+class _PoisonedTenantAckSender:
+    """Fails (raising, simulating a hung Twilio call) for every ``send_sms``
+    whose body matches *poison_body*; succeeds instantly for anything else
+    (the emergency_sms body). Advances a shared :class:`_FakeClock` on
+    every failure — mirrors a real Twilio HTTP timeout burning wall-clock
+    time, the exact PoC'd starvation mechanism this test regresses."""
+
+    def __init__(self, clock: _FakeClock, *, poison_body: str, advance_by: float) -> None:
+        self._clock = clock
+        self._poison_body = poison_body
+        self._advance_by = advance_by
+        self.calls: list[str] = []
+
+    async def send_sms(self, *, to: str, from_: str, body: str) -> str:
+        self.calls.append(body)
+        if body == self._poison_body:
+            self._clock.now += self._advance_by
+            raise RuntimeError("simulated twilio timeout")
+        return f"SM{uuid.uuid4().hex}"
+
+
+@pytest.mark.integration
+async def test_sms_drain_sweep_emergency_sms_not_starved_by_poisoned_tenant_ack_rows(
+    db_session: AsyncSession,
+) -> None:
+    """Safety re-review, blocking finding 1, 2026-08-01 -- regression for a
+    reproduced starvation bug: an EARLIER revision of this sweep's 25s
+    deadline drained ``tenant_ack`` and ``emergency_sms`` from ONE shared
+    ``ORDER BY created_at`` queue under the SAME budget. Three OLDER,
+    permanently-failing ``tenant_ack`` rows (each risking the full Twilio
+    timeout) could consume the entire deadline before the loop ever
+    reached a NEWER, genuinely-due ``emergency_sms`` row — the one
+    non-redundant tenant-facing message in the whole chain (see module
+    docstring "Idempotency") — silently never attempted, tick after tick.
+
+    Fixed with two SEPARATE passes (see module docstring "TWO PASSES"):
+    ``emergency_sms`` is now UNBOUNDED and runs FIRST, so it is sent on the
+    very FIRST sweep call regardless of how many poisoned ``tenant_ack``
+    rows sort ahead of it in ``created_at`` order, and regardless of how
+    tiny *deadline_seconds* is (the deadline only ever bounds the
+    ``tenant_ack`` pass, which runs second).
+
+    Note (reviewer advisory): this test does not itself pin WHICH pass
+    runs first -- that ordering is a LATENCY property (which row type gets
+    attempted soonest within a tick), not a safety one; the actual safety
+    guarantee under test is that emergency_sms is never starved, which
+    holds regardless of pass order."""
+    landlord_id, property_id, safe_tenant_id = await _seed(db_session)
+
+    poison_notification_ids: list[str] = []
+    for _ in range(3):
+        poison_tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+        poison_message_id = await factories.insert_message(
+            db_session,
+            landlord_id=landlord_id,
+            property_id=property_id,
+            tenant_id=poison_tenant_id,
+        )
+        poison_notification_ids.append(
+            await _insert_tenant_ack_notification(
+                db_session, landlord_id=landlord_id, message_id=poison_message_id, body="poison"
+            )
+        )
+
+    # Force these OLDER in created_at than the emergency_sms row below --
+    # ORDER BY created_at is exactly what let a stale tenant_ack backlog
+    # sort ahead of a fresh emergency_sms under the (now-removed)
+    # single-queue version of this deadline.
+    for notification_id in poison_notification_ids:
+        await db_session.execute(
+            text("UPDATE notifications SET created_at = now() - interval '2 hours' WHERE id = :id"),
+            {"id": notification_id},
+        )
+    await db_session.commit()
+
+    safe_message_id = await factories.insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=safe_tenant_id
+    )
+    category, body = emergency_chain.render_tenant_safety_sms(["fire"])
+    emergency_notification_id = await _insert_emergency_sms_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=safe_message_id,
+        property_id=property_id,
+        category=category,
+        body=body,
+    )
+
+    clock = _FakeClock(start=0.0)
+    sender = _PoisonedTenantAckSender(clock, poison_body="poison", advance_by=10.0)
+    set_twilio_sender_for_tests(sender)
+
+    try:
+        # A tiny 5s deadline -- three poison sends alone (10s each,
+        # matching the real Twilio HTTP timeout) would blow it many times
+        # over if emergency_sms shared the same budget/queue as an earlier
+        # revision of this fix did. It does not: this ONE sweep call still
+        # sends emergency_sms, on the first call, despite the deadline.
+        outcomes = await emergency_chain.run_sms_drain_sweep(
+            deadline_seconds=5.0, time_source=clock
+        )
+
+        emergency_outcome = next(
+            o for o in outcomes if str(o.notification_id) == emergency_notification_id
+        )
+        assert emergency_outcome.outcome == "sent"
+
+        notif = await _fetch_notification(db_session, emergency_notification_id)
+        assert notif["status"] == "sent"
+        assert notif["attempt"] == 1
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Exponential backoff on tenant_ack's next_attempt_at (issue #229 safety
+# re-review round 2, blocking finding, 2026-08-01 -- SYMMETRY with the
+# identical landlord_sms.py fix); emergency_sms is explicitly PINNED to have
+# NO backoff filter at all -- it must keep its unconditional every-tick
+# retry forever (see module docstring "TWO PASSES").
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("attempt", "expected_seconds"),
+    [
+        (1, 60.0),
+        (2, 120.0),
+        (3, 240.0),
+        (4, 480.0),
+        (5, 960.0),
+        (6, 1920.0),
+        (7, 3600.0),  # 60 * 2**6 = 3840, capped
+        (8, 3600.0),  # stays capped for every further attempt
+    ],
+)
+def test_tenant_ack_backoff_progression(attempt: int, expected_seconds: float) -> None:
+    """Pins the exact progression -- same formula and constants as
+    ``app/agent/landlord_sms.py``'s own ``_landlord_sms_backoff_seconds``
+    (issue #229 safety re-review round 2's reviewer-specified formula):
+    ``60s * 2**(attempt - 1)``, capped at 3600s."""
+    assert (
+        emergency_chain._tenant_ack_backoff_seconds(attempt)  # noqa: SLF001
+        == expected_seconds
+    )
+
+
+@pytest.mark.unit
+def test_emergency_sms_pass_select_has_no_backoff_filter() -> None:
+    """Structural pin (per the reviewer's own advisory): a future
+    "cleanup" harmonizing the two drain-pass SELECTs must never add a
+    ``next_attempt_at`` filter to the ``emergency_sms`` pass -- that row
+    type must retry EVERY tick, unconditionally (see
+    ``_SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL``'s own comment). Doing so would
+    silently reopen blocking finding 1's own starvation direction (a stuck
+    emergency_sms candidate quietly backing off instead of being retried
+    every tick -- the one non-redundant tenant-facing message in the whole
+    chain)."""
+    assert "next_attempt_at" not in str(
+        emergency_chain._SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL  # noqa: SLF001
+    )
+
+
+@pytest.mark.integration
+async def test_emergency_sms_pass_retries_every_tick_with_no_backoff(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    """Behavioral pin, complementing the structural one above: an
+    ``emergency_sms`` row that keeps failing is retried on EVERY call, even
+    when ``now`` never advances at all between calls -- proving no
+    backoff/``next_attempt_at`` window ever gates it, unlike ``tenant_ack``
+    (contrast
+    ``test_sms_drain_sweep_marks_failed_and_retries_on_the_next_tick``
+    above, which DOES need ``now`` to advance past its own backoff before
+    a retry succeeds)."""
+    landlord_id, property_id, tenant_id = await _seed(db_session)
+    message_id = await factories.insert_message(
+        db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
+    )
+    category, body = emergency_chain.render_tenant_safety_sms(["fire"])
+    notification_id = await _insert_emergency_sms_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        category=category,
+        body=body,
+    )
+
+    try:
+        fake_sender.fail_sms = True
+        now = datetime.now(UTC)  # deliberately the SAME `now` every call
+        for expected_attempt in range(1, 4):
+            outcomes = await emergency_chain.run_sms_drain_sweep(now=now)
+            assert [o.outcome for o in outcomes] == ["failed"]
+            notif = await _fetch_notification(db_session, notification_id)
+            assert notif["status"] == "failed"
+            assert notif["attempt"] == expected_attempt
     finally:
         await _cleanup(db_session, landlord_id)

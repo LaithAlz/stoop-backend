@@ -6,7 +6,18 @@ sweep:
 - ``app/agent/emergency_chain.py::run_emergency_chain_sweep``
 - ``app/agent/emergency_chain.py::run_sms_drain_sweep`` (safety review,
   2026-07-12, spec finding S1 / safety finding 3 — drains
-  ``tenant_ack``/``emergency_sms`` rows)
+  ``tenant_ack``/``emergency_sms`` rows). TWO PASSES internally (issue
+  #229, PR #228 senior re-review, blocking finding 1 — see that module's
+  own docstring): an UNBOUNDED pass drains every due ``emergency_sms`` row
+  (the one non-redundant tenant-facing message in the whole chain) to
+  completion first, then a SEPARATE 25s-bounded pass drains ``tenant_ack``
+  — a handful of permanently-failing ``tenant_ack`` rows can therefore
+  never starve a newer, genuinely-due ``emergency_sms`` row behind a
+  shared queue/budget the way an earlier single-pass revision of this
+  deadline did. The bounded pass alone is what stops an unbounded
+  per-send Twilio call chain here from delaying this SAME tick's own
+  ``run_emergency_chain_sweep`` NEXT run — see "Bounding sender_tick's own
+  worst-case duration" below.
 - ``app/agent/degraded_mode_sweep.py::sweep_degraded_mode_retries``
 - ``app/agent/draft_sender.py::sender_tick`` (#44/#45 integration commit —
   the ONLY other sanctioned outbound-send call site besides the emergency
@@ -46,13 +57,13 @@ sweep:
   module's own docstring and ``tests/test_twilio_send_allowlist.py``), but
   a landlord-facing convenience notice, same low-priority-ordering
   rationale as push above — never ahead of anything emergency/approval
-  -relevant. No wall-clock deadline of its own (unlike ``sender_tick``/
-  push): it has no bounded backoff schedule to race against (mirrors
-  ``run_sms_drain_sweep``'s own "resend every tick until sent" shape, not
-  ``run_push_outbox_sweep``'s bounded-attempt design) and, being LAST in
-  the tick, a slow/hanging run here only ever delays the NEXT tick's
-  FIRST sweep by its own duration — never itself, unlike a sweep earlier
-  in this same ordering.
+  -relevant. Wall-clock-bounded (issue #229 — see "Bounding sender_tick's
+  own worst-case duration" below), same as every other sweep in this list
+  except ``run_emergency_chain_sweep`` itself: even though, being LAST in
+  the tick, an unbounded run here would "only" delay the NEXT tick's FIRST
+  sweep (the emergency chain) rather than itself, that is exactly the
+  scenario the deadline exists to prevent — symmetric with
+  ``run_push_outbox_sweep``'s own rationale just above.
 
 Design choice (the campaign's "sender design menu" — (a) in-process
 asyncio periodic task, RECOMMENDED for v1; matches
@@ -67,8 +78,9 @@ file for the entire scheduler surface; if a FIFTH sweep ever needs
 combining here and this file starts to sprawl, split it back out rather
 than let it bloat.
 
-Bounding sender_tick's (and, since #210, run_push_outbox_sweep's) own
-worst-case duration (safety review, MEDIUM; extended HIGH-1 for push)
+Bounding sender_tick's (and, since #210, run_push_outbox_sweep's, and
+since #229, both SMS drain sweeps') own worst-case duration (safety
+review, MEDIUM; extended HIGH-1 for push; #229 for the two SMS drains)
 ------------------------------------------------------------------------
 ``sender_tick`` shares this SAME single ticker task with the three sweeps
 above — a slow tick here is a slow tick for the emergency chain sweep's
@@ -97,6 +109,36 @@ stop-claiming-not-abandoning semantics. Being the LAST sweep in the tick,
 an unbounded push backlog would otherwise delay only the NEXT tick's
 FIRST sweep (the emergency chain) — exactly the scenario this deadline
 exists to prevent, symmetric with sender_tick's own rationale above.
+
+``app/agent/emergency_chain.py::run_sms_drain_sweep`` and
+``app/agent/landlord_sms.py::run_landlord_sms_drain_sweep`` (issue #229,
+PR #228 senior-review advisory 1) share the identical risk shape once
+more — an unbounded number of due rows, each risking a Twilio HTTP call,
+with NO per-tick cap of their own. Before #229 neither had a wall-clock
+deadline at all (unlike ``sender_tick``/``run_push_outbox_sweep``), a real
+symmetry gap: ``run_sms_drain_sweep`` runs 2nd in this same tick (directly
+before ``run_emergency_chain_sweep``'s NEXT run, one tick later), and
+``run_landlord_sms_drain_sweep`` runs LAST, so a hung Twilio call chain in
+either could delay that next emergency sweep. ``run_landlord_sms_drain_sweep``
+is bounded straightforwardly: its own ``DEFAULT_TICK_DEADLINE_SECONDS``
+(25s), an injectable time source, stop-claiming-not-abandoning semantics
+— a candidate already claimed and mid-send always finishes; leftover due
+candidates simply wait, still ``'pending'``/``'failed'``, for the very
+next tick. ``run_sms_drain_sweep`` is bounded in TWO SEPARATE PASSES
+instead of one shared budget (safety re-review, blocking finding 1,
+2026-08-01 — see that module's own docstring): an UNBOUNDED first pass
+drains every due ``emergency_sms`` row to completion (never capped — this
+is the one non-redundant tenant-facing message in the whole chain), THEN
+a 25s-bounded second pass drains ``tenant_ack`` the same
+stop-claiming-not-abandoning way. A single shared queue/budget across both
+row types was tried first and reverted: a handful of older,
+permanently-failing ``tenant_ack`` rows could consume the entire 25s
+budget before the loop ever reached a newer, genuinely-due
+``emergency_sms`` row sorting later in one combined ``created_at``
+ordering — a real, reproduced starvation bug, not a hypothetical one.
+``run_emergency_chain_sweep`` itself (job 1, runs FIRST) is deliberately
+UNCHANGED by #229 — out of scope for that issue; see its own module
+docstring.
 
 Crash-safety
 ------------

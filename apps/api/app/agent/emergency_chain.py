@@ -189,8 +189,10 @@ machine-enforced by ``tests/test_twilio_send_allowlist.py``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
+from collections.abc import Callable
 from contextlib import asynccontextmanager as _acm
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -1256,13 +1258,165 @@ async def run_emergency_chain_sweep(*, now: datetime | None = None) -> list[Emer
 # terminal value ``degraded_retry`` uses) so a second tick is a true
 # no-op for that row, never an infinite, silently-repeating no-op send
 # attempt.
+#
+# Wall-clock tick deadline (issue #229, PR #228 senior-review advisory 1) --
+# TWO PASSES, not one shared queue (safety re-review, blocking finding 1,
+# 2026-08-01)
+# --------------------------------------------------------------------------
+# This sweep shares the SAME single scheduler ticker task
+# (``app/scheduler.py``) as ``run_emergency_chain_sweep`` (which runs
+# BEFORE it, unchanged/out of scope for #229) and every other sweep that
+# tick -- an unbounded run here, one ``send_sms`` per due row with no
+# per-tick cap, could otherwise delay the NEXT tick's emergency chain
+# sweep. Bounded the identical way ``app/agent/draft_sender.py::sender_tick``
+# / ``app/push_outbox.py::run_push_outbox_sweep`` already are: a wall-clock
+# budget (:data:`DEFAULT_TICK_DEADLINE_SECONDS`, 25s by default, computed
+# from an injectable *time_source*).
+#
+# An EARLIER revision of this deadline drained BOTH ``tenant_ack`` and
+# ``emergency_sms`` from ONE shared ``ORDER BY created_at`` queue under the
+# SAME budget -- a genuine, reproduced starvation bug: a handful of older,
+# permanently-failing ``tenant_ack`` rows (each risking the full 10s Twilio
+# timeout, ``app/integrations/twilio_send.py``'s ``AsyncTwilioHttpClient``)
+# could consume the ENTIRE 25s budget before the loop ever reached a
+# NEWER, genuinely-due ``emergency_sms`` row later in the same
+# ``created_at`` ordering -- the one non-redundant tenant-facing message in
+# the whole chain (see "Idempotency" above) silently never attempted, tick
+# after tick, for as long as the poisoned ``tenant_ack`` rows kept sorting
+# first. Fixed by giving ``emergency_sms`` its OWN, UNBOUNDED pass, run
+# FIRST and to completion every tick, entirely independent of the deadline:
+# ``emergency_sms`` rows are rare (tens at most, per the T+0 emergency
+# chain's own cadence -- never a bulk-insert path), so draining ALL of them
+# every tick, however long that takes, is the correct trade -- exactly
+# mirroring why this row type's retry-forever ('failed' never 'exhausted'
+# except for the structural ``no_tenant_phone`` case) semantics were never
+# capped in the first place (see "Idempotency" above). ``tenant_ack`` gets
+# its OWN, SEPARATE 25s-bounded pass, run second, using the exact
+# stop-claiming-not-abandoning discipline the (now-removed) single-queue
+# version used. Both passes still order ``ORDER BY created_at`` within
+# themselves; ONLY cross-type ordering (a stale ``tenant_ack`` blocking a
+# fresh ``emergency_sms``) was ever the problem.
 
-_SELECT_DUE_SMS_DRAIN_SQL = text(
+DEFAULT_TICK_DEADLINE_SECONDS: float = 25.0
+"""Wall-clock budget for the ``tenant_ack`` pass of one
+:func:`run_sms_drain_sweep` call (issue #229, PR #228 senior-review
+advisory 1) -- same value and rationale as
+``app/agent/draft_sender.py::DEFAULT_TICK_DEADLINE_SECONDS`` /
+``app/push_outbox.py::DEFAULT_TICK_DEADLINE_SECONDS``: this sweep shares
+the single scheduler ticker task with ``run_emergency_chain_sweep``, which
+must run promptly every tick. Once exceeded, the ``tenant_ack`` pass stops
+CLAIMING new candidates for that tick -- a candidate already claimed and
+mid-send always finishes; any leftover due rows simply remain due, picked
+up whole by the very next tick. Does NOT bound the ``emergency_sms``
+pass, which runs first, unbounded, to completion every tick -- see "TWO
+PASSES" above."""
+
+_SMS_DRAIN_SELECT_BATCH_LIMIT: int = 100
+"""Per-tick cap on how many due ``tenant_ack`` candidates one sweep call
+reads (issue #229, PR #228 senior-review advisory 2) -- mirrors
+``app/push_outbox.py``'s own ``_PUSH_OUTBOX_SWEEP_BATCH_LIMIT`` (same
+"bounded work per tick" discipline, same chosen value); anything left over
+is still due and is picked up on the NEXT tick. Deliberately NOT applied
+to the ``emergency_sms`` SELECT (see "TWO PASSES" above) -- capping that
+one would silently reintroduce the exact starvation bug this fix closes,
+just past the 100th row instead of past the 25s budget."""
+
+# Safety re-review round 2, blocking finding, 2026-08-01 -- SYMMETRY with
+# app/agent/landlord_sms.py's own fix for the identical A1+A2-shaped risk:
+# a permanently-failing ``tenant_ack`` row never exhausts (no exhaustion
+# cap exists for this type at all -- only the structural
+# ``no_tenant_phone`` terminal case, see module docstring "Idempotency")
+# and, with the batch LIMIT above + `ORDER BY created_at` + no backoff, a
+# cluster of stuck ``tenant_ack`` rows could permanently occupy the entire
+# LIMIT 100 window's head, hiding a newer, genuinely-due ``tenant_ack`` row
+# from ever being selected at all -- the SAME shape as the landlord_sms.py
+# finding, just for holding-ack SMS instead of draft-ready notices. Fixed
+# the SAME way: exponential backoff on ``next_attempt_at`` on every
+# genuine send failure, so a stuck row falls OUT of the window's head
+# instead of permanently occupying a slot.
+#
+# Backoff basis is ``attempt`` here, NOT a dedicated ``send_failures``
+# payload counter (deliberately, a narrower fix than landlord_sms.py's own
+# blocking-finding-2 remediation): this module's ``attempt`` column was
+# never the subject of an attempt-burn finding the way landlord_sms.py's
+# was, and adding a whole new payload-counter mechanism to LEGACY-BEHAVIOR
+# rows this issue never asked to attempt-burn-harden is real scope creep
+# for a backoff-only fix. The practical consequence is bounded and benign:
+# a crash/CancelledError between claim and send would advance the backoff
+# exponent slightly further than a "genuine failures only" count would --
+# but since ``tenant_ack`` retries forever regardless (no exhaustion cap
+# to prematurely trip), an occasionally-larger-than-warranted backoff
+# delay is a minor LATENCY effect, never a lost notification or an
+# incorrect terminal state. NOT applied to ``emergency_sms`` at all (see
+# "TWO PASSES" above and :data:`_SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL`'s own
+# comment) -- the tenant safety SMS keeps its unconditional every-tick
+# retry; a future "cleanup" adding a backoff there would silently reopen
+# blocking finding 1's own starvation direction (a stuck emergency_sms
+# candidate backing off instead of being retried every tick).
+_TENANT_ACK_BACKOFF_BASE_SECONDS: float = 60.0
+"""Base interval for :func:`_tenant_ack_backoff_seconds` -- same value and
+rationale as ``app/agent/landlord_sms.py``'s own
+``_LANDLORD_SMS_BACKOFF_BASE_SECONDS`` (one scheduler tick, so the FIRST
+genuine failure's backoff is indistinguishable from "just try again next
+tick")."""
+
+_TENANT_ACK_BACKOFF_CAP_SECONDS: float = 3600.0
+"""Backoff ceiling (1 hour) -- same value and rationale as
+``app/agent/landlord_sms.py``'s own ``_LANDLORD_SMS_BACKOFF_CAP_SECONDS``:
+a stuck ``tenant_ack`` row (which never exhausts) must still be retried at
+some bounded worst-case cadence forever."""
+
+
+def _tenant_ack_backoff_seconds(attempt: int) -> float:
+    """Pure: exponential backoff for the Nth claim/send attempt of a
+    ``tenant_ack`` candidate (1-indexed — ``attempt=1`` is the FIRST
+    attempt). ``60s * 2**(attempt - 1)``, capped at 3600s -- same
+    progression as ``app/agent/landlord_sms.py``'s own
+    ``_landlord_sms_backoff_seconds``, over ``attempt`` rather than a
+    dedicated failure counter (see the module comment above
+    :data:`_TENANT_ACK_BACKOFF_BASE_SECONDS` for why)."""
+    uncapped = _TENANT_ACK_BACKOFF_BASE_SECONDS * float(2 ** (attempt - 1))
+    return min(uncapped, _TENANT_ACK_BACKOFF_CAP_SECONDS)
+
+
+def _default_time_source() -> float:
+    """The real, monotonic clock :func:`run_sms_drain_sweep` budgets its
+    wall-clock deadline against -- mirrors
+    ``app/agent/draft_sender.py::_default_time_source`` /
+    ``app/push_outbox.py::_default_time_source`` exactly
+    (``asyncio.get_running_loop().time()``). Injectable so tests can
+    advance a fake clock deterministically instead of sleeping for real
+    seconds."""
+    return asyncio.get_running_loop().time()
+
+
+_SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL = text(
     """
     SELECT id, landlord_id, type, attempt, payload
     FROM notifications
-    WHERE type IN ('tenant_ack', 'emergency_sms') AND status IN ('pending', 'failed')
+    WHERE type = 'emergency_sms' AND status IN ('pending', 'failed')
     ORDER BY created_at
+    """
+)
+# Deliberately NO LIMIT and NO next_attempt_at/backoff filter -- see "TWO
+# PASSES" above and the backoff comment above _TENANT_ACK_BACKOFF_BASE_
+# SECONDS: this pass must drain every due emergency_sms row every tick,
+# unconditionally and unbounded, or BOTH fixes regress (the LIMIT
+# regression reintroduces blocking finding 1's starvation; a backoff
+# filter here would silently reintroduce it in a subtler shape -- a stuck
+# emergency_sms row LOOKS handled because it keeps "retrying", but a
+# backed-off one would stop being attempted every tick, which is exactly
+# what this row type must never do). Pinned by
+# test_emergency_sms_pass_has_no_backoff_filter.
+
+_SELECT_DUE_TENANT_ACK_DRAIN_SQL = text(
+    """
+    SELECT id, landlord_id, type, attempt, payload
+    FROM notifications
+    WHERE type = 'tenant_ack' AND status IN ('pending', 'failed')
+      AND (next_attempt_at IS NULL OR next_attempt_at <= :now)
+    ORDER BY created_at
+    LIMIT :limit
     """
 )
 
@@ -1281,9 +1435,24 @@ _MARK_SMS_DRAIN_SENT_SQL = text(
 _MARK_SMS_DRAIN_FAILED_SQL = text(
     "UPDATE notifications SET status = 'failed', updated_at = now() WHERE id = :id"
 )
-# ``'failed'`` is TRANSIENT-ONLY -- it stays inside _SELECT_DUE_SMS_DRAIN_SQL's
-# ``status IN ('pending', 'failed')`` retry set, so the next tick tries
-# again. Never use it for an outcome that retrying can never fix.
+# ``'failed'`` is TRANSIENT-ONLY -- it stays inside both
+# _SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL's and
+# _SELECT_DUE_TENANT_ACK_DRAIN_SQL's own ``status IN ('pending', 'failed')``
+# retry set, so the next tick tries again. Never use it for an outcome that
+# retrying can never fix. Used for BOTH row types' failure path EXCEPT
+# ``tenant_ack``'s own backoff write below -- see
+# :data:`_MARK_TENANT_ACK_FAILED_WITH_BACKOFF_SQL`'s own comment.
+
+# Safety re-review round 2, blocking finding, 2026-08-01 -- tenant_ack-ONLY
+# variant that ALSO sets `next_attempt_at` (exponential backoff, see the
+# module comment above _TENANT_ACK_BACKOFF_BASE_SECONDS). NEVER used for
+# emergency_sms (that pass keeps _MARK_SMS_DRAIN_FAILED_SQL, unconditional
+# every-tick retry -- see _SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL's own
+# comment).
+_MARK_TENANT_ACK_FAILED_WITH_BACKOFF_SQL = text(
+    "UPDATE notifications SET status = 'failed', updated_at = now(), "
+    "next_attempt_at = :next_attempt_at WHERE id = :id"
+)
 
 _MARK_SMS_DRAIN_EXHAUSTED_SQL = text(
     "UPDATE notifications SET status = 'exhausted', updated_at = now() WHERE id = :id"
@@ -1293,7 +1462,7 @@ _MARK_SMS_DRAIN_EXHAUSTED_SQL = text(
 # message's row has no stored channel back to a tenant (see module
 # docstring "Known limitation"). Marking it ``'failed'`` (the previous
 # behavior) was a genuine bug dressed up as "terminal" in a comment only:
-# ``'failed'`` rows ARE re-selected by _SELECT_DUE_SMS_DRAIN_SQL every
+# ``'failed'`` rows ARE re-selected by both drain-pass SELECTs above every
 # tick forever, so the sweep would silently re-attempt (and re-fail) this
 # exact row on every single tick, indefinitely. ``'exhausted'`` (schema-
 # v1.md's CHECK already allows it -- the SAME terminal value
@@ -1336,10 +1505,16 @@ def _sms_drain_candidate_from_row(row: dict[str, Any]) -> SmsDrainCandidate | No
     )
 
 
-async def _process_sms_drain_candidate(candidate: SmsDrainCandidate) -> str:
+async def _process_sms_drain_candidate(
+    candidate: SmsDrainCandidate, *, effective_now: datetime
+) -> str:
     """Claim + send exactly ONE attempt for *candidate* (may raise —
     callers must never let one candidate's exception silently stall the
-    whole tick; see :func:`run_sms_drain_sweep`)."""
+    whole tick; see :func:`run_sms_drain_sweep`). *effective_now* is used
+    ONLY for ``tenant_ack``'s own backoff write on a genuine send failure
+    (safety re-review round 2) -- a no-op for ``emergency_sms`` candidates,
+    which never back off (see :data:`_SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL`'s
+    own comment)."""
     new_attempt = candidate.attempt + 1
 
     async with _acm(get_admin_session)() as session:
@@ -1409,9 +1584,23 @@ async def _process_sms_drain_candidate(candidate: SmsDrainCandidate) -> str:
             },
         )
         async with _acm(get_admin_session)() as session:
-            await session.execute(
-                _MARK_SMS_DRAIN_FAILED_SQL, {"id": str(candidate.notification_id)}
-            )
+            if candidate.notification_type == "tenant_ack":
+                # Safety re-review round 2 -- exponential backoff, see the
+                # module comment above _TENANT_ACK_BACKOFF_BASE_SECONDS.
+                # NEVER for emergency_sms (see _SELECT_DUE_EMERGENCY_SMS_
+                # DRAIN_SQL's own comment) -- that branch below is
+                # unaffected, still _MARK_SMS_DRAIN_FAILED_SQL.
+                next_attempt_at = effective_now + timedelta(
+                    seconds=_tenant_ack_backoff_seconds(new_attempt)
+                )
+                await session.execute(
+                    _MARK_TENANT_ACK_FAILED_WITH_BACKOFF_SQL,
+                    {"id": str(candidate.notification_id), "next_attempt_at": next_attempt_at},
+                )
+            else:
+                await session.execute(
+                    _MARK_SMS_DRAIN_FAILED_SQL, {"id": str(candidate.notification_id)}
+                )
         return "failed"
 
     async with _acm(get_admin_session)() as session:
@@ -1425,13 +1614,15 @@ async def _process_sms_drain_candidate(candidate: SmsDrainCandidate) -> str:
     return "sent"
 
 
-async def _run_sms_drain_candidate_safely(candidate: SmsDrainCandidate) -> str:
+async def _run_sms_drain_candidate_safely(
+    candidate: SmsDrainCandidate, *, effective_now: datetime
+) -> str:
     """Never-raises wrapper — same rationale as
     :func:`_run_candidate_safely`: a row's own claim (or lack thereof) is
     the only durable state this sweep depends on, so there is no
     "stuck forever" risk from one candidate's exception blocking others."""
     try:
-        return await _process_sms_drain_candidate(candidate)
+        return await _process_sms_drain_candidate(candidate, effective_now=effective_now)
     except Exception as exc:
         log.error(
             "sms_drain_candidate_processing_failed",
@@ -1451,24 +1642,24 @@ async def _run_sms_drain_candidate_safely(candidate: SmsDrainCandidate) -> str:
         return "processing_error"
 
 
-async def run_sms_drain_sweep(*, now: datetime | None = None) -> list[SmsDrainOutcome]:
-    """DB entrypoint for one SMS-drain sweep tick — drains every
-    ``pending``/``failed`` ``tenant_ack``/``emergency_sms`` row, resending
-    until genuinely delivered. Called by ``app/scheduler.py``'s 60-second
-    ticker, in the SAME tick as :func:`run_emergency_chain_sweep` and
-    ``app/agent/degraded_mode_sweep.py::sweep_degraded_mode_retries``.
-    ``now`` is accepted for call-site symmetry with the other sweeps but
-    unused — there is no schedule here, only "not yet sent"."""
-    del now
+async def _drain_emergency_sms_pass(*, effective_now: datetime) -> list[SmsDrainOutcome]:
+    """Pass 1 -- UNBOUNDED. Drains every due ``emergency_sms`` row to
+    completion, every tick, with no deadline and no cap (see "TWO PASSES"
+    above). Run FIRST, before the ``tenant_ack`` pass, so a poisoned/slow
+    ``tenant_ack`` backlog can never sit ahead of the tenant safety text in
+    program order either. *effective_now* is threaded through purely for
+    :func:`_process_sms_drain_candidate`'s shared signature -- a genuine
+    no-op for every candidate here, which are all ``emergency_sms`` (never
+    backed off)."""
     async with _acm(get_admin_session)() as session:
-        rows = (await session.execute(_SELECT_DUE_SMS_DRAIN_SQL)).mappings().all()
+        rows = (await session.execute(_SELECT_DUE_EMERGENCY_SMS_DRAIN_SQL)).mappings().all()
         candidates = [
             c for row in rows if (c := _sms_drain_candidate_from_row(dict(row))) is not None
         ]
 
     outcomes: list[SmsDrainOutcome] = []
     for candidate in candidates:
-        outcome = await _run_sms_drain_candidate_safely(candidate)
+        outcome = await _run_sms_drain_candidate_safely(candidate, effective_now=effective_now)
         outcomes.append(
             SmsDrainOutcome(
                 notification_id=candidate.notification_id,
@@ -1476,7 +1667,107 @@ async def run_sms_drain_sweep(*, now: datetime | None = None) -> list[SmsDrainOu
                 outcome=outcome,
             )
         )
+    return outcomes
 
+
+async def _drain_tenant_ack_pass(
+    *, effective_now: datetime, deadline_seconds: float, time_source: Callable[[], float]
+) -> list[SmsDrainOutcome]:
+    """Pass 2 -- 25s-bounded (issue #229). Drains due ``tenant_ack`` rows,
+    up to :data:`_SMS_DRAIN_SELECT_BATCH_LIMIT` candidates, stopping
+    CLAIMING new ones once *deadline_seconds* is exceeded (stop-claiming
+    -not-abandoning — see "TWO PASSES" above). *start* is taken BEFORE the
+    candidate SELECT (issue #229, PR #228 senior-review advisory 2) so the
+    budget covers the SELECT's own duration too, not just the claim/send
+    loop. *effective_now* is the DB-side "what's due" clock (safety
+    re-review round 2's backoff window) -- unrelated to *time_source*,
+    which bounds only this call's own wall-clock duration."""
+    start = time_source()
+    async with _acm(get_admin_session)() as session:
+        rows = (
+            (
+                await session.execute(
+                    _SELECT_DUE_TENANT_ACK_DRAIN_SQL,
+                    {"limit": _SMS_DRAIN_SELECT_BATCH_LIMIT, "now": effective_now},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        candidates = [
+            c for row in rows if (c := _sms_drain_candidate_from_row(dict(row))) is not None
+        ]
+
+    outcomes: list[SmsDrainOutcome] = []
+    for index, candidate in enumerate(candidates):
+        if time_source() - start >= deadline_seconds:
+            # Wall-clock budget exceeded (issue #229) -- stop CLAIMING new
+            # candidates for the rest of this tick. Every candidate claimed
+            # above already finished processing (this loop awaits each one
+            # in turn, never abandoning a claimed row mid-send); the
+            # remaining candidates stay 'pending'/'failed' and due, claimed
+            # whole by the very next tick -- nothing lost, see
+            # DEFAULT_TICK_DEADLINE_SECONDS's own docstring.
+            log.info(
+                "sms_drain_sweep_tenant_ack_deadline_reached",
+                claimed_this_tick=len(outcomes),
+                remaining_candidates=len(candidates) - index,
+            )
+            break
+        outcome = await _run_sms_drain_candidate_safely(candidate, effective_now=effective_now)
+        outcomes.append(
+            SmsDrainOutcome(
+                notification_id=candidate.notification_id,
+                notification_type=candidate.notification_type,
+                outcome=outcome,
+            )
+        )
+    return outcomes
+
+
+async def run_sms_drain_sweep(
+    *,
+    now: datetime | None = None,
+    deadline_seconds: float = DEFAULT_TICK_DEADLINE_SECONDS,
+    time_source: Callable[[], float] = _default_time_source,
+) -> list[SmsDrainOutcome]:
+    """DB entrypoint for one SMS-drain sweep tick — drains every
+    ``pending``/``failed`` ``tenant_ack``/``emergency_sms`` row, resending
+    until genuinely delivered. Called by ``app/scheduler.py``'s 60-second
+    ticker, in the SAME tick as :func:`run_emergency_chain_sweep` and
+    ``app/agent/degraded_mode_sweep.py::sweep_degraded_mode_retries``.
+
+    ``now`` is an injectable override purely for tests (mirrors
+    ``run_emergency_chain_sweep(*, now=...)``/
+    ``run_push_outbox_sweep(*, now=...)``) — the DB-side "what's due" clock
+    for ``tenant_ack``'s own backoff window (safety re-review round 2, see
+    "TWO PASSES" below); a genuine no-op for ``emergency_sms``, which never
+    backs off. Production callers never pass it; the default is genuine
+    wall-clock time.
+
+    TWO PASSES (issue #229, PR #228 senior-review, blocking finding 1) —
+    see the module-level "TWO PASSES" comment above :data:`
+    DEFAULT_TICK_DEADLINE_SECONDS` for the full starvation story this
+    fixes: :func:`_drain_emergency_sms_pass` (UNBOUNDED, runs first, drains
+    every due ``emergency_sms`` row to completion) then
+    :func:`_drain_tenant_ack_pass` (25s-bounded, runs second). A poisoned
+    ``tenant_ack`` backlog can therefore never delay, let alone starve, a
+    genuinely due ``emergency_sms`` row — the two row types no longer share
+    a queue or a budget at all.
+
+    *deadline_seconds*/*time_source* bound ONLY the ``tenant_ack`` pass
+    (issue #229 — see "TWO PASSES" above); *time_source* defaults to the
+    real event loop clock (:func:`_default_time_source`) — tests inject a
+    fake, monotonically-advanceable callable instead of sleeping for real
+    seconds.
+    """
+    effective_now = now if now is not None else datetime.now(UTC)
+    outcomes = await _drain_emergency_sms_pass(effective_now=effective_now)
+    outcomes.extend(
+        await _drain_tenant_ack_pass(
+            effective_now=effective_now, deadline_seconds=deadline_seconds, time_source=time_source
+        )
+    )
     log.info("sms_drain_sweep_complete", candidates_processed=len(outcomes))
     return outcomes
 
@@ -1638,6 +1929,7 @@ async def acknowledge_by_token(token: str, *, channel: str) -> tuple[UUID, datet
 
 
 __all__: list[str] = [
+    "DEFAULT_TICK_DEADLINE_SECONDS",
     "ESCALATION_FIXED_OFFSETS_MINUTES",
     "ESCALATION_REPEAT_INTERVAL_MINUTES",
     "TENANT_STATUS_TEMPLATE",

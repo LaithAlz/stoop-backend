@@ -247,20 +247,29 @@ async def _insert_ready_notification(
     case_id: str,
     draft_id: str,
     created_at: datetime | None = None,
+    status: str = "sent",
 ) -> str:
+    """*status* defaults to ``'sent'`` (safety re-review, blocking finding
+    3, 2026-08-01): ``app/agent/landlord_sms.py``'s
+    ``_SELECT_MOST_RECENT_READY_DRAFT_SQL`` now only correlates against
+    ACTUALLY-DELIVERED notices — a landlord replying "1"/"2"/"UNDO" in
+    every test in this file is, by construction, replying to a text that
+    reached their phone, so ``'sent'`` is the realistic precondition, not
+    a test-only shortcut."""
     notification_id = str(uuid.uuid4())
     payload = {"draft_id": draft_id, "kind": "ready", "body": "Draft ready..."}
     await session.execute(
         text(
             "INSERT INTO notifications "
             "(id, landlord_id, case_id, type, channel, status, payload, created_at) "
-            "VALUES (:id, :landlord_id, :case_id, 'draft_ready', 'sms', 'pending', "
+            "VALUES (:id, :landlord_id, :case_id, 'draft_ready', 'sms', :status, "
             "CAST(:payload AS jsonb), COALESCE(:created_at, now()))"
         ),
         {
             "id": notification_id,
             "landlord_id": landlord_id,
             "case_id": case_id,
+            "status": status,
             "payload": json.dumps(payload),
             "created_at": created_at,
         },

@@ -173,13 +173,22 @@ async def test_resolve_reply_correlates_to_most_recent_ready_notice(
         db_session, landlord_id=landlord_id, property_id=property_id, tenant_id=tenant_id
     )
     draft_id = await factories.insert_draft(db_session, landlord_id=landlord_id, case_id=case_id)
-    await landlord_sms.enqueue_landlord_sms(
+    notification_id = await landlord_sms.enqueue_landlord_sms(
         db_session,
         landlord_id=uuid.UUID(landlord_id),
         case_id=uuid.UUID(case_id),
         draft_id=uuid.UUID(draft_id),
         kind=landlord_sms.KIND_READY,
         body="Draft ready...",
+    )
+    await db_session.commit()
+    # Safety re-review, blocking finding 3, 2026-08-01: correlation now
+    # only considers ACTUALLY-DELIVERED ('sent') notices -- a landlord
+    # replying "1" is, by construction, replying to a text that reached
+    # their phone.
+    await db_session.execute(
+        text("UPDATE notifications SET status = 'sent' WHERE id = :id"),
+        {"id": str(notification_id)},
     )
     await db_session.commit()
 
