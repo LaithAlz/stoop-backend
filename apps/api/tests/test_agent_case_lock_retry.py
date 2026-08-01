@@ -139,78 +139,114 @@ async def test_n_greater_than_pool_capacity_distinct_cases_all_complete() -> Non
 
 
 @pytest.mark.integration
-async def test_chatty_case_backlog_does_not_starve_unrelated_cases() -> None:
-    """Reproduces the reviewer's own repro shape: 12 messages racing for
-    the SAME (hot) case_id, genuinely serialized (correct), running
-    CONCURRENTLY with 8 UNRELATED, distinct-case messages that have
-    nothing to do with the hot case's contention. Before this fix, the 12
-    hot-case waiters alone could pin every connection the dedicated pool
-    has (each blocked, holding a connection, waiting its turn) -- leaving
-    the 8 unrelated cases unable to even ATTEMPT their own, otherwise
-    -instant, uncontended acquisition.
+async def test_chatty_case_backlog_does_not_starve_unrelated_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the reviewer's own repro shape, tuned to actually
+    DISCRIMINATE (safety review, #186 follow-up round, ADVISORY-4
+    remainder — the earlier relative-timing version of this test could
+    pass even under the pre-BLOCKING-2 shape on a fast enough machine;
+    this version makes the outcome BINARY instead of timing-dependent):
+    12 messages racing for the SAME (hot) case_id, genuinely serialized
+    (correct, each holding for 0.3s -- long enough that 12 of them
+    cannot fully drain inside this test's shrunk pool-checkout window),
+    running CONCURRENTLY with 8 UNRELATED, distinct-case messages that
+    have nothing to do with the hot case's contention.
 
-    Asserts the unrelated 8 finish in a MEANINGFULLY SMALLER fraction of
-    the hot case's own total drain time (a RELATIVE comparison against
-    ``last_hot_elapsed``, not a fixed absolute bound): this environment's
-    own connection-establishment latency (observed directly against this
-    dedicated pool: ~0.4s just to open a fresh physical connection,
-    dominating over this test's millisecond-scale ``hold_seconds``) makes
-    an absolute wall-clock prediction for the hot chain's own duration
-    unreliable across machines/CI runners, but the RATIO between "how long
-    did the unrelated cases take" and "how long did the hot case's own
-    backlog take" is exactly the signal that distinguishes "unrelated
-    cases proceed independently" (small ratio) from "unrelated cases
-    queued behind the hot backlog" (ratio near/at 1.0, the pre-fix
-    behavior) regardless of the absolute numbers this run happens to
-    produce.
+    The discriminating technique (same one already used at
+    ``test_saturating_the_dedicated_pool_raises_sqlalchemy_timeout_error``
+    above): shrink the DEDICATED POOL's own checkout timeout
+    (``case_lock_engine.pool._timeout``) to 0.5s. Under THIS fix, waiting
+    for a contended lock never pins a pool connection at all (module
+    docstring "Bounded try-lock retries, not a blocking wait"), so the 8
+    unrelated, uncontended cases each need the pool for only a brief,
+    uncontended instant regardless of how deep the hot backlog is --
+    all 8 succeed. Under the PRE-BLOCKING-2 shape (a single blocking
+    ``pg_advisory_xact_lock`` call issued AFTER an already-checked-out
+    connection), the 12 hot-case waiters alone would pin the pool for the
+    hot chain's own multi-second drain, so an unrelated case's OWN
+    checkout attempt would sit in the pool's queue past the shrunk 0.5s
+    timeout and raise ``sqlalchemy.exc.TimeoutError`` -- 0/8 would
+    succeed. Binary (8/8 vs 0/8), not a fuzzy timing ratio, and the whole
+    test completes in well under 4s (12 * 0.3s hot chain + retry-loop
+    overhead, comfortably bounded).
+
+    Pool warm-up, BEFORE shrinking the timeout: ``tests/conftest.py``'s
+    autouse ``_reset_case_lock_pool`` disposes this pool before every
+    test, so it starts genuinely cold. Establishing a brand-new physical
+    connection in this environment measurably takes real time (observed
+    directly, several hundred ms — see ``tests/test_agent_case_lock_
+    pool.py``'s own docstring on the ADVISORY-1 churn measurement); a
+    burst of 20 simultaneous FIRST-ever checkouts against a cold pool can
+    occasionally exceed a 0.5s timeout on connection-establishment
+    latency ALONE, unrelated to this fix's own correctness — a genuine
+    flake class, not a signal. Forcing all
+    :data:`case_lock_pool_mod._LOCK_POOL_SIZE` connections to be
+    established once, up front, under the pool's UNMODIFIED default
+    timeout, isolates the actual variable under test (lock contention
+    behavior) from one-time connection-establishment variance.
     """
+    engine = case_lock_pool_mod.case_lock_engine
+    warm_up_case_ids = [uuid.uuid4() for _ in range(case_lock_pool_mod._LOCK_POOL_SIZE)]  # noqa: SLF001
+    await asyncio.gather(
+        *(_hold_case_lock_briefly(cid, hold_seconds=0.01) for cid in warm_up_case_ids)
+    )
+
+    monkeypatch.setattr(engine.pool, "_timeout", 0.5)  # noqa: SLF001
+
     hot_case_id = uuid.uuid4()
-    hot_hold_seconds = 0.05
+    hot_hold_seconds = 0.3
     hot_message_count = 12
     unrelated_case_count = 8
 
     unrelated_case_ids = [uuid.uuid4() for _ in range(unrelated_case_count)]
-    unrelated_done_at: list[float] = []
 
     async def _unrelated(case_id: uuid.UUID) -> None:
         await _hold_case_lock_briefly(case_id, hold_seconds=0.01)
-        unrelated_done_at.append(time.monotonic())
-
-    hot_done_at: list[float] = []
 
     async def _hot() -> None:
         await _hold_case_lock_briefly(hot_case_id, hold_seconds=hot_hold_seconds)
-        hot_done_at.append(time.monotonic())
 
     start = time.monotonic()
-    results = await asyncio.gather(
+    unrelated_results = await asyncio.gather(
         *(_hot() for _ in range(hot_message_count)),
         *(_unrelated(cid) for cid in unrelated_case_ids),
         return_exceptions=True,
     )
+    elapsed = time.monotonic() - start
 
-    failures = [r for r in results if isinstance(r, BaseException)]
-    assert not failures, f"unexpected failures: {failures!r}"
-    assert len(unrelated_done_at) == unrelated_case_count
-    assert len(hot_done_at) == hot_message_count
+    hot_results = unrelated_results[:hot_message_count]
+    unrelated_only_results = unrelated_results[hot_message_count:]
 
-    last_unrelated_elapsed = max(unrelated_done_at) - start
-    last_hot_elapsed = max(hot_done_at) - start
-
-    # The unrelated cases must finish having taken meaningfully LESS time
-    # than the hot case's own full serialized chain -- proving they were
-    # never queued BEHIND the hot backlog, whatever the hot chain's own
-    # absolute duration (dominated by this environment's connection
-    # -establishment latency, not by this fix's own logic) turns out to be.
-    assert last_unrelated_elapsed < last_hot_elapsed * 0.75, (
-        f"unrelated cases took {last_unrelated_elapsed:.2f}s of the hot case's own "
-        f"{last_hot_elapsed:.2f}s total -- too close to 1.0x, suggesting they were "
-        "starved behind the hot backlog rather than proceeding independently"
+    unrelated_failures = [r for r in unrelated_only_results if isinstance(r, BaseException)]
+    assert not unrelated_failures, (
+        f"{len(unrelated_failures)}/{unrelated_case_count} unrelated, uncontended cases were "
+        f"starved behind the hot case's own backlog: {unrelated_failures!r}"
     )
+
     # The hot case's own chain still eventually, correctly, fully drains --
-    # genuine serialization under contention still works (every one of the
-    # 12 completed, asserted above), this fix did not trade correctness
-    # for the head-of-line fix.
+    # genuine serialization under contention still works, this fix did not
+    # trade correctness for the head-of-line fix. (A hot-case attempt
+    # COULD, in principle, itself hit the shrunk 0.5s pool timeout while
+    # WAITING for its own turn behind 11 others under the bounded retry
+    # loop's own -- separate -- _CASE_LOCK_MAX_WAIT_SECONDS bound, which
+    # this test's autouse fixture already set to 5.0s, comfortably above
+    # the ~3.6s the hot chain itself needs; the assertion below is the
+    # actual regression proof, not a tautology.)
+    hot_failures = [r for r in hot_results if isinstance(r, BaseException)]
+    assert not hot_failures, f"hot-case messages unexpectedly failed: {hot_failures!r}"
+
+    # Sanity bound, not the load-bearing assertion (the failure checks
+    # above are): the hot chain's own theoretical minimum is
+    # hot_message_count * hot_hold_seconds (~3.6s) -- this environment's
+    # own one-time connection-establishment cost for a freshly-reset pool
+    # (tests/conftest.py's autouse _reset_case_lock_pool disposes it
+    # before every test) adds a further, empirically observed, ~0.5s on
+    # top locally. A generous ceiling here still catches a genuine hang
+    # (the OLD, pre-BLOCKING-2 shape would have FAILED fast with
+    # TimeoutErrors well before this bound, never merely run long) without
+    # being flaky against normal environment variance.
+    assert elapsed < 6.0, f"test took {elapsed:.2f}s -- expected well under 6s"
 
 
 # ---------------------------------------------------------------------------

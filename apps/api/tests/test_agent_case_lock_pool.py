@@ -71,31 +71,44 @@ def test_case_lock_engine_pool_object_is_distinct_from_the_admin_pool_object() -
 
 
 @pytest.mark.unit
-def test_case_lock_pool_size_and_overflow_pin_the_reduced_idle_footprint() -> None:
+def test_case_lock_pool_has_zero_overflow_the_entire_peak_is_steady_state() -> None:
     """Pinned per the module's own sizing rationale (#186 follow-up round,
-    ADVISORY-1): the dedicated pool's PEAK capacity (``pool_size +
-    max_overflow``) stays in the SAME 10-connection class the admin engine
-    established, but the STEADY-STATE floor (``pool_size``) is smaller —
-    this pool's connections are the longest-lived/most
-    idle-in-transaction-prone of the four per-process pools (module
-    docstring "Full per-process connection-budget accounting"), so fewer
-    of them sit open by default."""
+    SECOND pass — the ``pool_size=2, max_overflow=8`` first revision was
+    reverted after being measured to cause a connection-churn storm under
+    contended retries): the dedicated pool's ``pool_size`` alone equals its
+    OWN peak (``pool_size + max_overflow``) — ``max_overflow`` is exactly
+    zero, so every connection this pool will ever hand out is already
+    counted in its steady-state floor; there is no elastic tier left for
+    ``QueuePool`` to churn open/closed under a busy case's retry loop.
+
+    Deliberately a LARGER floor than the admin engine's own ``pool_size=5``
+    (the opposite of the reverted first revision) — this pool's
+    connections are the longest-lived/most idle-in-transaction-prone of
+    the four per-process pools (module docstring "Full per-process
+    connection-budget accounting"), and BLOCKING-2's bounded try-lock
+    retry loop checks connections in and out far more often than a
+    long-held admin-pool connection ever would, which is exactly the
+    access pattern that makes a small floor expensive here."""
     pool = case_lock_pool_mod.case_lock_engine.pool
     admin_pool = db_session_mod.engine.pool
     assert isinstance(pool, AsyncAdaptedQueuePool)
     assert pool.size() == case_lock_pool_mod._LOCK_POOL_SIZE  # noqa: SLF001
     assert pool._max_overflow == case_lock_pool_mod._LOCK_MAX_OVERFLOW  # noqa: SLF001
+    assert case_lock_pool_mod._LOCK_MAX_OVERFLOW == 0  # noqa: SLF001
 
-    # Smaller floor than the admin engine's own pool_size=5 -- the whole
-    # point of ADVISORY-1.
-    assert pool.size() < admin_pool.size()
-    # Same PEAK ceiling as before (and as the admin engine) -- ADVISORY-1
-    # narrows the idle footprint, it does not change how many concurrent
-    # case-locks this process can hold at once (the "Bounded try-lock
-    # retries" fix in app/agent/graph.py assumes this peak is unchanged).
     peak = pool.size() + pool._max_overflow  # noqa: SLF001
+    assert peak == pool.size(), "pool_size alone must already equal the pool's own peak"
+
+    # Same PEAK ceiling as the admin engine (unchanged from #186 item 1) --
+    # this pool's own floor/overflow SPLIT changed, never the concurrency
+    # ceiling the "Bounded try-lock retries" fix in app/agent/graph.py
+    # assumes.
     admin_peak = admin_pool.size() + admin_pool._max_overflow  # noqa: SLF001
     assert peak == admin_peak == 10
+
+    # Deliberately LARGER floor than the admin engine's own -- the whole
+    # point of this round's revert.
+    assert pool.size() > admin_pool.size()
 
 
 @pytest.mark.unit
@@ -162,6 +175,32 @@ def test_case_lock_function_checks_out_from_the_dedicated_pool_not_get_admin_ses
     source = inspect.getsource(graph_mod._case_lock)  # noqa: SLF001
     assert "get_case_lock_session" in source
     assert "get_admin_session" not in source
+
+
+@pytest.mark.unit
+def test_case_lock_function_uses_the_non_blocking_try_lock_form() -> None:
+    """Source-level pin (safety review, #186 follow-up round, ADVISORY-4
+    remainder — same ``inspect.getsource`` convention as
+    :func:`test_case_lock_function_checks_out_from_the_dedicated_pool_not_
+    get_admin_session` above): ``_case_lock``'s body must reference
+    ``_TRY_ADVISORY_LOCK_SQL`` (whose own text is
+    ``pg_try_advisory_xact_lock`` — the non-blocking form, module
+    docstring "Bounded try-lock retries, not a blocking wait"), and that
+    constant's SQL text must actually BE the non-blocking form, never the
+    ORIGINAL blocking ``pg_advisory_xact_lock`` call BLOCKING-2 replaced —
+    a future edit that reverts to the blocking form must fail this test,
+    not just silently reopen the head-of-line-blocking bug
+    ``tests/test_agent_case_lock_retry.py`` exercises behaviorally."""
+    source = inspect.getsource(graph_mod._case_lock)  # noqa: SLF001
+    assert "_TRY_ADVISORY_LOCK_SQL" in source
+
+    sql_text = str(graph_mod._TRY_ADVISORY_LOCK_SQL)  # noqa: SLF001
+    assert "pg_try_advisory_xact_lock" in sql_text
+    # Substring-safe: "pg_advisory_xact_lock" is NOT a substring of
+    # "pg_try_advisory_xact_lock" (the "try_" breaks it), so this catches
+    # a genuine revert to the blocking form without false-flagging the
+    # non-blocking one.
+    assert "pg_advisory_xact_lock" not in sql_text.replace("pg_try_advisory_xact_lock", "")
 
 
 @pytest.mark.unit
