@@ -599,10 +599,16 @@ async def test_drain_sweep_exhausts_when_landlord_has_no_phone(
 # ---------------------------------------------------------------------------
 
 
-async def _seed_draft_ready_row(db_session: AsyncSession) -> str:
+async def _seed_draft_ready_row(db_session: AsyncSession, *, kind: str | None = None) -> str:
     """Seed one full has-phone landlord/property/tenant/case/draft chain
-    plus a pending KIND_READY ``draft_ready``/``sms`` row -- the shared
-    shape every drain-sweep test in this module needs."""
+    plus a pending ``draft_ready``/``sms`` row -- the shared shape every
+    drain-sweep test in this module needs. *kind* defaults to
+    :data:`landlord_sms.KIND_READY` (the historical default); pass one of
+    the four confirmation kinds explicitly for a test that specifically
+    exercises the attempt cap (issue #229 advisory 1 — KIND_READY is
+    EXEMPT from exhaustion, see ``_LANDLORD_SMS_MAX_ATTEMPTS``'s own
+    docstring)."""
+    effective_kind = kind or landlord_sms.KIND_READY
     landlord_phone = factories.fresh_phone()
     landlord_id = await factories.insert_landlord(db_session, phone=landlord_phone)
     twilio_number = factories.fresh_phone()
@@ -619,7 +625,7 @@ async def _seed_draft_ready_row(db_session: AsyncSession) -> str:
         landlord_id=uuid.UUID(landlord_id),
         case_id=uuid.UUID(case_id),
         draft_id=uuid.UUID(draft_id),
-        kind=landlord_sms.KIND_READY,
+        kind=effective_kind,
         body="Draft ready — reply 1 to send.",
     )
     await db_session.commit()
@@ -649,8 +655,11 @@ async def test_drain_sweep_exhausts_after_max_attempts_despite_valid_phone(
 ) -> None:
     """A landlord WITH a valid phone/twilio_number whose Twilio send keeps
     failing every tick must eventually reach ``'exhausted'`` — never retried
-    forever — after ``_LANDLORD_SMS_MAX_ATTEMPTS`` attempts."""
-    landlord_id = await _seed_draft_ready_row(db_session)
+    forever — after ``_LANDLORD_SMS_MAX_ATTEMPTS`` attempts. Uses a
+    CONFIRMATION kind, not KIND_READY (issue #229 advisory 1 — KIND_READY
+    is deliberately EXEMPT from this cap, see
+    test_drain_sweep_kind_ready_never_exhausts below)."""
+    landlord_id = await _seed_draft_ready_row(db_session, kind=landlord_sms.KIND_APPROVED)
     failing_sender = _FakeTwilioSender(fail=True)
     monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: failing_sender)
 
@@ -675,6 +684,45 @@ async def test_drain_sweep_exhausts_after_max_attempts_despite_valid_phone(
         status_after, attempt_after = await _row_status_and_attempt(db_session, landlord_id)
         assert status_after == "exhausted"
         assert attempt_after == max_attempts, "a no-op tick must not re-claim the row"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_drain_sweep_kind_ready_never_exhausts(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #229 advisory 1 (adjudicated 2026-08-01): KIND_READY is
+    deliberately EXEMPT from ``_LANDLORD_SMS_MAX_ATTEMPTS`` -- it is the
+    SOLE notice of a pending approval for an SMS-only landlord, unlike the
+    four confirmation kinds (covered by
+    test_drain_sweep_exhausts_after_max_attempts_despite_valid_phone
+    above). Well past the attempt cap, the row must still be ``'failed'``
+    (transient, retried), never ``'exhausted'`` -- and a healthy sender
+    still delivers it whenever the fault eventually clears."""
+    landlord_id = await _seed_draft_ready_row(db_session, kind=landlord_sms.KIND_READY)
+    failing_sender = _FakeTwilioSender(fail=True)
+    monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: failing_sender)
+
+    max_attempts = landlord_sms._LANDLORD_SMS_MAX_ATTEMPTS  # noqa: SLF001
+
+    try:
+        # THREE TIMES the cap -- still never exhausted.
+        last_outcomes: list[landlord_sms.LandlordSmsOutcome] = []
+        for _ in range(max_attempts * 3):
+            last_outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+            assert [o.outcome for o in last_outcomes] == ["failed"]
+
+        status, attempt = await _row_status_and_attempt(db_session, landlord_id)
+        assert status == "failed"  # never 'exhausted', however many attempts
+        assert attempt == max_attempts * 3
+
+        working_sender = _FakeTwilioSender()
+        monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: working_sender)
+        outcomes_after = await landlord_sms.run_landlord_sms_drain_sweep()
+        assert [o.outcome for o in outcomes_after] == ["sent"]
+        status_after, _ = await _row_status_and_attempt(db_session, landlord_id)
+        assert status_after == "sent"
     finally:
         await _cleanup(db_session, landlord_id)
 
@@ -720,8 +768,9 @@ async def test_drain_sweep_exhaustion_pages_sentry_distinct_from_per_attempt_fai
     (exhausting) attempt must ALSO fire a second, distinct, level='warning'
     page (mirrors ``app/agent/degraded_mode_sweep.py``'s own dedicated
     exhaustion-alert convention), metadata-only (never a phone number/body,
-    rule #5)."""
-    landlord_id = await _seed_draft_ready_row(db_session)
+    rule #5). Uses a CONFIRMATION kind, not KIND_READY -- see issue #229
+    advisory 1."""
+    landlord_id = await _seed_draft_ready_row(db_session, kind=landlord_sms.KIND_APPROVED)
     failing_sender = _FakeTwilioSender(fail=True)
     monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: failing_sender)
 

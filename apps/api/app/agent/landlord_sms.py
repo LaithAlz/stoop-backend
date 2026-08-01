@@ -447,17 +447,38 @@ _LANDLORD_SMS_MAX_ATTEMPTS: int = 5
 """After this many GENUINE send failures (``payload.send_failures`` --
 DISTINCT from the claim/CAS ``attempt`` column, see
 :data:`_MARK_LANDLORD_SMS_SEND_OUTCOME_SQL`'s own comment, issue #229
-blocking finding 2), a landlord-facing ``draft_ready``/``sms`` row (the
-draft-ready notice, or any approve-by-SMS reply confirmation — this sweep
-drains every ``payload.kind`` uniformly, see module docstring) is marked
-``'exhausted'`` instead of retried forever (issue #229 item 4, PR #228
-senior-review advisory 4). The SAME numeric constant
+blocking finding 2), a landlord-facing ``draft_ready``/``sms`` row is
+marked ``'exhausted'`` instead of retried forever (issue #229 item 4, PR
+#228 senior-review advisory 4). The SAME numeric constant
 ``app/push_outbox.py::_PUSH_MAX_ATTEMPTS`` and
 ``app/property_provisioning.py::_NUMBER_RELEASE_MAX_ATTEMPTS`` already
 use. Unlike those two sweeps' ``next_attempt_at``-scheduled backoff, this
 module has none (mirrors ``run_sms_drain_sweep``'s own "resend every tick
 until sent" shape — ``app/scheduler.py``'s own docstring) — the retry
-interval here is simply the next scheduler tick (60s), unchanged."""
+interval here is simply the next scheduler tick (60s), unchanged.
+
+Deliberate ASYMMETRY (issue #229 advisory 1, adjudicated 2026-08-01):
+:data:`KIND_READY` (the draft-ready notice itself) is EXEMPT from this cap
+entirely -- it keeps retrying every tick, ``'failed'`` never
+``'exhausted'``, forever. The four confirmation kinds
+(:data:`KIND_APPROVED`/:data:`KIND_REJECTED`/:data:`KIND_STALE`/
+:data:`KIND_UNDO`) keep the 5-attempt cap unchanged. Rationale: a
+``KIND_READY`` notice is the SOLE notice of a pending approval for an
+SMS-only landlord -- push is a best-effort nudge (``app/push_outbox.py``'s
+own "push never carries the emergency path" posture extends here: a push
+failure is invisible-by-design, but an SMS-only landlord has no OTHER
+channel at all), and the dashboard is a surface such a landlord may never
+open. Losing the ``KIND_READY`` retry forever would mean that landlord
+never learns a draft is waiting, permanently, once Twilio's path to them
+breaks for 5 ticks -- worse than the confirmation kinds, which are
+courtesy notices about an event (approve/reject/stale/undo) the landlord
+already directly caused and is aware of by construction. This asymmetry
+is SAFE against issue #229 blocking finding 3's own fix
+(:data:`_SELECT_MOST_RECENT_READY_DRAFT_SQL`'s ``status = 'sent'`` filter):
+correlation only ever considers ACTUALLY-DELIVERED notices regardless of
+how many times a still-``'failed'`` (never ``'exhausted'``) ``KIND_READY``
+row has been retried, so an un-capped retry-forever row can never win
+"most recent" correlation it wouldn't otherwise have won."""
 
 # Deferred (issue #229 item 3, PR #228 senior-review advisory 3): this
 # query filters on (type, channel, status) with no supporting composite
@@ -563,6 +584,11 @@ class LandlordSmsCandidate:
     case_id: UUID
     attempt: int
     body: str
+    kind: str
+    """``payload.kind`` — :data:`KIND_READY` or one of the four confirmation
+    kinds. Used ONLY to decide exhaustion eligibility (issue #229 advisory
+    1 — see :data:`_LANDLORD_SMS_MAX_ATTEMPTS`'s own docstring); every
+    other code path in this sweep already treats every kind uniformly."""
     send_failures: int
     """Genuine Twilio ``send_sms`` failures observed for this row so far —
     ``payload.send_failures``, DISTINCT from :attr:`attempt` (the claim/CAS
@@ -583,12 +609,18 @@ def _candidate_from_row(row: dict[str, Any]) -> LandlordSmsCandidate | None:
     if body is None:  # pragma: no cover — invariant: enqueue_landlord_sms always sets it
         return None
     send_failures_raw = payload.get("send_failures")
+    # ``kind`` defaults to "" (never KIND_READY) for a defensively
+    # -impossible row missing it (enqueue_landlord_sms always sets it) --
+    # a malformed row falls under the CAPPED path, never silently exempted
+    # from exhaustion by an unrelated missing key.
+    kind = payload.get("kind") or ""
     return LandlordSmsCandidate(
         notification_id=cast("UUID", row["id"]),
         landlord_id=cast("UUID", row["landlord_id"]),
         case_id=cast("UUID", row["case_id"]),
         attempt=cast("int", row["attempt"]),
         body=str(body),
+        kind=str(kind),
         send_failures=int(send_failures_raw) if send_failures_raw is not None else 0,
     )
 
@@ -663,7 +695,13 @@ async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
         # and therefore never increments this counter either -- exactly the
         # PoC'd crash scenario this fix closes.
         new_send_failures = candidate.send_failures + 1
-        is_last_attempt = new_send_failures >= _LANDLORD_SMS_MAX_ATTEMPTS
+        # Issue #229 advisory 1: KIND_READY is EXEMPT from the exhaustion
+        # cap entirely -- see _LANDLORD_SMS_MAX_ATTEMPTS's own docstring
+        # for why. send_failures still increments for observability either
+        # way; only the exhaustion DECISION is gated on kind.
+        is_last_attempt = (
+            candidate.kind != KIND_READY and new_send_failures >= _LANDLORD_SMS_MAX_ATTEMPTS
+        )
         log.error(
             "landlord_sms_send_failed",
             notification_id=str(candidate.notification_id),
