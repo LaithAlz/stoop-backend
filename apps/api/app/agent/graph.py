@@ -372,6 +372,30 @@ read), so staleness is correctly detected under real concurrency, not just
 sequential tests. Verified with genuine concurrent-task tests (not just
 sequential calls) in ``tests/test_agent_shadow_interrupt.py`` — see that
 module's "Concurrency" section.
+
+A dedicated pool for the lock, not the admin pool (#186 item 1 — pool
+starvation under burst)
+------------------------------------------------------------------------
+``_case_lock`` holds its session checked out for the FULL DURATION of the
+span above (seconds, LLM-bound) while every node INSIDE that span checks
+out its OWN, separately, briefly-held connection to do its own work. Both
+used to draw from the SAME admin pool (``app/db/session.py``,
+``pool_size=5, max_overflow=5``) — at ten concurrent, distinct-case
+``run_graph`` calls, all ten admin-pool connections would be held by locks
+with none left for the nodes running INSIDE those very locks to check
+out: a genuine deadlock, not merely degraded throughput. Fixed by drawing
+the lock's session from :func:`app.agent.case_lock_pool.get_case_lock_session`
+— a SEPARATE, dedicated ``AsyncEngine`` (see that module's own docstring
+for the full pool-sizing/timeout rationale) built the same way
+``app/agent/checkpointer.py``'s dedicated psycopg pool keeps checkpoint I/O
+off the admin pool, adapted to this lock's actual driver (plain SQL over
+SQLAlchemy/asyncpg, not psycopg). The lock itself is still
+``pg_advisory_xact_lock`` — transaction-scoped, released when the
+DEDICATED pool's session's transaction ends — and still spans the exact
+same two critical sections (:func:`run_graph`'s case-graph invoke,
+:func:`resume_case_thread`'s check-then-resume); only WHICH pool the
+lock-holding connection comes from changed, never the lock's semantics or
+scope.
 """
 
 from __future__ import annotations
@@ -389,6 +413,7 @@ from langgraph.types import Command
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.case_lock_pool import get_case_lock_session
 from app.agent.checkpointer import get_checkpointer
 from app.agent.nodes.auto_send import auto_send_draft
 from app.agent.nodes.await_approval import await_approval, mark_awaiting_approval
@@ -730,13 +755,15 @@ async def _resolve_thread_id(*, message_id: UUID, case_id: UUID | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Per-case serialization — see module docstring "Per-case serialization".
+# Per-case serialization — see module docstring "Per-case serialization" AND
+# "A dedicated pool for the lock, not the admin pool (#186 item 1)".
 # A Postgres advisory TRANSACTION lock (released automatically when the
 # holding session's transaction ends — commit OR rollback, both handled by
-# ``get_admin_session``) keyed on a stable, deterministic pair of int4
-# values derived directly from the case's own UUID bits (no ``hashtext()``
-# needed — the UUID is already 128 bits of good entropy; splitting it in
-# half gives two independent 32-bit keys with no extra hashing step).
+# ``app.agent.case_lock_pool.get_case_lock_session``) keyed on a stable,
+# deterministic pair of int4 values derived directly from the case's own
+# UUID bits (no ``hashtext()`` needed — the UUID is already 128 bits of
+# good entropy; splitting it in half gives two independent 32-bit keys with
+# no extra hashing step).
 # ---------------------------------------------------------------------------
 
 _ADVISORY_LOCK_SQL = text("SELECT pg_advisory_xact_lock(:part1, :part2)")
@@ -773,16 +800,20 @@ async def _case_lock(case_id: UUID) -> AsyncIterator[AsyncSession]:
     the SAME case, or a concurrent :func:`resume_case_thread` call) trying
     to acquire the SAME key blocks at the DATABASE level until this block
     exits (commit on clean exit, rollback on exception — either way the
-    lock releases with the transaction, via ``get_admin_session``). Yields
-    the lock-holding session so a caller can perform a read INSIDE the
-    locked span using the SAME connection (see :func:`resume_case_thread`'s
+    lock releases with the transaction, via
+    :func:`app.agent.case_lock_pool.get_case_lock_session` — a DEDICATED
+    pool, deliberately separate from the admin pool every in-span node
+    checks out its own connection from; see module docstring "A dedicated
+    pool for the lock, not the admin pool (#186 item 1)"). Yields the
+    lock-holding session so a caller can perform a read INSIDE the locked
+    span using the SAME connection (see :func:`resume_case_thread`'s
     staleness re-read) without an extra pool checkout, though this is not
     required — any other session's reads/writes made while this lock is
     held are still fully serialized against other holders of this same
     key, regardless of which connection performs them.
     """
     part1, part2 = _case_lock_keys(case_id)
-    async with asynccontextmanager(get_admin_session)() as session:
+    async with get_case_lock_session() as session:
         await session.execute(_ADVISORY_LOCK_SQL, {"part1": part1, "part2": part2})
         yield session
 
@@ -907,9 +938,10 @@ async def resume_case_thread(*, case_id: UUID, draft_id: UUID, resume_value: Any
             raise DraftStaleError(case_id=case_id, draft_id=draft_id, fresh_draft_id=fresh_draft_id)
 
         # Reuse the lock's own session for the thread-id read (senior
-        # review, PR #187): opening a second admin-pool connection while
-        # already holding one under the lock compounds the pool-pressure
-        # profile tracked in #186.
+        # review, PR #187): opening a second connection (from either pool)
+        # while already holding one under the lock compounds the
+        # pool-pressure profile #186 item 1's dedicated lock pool exists
+        # to relieve, not reintroduce it one checkout at a time.
         thread_row = (
             (await session.execute(_SELECT_CASE_THREAD_ID_SQL, {"case_id": str(case_id)}))
             .mappings()
