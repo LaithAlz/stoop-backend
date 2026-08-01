@@ -4,12 +4,40 @@ export interface Property {
   id: string;
   nickname: string;
   address: string;
+  /** Matches `property.address_line1` in `GET /v1/cases/{id}`'s narrower
+   * `property` ref (api-contracts.md "Cases", v1.16 amendment) — street
+   * only, no unit (the unit lives on the case's `QueueItem.unitLabel`,
+   * not on the property). */
+  addressLine1: string;
+  /** Matches `property.city` in the same ref. That ref has no `province`
+   * field — v1.16 pins the shape to exactly `{id, label, address_line1,
+   * city}` — so screens reading it (the emergency page) show city only,
+   * never a composed "city, ON". */
+  city: string;
 }
 
 export const properties: Property[] = [
-  { id: "main4", nickname: "123 Main #4", address: "123 Main St #4, Oakville ON" },
-  { id: "walmer2", nickname: "Walmer Unit 2", address: "47 Walmer Rd Unit 2, Toronto ON" },
-  { id: "stoop", nickname: "Stoop House", address: "88 Lansdowne Ave, Toronto ON" },
+  {
+    id: "main4",
+    nickname: "123 Main #4",
+    address: "123 Main St #4, Oakville ON",
+    addressLine1: "123 Main St",
+    city: "Oakville",
+  },
+  {
+    id: "walmer2",
+    nickname: "Walmer Unit 2",
+    address: "47 Walmer Rd Unit 2, Toronto ON",
+    addressLine1: "47 Walmer Rd",
+    city: "Toronto",
+  },
+  {
+    id: "stoop",
+    nickname: "Stoop House",
+    address: "88 Lansdowne Ave, Toronto ON",
+    addressLine1: "88 Lansdowne Ave",
+    city: "Toronto",
+  },
 ];
 
 /**
@@ -129,6 +157,16 @@ export interface QueueItem {
   propertyLabel: string;
   tenantFirst: string;
   tenantPhoneMasked: string;
+  /** Tenant's real, dialable phone number. Mirrors `tenant.phone` in
+   * `GET /v1/cases/{id}` (api-contracts.md "Cases", v1.16 amendment) — the
+   * landlord's own authenticated read of their own tenant's contact info,
+   * present on that endpoint precisely so a screen like this one can
+   * offer a real `tel:`/`sms:` link. Distinct from `tenantPhoneMasked`
+   * above, which is a display-only value for list screens; `GET /v1/queue`
+   * itself has no phone field at all (see that section's json example) —
+   * `tenantPhoneMasked` is a mock-only stand-in for that gap, flagged here
+   * rather than silently treated as contract-accurate. */
+  tenantPhone: string;
   severity: Severity;
   status: CaseStatus;
   receivedAgo: string;
@@ -178,6 +216,7 @@ export const queue: QueueItem[] = [
     propertyLabel: "123 Main #4",
     tenantFirst: "Maria",
     tenantPhoneMasked: "+1 905 ●●● 4421",
+    tenantPhone: "+1 905 555 4421",
     severity: "emergency",
     status: "open",
     receivedAgo: "2 min ago",
@@ -231,6 +270,7 @@ export const queue: QueueItem[] = [
     propertyLabel: "Walmer Unit 2",
     tenantFirst: "Jesse",
     tenantPhoneMasked: "+1 416 ●●● 7421",
+    tenantPhone: "+1 416 555 7421",
     severity: "urgent",
     status: "awaiting_approval",
     receivedAgo: "17 min ago",
@@ -302,6 +342,7 @@ export const queue: QueueItem[] = [
     propertyLabel: "Stoop House",
     tenantFirst: "Sam",
     tenantPhoneMasked: "+1 647 ●●● 2210",
+    tenantPhone: "+1 647 555 2210",
     severity: "routine",
     status: "awaiting_approval",
     receivedAgo: "1 hr ago",

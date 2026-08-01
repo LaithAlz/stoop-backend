@@ -60,11 +60,11 @@ function AccountPage() {
         <Section title="Plan">
           <div className="rounded-2xl border border-brand/20 bg-brand-muted/50 p-5">
             <div className="flex items-center gap-2 font-mono text-[10px] font-bold uppercase tracking-widest text-brand">
-              <Sparkles className="size-3.5" /> Pro · annual
+              <Sparkles className="size-3.5" /> Full Plan
             </div>
-            <p className="mt-2 font-display text-[20px] text-ink">$39 / mo · billed yearly</p>
+            <p className="mt-2 font-display text-[20px] text-ink">$10 / month</p>
             <p className="mt-1 text-[13px] text-ink-muted">
-              Up to 5 properties. Renews August 14, 2026.
+              You're on the early-access rate — $5 / month, locked in for as long as you stay.
             </p>
             <div className="mt-4 flex gap-2">
               <Button

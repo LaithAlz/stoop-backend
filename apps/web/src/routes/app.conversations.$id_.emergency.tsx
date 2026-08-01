@@ -7,8 +7,9 @@ import {
   Wrench,
   Image as ImageIcon,
 } from "lucide-react";
+import { toast } from "sonner";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
-import { queue } from "@/lib/mock-app";
+import { properties, queue } from "@/lib/mock-app";
 
 export const Route = createFileRoute("/app/conversations/$id_/emergency")({
   head: () => ({
@@ -44,7 +45,8 @@ export const Route = createFileRoute("/app/conversations/$id_/emergency")({
 
 function EmergencyPage() {
   const item = Route.useLoaderData();
-  const phoneDigits = "905-555-4421";
+  const property = properties.find((p) => p.id === item.propertyId);
+  const phoneDigits = item.tenantPhone.replace(/\D/g, "");
 
   return (
     <PhoneFrame tone="dark">
@@ -73,14 +75,14 @@ function EmergencyPage() {
               Property
             </p>
             <h1 className="mt-1 font-display text-[26px] font-bold leading-tight tracking-tight text-white">
-              123 Main St, Unit 4
+              {property ? `${property.addressLine1}, ${item.unitLabel}` : item.propertyLabel}
               <br />
-              Oakville, ON
+              {property?.city}
             </h1>
           </div>
 
           <a
-            href={`tel:+1${phoneDigits.replace(/\D/g, "")}`}
+            href={`tel:+${phoneDigits}`}
             className="mt-5 flex items-center justify-between rounded-2xl bg-white/15 px-4 py-3 text-white hover:bg-white/25"
           >
             <span>
@@ -139,14 +141,14 @@ function EmergencyPage() {
         {/* Action stack */}
         <div className="space-y-2 border-t border-white/10 bg-black/30 p-4 pb-6">
           <a
-            href={`tel:+1${phoneDigits.replace(/\D/g, "")}`}
+            href={`tel:+${phoneDigits}`}
             className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl bg-white text-lg font-bold uppercase tracking-wide text-ink hover:bg-white/95"
           >
             <Phone className="size-5" aria-hidden="true" />
             Call {item.tenantFirst} now
           </a>
           <a
-            href={`sms:+1${phoneDigits.replace(/\D/g, "")}`}
+            href={`sms:+${phoneDigits}`}
             className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/[0.06] text-base font-bold text-white hover:bg-white/15"
           >
             <MessageSquare className="size-5" aria-hidden="true" />
@@ -154,6 +156,7 @@ function EmergencyPage() {
           </a>
           <button
             type="button"
+            onClick={() => toast("Dispatch Mike's Plumbing (mock)")}
             className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/[0.06] text-base font-bold text-white hover:bg-white/15"
           >
             <Wrench className="size-5" aria-hidden="true" />

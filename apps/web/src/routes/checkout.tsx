@@ -4,8 +4,13 @@ import { MarketingNav } from "@/components/stoop/MarketingNav";
 import { SiteFooter } from "@/components/stoop/SiteFooter";
 
 const searchSchema = z.object({
-  plan: z.enum(["solo", "standard", "pro"]).catch("standard").default("standard"),
+  plan: z.enum(["full", "early_access"]).catch("full").default("full"),
 });
+
+const planLabel: Record<"full" | "early_access", string> = {
+  full: "Full Plan ($10 / month)",
+  early_access: "early-access rate ($5 / month, locked in for as long as you stay)",
+};
 
 export const Route = createFileRoute("/checkout")({
   validateSearch: (s) => searchSchema.parse(s),
@@ -26,8 +31,8 @@ function CheckoutPage() {
           Stripe checkout — coming soon
         </h1>
         <p className="mt-4 text-ink-muted">
-          You picked the <span className="font-semibold text-ink">{plan}</span> plan. Hosted Stripe
-          checkout will live here. For now, start your trial in the app.
+          You picked the <span className="font-semibold text-ink">{planLabel[plan]}</span>. Hosted
+          Stripe checkout will live here. For now, start your trial in the app.
         </p>
         <Link
           to="/plans"
