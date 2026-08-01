@@ -1,8 +1,9 @@
 # apps/api — FastAPI + LangGraph backend
 
 Read the root `CLAUDE.md` first. This file adds API-specific conventions.
-The app skeleton is built by issues #1–#16; layout below is the target
-(`docs/03-engineering/architecture.md` §4 is the authority).
+The layout below reflects the shipped codebase (Train-1 core loop complete);
+`docs/03-engineering/architecture.md` §4 is the design authority where the
+two ever disagree.
 
 ## Stack & commands
 
@@ -18,21 +19,35 @@ uv run alembic upgrade head               # migrate (down/up must round-trip)
 uv run ruff check . && uv run mypy app    # lint + types (strict)
 ```
 
-## Layout (target)
+## Layout (actual — updated 2026-08-01; verify with `ls`, not this block)
 
 ```
 app/
-  main.py settings.py deps.py
-  db/         engine, session, migrations/
-  models/     SQLAlchemy models — names from docs/03-engineering/schema-v1.md
+  main.py config.py deps.py errors.py pagination.py validation.py
+  observability.py audit.py
+  scheduler.py           # the 60s ticker — SIX sweeps, order pinned by test
+  trust.py property_provisioning.py push_outbox.py cost_reporting.py
+  db/         session.py — TWO engines (admin + app_role request engine);
+              raw text() SQL everywhere. There is NO models/ dir and no ORM;
+              names come from docs/03-engineering/schema-v1.md.
   routers/    me, properties, tenants, vendors, queue, cases, drafts,
-              notifications, billing, webhooks/{twilio,stripe}
-  agent/      graph.py, state.py, rubric.py, prefilter.py, tools.py,
-              prompts/v1.py, nodes/{identify_property, load_context,
-              identify_case, classify_intent, classify_severity,
-              draft_response, emergency_protocol}
-  integrations/  supabase_auth.py, twilio.py, anthropic.py, weather.py, posthog.py
+              notifications, trust, devices, health, auth_test, debug,
+              webhooks/twilio (sms + status + voice).
+              billing + webhooks/stripe do NOT exist yet (Train-2, #52/#58/#59).
+  agent/      graph.py graph_entry.py state.py schemas.py rubric.py
+              prefilter.py tools.py checkpointer.py
+              emergency.py emergency_chain.py draft_sender.py landlord_sms.py
+              approve_by_sms.py case_lifecycle.py degraded_mode_sweep.py
+              prompts/{v1,v2}.py (both FROZEN — next free slot is v3),
+              nodes/{identify_property, load_context, identify_case,
+              classify_intent, classify_severity, draft_response,
+              await_approval (mark_awaiting_approval + await_approval),
+              auto_send, finalize_draft_decision, degraded_mode}
+  integrations/  supabase_auth, twilio (inbound verify ONLY), twilio_send,
+              twilio_provision, sms_sender, expo_push, anthropic, weather,
+              sms_segments. posthog.py does NOT exist yet (#120/#121).
 evals/        scenarios/*.yaml + runner (format: docs/02-product/eval-scenarios-v1.md)
+migrations/   Alembic, hand-written raw SQL (no autogenerate)
 ```
 
 ## Conventions
