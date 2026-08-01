@@ -42,9 +42,14 @@ export function emergencySubtext(item: Pick<QueueItem, "property_label">): strin
 // emergency-prefilter.md's escalation-chain section — "it stops the chain"
 // — and nothing more: it never claims the case is handled, resolved, or
 // that anyone has actually been reached, none of which acknowledging does.
+// The idle label follows the same rule (copy-guardian review on this
+// branch): "I'm on it" implied the landlord was addressing the emergency
+// itself, which acknowledging doesn't do, and broke the app's own
+// second-person-imperative button register ("Turn off", "Mark resolved").
+// "Stop the calls" states only the actual, literal effect.
 // ---------------------------------------------------------------------------
 
-export const EMERGENCY_ACK_LABEL = "I'm on it";
+export const EMERGENCY_ACK_LABEL = "Stop the calls";
 
 export const EMERGENCY_ACK_PENDING_LABEL = "Stopping the calls…";
 
