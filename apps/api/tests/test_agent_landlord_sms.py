@@ -16,6 +16,7 @@ import sys
 import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -494,9 +495,9 @@ async def test_drain_sweep_exhausts_when_landlord_has_no_phone(
 
 
 # ---------------------------------------------------------------------------
-# Wall-clock tick deadline (issue #229, PR #228 senior-review advisory 1) --
-# mirrors tests/test_agent_draft_sender.py's / tests/test_push_outbox_sweep
-# .py's own deadline test pattern exactly.
+# Bounded-retry attempt cap (issue #229 item 4, PR #228 senior-review
+# advisory 4) -- a has-phone row that keeps failing every tick must
+# eventually stop retrying, not fail forever.
 # ---------------------------------------------------------------------------
 
 
@@ -542,6 +543,119 @@ async def _row_status_and_attempt(db_session: AsyncSession, landlord_id: str) ->
         .one()
     )
     return row["status"], row["attempt"]
+
+
+@pytest.mark.integration
+async def test_drain_sweep_exhausts_after_max_attempts_despite_valid_phone(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A landlord WITH a valid phone/twilio_number whose Twilio send keeps
+    failing every tick must eventually reach ``'exhausted'`` — never retried
+    forever — after ``_LANDLORD_SMS_MAX_ATTEMPTS`` attempts."""
+    landlord_id = await _seed_draft_ready_row(db_session)
+    failing_sender = _FakeTwilioSender(fail=True)
+    monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: failing_sender)
+
+    max_attempts = landlord_sms._LANDLORD_SMS_MAX_ATTEMPTS  # noqa: SLF001
+
+    try:
+        last_outcomes: list[landlord_sms.LandlordSmsOutcome] = []
+        for _ in range(max_attempts):
+            last_outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+
+        assert [o.outcome for o in last_outcomes] == ["exhausted"]
+
+        status, attempt = await _row_status_and_attempt(db_session, landlord_id)
+        assert status == "exhausted"
+        assert attempt == max_attempts
+
+        # A further tick must be a true no-op -- 'exhausted' rows are
+        # excluded from the sweep's own retry set (status IN ('pending',
+        # 'failed')).
+        further_outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+        assert further_outcomes == []
+        status_after, attempt_after = await _row_status_and_attempt(db_session, landlord_id)
+        assert status_after == "exhausted"
+        assert attempt_after == max_attempts, "a no-op tick must not re-claim the row"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_drain_sweep_below_max_attempts_stays_failed_and_still_retries(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Below the attempt cap, a failure stays transient ('failed', in the
+    retry set) -- and the cap never blocks a row that eventually succeeds
+    once the fault clears."""
+    landlord_id = await _seed_draft_ready_row(db_session)
+    failing_sender = _FakeTwilioSender(fail=True)
+    monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: failing_sender)
+
+    max_attempts = landlord_sms._LANDLORD_SMS_MAX_ATTEMPTS  # noqa: SLF001
+    assert max_attempts > 1, "test assumes at least one non-terminal failed attempt"
+
+    try:
+        outcomes = await landlord_sms.run_landlord_sms_drain_sweep()
+        assert [o.outcome for o in outcomes] == ["failed"]
+
+        status, attempt = await _row_status_and_attempt(db_session, landlord_id)
+        assert status == "failed"  # transient -- stays in the retry set
+        assert attempt == 1
+
+        working_sender = _FakeTwilioSender()
+        monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: working_sender)
+        outcomes_after = await landlord_sms.run_landlord_sms_drain_sweep()
+        assert [o.outcome for o in outcomes_after] == ["sent"]
+
+        status_after, _attempt_after = await _row_status_and_attempt(db_session, landlord_id)
+        assert status_after == "sent"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_drain_sweep_exhaustion_pages_sentry_distinct_from_per_attempt_failure(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every send failure already pages Sentry (level='error') -- the LAST
+    (exhausting) attempt must ALSO fire a second, distinct, level='warning'
+    page (mirrors ``app/agent/degraded_mode_sweep.py``'s own dedicated
+    exhaustion-alert convention), metadata-only (never a phone number/body,
+    rule #5)."""
+    landlord_id = await _seed_draft_ready_row(db_session)
+    failing_sender = _FakeTwilioSender(fail=True)
+    monkeypatch.setattr(landlord_sms, "get_twilio_sender", lambda: failing_sender)
+
+    mock_capture = MagicMock()
+    monkeypatch.setattr(landlord_sms.sentry_sdk, "capture_message", mock_capture)
+
+    max_attempts = landlord_sms._LANDLORD_SMS_MAX_ATTEMPTS  # noqa: SLF001
+
+    try:
+        for _ in range(max_attempts):
+            await landlord_sms.run_landlord_sms_drain_sweep()
+
+        # One "send failed" page per attempt, PLUS one distinct "exhausted"
+        # page on the last -- never a phone number/message body in either.
+        calls = mock_capture.call_args_list
+        assert len(calls) == max_attempts + 1
+        exhaustion_calls = [c for c in calls if "exhausted" in c.args[0]]
+        assert len(exhaustion_calls) == 1
+        assert exhaustion_calls[0].kwargs["level"] == "warning"
+        for call in calls:
+            for value in call.kwargs.get("extras", {}).values():
+                assert value is None or "+1" not in str(value)
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock tick deadline (issue #229, PR #228 senior-review advisory 1) --
+# mirrors tests/test_agent_draft_sender.py's / tests/test_push_outbox_sweep
+# .py's own deadline test pattern exactly. Reuses _seed_draft_ready_row /
+# _row_status_and_attempt from the attempt-cap section above.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

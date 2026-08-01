@@ -414,6 +414,19 @@ def _default_time_source() -> float:
     return asyncio.get_running_loop().time()
 
 
+_LANDLORD_SMS_MAX_ATTEMPTS: int = 5
+"""After this many failed send attempts, a landlord-facing ``draft_ready``/
+``sms`` row (the draft-ready notice, or any approve-by-SMS reply
+confirmation — this sweep drains every ``payload.kind`` uniformly, see
+module docstring) is marked ``'exhausted'`` instead of retried forever
+(issue #229 item 4, PR #228 senior-review advisory 4). The SAME numeric
+constant ``app/push_outbox.py::_PUSH_MAX_ATTEMPTS`` and
+``app/property_provisioning.py::_NUMBER_RELEASE_MAX_ATTEMPTS`` already
+use. Unlike those two sweeps' ``next_attempt_at``-scheduled backoff, this
+module has none (mirrors ``run_sms_drain_sweep``'s own "resend every tick
+until sent" shape — ``app/scheduler.py``'s own docstring) — the retry
+interval here is simply the next scheduler tick (60s), unchanged."""
+
 _SELECT_DUE_LANDLORD_SMS_SQL = text(
     """
     SELECT id, landlord_id, case_id, attempt, payload
@@ -439,9 +452,12 @@ _MARK_LANDLORD_SMS_FAILED_SQL = text(
     "UPDATE notifications SET status = 'failed', updated_at = now() WHERE id = :id"
 )
 
-# Terminal — mirrors app/agent/emergency_chain.py's own 'no_tenant_phone'
-# precedent: no amount of retrying supplies a phone number/twilio_number
-# this row never had. 'exhausted' is excluded from the SELECT above's
+# Terminal -- reached two ways: (1) mirrors app/agent/emergency_chain.py's
+# own 'no_tenant_phone' precedent below (no amount of retrying supplies a
+# phone number/twilio_number this row never had), or (2) issue #229 item 4:
+# _LANDLORD_SMS_MAX_ATTEMPTS consecutive send failures despite a valid
+# phone/twilio_number -- a permanently-failing Twilio path, not a missing
+# contact fact. 'exhausted' is excluded from the SELECT above's
 # `status IN ('pending', 'failed')`, so a row marked this way is never
 # re-attempted.
 _MARK_LANDLORD_SMS_EXHAUSTED_SQL = text(
@@ -471,7 +487,7 @@ class LandlordSmsCandidate:
 @dataclass(frozen=True)
 class LandlordSmsOutcome:
     notification_id: UUID
-    outcome: str  # "sent" | "failed" | "lost_race" | "context_missing" | "no_phone"
+    outcome: str  # "sent" | "failed" | "exhausted" | "lost_race" | "context_missing" | "no_phone"
 
 
 def _candidate_from_row(row: dict[str, Any]) -> LandlordSmsCandidate | None:
@@ -490,6 +506,7 @@ def _candidate_from_row(row: dict[str, Any]) -> LandlordSmsCandidate | None:
 
 async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
     new_attempt = candidate.attempt + 1
+    is_last_attempt = new_attempt >= _LANDLORD_SMS_MAX_ATTEMPTS
 
     async with _acm(get_admin_session)() as session:
         claim_row = (
@@ -556,10 +573,31 @@ async def _process_candidate(candidate: LandlordSmsCandidate) -> str:
                 "exc_type": type(exc).__name__,
             },
         )
+        mark_sql = (
+            _MARK_LANDLORD_SMS_EXHAUSTED_SQL if is_last_attempt else _MARK_LANDLORD_SMS_FAILED_SQL
+        )
         async with _acm(get_admin_session)() as session:
-            await session.execute(
-                _MARK_LANDLORD_SMS_FAILED_SQL, {"id": str(candidate.notification_id)}
+            await session.execute(mark_sql, {"id": str(candidate.notification_id)})
+        if is_last_attempt:
+            # Issue #229 item 4: distinct from the per-attempt "send
+            # failed" page above (which already fired for THIS attempt) —
+            # this row will now NEVER be retried again, a materially
+            # different operational fact than one of several transient
+            # failures. Mirrors app/agent/degraded_mode_sweep.py's own
+            # dedicated exhaustion/escalation alert shape (a distinct,
+            # warning-level page separate from its own per-exception error
+            # -level page) — see this module's own docstring / issue #229's
+            # report for why that convention was chosen over
+            # push_outbox.py's "never page on exhaustion" posture: this is
+            # a landlord-approval-flow surface (confirmations/notices about
+            # the landlord's own draft), not a best-effort push nudge.
+            log.warning("landlord_sms_exhausted", notification_id=str(candidate.notification_id))
+            sentry_sdk.capture_message(
+                "landlord_sms: confirmation/notice SMS exhausted its retry budget",
+                level="warning",
+                extras={"notification_id": str(candidate.notification_id)},
             )
+            return "exhausted"
         return "failed"
 
     async with _acm(get_admin_session)() as session:
