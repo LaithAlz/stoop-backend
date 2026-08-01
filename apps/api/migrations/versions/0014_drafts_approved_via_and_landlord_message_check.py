@@ -70,6 +70,13 @@ def upgrade() -> None:
     )
 
     # ── messages: DB-level enforcement of the landlord-row-NULL invariant ───
+    # Deferred (issue #229 item 2, PR #228 senior-review advisory 2): this
+    # is a plain validating ADD CONSTRAINT (ACCESS EXCLUSIVE, full-table
+    # scan) -- safe at current scale (see this migration's own docstring).
+    # If `messages` ever grows large, split this into `ADD CONSTRAINT ...
+    # NOT VALID` followed by a later `VALIDATE CONSTRAINT` to avoid a long
+    # write-lock. Deliberately no migration change here -- see issue #229's
+    # own scope note.
     op.execute(
         "ALTER TABLE messages ADD CONSTRAINT messages_landlord_party_null_check "
         "CHECK (party <> 'landlord' OR (tenant_id IS NULL AND vendor_id IS NULL))"

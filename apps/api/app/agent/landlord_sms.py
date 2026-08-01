@@ -282,6 +282,12 @@ async def enqueue_landlord_sms(
 # scoped to the property owning the To number" (api-contracts.md).
 # ---------------------------------------------------------------------------
 
+# Deferred (issue #229 item 3, PR #228 senior-review advisory 3): this
+# query filters on (type, channel, kind) with no supporting composite
+# index -- only idx_notifications_sweep(status, next_attempt_at) exists.
+# Negligible at current scale; add a composite index if `notifications`
+# ever grows large enough for this to show up in practice. Deliberately no
+# migration here -- see this issue's own scope note.
 _SELECT_MOST_RECENT_READY_DRAFT_SQL = text(
     """
     SELECT n.payload ->> 'draft_id' AS draft_id, n.case_id AS case_id
@@ -427,6 +433,12 @@ module has none (mirrors ``run_sms_drain_sweep``'s own "resend every tick
 until sent" shape — ``app/scheduler.py``'s own docstring) — the retry
 interval here is simply the next scheduler tick (60s), unchanged."""
 
+# Deferred (issue #229 item 3, PR #228 senior-review advisory 3): this
+# query filters on (type, channel, status) with no supporting composite
+# index -- only idx_notifications_sweep(status, next_attempt_at) exists.
+# Negligible at current scale; add a composite index if `notifications`
+# ever grows large enough for this to show up in practice. Deliberately no
+# migration here -- see this issue's own scope note.
 _SELECT_DUE_LANDLORD_SMS_SQL = text(
     """
     SELECT id, landlord_id, case_id, attempt, payload
