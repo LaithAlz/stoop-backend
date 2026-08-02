@@ -40,7 +40,12 @@ for _key, _value in _PLACEHOLDER_ENV.items():
 
 # ---------------------------------------------------------------------------
 # Known bleed class (#212 item 1, comment-only note -- no fixture fixes this):
-# "dirty-DB bleed" across sender_tick integration tests.
+# "dirty-DB bleed" across sender_tick integration tests. The SAME shape
+# applies to app/agent/landlord_sms.py's run_landlord_sms_drain_sweep (its
+# own candidate SELECT, _SELECT_DUE_LANDLORD_SMS_SQL, is unscoped
+# cluster-wide too, for the identical reason below) -- flagged by the #240
+# implementer; naming it here so a future reader hits this note from either
+# sweep's own test failures.
 #
 # app/agent/draft_sender.py's sender_tick() candidate SELECT is
 # INTENTIONALLY unscoped (the production ticker drains every landlord's
@@ -117,6 +122,21 @@ def _reset_weather_cache() -> Iterator[None]:
     import app.integrations.weather as weather_mod
 
     weather_mod._cache_state.reset_for_tests()  # noqa: SLF001
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_unrouted_maintenance_digest() -> Iterator[None]:
+    """Reset the unrouted_inbound operator digest's in-memory once-per-day
+    dedupe stamp before every test (#231) — same cross-test-leakage
+    rationale as ``_reset_weather_cache``/``_reset_jwks_auth_state`` above:
+    a day-key stamped by one test would otherwise make a later same-day
+    test observe "already fired today" and silently skip its own
+    assertion, an order-dependent flake.
+    """
+    import app.unrouted_maintenance as unrouted_maintenance_mod
+
+    unrouted_maintenance_mod.reset_for_tests()
     yield
 
 

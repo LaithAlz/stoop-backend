@@ -1,8 +1,8 @@
-"""In-process 60-second scheduler ticker (#108/#109/#53/#210) — FastAPI
-lifespan-managed, drives the emergency escalation chain sweep, the SMS
-drain sweep, the degraded-mode retry sweep, the approve-flow draft
-sender, the deprovisioning number-release sweep, and the push-outbox
-sweep:
+"""In-process 60-second scheduler ticker (#108/#109/#53/#210/#122/#231) —
+FastAPI lifespan-managed, drives the emergency escalation chain sweep, the
+SMS drain sweep, the degraded-mode retry sweep, the approve-flow draft
+sender, the deprovisioning number-release sweep, the push-outbox sweep,
+the landlord SMS drain sweep, and the unrouted_inbound maintenance sweep:
 - ``app/agent/emergency_chain.py::run_emergency_chain_sweep``
 - ``app/agent/emergency_chain.py::run_sms_drain_sweep`` (safety review,
   2026-07-12, spec finding S1 / safety finding 3 — drains
@@ -53,17 +53,33 @@ sweep:
   outage can never starve the emergency sweep's NEXT run either.
 - ``app/agent/landlord_sms.py::run_landlord_sms_drain_sweep`` (#122,
   approve-by-SMS — drains the draft-ready SMS + every reply confirmation).
-  Runs LAST: this is the THIRD sanctioned Twilio-send call site (see that
+  Runs after ``push_outbox``, before the unrouted_inbound maintenance sweep
+  below: this is the THIRD sanctioned Twilio-send call site (see that
   module's own docstring and ``tests/test_twilio_send_allowlist.py``), but
   a landlord-facing convenience notice, same low-priority-ordering
   rationale as push above — never ahead of anything emergency/approval
   -relevant. Wall-clock-bounded (issue #229 — see "Bounding sender_tick's
   own worst-case duration" below), same as every other sweep in this list
-  except ``run_emergency_chain_sweep`` itself: even though, being LAST in
-  the tick, an unbounded run here would "only" delay the NEXT tick's FIRST
-  sweep (the emergency chain) rather than itself, that is exactly the
+  except ``run_emergency_chain_sweep`` itself: even though, an unbounded
+  run here would "only" delay whatever runs after it this same tick (or
+  the NEXT tick's FIRST sweep, if it were last), that is exactly the
   scenario the deadline exists to prevent — symmetric with
   ``run_push_outbox_sweep``'s own rationale just above.
+- ``app/unrouted_maintenance.py::run_unrouted_maintenance_sweep`` (#231,
+  follow-up from #170/PR #230 — retention for resolved ``unrouted_inbound``
+  dead-letter rows + a once-per-UTC-day operator digest for unresolved
+  ones; see that module's own docstring for the full design, including why
+  it deliberately narrows the issue's own wording to "resolved rows only,
+  never unresolved ones, regardless of age"). Runs LAST, EIGHTH in the
+  tick: pure cleanup plus a reminder page — it must never sit ahead of
+  anything else, and unlike every sweep above it, it has no relationship
+  whatsoever to the emergency path, the approval flow, or any outbound
+  send (no Twilio call site here at all). Wall-clock-bounded the same
+  house way (its own ``DEFAULT_TICK_DEADLINE_SECONDS``, an injectable
+  *time_source*) — see "Bounding sender_tick's own worst-case duration"
+  below for why even a LAST-place sweep still needs this: an unbounded run
+  here would delay the NEXT tick's FIRST sweep (the emergency chain), the
+  exact scenario every deadline in this file exists to prevent.
 
 Design choice (the campaign's "sender design menu" — (a) in-process
 asyncio periodic task, RECOMMENDED for v1; matches
@@ -78,9 +94,10 @@ file for the entire scheduler surface; if a FIFTH sweep ever needs
 combining here and this file starts to sprawl, split it back out rather
 than let it bloat.
 
-Bounding sender_tick's (and, since #210, run_push_outbox_sweep's, and
-since #229, both SMS drain sweeps') own worst-case duration (safety
-review, MEDIUM; extended HIGH-1 for push; #229 for the two SMS drains)
+Bounding sender_tick's (and, since #210, run_push_outbox_sweep's, since
+#229, both SMS drain sweeps', and since #231, run_unrouted_maintenance_
+sweep's) own worst-case duration (safety review, MEDIUM; extended HIGH-1
+for push; #229 for the two SMS drains; #231 for the maintenance sweep)
 ------------------------------------------------------------------------
 ``sender_tick`` shares this SAME single ticker task with the three sweeps
 above — a slow tick here is a slow tick for the emergency chain sweep's
@@ -140,6 +157,21 @@ ordering — a real, reproduced starvation bug, not a hypothetical one.
 UNCHANGED by #229 — out of scope for that issue; see its own module
 docstring.
 
+``app/unrouted_maintenance.py::run_unrouted_maintenance_sweep`` (#231) is a
+DIFFERENT risk shape from every sweep above it — it never calls Twilio (or
+any other network dependency) at all, so it cannot hang on a slow HTTP
+response the way the send-heavy sweeps can. Its only cost is DB work: a
+bounded-batch DELETE (retention) that only needs to loop at all if the
+number of eligible rows in one tick exceeds its own per-batch cap, plus one
+cheap aggregate SELECT (the digest). It is still wall-clock-bounded the
+same house way (its own ``DEFAULT_TICK_DEADLINE_SECONDS``, an injectable
+time source, checked before claiming each additional retention batch) for
+symmetry with every other sweep in this file and because it is the very
+LAST job in the tick: an unbounded run here would delay only the NEXT
+tick's FIRST sweep (the emergency chain), the exact scenario every
+deadline in this file exists to prevent — see that module's own docstring
+for the full design.
+
 Crash-safety
 ------------
 The ticker itself carries NO schedule state — it only wakes every
@@ -148,8 +180,13 @@ right now?", which reads directly from the ``notifications`` table
 (``run_emergency_chain_sweep``/``run_sms_drain_sweep``/
 ``sweep_degraded_mode_retries``/``sweep_pending_number_releases``), the
 ``drafts`` table (``sender_tick`` — "the undo window is data, not a
-sleep", ``app/agent/draft_sender.py``'s own phrase), or the
-``push_outbox`` table (``run_push_outbox_sweep`` — #210 M3).
+sleep", ``app/agent/draft_sender.py``'s own phrase), the ``push_outbox``
+table (``run_push_outbox_sweep`` — #210 M3), or the ``unrouted_inbound``
+table (``run_unrouted_maintenance_sweep`` — #231; its digest's own
+once-per-day DEDUPE stamp is the one piece of in-memory-only state among
+all these sweeps — see that module's own docstring "Digest dedupe stamp"
+for why, and for the accepted at-most-one-extra-page consequence of a
+restart losing it).
 A process restart loses only the in-memory tick loop, never the schedule:
 every due row is still due (or becomes due) after restart, and the very
 next tick catches up — the literal meaning of the task's "retries/chain
@@ -207,6 +244,7 @@ from app.agent.landlord_sms import run_landlord_sms_drain_sweep
 from app.integrations.sms_sender import get_default_sms_sender
 from app.property_provisioning import sweep_pending_number_releases
 from app.push_outbox import run_push_outbox_sweep
+from app.unrouted_maintenance import run_unrouted_maintenance_sweep
 
 log = structlog.get_logger(__name__)
 
@@ -297,6 +335,15 @@ async def _run_one_tick_body() -> None:
         _safe_report(
             "scheduler_landlord_sms_drain_sweep_failed",
             "scheduler: landlord sms drain sweep tick raised",
+            exc,
+        )
+
+    try:
+        await run_unrouted_maintenance_sweep()
+    except Exception as exc:
+        _safe_report(
+            "scheduler_unrouted_maintenance_sweep_failed",
+            "scheduler: unrouted maintenance sweep tick raised",
             exc,
         )
 
