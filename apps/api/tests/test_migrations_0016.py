@@ -55,29 +55,40 @@ async def test_index_exists_with_exact_expression_and_predicate() -> None:
 
 @pytest.mark.integration
 async def test_concurrent_message_received_inserts_exactly_one_row() -> None:
-    """Recipe-2 race: same message_id, two separate connections, gathered.
-    Exactly one audit row must exist afterward — the index (not
-    application logic) is what wins the race."""
-    engine = create_async_engine(_db_url())
+    """Recipe-2 race — GENUINELY concurrent (#184 safety review B4: the
+    first draft gathered two inserts on ONE lazily-connecting engine,
+    which serializes — even the old WHERE NOT EXISTS form passed). Now:
+    two SEPARATE engines, both pre-warmed, an asyncio.Barrier holding both
+    transactions open at the pre-INSERT line so conflict arbitration
+    happens with both uncommitted. The INDEX (not application logic) wins.
+    MUTANT KILLED: reverting graph_entry's INSERT to WHERE NOT EXISTS
+    yields two rows under this barrier."""
+    engine_a = create_async_engine(_db_url())
+    engine_b = create_async_engine(_db_url())
     landlord_id = str(uuid.uuid4())
     message_id = str(uuid.uuid4())
+    barrier = asyncio.Barrier(2)
     try:
-        async with engine.begin() as conn:
+        async with engine_a.begin() as conn:
             await conn.execute(
                 text("INSERT INTO landlords (id, auth_user_id, email) VALUES (:id, :auth, :email)"),
                 {"id": landlord_id, "auth": str(uuid.uuid4()), "email": "race@test.local"},
             )
+        for eng in (engine_a, engine_b):
+            async with eng.connect() as conn:
+                await conn.execute(text("SELECT 1"))
 
-        async def _insert() -> None:
-            async with engine.begin() as conn:
+        async def _insert(eng: object) -> None:
+            async with eng.begin() as conn:  # type: ignore[attr-defined]
+                await barrier.wait()  # both txns open, neither committed
                 await conn.execute(
                     _INSERT_RECEIVED_IF_NOT_EXISTS_SQL,
                     {"landlord_id": landlord_id, "message_id": message_id},
                 )
 
-        await asyncio.gather(_insert(), _insert())
+        await asyncio.gather(_insert(engine_a), _insert(engine_b))
 
-        async with engine.connect() as conn:
+        async with engine_a.connect() as conn:
             count = (
                 await conn.execute(
                     text(
@@ -90,7 +101,7 @@ async def test_concurrent_message_received_inserts_exactly_one_row() -> None:
             ).scalar_one()
         assert count == 1
     finally:
-        async with engine.begin() as conn:
+        async with engine_a.begin() as conn:
             await conn.execute(
                 text(
                     "DELETE FROM audit_log WHERE payload ->> 'message_id' = :mid "
@@ -99,7 +110,8 @@ async def test_concurrent_message_received_inserts_exactly_one_row() -> None:
                 {"mid": message_id},
             )
             await conn.execute(text("DELETE FROM landlords WHERE id = :id"), {"id": landlord_id})
-        await engine.dispose()
+        await engine_a.dispose()
+        await engine_b.dispose()
 
 
 @pytest.mark.integration

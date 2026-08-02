@@ -873,3 +873,109 @@ async def test_run_graph_tier0_fired_emergency_skips_second_needs_eyes(
         assert case_status == "awaiting_approval"
     finally:
         await _cleanup(db_session, landlord_id)
+
+
+async def test_run_graph_emergency_with_present_miss_snapshot_routes_to_degraded_mode(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#184 safety review B3(b): the Tier-0-MISS branch with a PRESENT
+    hard_hit=false snapshot (production reality — the webhook always
+    persists one; the sibling test above this file's original EMERGENCY
+    test exercises only the missing-snapshot fallback, a state production
+    never produces). MUTANT KILLED: `_prefilter_hard_hit` returning True
+    unconditionally (or the router inverting the check) suppresses the
+    needs_eyes this asserts."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="my elderly mother cannot reach anyone and her medical alarm is unanswered",
+        prefilter=('{"hard_hit": false, "categories": [], "soft_annotations": [], "guards": []}'),
+    )
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _intent_response(),
+            _severity_response(severity="EMERGENCY"),
+            _draft_response_message(),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        await run_graph(uuid.UUID(message_id))
+
+        needs_eyes_count = (
+            await db_session.execute(
+                text(
+                    "SELECT count(*) FROM notifications "
+                    "WHERE landlord_id = :lid AND type = 'needs_eyes'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert needs_eyes_count == 1  # the genuine-miss floor fired
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+async def test_run_graph_emergency_prefilter_read_failure_still_reaches_degraded_mode(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#184 safety review B1/B3(c): a RAISING snapshot read inside the
+    conditional edge must be mapped to hard_hit=False (trigger fires,
+    extra-never-skipped) — never allowed to kill the run at a checkpoint
+    the redelivery gate reads as complete. MUTANT KILLED: removing the
+    router's try/except around `_prefilter_hard_hit` makes run_graph
+    raise here and the needs_eyes assertion red."""
+    import app.agent.graph as graph_mod
+
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    tenant_id = await factories.insert_tenant(db_session, landlord_id, property_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+        body="please help, something is very wrong here",
+        prefilter=(
+            '{"hard_hit": true, "categories": ["fire"], "soft_annotations": [], "guards": []}'
+        ),
+    )
+
+    async def _raising_read(_message_id: object) -> bool:
+        raise RuntimeError("pool checkout timeout")
+
+    monkeypatch.setattr(graph_mod, "_prefilter_hard_hit", _raising_read)
+
+    fake_messages = _FakeMessages(
+        responses=[
+            _intent_response(),
+            _severity_response(severity="EMERGENCY"),
+            _draft_response_message(),
+        ]
+    )
+    _patch_client(monkeypatch, fake_messages)
+
+    try:
+        final_state = await run_graph(uuid.UUID(message_id))  # must not raise
+        assert final_state["severity"].severity.value == "EMERGENCY"
+
+        needs_eyes_count = (
+            await db_session.execute(
+                text(
+                    "SELECT count(*) FROM notifications "
+                    "WHERE landlord_id = :lid AND type = 'needs_eyes'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        # Unreadable snapshot => treated as a MISS => the trigger fires.
+        assert needs_eyes_count == 1
+    finally:
+        await _cleanup(db_session, landlord_id)

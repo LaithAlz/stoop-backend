@@ -59,15 +59,19 @@ pair entirely
 ------------------------------------------------------------------------
 ``app/agent/graph.py``'s ``_route_after_draft_response`` checks
 ``draft_guard_failed`` and LLM-classified ``Severity.EMERGENCY`` BEFORE
-ever reaching ``mark_awaiting_approval``'s edge — either trigger routes
-straight to ``degraded_mode -> END`` instead, so a ``needs_eyes``
-notification for those cases is written and the run reaches ``END``
-WITHOUT ever pausing here. The interim emergency/degraded-mode path (#34's
-own documented seam, "Interim, not #108") is therefore never blocked
-behind an unresumed approval interrupt — verified directly (see
+ever reaching ``mark_awaiting_approval``'s edge. ``draft_guard_failed``
+always routes straight to ``degraded_mode -> END`` (never pauses here);
+EMERGENCY does so ONLY for a genuine Tier-0 MISS (#184 scoping — the
+router re-reads the durable prefilter snapshot). **A Tier-0 HARD-HIT
+emergency's draft DOES now flow through this pair** — the webhook already
+placed the real call, so its tenant-facing reply draft gets the ordinary
+``awaiting_approval`` pause (queue card, push, draft-ready SMS) like any
+other draft. Verified directly (see
 ``tests/test_agent_shadow_interrupt.py``'s
-``test_llm_emergency_bypasses_the_pause_never_traps_needs_eyes`` and
-``test_draft_guard_failed_bypasses_the_pause``).
+``test_llm_emergency_bypasses_the_pause_never_traps_needs_eyes``,
+``test_draft_guard_failed_bypasses_the_pause``, and
+``tests/test_agent_graph.py``'s
+``test_run_graph_tier0_fired_emergency_skips_second_needs_eyes``).
 
 Stale-draft re-run interaction (the #34 spec-review pinned warning) — see
 ``app/agent/graph.py``'s module docstring "Stale-draft re-run" for the

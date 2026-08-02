@@ -295,11 +295,13 @@ UNCHANGED from #43 — every #43 test against it still holds — #44/#45 only
 add what happens ONCE the resume actually reaches a live interrupt.
 
 **The #44-pinned open design question, decided**: ``draft_response``'s
-degraded-mode exit (EMERGENCY / ``draft_guard_failed``) still inserts a
-``pending`` draft but routes to ``degraded_mode`` instead of
-``mark_awaiting_approval`` — so ``cases.status`` never becomes
-``'awaiting_approval'`` and no live interrupt is ever created for that
-draft (:class:`CaseNotAwaitingApprovalError`'s own docstring, cause 1).
+degraded-mode exit (``draft_guard_failed``, or EMERGENCY on a genuine
+Tier-0 MISS — since #184, a Tier-0 HARD hit's draft takes the ordinary
+``mark_awaiting_approval`` pause instead) still inserts a ``pending``
+draft but routes to ``degraded_mode`` — so for THOSE drafts
+``cases.status`` never becomes ``'awaiting_approval'`` and no live
+interrupt is ever created (:class:`CaseNotAwaitingApprovalError`'s own
+docstring, cause 1).
 **Decision (this issue): these drafts ARE approvable/rejectable/editable
 from the dashboard, via the SAME four endpoints** — a landlord must not
 lose the ability to act on a safe-fallback or EMERGENCY-drafted reply just
@@ -599,7 +601,16 @@ async def _prefilter_hard_hit(message_id: UUID) -> bool:
     ``False`` here means the EMERGENCY trigger still fires normally. This
     can only ever cause an EXTRA (never a skipped) notification if the
     snapshot is unreadable, which is the same fail-safe direction every
-    other Tier-0 fallback in this codebase already takes."""
+    other Tier-0 fallback in this codebase already takes.
+
+    The parse fallbacks above cover ``None``/``ValidationError`` only —
+    the DB READ itself (a pool timeout, a connection blip) can still
+    raise out of this function, and the CALLER guards that (#184 safety
+    review B1): the router wraps this call and maps any exception to
+    ``hard_hit = False``, because a raise inside a conditional edge kills
+    the run at a checkpoint indistinguishable from a clean END and would
+    permanently gate redelivery. Do not call this helper unguarded from
+    any routing context."""
     async with asynccontextmanager(get_admin_session)() as session:
         row = (
             (await session.execute(_SELECT_MESSAGE_PREFILTER_SQL, {"message_id": str(message_id)}))
@@ -716,8 +727,27 @@ async def _route_after_draft_response(state: AgentState) -> str:
     severity_result = state.get("severity")
     if severity_result is not None and severity_result.severity is Severity.EMERGENCY:
         # #184 — scoped to genuine Tier-0 misses only; see docstring above
-        # "The `not prefilter.hard_hit` scoping (#184)".
-        if not await _prefilter_hard_hit(state["message_id"]):
+        # "The `not prefilter.hard_hit` scoping (#184)". GUARDED (#184
+        # safety review B1, CRITICAL): a raising conditional edge kills
+        # the run at a checkpoint indistinguishable from a clean END
+        # (values populated, next empty, no interrupt — reviewer-probed),
+        # which the redelivery gate then reads as "already completed" —
+        # permanently gating a Tier-0-MISS emergency into silence. Any
+        # failure reading the snapshot (pool timeout, DB blip) therefore
+        # treats the message as a MISS: the trigger still fires, cost is
+        # at worst one redundant needs_eyes — the same
+        # extra-never-skipped direction as the helper's own parse
+        # fallbacks. Mirrors the auto-send reads' fail-closed guard below.
+        try:
+            hard_hit = await _prefilter_hard_hit(state["message_id"])
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "route_after_draft_response_prefilter_read_failed",
+                message_id=str(state["message_id"]),
+                exc_type=type(exc).__name__,
+            )
+            hard_hit = False
+        if not hard_hit:
             return NODE_DEGRADED_MODE
     if severity_result is not None and severity_result.severity is Severity.ROUTINE:
         case_context = state.get("case_context") or CaseContext()

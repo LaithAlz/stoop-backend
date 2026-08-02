@@ -353,18 +353,26 @@ async def _attempt_last_resort_needs_eyes(*, message_id: UUID, landlord_id: UUID
                     "landlord_id": str(landlord_id),
                     "payload": json.dumps(
                         # #184 item 5: plural "reasons" list, matching degraded_mode.py's
-                        # own needs_eyes payload key — one vocabulary for
-                        # every writer of this notification type.
+                        # own needs_eyes payloads. NOT claimed as global
+                        # unification: identify_property.py's unknown
+                        # -sender needs_eyes still writes a singular
+                        # `reason` key (pre-existing; no consumer reads
+                        # either key today).
                         {"message_id": str(message_id), "reasons": ["run_graph_failed"]}
                     ),
                 },
             )
     except Exception as exc:
-        log.error(
-            "graph_entry_last_resort_needs_eyes_failed",
-            message_id=str(message_id),
-            exc_type=type(exc).__name__,
-        )
+        # #184 safety review A5: guarded — a raising logger must not
+        # escape a fallback helper (nothing downstream can catch it).
+        try:
+            log.error(
+                "graph_entry_last_resort_needs_eyes_failed",
+                message_id=str(message_id),
+                exc_type=type(exc).__name__,
+            )
+        except Exception:  # noqa: BLE001, S110
+            pass
 
 
 def _report_run_graph_failure(*, message_id: UUID, landlord_id: UUID, exc_type: str) -> None:
@@ -483,10 +491,24 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
                     # to have run (a never-run thread also has empty
                     # ``next``; treating that as complete would skip the
                     # FIRST delivery of every case-less message — the
-                    # silent-dead-end class).
-                    already_completed = await _fallback_thread_ran_to_completion(
-                        f"message:{message_id}"
-                    )
+                    # silent-dead-end class). LOCALLY GUARDED (#184 safety
+                    # review B2, HIGH): this branch runs on the FIRST
+                    # delivery of every message and reads the
+                    # checkpointer's own separate psycopg pool — a
+                    # PoolClosed/failover blip here must NEVER veto the
+                    # graph run. Any failure reads as "not completed" →
+                    # re-run, which is idempotent and merely paid.
+                    try:
+                        already_completed = await _fallback_thread_ran_to_completion(
+                            f"message:{message_id}"
+                        )
+                    except Exception as gate_exc:  # noqa: BLE001
+                        log.error(
+                            "graph_entry_fallback_gate_read_failed",
+                            message_id=str(message_id),
+                            exc_type=type(gate_exc).__name__,
+                        )
+                        already_completed = False
 
             if already_completed:
                 return
@@ -498,7 +520,15 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
         # get_admin_session) by this point — the message_received row is
         # durable regardless of whatever happens in run_graph() below.
     except Exception as exc:
-        log.error("graph_entry_message_received_guard_failed", exc_type=type(exc).__name__)
+        # #184 safety review B2: a bare log-and-return here was a silent
+        # message drop (log.error never pages — event_level=None), on the
+        # one path where Twilio already got its 200 and will never retry.
+        # Failure must land toward "tell the landlord": durable last-resort
+        # row first, then the guarded page.
+        await _attempt_last_resort_needs_eyes(message_id=message_id, landlord_id=landlord_id)
+        _report_run_graph_failure(
+            message_id=message_id, landlord_id=landlord_id, exc_type=type(exc).__name__
+        )
         return
 
     try:

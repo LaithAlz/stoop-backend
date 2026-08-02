@@ -21,6 +21,12 @@ grants, no RLS — only an index on a table whose append-only REVOKEs
 (migration 0005) are untouched. (The dry-run rule covers role/grant/RLS
 migrations specifically — CLAUDE.md / stoop-change-control rule 10.)
 
+Operator note (#184 safety review A7): if this migration ever fails on
+pre-existing duplicates, identify them with
+  SELECT payload ->> 'message_id', count(*) FROM audit_log
+  WHERE action = 'message_received' GROUP BY 1 HAVING count(*) > 1;
+and adjudicate manually — never bulk-DELETE from audit_log.
+
 Pre-existing duplicates would fail the CREATE UNIQUE INDEX: acceptable by
 construction — no deployed environment exists (live Supabase carries no
 traffic), local/CI DBs migrate from scratch, and a hypothetical operator
