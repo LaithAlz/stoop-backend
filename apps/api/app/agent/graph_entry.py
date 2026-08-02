@@ -343,6 +343,35 @@ async def _attempt_last_resort_needs_eyes(*, message_id: UUID, landlord_id: UUID
         )
 
 
+def _report_run_graph_failure(*, message_id: UUID, landlord_id: UUID, exc_type: str) -> None:
+    """Log + Sentry-page a ``run_graph`` failure, each call individually
+    guarded (#184 item 2 / the #231 NEW-2 house pattern): the durable
+    fallback has ALREADY been written by the time this runs, and a raising
+    logger or Sentry transport must degrade to at-worst a quieter page —
+    never to an exception escaping the failure handler. Metadata only
+    (uuids + exception type name — rule #5)."""
+    try:
+        log.error(
+            "graph_entry_run_graph_failed",
+            message_id=str(message_id),
+            exc_type=exc_type,
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
+    try:
+        sentry_sdk.capture_message(
+            "graph_entry: run_graph failed -- message may be stuck with no draft/notification",
+            level="error",
+            extras={
+                "message_id": str(message_id),
+                "landlord_id": str(landlord_id),
+                "exc_type": exc_type,
+            },
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
 async def _queue_degraded_retry_for_lock_timeout(
     *, message_id: UUID, landlord_id: UUID, case_id: UUID
 ) -> None:
@@ -433,39 +462,22 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
     except CaseLockAcquisitionTimeoutError as exc:
         # Transient resource failure, not a logic one -- see module
         # docstring "A transient failure gets a RETRY, not just a page"
-        # (#186 follow-up round, NEW-2). Sentry page UNCHANGED (below,
-        # same shape as the generic branch); only the fallback differs:
-        # a durable degraded_retry marker instead of a one-shot needs_eyes.
-        log.error(
-            "graph_entry_run_graph_failed",
-            message_id=str(message_id),
-            exc_type=type(exc).__name__,
-        )
-        sentry_sdk.capture_message(
-            "graph_entry: run_graph failed -- message may be stuck with no draft/notification",
-            level="error",
-            extras={
-                "message_id": str(message_id),
-                "landlord_id": str(landlord_id),
-                "exc_type": type(exc).__name__,
-            },
-        )
+        # (#186 follow-up round, NEW-2). DURABLE FALLBACK FIRST (#184
+        # item 2): the degraded_retry marker is the thing that guarantees
+        # a person/retry ever hears about this message -- it must never
+        # be skipped because a REPORTING call raised. The helper is fully
+        # self-guarded; the log + Sentry page after it are each
+        # individually guarded too (the #231 NEW-2 house pattern).
         await _queue_degraded_retry_for_lock_timeout(
             message_id=message_id, landlord_id=landlord_id, case_id=exc.case_id
         )
+        _report_run_graph_failure(
+            message_id=message_id, landlord_id=landlord_id, exc_type=type(exc).__name__
+        )
     except Exception as exc:
-        log.error(
-            "graph_entry_run_graph_failed",
-            message_id=str(message_id),
-            exc_type=type(exc).__name__,
-        )
-        sentry_sdk.capture_message(
-            "graph_entry: run_graph failed -- message may be stuck with no draft/notification",
-            level="error",
-            extras={
-                "message_id": str(message_id),
-                "landlord_id": str(landlord_id),
-                "exc_type": type(exc).__name__,
-            },
-        )
+        # DURABLE FALLBACK FIRST (#184 item 2) -- same ordering rationale
+        # as the lock-timeout branch above.
         await _attempt_last_resort_needs_eyes(message_id=message_id, landlord_id=landlord_id)
+        _report_run_graph_failure(
+            message_id=message_id, landlord_id=landlord_id, exc_type=type(exc).__name__
+        )
