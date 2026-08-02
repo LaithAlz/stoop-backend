@@ -232,18 +232,29 @@ same house value as every other bounded sweep (`app/push_outbox.py`,
 #   doctrine applied to this module's one mutating statement: the rows are
 #   locked by the inner SELECT so it cannot fire today, but it makes the
 #   statement safe by construction rather than by planner behavior.
+# CTE form, NOT `WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)`: a
+# locking subquery under IN is not guaranteed to be evaluated exactly
+# once — the planner may re-execute it per outer candidate row, each
+# evaluation locking-and-returning MORE rows, so a `LIMIT 1` batch
+# empirically deleted 3 rows in one statement (caught by
+# test_retention_stops_at_deadline_then_resumes_next_tick going red in a
+# full-suite run after passing module-only — the plan choice flips with
+# table stats). A CTE carrying FOR UPDATE is materialized exactly once,
+# making the batch bound plan-independent.
 _DELETE_RETENTION_BATCH_SQL = text(
     """
-    DELETE FROM unrouted_inbound
-    WHERE id IN (
+    WITH claimed AS (
         SELECT id FROM unrouted_inbound
         WHERE resolved_at IS NOT NULL AND resolved_at < :cutoff
         ORDER BY resolved_at ASC
         LIMIT :limit
         FOR UPDATE SKIP LOCKED
     )
-    AND resolved_at IS NOT NULL AND resolved_at < :cutoff
-    RETURNING id
+    DELETE FROM unrouted_inbound u
+    USING claimed
+    WHERE u.id = claimed.id
+      AND u.resolved_at IS NOT NULL AND u.resolved_at < :cutoff
+    RETURNING u.id
     """
 )
 
