@@ -96,7 +96,15 @@ function toHouseAuthError(error: { message: string }): string {
 // Attack Protection should have Turnstile/hCaptcha on the OTP endpoint —
 // `shouldCreateUser: false` stops account creation but doesn't rate-limit
 // probing by itself.
-function isBlockedSignupError(error: { message: string }): boolean {
+function isBlockedSignupError(error: { message: string; code?: string }): boolean {
+  // Safety re-review B4 residual: match auth-js's STABLE machine code
+  // first (AuthApiError.code — 'signup_disabled'/'otp_disabled' in
+  // lib/error-codes); the English-prose substring stays only as a
+  // fallback so a GoTrue rewording can't silently turn this fence into
+  // the enumeration oracle it exists to prevent.
+  if (error.code === "signup_disabled" || error.code === "otp_disabled") {
+    return true;
+  }
   return error.message.toLowerCase().includes("signup");
 }
 
@@ -145,11 +153,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       };
     }
 
+    // Safety re-review NEW-1: ONE compare-then-assign helper for BOTH
+    // settle arms. The getSession() arm previously overwrote the ref
+    // blindly — harmless on a cold first mount, but the effect re-runs on
+    // retryNonce with the ref AND the query cache surviving, so a
+    // watchdog-retry landing on a DIFFERENT account's session (shared
+    // browser, other-tab sign-in during the outage) would have skipped
+    // the fence entirely.
+    const settleIdentity = (nextUserId: string | null) => {
+      const identityChanged =
+        lastUserIdRef.current !== null &&
+        nextUserId !== null &&
+        nextUserId !== lastUserIdRef.current;
+      if (identityChanged) {
+        queryClient.clear();
+      }
+      lastUserIdRef.current = nextUserId;
+      return identityChanged;
+    };
+
     supabase.auth.getSession().then(({ data }) => {
       if (!mounted) return;
       clearTimeout(watchdog);
-      lastUserIdRef.current = data.session?.user.id ?? null;
+      settleIdentity(data.session?.user.id ?? null);
       setSession(data.session);
+      setInitTimedOut(false); // NEW-3: a late-but-successful check self-heals
       setInitializing(false);
     });
 
@@ -158,10 +186,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       clearTimeout(watchdog);
 
       const nextUserId = nextSession?.user.id ?? null;
-      const identityChanged =
-        lastUserIdRef.current !== null &&
-        nextUserId !== null &&
-        nextUserId !== lastUserIdRef.current;
+      const identityChanged = settleIdentity(nextUserId);
 
       // PII fence (mirrors mobile's M1 senior review, BLOCKING finding,
       // sharpened by B2 above): the shared React Query cache holds tenant
@@ -174,11 +199,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // tab refocus for the same still-signed-in account, which must be a
       // no-op here. See PR report — web has no test runner configured
       // yet, unlike mobile's signOutClearsCache.test.tsx.
-      if (event === "SIGNED_OUT" || identityChanged) {
+      if (event === "SIGNED_OUT" && !identityChanged) {
+        // identityChanged already cleared inside settleIdentity; a plain
+        // sign-out (next id null) clears here.
         queryClient.clear();
       }
-      lastUserIdRef.current = nextUserId;
       setSession(nextSession);
+      setInitTimedOut(false); // NEW-3: any real auth settle self-heals
       setInitializing(false);
     });
 
