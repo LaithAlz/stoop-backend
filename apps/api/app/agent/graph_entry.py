@@ -290,6 +290,27 @@ async def _thread_reached_terminal_or_paused_state(thread_id: str) -> bool:
     return bool(snapshot.interrupts)
 
 
+async def _fallback_thread_ran_to_completion(thread_id: str) -> bool:
+    """``True`` iff the per-message FALLBACK thread (unknown-sender path,
+    #184 item 3) genuinely RAN and reached a terminal/paused state.
+    Differs from :func:`_thread_reached_terminal_or_paused_state` in one
+    load-bearing way: that helper is only ever called on a thread a
+    ``'drafted'`` marker PROVES has run, so it may read "empty ``next``"
+    as "terminal". A never-run thread ALSO has empty ``next`` (and empty
+    ``values``) — reading that as complete would skip the FIRST delivery
+    outright. Here ``snapshot.values`` non-empty is the "it actually ran"
+    witness; fail direction on any ambiguity is ``False`` → re-run (safe
+    and idempotent, merely paid)."""
+    case_graph = compile_case_graph()
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    snapshot = await case_graph.aget_state(config)
+    if not snapshot.values:
+        return False  # never ran at all — first delivery must proceed
+    if not snapshot.next:
+        return True
+    return bool(snapshot.interrupts)
+
+
 # Single-statement idempotent insert — see module docstring "Idempotent
 # INSERT, single statement" for the honest limits of this pattern.
 _INSERT_RECEIVED_IF_NOT_EXISTS_SQL = text(
@@ -331,7 +352,10 @@ async def _attempt_last_resort_needs_eyes(*, message_id: UUID, landlord_id: UUID
                 {
                     "landlord_id": str(landlord_id),
                     "payload": json.dumps(
-                        {"message_id": str(message_id), "reason": "run_graph_failed"}
+                        # #184 item 5: plural "reasons" list, matching degraded_mode.py's
+                        # own needs_eyes payload key — one vocabulary for
+                        # every writer of this notification type.
+                        {"message_id": str(message_id), "reasons": ["run_graph_failed"]}
                     ),
                 },
             )
@@ -442,6 +466,26 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
                 if drafted_row is not None:
                     already_completed = await _thread_reached_terminal_or_paused_state(
                         drafted_row["langgraph_thread_id"]
+                    )
+                else:
+                    # #184 item 3 — unknown-sender completion. A message
+                    # with no case (unknown sender) runs the case graph on
+                    # the per-message fallback thread (app/agent/graph.py's
+                    # `f"message:{message_id}"`), which IS checkpointed —
+                    # but it earns neither a 'degraded_mode' marker nor a
+                    # drafted-row thread, so every Twilio redelivery
+                    # re-ran the PAID classification pipeline for that one
+                    # shape (cost-only: the needs_eyes re-notify was always
+                    # an idempotent no-op). Checked with
+                    # :func:`_fallback_thread_ran_to_completion` — NOT the
+                    # drafted-row helper above, whose "empty next =
+                    # terminal" reading is only valid for a thread KNOWN
+                    # to have run (a never-run thread also has empty
+                    # ``next``; treating that as complete would skip the
+                    # FIRST delivery of every case-less message — the
+                    # silent-dead-end class).
+                    already_completed = await _fallback_thread_ran_to_completion(
+                        f"message:{message_id}"
                     )
 
             if already_completed:

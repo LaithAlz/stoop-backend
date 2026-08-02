@@ -453,7 +453,8 @@ async def test_enqueue_classification_pages_sentry_and_writes_last_resort_needs_
         assert notif_row["status"] == "pending"
         assert notif_row["case_id"] is None
         assert notif_row["payload"]["message_id"] == str(message_id)
-        assert notif_row["payload"]["reason"] == "run_graph_failed"
+        # #184 item 5: plural "reasons" list, unified with degraded_mode.py
+        assert notif_row["payload"]["reasons"] == ["run_graph_failed"]
     finally:
         await _cleanup(db_session, landlord_id)
 
