@@ -151,21 +151,31 @@ must EACH route to an explicit degraded-mode edge"):
    reasoning_log note — see its own docstring). :func:`_route_after_
    classify_severity` intercepts exactly that flag and routes to
    ``degraded_mode`` INSTEAD of ``draft_response`` — no silent dead end.
-2. **EMERGENCY severity the model itself assigned** (a genuine Tier-0
-   MISS the LLM caught — architecture.md §5/§8 and
-   ``docs/02-product/emergency-prefilter.md``'s escalate-past-a-miss
-   doctrine: the agent may escalate past a miss, it may never de-escalate
-   a fire). A first revision of this graph let an LLM-classified
-   EMERGENCY fall through to an ORDINARY approval-queued draft with NO
-   notification at all — silent, exactly the failure mode this whole
-   gate exists to prevent (senior review, CRITICAL). Fixed by
+2. **EMERGENCY severity the model itself assigned, AND Tier-0 did NOT
+   already fire** (a genuine Tier-0 MISS the LLM caught — architecture.md
+   §5/§8 and ``docs/02-product/emergency-prefilter.md``'s
+   escalate-past-a-miss doctrine: the agent may escalate past a miss, it
+   may never de-escalate a fire). A first revision of this graph let an
+   LLM-classified EMERGENCY fall through to an ORDINARY approval-queued
+   draft with NO notification at all — silent, exactly the failure mode
+   this whole gate exists to prevent (senior review, CRITICAL). Fixed by
    :func:`_route_after_draft_response` checking ``state["severity"]`` for
    ``Severity.EMERGENCY`` IN ADDITION TO ``draft_guard_failed`` — checked
    AFTER ``draft_response`` runs (not instead of it), so the draft is
    composed first (a draft plus a needs_eyes notification beats a
    notification alone) and the notification is what actually gates
    "did a person get told" — see "Interim, not #108" below for why this
-   lives here instead of a real escalation.
+   lives here instead of a real escalation. **Scoped to exclude Tier-0
+   HARD hits (#184)**: ``classify_severity``'s own clamp (never de-escalate
+   a fire) means EVERY Tier-0-caught emergency also reads
+   ``Severity.EMERGENCY`` here — routing those through this trigger too
+   would fire a second, redundant ``needs_eyes`` on top of the webhook's
+   own real ``emergency_call`` notification (#108's actual execution seam),
+   diluting the signal for the genuine tail case this trigger exists for.
+   :func:`_prefilter_hard_hit` re-reads the durable ``messages.prefilter``
+   snapshot (never re-run) so this trigger only fires for an actual Tier-0
+   miss; a Tier-0 hit still gets its draft, just via the ordinary
+   ``mark_awaiting_approval`` pause instead of a second degraded-mode pass.
 3. ``draft_response`` sets ``state["draft_guard_failed"] = True`` when the
    model's own text failed the hard safety guards twice (a draft IS
    still inserted, using the safe generic fallback) —
@@ -181,9 +191,21 @@ Interim, not #108 — this is NOT the real escalation chain
 Routing an LLM-classified EMERGENCY to ``degraded_mode`` is an INTERIM
 behavior, not #108's actual voice-call/safety-SMS/escalation-chain seam
 (``app/agent/emergency.py``). It exists because "silent" is strictly
-worse than "a needs_eyes notification, no voice call yet" — #108 replaces
-this edge (or adds a second one) once the real execution seam exists;
-until then, a durable, queryable ``needs_eyes`` row is the honest floor.
+worse than "a needs_eyes notification, no voice call yet" — a durable,
+queryable ``needs_eyes`` row is the honest floor for the case #108's own
+Tier-0-triggered seam does not cover (a MISS, not a hit).
+
+**#108 has since shipped and did NOT replace this edge (#184 triage,
+evidence-based)**: #108 wired the REAL emergency executor for Tier-0 HARD
+hits (the webhook's own call site, ``app/routers/webhooks/twilio.py`` →
+``app/agent/emergency.py`` → ``emergency_chain.py``) — but that is a
+DIFFERENT trigger (Tier-0 firing, before this graph even runs), not a
+replacement of this interim graph edge. What #108's arrival DID change is
+that this edge, unscoped, became actively redundant on every Tier-0-caught
+emergency (a real call already placed, PLUS a second needs_eyes push) —
+fixed by the ``not prefilter.hard_hit`` scoping above (#184), not by
+removing the edge itself (a genuine LLM-only Tier-0 MISS still has no
+other execution seam and still needs this durable floor).
 
 Shadow mode (#43) — interrupt() before any send
 ------------------------------------------------------------------------
@@ -273,11 +295,13 @@ UNCHANGED from #43 — every #43 test against it still holds — #44/#45 only
 add what happens ONCE the resume actually reaches a live interrupt.
 
 **The #44-pinned open design question, decided**: ``draft_response``'s
-degraded-mode exit (EMERGENCY / ``draft_guard_failed``) still inserts a
-``pending`` draft but routes to ``degraded_mode`` instead of
-``mark_awaiting_approval`` — so ``cases.status`` never becomes
-``'awaiting_approval'`` and no live interrupt is ever created for that
-draft (:class:`CaseNotAwaitingApprovalError`'s own docstring, cause 1).
+degraded-mode exit (``draft_guard_failed``, or EMERGENCY on a genuine
+Tier-0 MISS — since #184, a Tier-0 HARD hit's draft takes the ordinary
+``mark_awaiting_approval`` pause instead) still inserts a ``pending``
+draft but routes to ``degraded_mode`` — so for THOSE drafts
+``cases.status`` never becomes ``'awaiting_approval'`` and no live
+interrupt is ever created (:class:`CaseNotAwaitingApprovalError`'s own
+docstring, cause 1).
 **Decision (this issue): these drafts ARE approvable/rejectable/editable
 from the dashboard, via the SAME four endpoints** — a landlord must not
 lose the ability to act on a safe-fallback or EMERGENCY-drafted reply just
@@ -494,6 +518,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
+from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -518,7 +543,7 @@ from app.agent.nodes.finalize_draft_decision import (
 from app.agent.nodes.identify_case import identify_case
 from app.agent.nodes.identify_property import identify_property
 from app.agent.nodes.load_context import load_context
-from app.agent.schemas import CaseContext, Severity
+from app.agent.schemas import CaseContext, PrefilterResult, Severity
 from app.agent.state import AgentState
 from app.config import settings
 from app.db.session import get_admin_session
@@ -553,6 +578,62 @@ _UNKNOWN_SENDER_THREAD_PREFIX = "message:"
 # Conditional routers (#34 G1 — see module docstring)
 # ---------------------------------------------------------------------------
 
+_SELECT_MESSAGE_PREFILTER_SQL = text("SELECT prefilter FROM messages WHERE id = :message_id")
+
+
+async def _prefilter_hard_hit(message_id: UUID) -> bool:
+    """Re-reads the durable Tier-0 snapshot (``messages.prefilter``) for
+    *message_id* — the SAME "never re-run, never trust anything but the
+    webhook's own persisted snapshot" convention every other node in this
+    package already follows (``identify_case.py``/``classify_severity.py``/
+    ``degraded_mode.py`` each keep their own local copy of this exact
+    fallback rather than importing one another's — established project
+    convention). ``AgentState.prefilter`` is never actually populated by
+    any node's return value (the field predates #34's graph wiring and its
+    own docstring's "set by the webhook handler" was never implemented for
+    the graph path), so :func:`_route_after_draft_response` reads the
+    snapshot directly here rather than threading a new state key through
+    the checkpointer for a single boolean.
+
+    Fails SAFE toward "not yet confirmed handled": a missing or malformed
+    snapshot returns ``False`` (never ``True``) — under
+    :func:`_route_after_draft_response`'s ``not hard_hit`` check below,
+    ``False`` here means the EMERGENCY trigger still fires normally. This
+    can only ever cause an EXTRA (never a skipped) notification if the
+    snapshot is unreadable, which is the same fail-safe direction every
+    other Tier-0 fallback in this codebase already takes.
+
+    The parse fallbacks above cover ``None``/``ValidationError`` only —
+    the DB READ itself (a pool timeout, a connection blip) can still
+    raise out of this function, and the CALLER guards that (#184 safety
+    review B1): the router wraps this call and maps any exception to
+    ``hard_hit = False``, because a raise inside a conditional edge kills
+    the run at a checkpoint indistinguishable from a clean END and would
+    permanently gate redelivery. Do not call this helper unguarded from
+    any routing context."""
+    async with asynccontextmanager(get_admin_session)() as session:
+        row = (
+            (await session.execute(_SELECT_MESSAGE_PREFILTER_SQL, {"message_id": str(message_id)}))
+            .mappings()
+            .one_or_none()
+        )
+    raw = row["prefilter"] if row is not None else None
+    if raw is None:
+        log.error(
+            "route_after_draft_response_prefilter_snapshot_missing",
+            message_id=str(message_id),
+        )
+        return False
+    try:
+        return bool(PrefilterResult.model_validate(raw).hard_hit)
+    except (ValidationError, TypeError) as exc:
+        log.warning(
+            "route_after_draft_response_prefilter_snapshot_malformed",
+            message_id=str(message_id),
+            exc_type=type(exc).__name__,
+        )
+        return False
+
 
 def _route_after_classify_severity(state: AgentState) -> str:
     """``classification_failed`` skips ``draft_response`` entirely (there
@@ -569,12 +650,36 @@ async def _route_after_draft_response(state: AgentState) -> str:
 
     - ``draft_guard_failed`` — the model's OWN acknowledgment text failed
       the hard safety guards twice.
-    - ``severity == EMERGENCY`` — an LLM-classified emergency Tier-0
-      missed (see module docstring "The degraded-mode routing", trigger
-      2). Checked AFTER ``draft_response`` runs, not instead of it: the
-      draft is still composed and inserted either way (a draft plus a
-      needs_eyes notification beats a notification alone) — this router
-      only decides whether a person ALSO gets durably notified.
+    - ``severity == EMERGENCY and not prefilter.hard_hit`` — an
+      LLM-classified emergency Tier-0 itself MISSED (see module docstring
+      "The degraded-mode routing", trigger 2). Checked AFTER
+      ``draft_response`` runs, not instead of it: the draft is still
+      composed and inserted either way (a draft plus a needs_eyes
+      notification beats a notification alone) — this router only decides
+      whether a person ALSO gets durably notified.
+
+      **The ``not prefilter.hard_hit`` scoping (#184)**: a Tier-0 HARD hit
+      already made the webhook fire the REAL emergency protocol
+      (``app/agent/emergency.py`` / ``emergency_chain.py`` — a landlord
+      voice call plus an ``emergency_call`` notification row) before this
+      graph ever ran; ``classify_severity``'s own Tier-0 clamp then ALWAYS
+      forces ``state["severity"]`` to ``EMERGENCY`` for that same message
+      (never de-escalates a fire). Without this scoping, EVERY Tier-0-caught
+      emergency also fell through this trigger and got a SECOND, redundant
+      ``needs_eyes`` push — diluting the signal for the actual tail case
+      this trigger exists for (a genuine LLM-caught Tier-0 MISS, where no
+      call has been placed at all). :func:`_prefilter_hard_hit` re-reads
+      the durable ``messages.prefilter`` snapshot (never re-run) to tell
+      the two apart; a hard hit here still gets its draft (composed above,
+      unconditionally) but no longer routes to a second, redundant
+      ``degraded_mode`` pass for the EMERGENCY trigger specifically —
+      it falls through to the SAME ``mark_awaiting_approval ->
+      await_approval`` pause an ordinary urgent/routine draft gets, since
+      the landlord has already been called about the actual emergency and
+      this draft is just the tenant-facing reply text now needing ordinary
+      review. (``draft_guard_failed`` is checked independently, above, and
+      is UNCHANGED by this scoping — a guard failure needs a person's eyes
+      regardless of whether Tier-0 also fired.)
 
     Either way this is IN ADDITION TO (not instead of) the draft that
     ``draft_response`` already inserted. Checked FIRST, before either exit
@@ -621,7 +726,29 @@ async def _route_after_draft_response(state: AgentState) -> str:
         return NODE_DEGRADED_MODE
     severity_result = state.get("severity")
     if severity_result is not None and severity_result.severity is Severity.EMERGENCY:
-        return NODE_DEGRADED_MODE
+        # #184 — scoped to genuine Tier-0 misses only; see docstring above
+        # "The `not prefilter.hard_hit` scoping (#184)". GUARDED (#184
+        # safety review B1, CRITICAL): a raising conditional edge kills
+        # the run at a checkpoint indistinguishable from a clean END
+        # (values populated, next empty, no interrupt — reviewer-probed),
+        # which the redelivery gate then reads as "already completed" —
+        # permanently gating a Tier-0-MISS emergency into silence. Any
+        # failure reading the snapshot (pool timeout, DB blip) therefore
+        # treats the message as a MISS: the trigger still fires, cost is
+        # at worst one redundant needs_eyes — the same
+        # extra-never-skipped direction as the helper's own parse
+        # fallbacks. Mirrors the auto-send reads' fail-closed guard below.
+        try:
+            hard_hit = await _prefilter_hard_hit(state["message_id"])
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "route_after_draft_response_prefilter_read_failed",
+                message_id=str(state["message_id"]),
+                exc_type=type(exc).__name__,
+            )
+            hard_hit = False
+        if not hard_hit:
+            return NODE_DEGRADED_MODE
     if severity_result is not None and severity_result.severity is Severity.ROUTINE:
         case_context = state.get("case_context") or CaseContext()
         property_id = case_context.property_id

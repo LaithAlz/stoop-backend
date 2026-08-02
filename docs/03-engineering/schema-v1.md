@@ -873,6 +873,29 @@
 >    simply the first writer of this combination. No migration needed for
 >    this part.
 
+> **v1.20 amendment (2026-08-02)** — migration 0016 implements this (#184
+> item 4; same class as the v1.3 dedupe index — an app-level existence
+> check replaced by a real Postgres constraint):
+> 1. New partial unique expression index on `audit_log`:
+>    ```sql
+>    CREATE UNIQUE INDEX uq_audit_message_received_dedupe
+>      ON audit_log ((payload ->> 'message_id'))
+>      WHERE action = 'message_received';
+>    ```
+>    `graph_entry.py`'s `message_received` observability row previously
+>    used `INSERT ... WHERE NOT EXISTS` — honestly documented in that
+>    module as not cross-process-safe (duplicates were cosmetic since the
+>    row stopped gating anything in the #34 round-2 fix, but the audit
+>    trail is the LTB artifact). The write is now `ON CONFLICT ... DO
+>    NOTHING` against this index (the v1.3/0006 inference pattern). Only
+>    `message_received` rows are constrained; every other action repeats
+>    freely, and NULL-extracting payloads never collide (standard partial
+>    -unique NULL semantics, as everywhere else in this file).
+> 2. Append-only posture unchanged: an index adds no UPDATE/DELETE path;
+>    migration 0005's REVOKEs are untouched. No roles/grants/RLS → the
+>    live-dry-run rule does not apply. Downgrade drops the index only
+>    (performance regression, never correctness — same shape as v1.9).
+
 <!-- DDL-body annotation for v1.19 lives on the unrouted_inbound CREATE
      TABLE block below (retention marker), per the house annotate-don't-
      silently-edit convention. -->
@@ -1311,6 +1334,11 @@ CREATE TABLE audit_log (
 );
 CREATE INDEX idx_audit_case     ON audit_log (case_id, created_at);
 CREATE INDEX idx_audit_landlord ON audit_log (landlord_id, created_at);
+-- v1.20 (migration 0016, #184): cross-process dedupe for the
+-- message_received observability row -- see the v1.20 amendment block.
+CREATE UNIQUE INDEX uq_audit_message_received_dedupe
+  ON audit_log ((payload ->> 'message_id'))
+  WHERE action = 'message_received';
 -- append-only: REVOKE UPDATE, DELETE ON audit_log FROM app_role;
 
 -- ───────────────────────── notifications ─────────────────────

@@ -47,16 +47,16 @@ migration 0006; ``uq_drafts_one_pending`` + ``draft_response.py``'s own
 stale-then-insert retry; ``message_cases``' ``ON CONFLICT DO NOTHING``)
 absorb a re-run safely rather than double-creating anything.
 
-Known gap, not fixed here (flagged, not silently accepted): a message from
-an unrecognized/unknown-sender (``identify_property``'s own "unknown
-sender" branch) never reaches ``draft_response`` far enough to insert a
-draft (case_id is ``None``, that node returns early) NOR
-``classification_failed``/``draft_guard_failed``/EMERGENCY (classification
-still runs and normally succeeds) — so it never gets a completion marker
-either, and every redelivery re-runs the full (paid) classification/draft
-pipeline for it. Rare in practice (unknown senders should be uncommon)
-but a real, discovered cost tradeoff — worth a dedicated completion
-signal for that path if it turns out to matter in production.
+The unknown-sender gap above was CLOSED by #184 item 3: a message with no
+case runs the case graph on the checkpointed per-message fallback thread
+(``f"message:{message_id}"``), and the completion gate now inspects that
+thread via :func:`_fallback_thread_ran_to_completion` when no drafted row
+exists — reusing the existing checkpoint-inspection mechanism, no new
+marker vocabulary. The helper deliberately differs from the drafted-row
+one: it requires ``snapshot.values`` non-empty as the "actually ran"
+witness, because a NEVER-RUN thread also has empty ``next`` and treating
+that as complete would skip the first delivery outright (see its own
+docstring).
 
 Crash-window coherence with #43's ``mark_awaiting_approval`` (safety
 review MEDIUM, #43 fix round; REPRODUCED as MAJOR and fixed again, same
@@ -136,27 +136,21 @@ line, not a gate — appended idempotently (see below) the first time this
 process sees the message, regardless of whether the graph goes on to
 succeed.
 
-Idempotent INSERT, single statement (safety review MEDIUM, same fix round)
+Idempotent INSERT — index-enforced since migration 0016 (#184 item 4)
 ------------------------------------------------------------------------
-:data:`_INSERT_RECEIVED_IF_NOT_EXISTS_SQL` collapses the old separate
-``SELECT EXISTS`` + ``INSERT`` into ONE ``INSERT ... SELECT ... WHERE NOT
-EXISTS (...)`` statement — the same shape
-``app/routers/webhooks/twilio.py``'s own module docstring names as an
-EARLIER, superseded attempt at this exact problem. Full disclosure of that
-history's lesson, honestly carried over here: that single-statement form
-is NOT airtight against two genuinely CONCURRENT transactions (each can
-evaluate its own ``NOT EXISTS`` as true before the other commits,
-producing two rows) — true concurrency-proof idempotency needs a real
-unique index + ``ON CONFLICT``, which the webhook's OWN
-``notifications``/``messages`` writes have (migration 0006) and this
-``audit_log`` jsonb-payload correlation does not (adding one would be a
-schema/migration change, out of this issue's scope). Collapsing to one
-round trip still meaningfully shrinks the race window versus the old
-two-statement form, and — critically — a duplicate ``message_received``
-row is merely a cosmetic double log line, never a safety issue: it no
-longer gates anything (see above), so losing this narrower race only
-means an extra observability row, not a duplicate graph run or a lost
-message.
+:data:`_INSERT_RECEIVED_IF_NOT_EXISTS_SQL` (name kept for grep history)
+is now a plain ``INSERT ... ON CONFLICT ... DO NOTHING`` against the
+partial unique expression index ``uq_audit_message_received_dedupe``
+(migration 0016, schema-v1.md v1.20) — Postgres's own conflict detection,
+safe across arbitrarily many concurrent connections. This replaced the
+earlier ``INSERT ... SELECT ... WHERE NOT EXISTS`` form, which this
+docstring previously (honestly) flagged as not cross-process-safe: two
+genuinely concurrent transactions could each evaluate ``NOT EXISTS`` as
+true before either committed, producing duplicate rows. Duplicates were
+only ever cosmetic (``message_received`` stopped gating anything in the
+round-2 fix above), but the audit trail is a product surface (the LTB
+artifact), and the index is the same 0006 pattern every other idempotent
+write here already uses.
 
 Never raises outward
 ---------------------
@@ -290,16 +284,43 @@ async def _thread_reached_terminal_or_paused_state(thread_id: str) -> bool:
     return bool(snapshot.interrupts)
 
 
+async def _fallback_thread_ran_to_completion(thread_id: str) -> bool:
+    """``True`` iff the per-message FALLBACK thread (unknown-sender path,
+    #184 item 3) genuinely RAN and reached a terminal/paused state.
+    Differs from :func:`_thread_reached_terminal_or_paused_state` in one
+    load-bearing way: that helper is only ever called on a thread a
+    ``'drafted'`` marker PROVES has run, so it may read "empty ``next``"
+    as "terminal". A never-run thread ALSO has empty ``next`` (and empty
+    ``values``) — reading that as complete would skip the FIRST delivery
+    outright. Here ``snapshot.values`` non-empty is the "it actually ran"
+    witness; fail direction on any ambiguity is ``False`` → re-run (safe
+    and idempotent, merely paid)."""
+    case_graph = compile_case_graph()
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    snapshot = await case_graph.aget_state(config)
+    if not snapshot.values:
+        return False  # never ran at all — first delivery must proceed
+    if not snapshot.next:
+        return True
+    return bool(snapshot.interrupts)
+
+
 # Single-statement idempotent insert — see module docstring "Idempotent
 # INSERT, single statement" for the honest limits of this pattern.
+# #184 item 4: the WHERE NOT EXISTS form this replaced was honestly
+# documented as not cross-process-safe (two concurrent transactions can
+# both pass the existence check). Migration 0016's partial unique
+# expression index (`uq_audit_message_received_dedupe`) + this ON CONFLICT
+# (expression + predicate matching the index verbatim, required for
+# Postgres's unique-index inference — the house 0006 pattern) closes it at
+# the database. Purely-cosmetic-duplicate era is over; the audit trail is
+# a product surface (the LTB artifact).
 _INSERT_RECEIVED_IF_NOT_EXISTS_SQL = text(
     "INSERT INTO audit_log (landlord_id, case_id, actor, action, payload) "
-    "SELECT :landlord_id, NULL, 'system', 'message_received', "
-    "       jsonb_build_object('message_id', CAST(:message_id AS text)) "
-    "WHERE NOT EXISTS ("
-    "  SELECT 1 FROM audit_log"
-    "  WHERE action = 'message_received' AND payload ->> 'message_id' = :message_id"
-    ")"
+    "VALUES (:landlord_id, NULL, 'system', 'message_received', "
+    "        jsonb_build_object('message_id', CAST(:message_id AS text))) "
+    "ON CONFLICT ((payload ->> 'message_id')) WHERE action = 'message_received' "
+    "DO NOTHING"
 )
 
 # Same uq_notifications_message_dedupe idempotency pattern used everywhere
@@ -331,16 +352,60 @@ async def _attempt_last_resort_needs_eyes(*, message_id: UUID, landlord_id: UUID
                 {
                     "landlord_id": str(landlord_id),
                     "payload": json.dumps(
-                        {"message_id": str(message_id), "reason": "run_graph_failed"}
+                        # #184 item 5: plural "reasons" list, matching degraded_mode.py's
+                        # own needs_eyes payloads. NOT claimed as global
+                        # unification: identify_property.py's unknown
+                        # -sender needs_eyes still writes a singular
+                        # `reason` key (pre-existing; no consumer reads
+                        # either key today).
+                        {"message_id": str(message_id), "reasons": ["run_graph_failed"]}
                     ),
                 },
             )
     except Exception as exc:
+        # #184 safety review A5: guarded — a raising logger must not
+        # escape a fallback helper (nothing downstream can catch it).
+        try:
+            log.error(
+                "graph_entry_last_resort_needs_eyes_failed",
+                message_id=str(message_id),
+                exc_type=type(exc).__name__,
+            )
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+
+def _report_run_graph_failure(
+    *, message_id: UUID, landlord_id: UUID, exc_type: str, stage: str = "run_graph"
+) -> None:
+    """Log + Sentry-page a ``run_graph`` failure, each call individually
+    guarded (#184 item 2 / the #231 NEW-2 house pattern): the durable
+    fallback has ALREADY been written by the time this runs, and a raising
+    logger or Sentry transport must degrade to at-worst a quieter page —
+    never to an exception escaping the failure handler. Metadata only
+    (uuids + exception type name — rule #5)."""
+    try:
         log.error(
-            "graph_entry_last_resort_needs_eyes_failed",
+            "graph_entry_run_graph_failed",
             message_id=str(message_id),
-            exc_type=type(exc).__name__,
+            exc_type=exc_type,
+            stage=stage,
         )
+    except Exception:  # noqa: BLE001, S110
+        pass
+    try:
+        sentry_sdk.capture_message(
+            "graph_entry: run_graph failed -- message may be stuck with no draft/notification",
+            level="error",
+            extras={
+                "message_id": str(message_id),
+                "landlord_id": str(landlord_id),
+                "exc_type": exc_type,
+                "stage": stage,
+            },
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
 
 
 async def _queue_degraded_retry_for_lock_timeout(
@@ -350,9 +415,9 @@ async def _queue_degraded_retry_for_lock_timeout(
     review, #186 follow-up round, NEW-2) — see module docstring "A
     transient failure gets a RETRY, not just a page". Best-effort and
     itself fully guarded, same shape as
-    :func:`_attempt_last_resort_needs_eyes`: a failure here is logged and
-    swallowed, never raised — there is nothing left downstream to catch
-    it.
+    :func:`_attempt_last_resort_needs_eyes`: a failure here is logged (the
+    log call itself guarded too — #184 A5) and swallowed, never raised —
+    there is nothing left downstream to catch it.
     """
     try:
         async with asynccontextmanager(get_admin_session)() as session:
@@ -414,6 +479,40 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
                     already_completed = await _thread_reached_terminal_or_paused_state(
                         drafted_row["langgraph_thread_id"]
                     )
+                else:
+                    # #184 item 3 — unknown-sender completion. A message
+                    # with no case (unknown sender) runs the case graph on
+                    # the per-message fallback thread (app/agent/graph.py's
+                    # `f"message:{message_id}"`), which IS checkpointed —
+                    # but it earns neither a 'degraded_mode' marker nor a
+                    # drafted-row thread, so every Twilio redelivery
+                    # re-ran the PAID classification pipeline for that one
+                    # shape (cost-only: the needs_eyes re-notify was always
+                    # an idempotent no-op). Checked with
+                    # :func:`_fallback_thread_ran_to_completion` — NOT the
+                    # drafted-row helper above, whose "empty next =
+                    # terminal" reading is only valid for a thread KNOWN
+                    # to have run (a never-run thread also has empty
+                    # ``next``; treating that as complete would skip the
+                    # FIRST delivery of every case-less message — the
+                    # silent-dead-end class). LOCALLY GUARDED (#184 safety
+                    # review B2, HIGH): this branch runs on the FIRST
+                    # delivery of every message and reads the
+                    # checkpointer's own separate psycopg pool — a
+                    # PoolClosed/failover blip here must NEVER veto the
+                    # graph run. Any failure reads as "not completed" →
+                    # re-run, which is idempotent and merely paid.
+                    try:
+                        already_completed = await _fallback_thread_ran_to_completion(
+                            f"message:{message_id}"
+                        )
+                    except Exception as gate_exc:  # noqa: BLE001
+                        log.error(
+                            "graph_entry_fallback_gate_read_failed",
+                            message_id=str(message_id),
+                            exc_type=type(gate_exc).__name__,
+                        )
+                        already_completed = False
 
             if already_completed:
                 return
@@ -425,7 +524,18 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
         # get_admin_session) by this point — the message_received row is
         # durable regardless of whatever happens in run_graph() below.
     except Exception as exc:
-        log.error("graph_entry_message_received_guard_failed", exc_type=type(exc).__name__)
+        # #184 safety review B2: a bare log-and-return here was a silent
+        # message drop (log.error never pages — event_level=None), on the
+        # one path where Twilio already got its 200 and will never retry.
+        # Failure must land toward "tell the landlord": durable last-resort
+        # row first, then the guarded page.
+        await _attempt_last_resort_needs_eyes(message_id=message_id, landlord_id=landlord_id)
+        _report_run_graph_failure(
+            message_id=message_id,
+            landlord_id=landlord_id,
+            exc_type=type(exc).__name__,
+            stage="completion_gate",  # #184 N2: the graph never ran here
+        )
         return
 
     try:
@@ -433,39 +543,22 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
     except CaseLockAcquisitionTimeoutError as exc:
         # Transient resource failure, not a logic one -- see module
         # docstring "A transient failure gets a RETRY, not just a page"
-        # (#186 follow-up round, NEW-2). Sentry page UNCHANGED (below,
-        # same shape as the generic branch); only the fallback differs:
-        # a durable degraded_retry marker instead of a one-shot needs_eyes.
-        log.error(
-            "graph_entry_run_graph_failed",
-            message_id=str(message_id),
-            exc_type=type(exc).__name__,
-        )
-        sentry_sdk.capture_message(
-            "graph_entry: run_graph failed -- message may be stuck with no draft/notification",
-            level="error",
-            extras={
-                "message_id": str(message_id),
-                "landlord_id": str(landlord_id),
-                "exc_type": type(exc).__name__,
-            },
-        )
+        # (#186 follow-up round, NEW-2). DURABLE FALLBACK FIRST (#184
+        # item 2): the degraded_retry marker is the thing that guarantees
+        # a person/retry ever hears about this message -- it must never
+        # be skipped because a REPORTING call raised. The helper is fully
+        # self-guarded; the log + Sentry page after it are each
+        # individually guarded too (the #231 NEW-2 house pattern).
         await _queue_degraded_retry_for_lock_timeout(
             message_id=message_id, landlord_id=landlord_id, case_id=exc.case_id
         )
+        _report_run_graph_failure(
+            message_id=message_id, landlord_id=landlord_id, exc_type=type(exc).__name__
+        )
     except Exception as exc:
-        log.error(
-            "graph_entry_run_graph_failed",
-            message_id=str(message_id),
-            exc_type=type(exc).__name__,
-        )
-        sentry_sdk.capture_message(
-            "graph_entry: run_graph failed -- message may be stuck with no draft/notification",
-            level="error",
-            extras={
-                "message_id": str(message_id),
-                "landlord_id": str(landlord_id),
-                "exc_type": type(exc).__name__,
-            },
-        )
+        # DURABLE FALLBACK FIRST (#184 item 2) -- same ordering rationale
+        # as the lock-timeout branch above.
         await _attempt_last_resort_needs_eyes(message_id=message_id, landlord_id=landlord_id)
+        _report_run_graph_failure(
+            message_id=message_id, landlord_id=landlord_id, exc_type=type(exc).__name__
+        )
