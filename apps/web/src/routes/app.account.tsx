@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { queue } from "@/lib/mock-app";
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/auth/AuthProvider";
 
 export const Route = createFileRoute("/app/account")({
   head: () => ({
@@ -27,9 +28,11 @@ export const Route = createFileRoute("/app/account")({
 });
 
 function AccountPage() {
+  const { signOut } = useAuth();
   const [push, setPush] = useState(true);
   const [email, setEmail] = useState(true);
   const [logoutOpen, setLogoutOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
 
   return (
     <PhoneFrame>
@@ -209,8 +212,16 @@ function AccountPage() {
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-brand text-brand-foreground hover:bg-brand/90"
-              onClick={() => {
+              disabled={signingOut}
+              onClick={async () => {
+                setSigningOut(true);
+                // src/routes/app.tsx's route guard picks up the session
+                // change and redirects to /sign-in; the PII fence
+                // (src/auth/AuthProvider.tsx) clears the query cache on
+                // the same SIGNED_OUT event.
+                await signOut();
                 setLogoutOpen(false);
+                setSigningOut(false);
                 toast.success("Signed out", { duration: 1500 });
               }}
             >
