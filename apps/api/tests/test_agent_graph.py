@@ -804,6 +804,7 @@ async def test_reasoning_log_no_reducer_convention_does_not_duplicate() -> None:
     assert result["reasoning_log"] == ["node a ran", "node b ran"]
 
 
+@pytest.mark.integration
 async def test_run_graph_tier0_fired_emergency_skips_second_needs_eyes(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -875,6 +876,7 @@ async def test_run_graph_tier0_fired_emergency_skips_second_needs_eyes(
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
 async def test_run_graph_emergency_with_present_miss_snapshot_routes_to_degraded_mode(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -923,6 +925,7 @@ async def test_run_graph_emergency_with_present_miss_snapshot_routes_to_degraded
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
 async def test_run_graph_emergency_prefilter_read_failure_still_reaches_degraded_mode(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

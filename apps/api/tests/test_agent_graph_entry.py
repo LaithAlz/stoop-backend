@@ -434,7 +434,7 @@ async def test_enqueue_classification_pages_sentry_and_writes_last_resort_needs_
         assert extras["landlord_id"] == landlord_id
         assert extras["exc_type"]  # some exception type name, never body/phone/JWT content
         # Metadata only -- rule #5.
-        assert set(extras) == {"message_id", "landlord_id", "exc_type"}
+        assert set(extras) == {"message_id", "landlord_id", "exc_type", "stage"}  # #184 N2
 
         notif_row = (
             (
@@ -664,7 +664,16 @@ async def test_unknown_sender_redelivery_after_completion_is_skipped(
         body="wrong number probably",
     )
 
-    _patch_client(monkeypatch, _full_success_fake_messages())
+    # #184 safety re-review N1: TWO full response sets — if the gate
+    # mutant lets the graph re-run, the second run COMPLETES and writes a
+    # second 'classified' row, making the count assertion genuinely
+    # discriminating (a single set made the mutant die of response
+    # exhaustion instead, passing the assertion vacuously).
+    fake = _full_success_fake_messages()
+    fake_double = _FakeMessages(
+        responses=fake._responses + _full_success_fake_messages()._responses
+    )  # noqa: SLF001
+    _patch_client(monkeypatch, fake_double)
 
     try:
         await enqueue_classification(uuid.UUID(message_id), uuid.UUID(landlord_id))

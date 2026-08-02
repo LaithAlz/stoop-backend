@@ -375,7 +375,9 @@ async def _attempt_last_resort_needs_eyes(*, message_id: UUID, landlord_id: UUID
             pass
 
 
-def _report_run_graph_failure(*, message_id: UUID, landlord_id: UUID, exc_type: str) -> None:
+def _report_run_graph_failure(
+    *, message_id: UUID, landlord_id: UUID, exc_type: str, stage: str = "run_graph"
+) -> None:
     """Log + Sentry-page a ``run_graph`` failure, each call individually
     guarded (#184 item 2 / the #231 NEW-2 house pattern): the durable
     fallback has ALREADY been written by the time this runs, and a raising
@@ -387,6 +389,7 @@ def _report_run_graph_failure(*, message_id: UUID, landlord_id: UUID, exc_type: 
             "graph_entry_run_graph_failed",
             message_id=str(message_id),
             exc_type=exc_type,
+            stage=stage,
         )
     except Exception:  # noqa: BLE001, S110
         pass
@@ -398,6 +401,7 @@ def _report_run_graph_failure(*, message_id: UUID, landlord_id: UUID, exc_type: 
                 "message_id": str(message_id),
                 "landlord_id": str(landlord_id),
                 "exc_type": exc_type,
+                "stage": stage,
             },
         )
     except Exception:  # noqa: BLE001, S110
@@ -411,9 +415,9 @@ async def _queue_degraded_retry_for_lock_timeout(
     review, #186 follow-up round, NEW-2) — see module docstring "A
     transient failure gets a RETRY, not just a page". Best-effort and
     itself fully guarded, same shape as
-    :func:`_attempt_last_resort_needs_eyes`: a failure here is logged and
-    swallowed, never raised — there is nothing left downstream to catch
-    it.
+    :func:`_attempt_last_resort_needs_eyes`: a failure here is logged (the
+    log call itself guarded too — #184 A5) and swallowed, never raised —
+    there is nothing left downstream to catch it.
     """
     try:
         async with asynccontextmanager(get_admin_session)() as session:
@@ -527,7 +531,10 @@ async def enqueue_classification(message_id: UUID, landlord_id: UUID) -> None:
         # row first, then the guarded page.
         await _attempt_last_resort_needs_eyes(message_id=message_id, landlord_id=landlord_id)
         _report_run_graph_failure(
-            message_id=message_id, landlord_id=landlord_id, exc_type=type(exc).__name__
+            message_id=message_id,
+            landlord_id=landlord_id,
+            exc_type=type(exc).__name__,
+            stage="completion_gate",  # #184 N2: the graph never ran here
         )
         return
 
