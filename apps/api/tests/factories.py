@@ -37,12 +37,20 @@ status a given approve/reject/edit-and-send/sender test needs.
 ``acknowledged_at``/``created_at`` a given correlation/latest-wins/
 cross-tenant test needs, bypassing the webhook + escalation-chain
 machinery that would normally create one.
+
+``insert_unrouted_inbound`` was added for #231's retention/digest sweep
+tests (``test_unrouted_maintenance.py``) — seeds an ``unrouted_inbound``
+row directly at whatever ``received_at``/``resolved_at`` a given
+retention-boundary/digest-grace test needs, bypassing the Twilio webhook's
+own dead-letter insert (``app/routers/webhooks/twilio.py::
+_dead_letter_unrouted_inbound``) that would normally create one.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -533,6 +541,46 @@ async def insert_push_outbox(
     return push_outbox_id
 
 
+async def insert_unrouted_inbound(
+    session: AsyncSession,
+    *,
+    twilio_sid: str | None = None,
+    from_number: str | None = None,
+    to_number: str | None = None,
+    payload: dict[str, Any] | None = None,
+    received_at: Any = None,
+    resolved_at: Any = None,
+) -> str:
+    """Seeds an ``unrouted_inbound`` row (#170/migration 0015) directly —
+    #231's retention/digest sweep tests exercise it against a KNOWN
+    ``received_at``/``resolved_at`` state, not against whatever the Twilio
+    webhook's own dead-letter insert would naturally produce. Admin-only
+    table (no ``app_role`` grant at all — schema-v1.md v1.17 amendments);
+    the session passed in must already be able to bypass RLS (the same
+    superuser-backed engine every other factory helper here already
+    assumes locally)."""
+    row_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            "INSERT INTO unrouted_inbound "
+            "(id, twilio_sid, from_number, to_number, payload, received_at, resolved_at) "
+            "VALUES (:id, :twilio_sid, :from_number, :to_number, CAST(:payload AS jsonb), "
+            ":received_at, :resolved_at)"
+        ),
+        {
+            "id": row_id,
+            "twilio_sid": twilio_sid,
+            "from_number": from_number or fresh_phone(),
+            "to_number": to_number or fresh_phone(),
+            "payload": json.dumps(payload or {}),
+            "received_at": received_at if received_at is not None else datetime.now(UTC),
+            "resolved_at": resolved_at,
+        },
+    )
+    await session.commit()
+    return row_id
+
+
 __all__: list[str] = [
     "fresh_phone",
     "insert_audit_log",
@@ -547,5 +595,6 @@ __all__: list[str] = [
     "insert_push_token",
     "insert_tenant",
     "insert_trust_metrics",
+    "insert_unrouted_inbound",
     "insert_vendor",
 ]

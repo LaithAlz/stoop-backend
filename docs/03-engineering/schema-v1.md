@@ -873,6 +873,37 @@
 >    simply the first writer of this combination. No migration needed for
 >    this part.
 
+<!-- DDL-body annotation for v1.19 lives on the unrouted_inbound CREATE
+     TABLE block below (retention marker), per the house annotate-don't-
+     silently-edit convention. -->
+> **v1.19 amendment (2026-08-02)** — no migration required (#231; data
+> -lifecycle policy, doc-first per the #231 safety review's ADVISORY-2).
+> `unrouted_inbound` is no longer retained forever:
+> 1. **Retention:** a scheduler sweep (`app/unrouted_maintenance.py`, the
+>    eighth tick job) deletes rows where `resolved_at IS NOT NULL AND
+>    resolved_at < now() - interval '30 days'` — RESOLVED rows only, in
+>    bounded batches (`LIMIT 500` per statement, 25s wall-clock deadline,
+>    `FOR UPDATE SKIP LOCKED` so it never queues behind or overrides an
+>    operator's in-flight `psql` transaction). **UNRESOLVED rows are NEVER
+>    auto-deleted, regardless of age** — an unadjudicated dead-letter row
+>    is the artifact #170 exists to preserve; discarding old unresolved
+>    noise is an operator decision (#244), never a sweep's.
+> 2. **Retention-clock caveat (operator guidance):** the predicate keys on
+>    the `resolved_at` VALUE — resolving with a backdated timestamp (e.g.
+>    `SET resolved_at = received_at` on rows >30d old) makes them eligible
+>    on the next tick with no grace. Resolve with `resolved_at = now()`
+>    unless immediate cleanup is intended.
+> 3. **Dedupe consequence (accepted, fail-loud):** deleting a resolved row
+>    reopens its `twilio_sid` for the webhook's `ON CONFLICT` — a
+>    redelivery after deletion creates a fresh dead-letter row + fresh
+>    alert rather than a silent no-op. Twilio's ~72h retry horizon vs the
+>    30-day window makes this practically unreachable.
+> 4. **Operator digest:** the same sweep pages Sentry (level=warning) at
+>    most once per UTC day when unresolved rows older than 1 hour exist —
+>    count + oldest-age only, never numbers/SIDs/bodies (rule #5). The
+>    "durable-until-an-operator-acts" description in the v1.17 amendment
+>    below now applies to unresolved rows only.
+
 > **v1.18 amendment (2026-08-01)** — no migration required (#212; same
 > payload-only, doc-first path as v1.6/v1.7/v1.12/v1.14). The `audit_log`
 > `send_cancelled` payload gains an OPTIONAL **`leg`** key
@@ -1377,7 +1408,10 @@ CREATE INDEX idx_push_outbox_device   ON push_outbox (device_token_id);
 -- would otherwise be silently dropped -- including a true emergency to a
 -- misconfigured/format-mismatched number. NOT append-only (rule #2 does
 -- not apply) -- resolved_at is set by a human operator, out-of-band, once
--- the number/tenant mismatch is fixed. ADMIN-ONLY: no landlord_id and
+-- the number/tenant mismatch is fixed. v1.19 (#231): RESOLVED rows are
+-- auto-deleted 30 days after resolved_at by the scheduler's maintenance
+-- sweep; UNRESOLVED rows are never auto-deleted (operator purge = #244).
+-- ADMIN-ONLY: no landlord_id and
 -- nothing to EXISTS-join through (no tenant, no case), so app_role gets
 -- NO grant at all here, plus one unconditional-deny RLS policy as
 -- defense-in-depth -- see the v1.17 amendments block above for the full

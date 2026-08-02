@@ -635,6 +635,14 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # Named here deliberately rather than narrowing the pattern back
         # down to miss it.
         "app/main.py",
+        # #231: the unrouted_inbound retention + operator digest sweep
+        # (run_unrouted_maintenance_sweep, scheduled by app/scheduler.py,
+        # LAST) -- same pre-identity background/scheduler context as
+        # sweep_pending_number_releases/run_push_outbox_sweep above, and
+        # unrouted_inbound itself grants app_role NO privileges at all
+        # (schema-v1.md's v1.17 amendments, migration 0015) -- only the
+        # admin engine can reach this table at all.
+        "app/unrouted_maintenance.py",
     }
 )
 

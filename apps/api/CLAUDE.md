@@ -25,7 +25,9 @@ uv run ruff check . && uv run mypy app    # lint + types (strict)
 app/
   main.py config.py deps.py errors.py pagination.py validation.py
   observability.py audit.py
-  scheduler.py           # the 60s ticker — SIX sweeps, order pinned by test
+  scheduler.py           # the 60s ticker — EIGHT sweeps (emergency chain
+                         # always FIRST; unrouted maintenance last), order
+                         # pinned by test — count drifts, trust the test
   trust.py property_provisioning.py push_outbox.py cost_reporting.py
   db/         session.py — TWO engines (admin + app_role request engine);
               raw text() SQL everywhere. There is NO models/ dir and no ORM;
