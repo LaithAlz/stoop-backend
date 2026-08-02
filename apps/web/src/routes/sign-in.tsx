@@ -86,8 +86,11 @@ function SignInPage() {
                 role="status"
               >
                 Sign-in isn't set up on this build yet. If you're expecting access, email us at{" "}
-                <a href="mailto:hello@stoop.co" className="font-semibold text-brand underline">
-                  hello@stoop.co
+                <a
+                  href="mailto:allaithalzoubi2@gmail.com"
+                  className="font-semibold text-brand underline"
+                >
+                  allaithalzoubi2@gmail.com
                 </a>
                 .
               </p>
