@@ -595,3 +595,160 @@ async def test_enqueue_classification_queues_degraded_retry_on_lock_timeout_and_
         assert draft_count == 1
     finally:
         await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #184 item 3 — unknown-sender completion gate (the fallback thread)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_unknown_sender_first_delivery_is_never_gated_out(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#184 item 3, half (a) — the never-run-thread distinction. A
+    case-less (unknown-sender, ``tenant_id=None``) message's FIRST
+    delivery must run the graph: its fallback thread has never run, and
+    ``_fallback_thread_ran_to_completion`` must read the empty snapshot as
+    NOT complete. MUTANT KILLED: reading "empty ``next``" as terminal
+    without the ``snapshot.values`` ran-witness (the first draft of this
+    fix did exactly that) skips the first delivery outright — the
+    classified-audit assertion below goes red."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=None,  # unknown sender -- no case, fallback thread
+        body="hello, who is this number?",
+    )
+
+    _patch_client(monkeypatch, _full_success_fake_messages())
+
+    try:
+        await enqueue_classification(uuid.UUID(message_id), uuid.UUID(landlord_id))
+
+        classified_count = (
+            await db_session.execute(
+                text(
+                    "SELECT count(*) FROM audit_log "
+                    "WHERE landlord_id = :lid AND action = 'classified'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert classified_count >= 1, "first delivery was gated out — the silent-skip class"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_unknown_sender_redelivery_after_completion_is_skipped(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#184 item 3, half (b) — the cost-savings point. Once the fallback
+    thread has genuinely run to a terminal state, a Twilio redelivery of
+    the SAME message must NOT re-run the paid classification pipeline.
+    Pinned by counting 'classified' audit rows across two calls: the
+    second call adds none. MUTANT KILLED: removing the else-branch
+    fallback-thread check in ``enqueue_classification`` re-runs the graph
+    on every redelivery — the count doubles and the assertion goes red."""
+    landlord_id = await factories.insert_landlord(db_session)
+    property_id = await factories.insert_property(db_session, landlord_id)
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=None,
+        body="wrong number probably",
+    )
+
+    _patch_client(monkeypatch, _full_success_fake_messages())
+
+    try:
+        await enqueue_classification(uuid.UUID(message_id), uuid.UUID(landlord_id))
+        count_after_first = (
+            await db_session.execute(
+                text(
+                    "SELECT count(*) FROM audit_log "
+                    "WHERE landlord_id = :lid AND action = 'classified'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert count_after_first >= 1
+
+        # Twilio redelivery of the same message.
+        await enqueue_classification(uuid.UUID(message_id), uuid.UUID(landlord_id))
+        count_after_second = (
+            await db_session.execute(
+                text(
+                    "SELECT count(*) FROM audit_log "
+                    "WHERE landlord_id = :lid AND action = 'classified'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert count_after_second == count_after_first, (
+            "redelivery re-ran the paid classification pipeline"
+        )
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_run_graph_failure_durable_write_survives_raising_reporters(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#184 item 2 — the ordering guarantee under reporter failure. With
+    BOTH the logger and Sentry raising, a run_graph failure must still
+    leave the durable last-resort needs_eyes row, and nothing may escape
+    the handler. MUTANT KILLED: the old ordering (page before durable
+    write, unguarded) either loses the row or lets the raise escape."""
+    landlord_id = await factories.insert_landlord(db_session)
+    message_id = uuid.uuid4()  # no messages row -> run_graph fails deterministically
+
+    def _raising_capture(*_a: object, **_k: object) -> None:
+        raise RuntimeError("sentry transport is down")
+
+    monkeypatch.setattr(graph_entry_mod.sentry_sdk, "capture_message", _raising_capture)
+
+    class _ErrorRaisingLogger:
+        """Raises ONLY on .error (the failure handler's own call) —
+        .info/.warning pass through as no-ops, because the entry-point
+        log.info at the top of enqueue_classification sits outside the
+        failure handler and is not what this test is about."""
+
+        def error(self, *_a: object, **_k: object) -> None:
+            raise RuntimeError("logging pipe is broken")
+
+        def __getattr__(self, _name: str) -> object:
+            def _noop(*_a: object, **_k: object) -> None:
+                return None
+
+            return _noop
+
+    monkeypatch.setattr(graph_entry_mod, "log", _ErrorRaisingLogger())
+
+    try:
+        # Must not raise despite both reporters raising.
+        await enqueue_classification(message_id, uuid.UUID(landlord_id))
+
+        notif_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT type, payload FROM notifications "
+                        "WHERE landlord_id = :lid AND type = 'needs_eyes'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        assert notif_row is not None, "durable fallback lost when reporters raised"
+        assert notif_row["payload"]["message_id"] == str(message_id)
+    finally:
+        await _cleanup(db_session, landlord_id)

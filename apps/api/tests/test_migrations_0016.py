@@ -100,3 +100,45 @@ async def test_concurrent_message_received_inserts_exactly_one_row() -> None:
             )
             await conn.execute(text("DELETE FROM landlords WHERE id = :id"), {"id": landlord_id})
         await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_downgrade_to_0015_drops_index_and_reupgrade_restores() -> None:
+    """Round-trip (the 0006 precedent this migration claims): downgrade
+    drops `uq_audit_message_received_dedupe`, re-upgrade restores it.
+    Serialized via subprocess alembic, same as the sibling suites."""
+    import subprocess
+    import sys
+
+    def _alembic(*args: str) -> None:
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "alembic", *args],
+            capture_output=True,
+            text=True,
+            cwd=os.path.join(os.path.dirname(__file__), ".."),
+            env={**os.environ, "DATABASE_URL": _db_url()},
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"alembic {' '.join(args)} failed:\n{result.stderr}")
+
+    engine = create_async_engine(_db_url())
+
+    async def _index_exists() -> bool:
+        async with engine.connect() as conn:
+            return (
+                await conn.execute(
+                    text(
+                        "SELECT 1 FROM pg_indexes "
+                        "WHERE indexname = 'uq_audit_message_received_dedupe'"
+                    )
+                )
+            ).scalar_one_or_none() is not None
+
+    try:
+        assert await _index_exists()  # head state
+        _alembic("downgrade", "0015")
+        assert not await _index_exists()
+        _alembic("upgrade", "head")
+        assert await _index_exists()
+    finally:
+        await engine.dispose()
