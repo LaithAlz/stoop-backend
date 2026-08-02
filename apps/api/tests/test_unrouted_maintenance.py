@@ -565,3 +565,117 @@ def test_reset_for_tests_clears_the_daily_stamp() -> None:
     unrouted_maintenance_mod._digest_state.last_fired_day = "2026-08-01"  # noqa: SLF001
     unrouted_maintenance_mod.reset_for_tests()
     assert unrouted_maintenance_mod._digest_state.last_fired_day is None  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# 6. #231 safety-review regressions — BLOCKING-1/-2 (operator-lock
+#    concurrency) and BLOCKING-3 (digest isolation from retention failure)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_sweep_skips_operator_locked_row_without_blocking_or_deleting(
+    db_session: AsyncSession,
+    db_engine: AsyncEngine,
+) -> None:
+    """#231 safety review BLOCKING-1 + BLOCKING-2, one scenario.
+
+    A second connection (the "operator's psql session") holds an
+    un-resolve ``UPDATE ... SET resolved_at = NULL`` open — uncommitted —
+    on a resolved-and-old row while the sweep runs.
+
+    MUTANTS KILLED: removing ``FOR UPDATE SKIP LOCKED`` from
+    ``_DELETE_RETENTION_BATCH_SQL``'s inner SELECT makes the sweep either
+    (a) block behind the operator's row lock until their transaction ends
+    (BLOCKING-2 — this test would hang past its timeout), or (b) once the
+    operator commits, delete the row they just un-resolved (BLOCKING-1 —
+    the survival assertion below goes red).
+
+    The sweep must complete promptly (never queuing behind a human), the
+    operator-held row must survive, and an UNLOCKED eligible row seeded
+    alongside it must still be deleted in the same tick.
+    """
+    now = datetime.now(UTC)
+    locked_id = await factories.insert_unrouted_inbound(
+        db_session,
+        received_at=now - timedelta(days=45),
+        resolved_at=now - timedelta(days=40),
+    )
+    unlocked_id = await factories.insert_unrouted_inbound(
+        db_session,
+        received_at=now - timedelta(days=45),
+        resolved_at=now - timedelta(days=40),
+    )
+    await db_session.commit()
+
+    operator_conn = await db_engine.connect()
+    try:
+        operator_txn = await operator_conn.begin()
+        await operator_conn.execute(
+            text("UPDATE unrouted_inbound SET resolved_at = NULL WHERE id = :id"),
+            {"id": locked_id},
+        )
+        # Operator transaction HELD OPEN across the sweep — the exact
+        # idle-in-transaction psql shape the safety review reproduced.
+        outcome = await run_unrouted_maintenance_sweep(now=now)
+
+        deleted = {str(i) for i in outcome.deleted_ids}
+        assert str(unlocked_id) in deleted  # sweep did real work this tick
+        assert str(locked_id) not in deleted  # never touched the held row
+
+        await operator_txn.commit()
+    finally:
+        await operator_conn.close()
+
+    # After the operator's un-resolve commits, the row exists and is
+    # UNRESOLVED — the evidence survived with the operator's edit intact.
+    row = (
+        (
+            await db_session.execute(
+                text("SELECT resolved_at FROM unrouted_inbound WHERE id = :id"),
+                {"id": locked_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    assert row is not None, "operator-held row was deleted out from under their UPDATE 1"
+    assert row["resolved_at"] is None
+    await _cleanup(db_session, [locked_id])
+
+
+@pytest.mark.integration
+async def test_retention_failure_never_silences_the_digest(
+    db_session: AsyncSession,
+) -> None:
+    """#231 safety review BLOCKING-3: the digest is the only periodic
+    surfacing of an aging unreconciled dead-letter row — an unrelated
+    retention failure (pool blip, lock timeout, deadlock) must not take it
+    down. MUTANT KILLED: removing the try/except around
+    ``_run_retention_sweep`` in ``run_unrouted_maintenance_sweep`` makes
+    this test raise instead of paging the digest."""
+    now = datetime.now(UTC)
+    aged_unresolved_id = await factories.insert_unrouted_inbound(
+        db_session,
+        received_at=now - timedelta(hours=3),
+        resolved_at=None,
+    )
+    await db_session.commit()
+
+    async def _boom(**_kwargs: object) -> tuple[int, list[object]]:
+        raise RuntimeError("delete blew up")
+
+    try:
+        with (
+            patch.object(unrouted_maintenance_mod, "_run_retention_sweep", _boom),
+            patch.object(unrouted_maintenance_mod.sentry_sdk, "capture_message") as capture,
+        ):
+            outcome = await run_unrouted_maintenance_sweep(now=now)
+
+        assert outcome.deleted_count == 0
+        assert outcome.digest_fired is True
+        messages = [call.args[0] for call in capture.call_args_list]
+        assert any("retention sweep failed" in m for m in messages)
+        assert any("awaiting operator reconciliation" in m for m in messages)
+    finally:
+        await _cleanup(db_session, [aged_unresolved_id])

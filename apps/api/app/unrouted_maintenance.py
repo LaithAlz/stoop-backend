@@ -207,10 +207,31 @@ same house value as every other bounded sweep (`app/push_outbox.py`,
 
 # Bounded-batch delete: Postgres has no `DELETE ... LIMIT`, so the LIMIT is
 # applied via the inner SELECT and the outer DELETE targets exactly those
-# ids -- the standard Postgres "bounded delete" idiom. `ORDER BY
-# resolved_at ASC` is not required for correctness (any eligible row is
-# equally safe to delete) but makes each tick's behavior deterministic
-# (oldest-resolved-first) and easy to test.
+# ids. `ORDER BY resolved_at ASC` is not required for correctness (any
+# eligible row is equally safe to delete) but makes each tick's behavior
+# deterministic (oldest-resolved-first) and easy to test.
+#
+# `FOR UPDATE SKIP LOCKED` + the repeated predicate on the OUTER delete are
+# BOTH load-bearing (#231 safety review, BLOCKING-1/-2 — each empirically
+# reproduced against a live second session before the fix):
+#
+# - Without them, the inner id-set is frozen under READ COMMITTED before
+#   any row lock is taken, and EvalPlanQual re-checks only `id = ...` on a
+#   concurrently-updated tuple — so an operator's in-flight
+#   `UPDATE ... SET resolved_at = NULL` (an un-resolve, run exactly the
+#   way schema-v1.md prescribes reconciliation: a one-off psql statement)
+#   COMMITTED mid-delete was overwritten and the evidence row deleted
+#   anyway, with the operator having seen a successful `UPDATE 1`.
+# - `SKIP LOCKED` additionally means the sweep never QUEUES behind a row a
+#   human is holding open in an interactive transaction — without it, one
+#   idle-in-transaction psql session stalled the DELETE (and with it the
+#   whole ticker, emergency sweep included) for as long as the terminal
+#   sat open. A skipped row is simply picked up on a later tick once the
+#   operator's transaction ends.
+# - The outer `resolved_at` re-check is the house self-guarding-write
+#   doctrine applied to this module's one mutating statement: the rows are
+#   locked by the inner SELECT so it cannot fire today, but it makes the
+#   statement safe by construction rather than by planner behavior.
 _DELETE_RETENTION_BATCH_SQL = text(
     """
     DELETE FROM unrouted_inbound
@@ -219,10 +240,21 @@ _DELETE_RETENTION_BATCH_SQL = text(
         WHERE resolved_at IS NOT NULL AND resolved_at < :cutoff
         ORDER BY resolved_at ASC
         LIMIT :limit
+        FOR UPDATE SKIP LOCKED
     )
+    AND resolved_at IS NOT NULL AND resolved_at < :cutoff
     RETURNING id
     """
 )
+
+# Belt-and-braces bound on lock waits inside the retention DELETE (#231
+# safety review, BLOCKING-2): SKIP LOCKED above already steps over
+# operator-held rows, but any OTHER lock this statement could ever wait on
+# fails fast instead of stalling the shared ticker. Transaction-scoped
+# (SET LOCAL), same precedent as app/agent/graph.py's advisory-lock
+# session. 2s is generous against sub-second app transactions and
+# irrelevant to correctness — a timed-out batch simply retries next tick.
+_SET_RETENTION_LOCK_TIMEOUT_SQL = text("SET LOCAL lock_timeout = '2s'")
 
 
 def _retention_cutoff(now: datetime) -> datetime:
@@ -245,6 +277,13 @@ def _default_time_source() -> float:
     return asyncio.get_running_loop().time()
 
 
+_DELETED_IDS_SAMPLE_CAP: int = 1000
+"""Upper bound on how many deleted-row UUIDs one tick's outcome retains
+(#231 safety review ADVISORY-5) — comfortably above every test's seeding
+volume, comfortably below a megabyte even at backlog scale. The count is
+always exact regardless."""
+
+
 async def _run_retention_sweep(
     *,
     now: datetime,
@@ -252,10 +291,22 @@ async def _run_retention_sweep(
     time_source: Callable[[], float],
     tick_start: float,
     batch_limit: int = _RETENTION_SWEEP_BATCH_LIMIT,
-) -> list[UUID]:
+) -> tuple[int, list[UUID]]:
     """Delete every resolved-and-old row, in bounded batches (see module
-    docstring "Deadline discipline"). Returns every deleted row's id (test
-    /observability seam — production callers only log the count).
+    docstring "Deadline discipline"). Returns ``(true total deleted, a
+    bounded sample of their ids)`` — the sample is the test/observability
+    seam; production callers only log the count.
+
+    NOTE on the retention clock (#231 safety review ADVISORY-1): the
+    predicate keys on the ``resolved_at`` VALUE, not on when the resolving
+    UPDATE actually ran — an operator who backfills ``resolved_at =
+    received_at`` on rows older than 30 days makes them eligible on the
+    very next tick, with no grace window. There is no
+    "resolution-action timestamp" column to key on (adding one is a
+    schema-doc-first decision this module refuses to make unilaterally),
+    so the operator guidance is: resolve with ``resolved_at = now()``
+    unless immediate cleanup is exactly what you want. Recorded in
+    schema-v1.md's retention amendment as well.
 
     ``batch_limit`` defaults to :data:`_RETENTION_SWEEP_BATCH_LIMIT` (500)
     in production; :func:`run_unrouted_maintenance_sweep` exposes it as an
@@ -264,17 +315,19 @@ async def _run_retention_sweep(
     multi-batch-plus-deadline path without seeding hundreds of rows.
     """
     cutoff = _retention_cutoff(now)
+    deleted_count = 0
     deleted: list[UUID] = []
 
     while True:
         if time_source() - tick_start >= deadline_seconds:
             log.info(
                 "unrouted_retention_sweep_tick_deadline_reached",
-                deleted_so_far=len(deleted),
+                deleted_so_far=deleted_count,
             )
             break
 
         async with _acm(get_admin_session)() as session:
+            await session.execute(_SET_RETENTION_LOCK_TIMEOUT_SQL)
             rows = (
                 (
                     await session.execute(
@@ -287,15 +340,19 @@ async def _run_retention_sweep(
             )
 
         batch_ids = [cast("UUID", row["id"]) for row in rows]
-        deleted.extend(batch_ids)
+        deleted_count += len(batch_ids)
+        if len(deleted) < _DELETED_IDS_SAMPLE_CAP:
+            deleted.extend(batch_ids[: _DELETED_IDS_SAMPLE_CAP - len(deleted)])
 
         if len(batch_ids) < batch_limit:
             # Fewer than a full batch came back -- nothing more is due
             # this tick, no need to loop again (or check the deadline
-            # again).
+            # again). NOTE: rows skipped by SKIP LOCKED (an operator
+            # holding them open) also present as a short batch — they are
+            # deliberately left for a later tick, never waited on.
             break
 
-    return deleted
+    return deleted_count, deleted
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +458,11 @@ async def _maybe_fire_digest(*, now: datetime) -> bool:
         else 0.0
     )
 
+    # Stamp AFTER the alert call returns — a raising capture never consumes
+    # the day. Caveat (#231 safety review ADVISORY-4): `capture_message`
+    # does not raise on client-side rate-limiting/drops, so "once per day"
+    # means "attempted once per day", not "guaranteed delivered"; the
+    # structlog warning above is the durable-in-logs backstop.
     _alert_unrouted_digest(count=count, oldest_age_hours=oldest_age_hours)
     _digest_state.last_fired_day = day_key
     return True
@@ -414,8 +476,15 @@ async def _maybe_fire_digest(*, now: datetime) -> bool:
 @dataclass(frozen=True)
 class UnroutedMaintenanceOutcome:
     """One sweep tick's outcome — test/observability seam, mirrors
-    ``app/push_outbox.py``'s `PushOutboxOutcome`."""
+    ``app/push_outbox.py``'s `PushOutboxOutcome`.
 
+    ``deleted_ids`` is a BOUNDED SAMPLE (at most
+    :data:`_DELETED_IDS_SAMPLE_CAP` ids — #231 safety review ADVISORY-5: a
+    first sweep against a large backlog would otherwise accumulate every
+    UUID in memory for a value production only ever counts);
+    ``deleted_count`` is always the true total."""
+
+    deleted_count: int
     deleted_ids: list[UUID]
     digest_fired: bool
 
@@ -454,21 +523,40 @@ async def run_unrouted_maintenance_sweep(
     effective_now = now if now is not None else datetime.now(UTC)
     tick_start = time_source()
 
-    deleted_ids = await _run_retention_sweep(
-        now=effective_now,
-        deadline_seconds=deadline_seconds,
-        time_source=time_source,
-        tick_start=tick_start,
-        batch_limit=retention_batch_limit,
-    )
+    # #231 safety review BLOCKING-3: the two halves are independent jobs
+    # sharing one entrypoint — a retention failure (pool blip, lock
+    # timeout, deadlock) must NEVER silence the operator digest, which is
+    # the only periodic surfacing of an aging unreconciled dead-letter
+    # row. Same isolation discipline the scheduler applies BETWEEN its
+    # eight jobs, applied WITHIN this one. Metadata-only page (rule #5).
+    deleted_count = 0
+    deleted_ids: list[UUID] = []
+    try:
+        deleted_count, deleted_ids = await _run_retention_sweep(
+            now=effective_now,
+            deadline_seconds=deadline_seconds,
+            time_source=time_source,
+            tick_start=tick_start,
+            batch_limit=retention_batch_limit,
+        )
+    except Exception as exc:
+        log.error("unrouted_retention_sweep_failed", exc_type=type(exc).__name__)
+        sentry_sdk.capture_message(
+            "unrouted_inbound: retention sweep failed (digest still ran)",
+            level="error",
+            extras={"exc_type": type(exc).__name__},
+        )
+
     digest_fired = await _maybe_fire_digest(now=effective_now)
 
     log.info(
         "unrouted_maintenance_sweep_complete",
-        deleted_count=len(deleted_ids),
+        deleted_count=deleted_count,
         digest_fired=digest_fired,
     )
-    return UnroutedMaintenanceOutcome(deleted_ids=deleted_ids, digest_fired=digest_fired)
+    return UnroutedMaintenanceOutcome(
+        deleted_count=deleted_count, deleted_ids=deleted_ids, digest_fired=digest_fired
+    )
 
 
 __all__: list[str] = [
