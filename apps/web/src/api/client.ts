@@ -9,12 +9,7 @@
  * every call (mirrors mobile's #210 M1 brief: "never store the token
  * separately") — there is no token cached in this module or anywhere else;
  * supabase-js already persists/refreshes the session
- * (src/lib/supabase.ts), so this is just reading its current value. When
- * `supabase` is `null` (Supabase not configured for this build,
- * src/lib/env.ts), `authHeader()` sends no `Authorization` header at all —
- * every route that could reach here is already gated behind a live session
- * (src/routes/app.tsx), so this only matters for a misconfigured deploy,
- * where the request will 401 honestly rather than throw locally.
+ * (src/lib/supabase.ts), so this is just reading its current value.
  *
  * Never log a request/response body, header, or token (CLAUDE.md rule 5 —
  * tenant messages are PII-adjacent, JWTs are secrets). This module has no
@@ -35,6 +30,22 @@ export interface ApiRequestOptions {
 }
 
 async function authHeader(): Promise<Record<string, string>> {
+  // A5 (safety review, #234): `supabase` is unconditionally `null` during
+  // SSR (src/lib/supabase.ts's window-gate), which used to make this
+  // function silently degrade to an anonymous request whenever it ran on
+  // the server — indistinguishable from the genuinely-unconfigured case.
+  // No route calls `apiRequest` from a server context today, but a future
+  // loader/server function that did would otherwise fire an unauthenticated
+  // request instead of failing loudly. Distinct code from `not_configured`
+  // on purpose — this is a programming-contract violation, not a
+  // deployment config problem, and should never reach a real screen.
+  if (typeof window === "undefined") {
+    throw new ApiError(0, {
+      code: "server_context",
+      message: "This request needs a browser session and can't run on the server.",
+      request_id: "req_local",
+    });
+  }
   if (!supabase) return {};
   const { data } = await supabase.auth.getSession();
   const token = data.session?.access_token;
@@ -138,13 +149,32 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
 
   if (!response.ok) {
     if (response.status === 401 && supabase) {
-      // The server rejected a token we believed was live (expired/revoked
-      // between local checks) — sign out so the auth gate (src/routes/
-      // app.tsx, resolveAuthRoute) swaps back to sign-in instead of every
-      // screen quietly re-401ing forever. This fires `onAuthStateChange`'s
-      // `SIGNED_OUT` event, which src/auth/AuthProvider.tsx uses to clear
-      // the query cache (the PII fence).
-      void supabase.auth.signOut();
+      // B3 (safety review, #234): a bare 401 is NOT proof the session is
+      // actually dead — a transient backend hiccup (e.g. a JWKS rotation
+      // blip on the API side) can 401 a token that's still genuinely
+      // live. Check the LOCAL session before reacting: only sign out when
+      // it's genuinely absent or past its own `expires_at` (the server
+      // and the local client disagreeing on a still-valid token is not
+      // grounds to destroy it); otherwise let the `ApiError` below
+      // surface normally and leave the session alone so the caller can
+      // retry.
+      const { data } = await supabase.auth.getSession();
+      const localSession = data.session;
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const sessionLooksDead =
+        !localSession ||
+        (typeof localSession.expires_at === "number" && localSession.expires_at <= nowSeconds);
+      if (sessionLooksDead) {
+        // `scope: "local"` — this device's session only. A transient API
+        // 401 (or a session that's actually expired here) must never
+        // reach out and kill the landlord's OTHER signed-in devices; see
+        // the matching comment on AuthProvider.signOut(). This fires
+        // `onAuthStateChange`'s `SIGNED_OUT` event, which
+        // src/auth/AuthProvider.tsx uses to clear the query cache (the
+        // PII fence) and src/routes/app.tsx's guard uses to swap back to
+        // sign-in.
+        void supabase.auth.signOut({ scope: "local" });
+      }
     }
     throw new ApiError(response.status, coerceErrorBody(parsed, response.status));
   }

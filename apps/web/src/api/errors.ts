@@ -21,6 +21,14 @@
  */
 import type { ApiErrorBody } from "./types";
 
+// A6 (safety review, #234, advisory — flagged not fixed): `.code` below is
+// a plain `string`, so `error.code === "draft_stale"` and a typo like
+// `"draft_stle"` both typecheck identically. A branded/union type (the
+// server's real code vocabulary, `docs/03-engineering/api-contracts.md`,
+// plus this file's client-synthesized ones) would catch that at compile
+// time. Not done here — the server's code vocabulary isn't centrally typed
+// anywhere yet either, and this file's `switch` is the only place codes
+// are string-matched today.
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -49,6 +57,12 @@ export function toHouseApiError(error: ApiError): string {
     // reaches here instead of ever making a request.
     case "not_configured":
       return "Stoop's API isn't set up for this build yet.";
+    // `server_context` (src/api/client.ts's authHeader, A5 amendment) is
+    // deliberately NOT given a bespoke line here — it's a programming-
+    // contract violation (something called `apiRequest` outside the
+    // browser), not a state a real landlord should ever see, so it falls
+    // through to the honest generic default like any other code no
+    // shipped screen surfaces.
     case "draft_stale":
       return "A new message came in — this draft just updated.";
     case "already_sent":

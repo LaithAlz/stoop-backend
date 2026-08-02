@@ -1,7 +1,8 @@
 import { createFileRoute, Outlet, useNavigate } from "@tanstack/react-router";
 import { useEffect } from "react";
-import { Loader2 } from "lucide-react";
+import { Loader2, RefreshCw } from "lucide-react";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
+import { Button } from "@/components/ui/button";
 import { useAuth } from "@/auth/AuthProvider";
 import { resolveAuthRoute } from "@/auth/resolveAuthRoute";
 
@@ -22,15 +23,23 @@ export const Route = createFileRoute("/app")({
  * SSR/hydration lesson).
  */
 function AppLayout() {
-  const { session, initializing } = useAuth();
+  const { session, initializing, initTimedOut, retryInit } = useAuth();
   const navigate = useNavigate();
   const authRoute = resolveAuthRoute({ session, initializing });
 
   useEffect(() => {
+    // A3 (safety review, #234): a timed-out check is NOT a confirmed
+    // sign-out — don't bounce to /sign-in as if it were. Show the retry
+    // shell below instead and let the landlord decide.
+    if (initTimedOut) return;
     if (authRoute === "sign-in") {
       void navigate({ to: "/sign-in", replace: true });
     }
-  }, [authRoute, navigate]);
+  }, [authRoute, initTimedOut, navigate]);
+
+  if (initTimedOut) {
+    return <AppTimeoutShell onRetry={retryInit} />;
+  }
 
   if (authRoute !== "app") {
     return <AppLoadingShell />;
@@ -52,6 +61,28 @@ function AppLoadingShell() {
           aria-hidden="true"
         />
         <p className="text-sm font-medium text-ink-muted">Checking your account…</p>
+      </div>
+    </PhoneFrame>
+  );
+}
+
+function AppTimeoutShell({ onRetry }: { onRetry: () => void }) {
+  return (
+    <PhoneFrame>
+      <div
+        role="alert"
+        className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center"
+      >
+        <p className="text-sm font-medium text-ink">Couldn't check your account.</p>
+        <p className="text-sm text-ink-muted">That took too long. Check your connection.</p>
+        <Button
+          type="button"
+          onClick={onRetry}
+          className="mt-2 h-11 bg-brand text-brand-foreground hover:bg-brand/90"
+        >
+          <RefreshCw className="size-4" aria-hidden="true" />
+          Try again
+        </Button>
       </div>
     </PhoneFrame>
   );

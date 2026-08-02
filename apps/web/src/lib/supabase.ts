@@ -38,14 +38,34 @@
  * the standard, documented pattern for a Supabase browser client and is
  * the explicit call in this PR's brief ("supabase-js default localStorage
  * is fine for web"). `detectSessionInUrl: true` is what lets the magic-link
- * callback (the token supabase-js appends to the redirect URL) resolve into
- * a session automatically on load.
+ * callback resolve into a session automatically on load.
+ *
+ * `flowType: "pkce"` (safety review B1, #234) — the default `"implicit"`
+ * flow puts the actual access/refresh token pair directly in the magic
+ * link's redirect URL (as a `#access_token=...` fragment), which then also
+ * sits in Plausible's page-view beacon (the referrer/URL) and in browser
+ * history until `_getSessionFromURL` clears the hash. PKCE instead sends a
+ * single-use `?code=` that's worthless without the `code_verifier`
+ * supabase-js stashed in `localStorage` when `signInWithOtp` was called
+ * (AuthProvider.tsx) — so a leaked/forwarded/prefetched link URL alone
+ * can't be replayed into a session. `detectSessionInUrl` needs no other
+ * change: confirmed against the installed auth-js source
+ * (GoTrueClient.ts's `_getSessionFromURL`) that it exchanges `?code=` for a
+ * session and cleans the URL via `history.replaceState` the same
+ * automatic way it already handled the implicit hash.
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { env } from "./env";
 
 export const supabaseConfigured = Boolean(env.supabaseUrl && env.supabaseAnonKey);
 
+// A7 (safety review, #234, advisory — flagged not fixed): supabase-js
+// pulls in @supabase/storage-js, which itself depends on `iceberg-js` — a
+// transitive dependency for a Storage feature this app never uses either
+// (same shape as the Realtime/WebSocket issue fixed above). Worth an
+// audit of whether any of storage-js/iceberg-js's own module-scope side
+// effects have a similar SSR/edge-runtime landmine, but out of scope to
+// chase down for this PR.
 export const supabase: SupabaseClient | null =
   typeof window !== "undefined" && supabaseConfigured
     ? createClient(env.supabaseUrl as string, env.supabaseAnonKey as string, {
@@ -53,6 +73,7 @@ export const supabase: SupabaseClient | null =
           persistSession: true,
           autoRefreshToken: true,
           detectSessionInUrl: true,
+          flowType: "pkce",
         },
       })
     : null;

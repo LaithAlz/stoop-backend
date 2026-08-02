@@ -9,6 +9,32 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/auth/AuthProvider";
 
+// A1 (safety review, #234): a used/expired magic link (a corporate email
+// scanner "Safe Links"-style prefetch can burn a single-use link before
+// the real person clicks it) redirects back here with `error`/
+// `error_code`/`error_description` params — historically as a `#hash`
+// fragment, though PKCE's `?code=` convention means a future GoTrue
+// version could plausibly move errors to the query string too, so this
+// checks both. One unified house-voice line rather than per-code
+// branching — "expired" and "already used" are the same story to a
+// landlord either way.
+function toHouseCallbackError(): string {
+  return "That sign-in link didn't work — it may have expired or already been used. Send yourself a new one below.";
+}
+
+function parseAuthCallbackParams(): { hasError: boolean; hasPendingExchange: boolean } {
+  if (typeof window === "undefined") return { hasError: false, hasPendingExchange: false };
+  const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  const search = new URLSearchParams(window.location.search);
+  const hasError = hash.has("error") || search.has("error");
+  // A2: `code` is the PKCE callback shape (src/lib/supabase.ts's
+  // `flowType: "pkce"`); `access_token` is kept as a defensive check for
+  // the legacy implicit shape in case any old magic link is still in
+  // flight from before that change.
+  const hasPendingExchange = !hasError && (search.has("code") || hash.has("access_token"));
+  return { hasError, hasPendingExchange };
+}
+
 export const Route = createFileRoute("/sign-in")({
   head: () => ({
     meta: [
@@ -35,6 +61,13 @@ function SignInPage() {
   const [sent, setSent] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [callbackError, setCallbackError] = useState<string | null>(null);
+  // A2: starts `false` on both the server and the client's first paint
+  // (there's no URL to read during SSR) and only settles in the mount
+  // effect below — the same stable-then-settle shape as GreetingHeader
+  // (apps/web/AGENTS.md's SSR/hydration lesson), so this never disagrees
+  // with the server-rendered form on hydration.
+  const [isFinishingSignIn, setIsFinishingSignIn] = useState(false);
 
   const alreadySignedIn = !initializing && session !== null;
 
@@ -43,6 +76,21 @@ function SignInPage() {
       void navigate({ to: "/app", replace: true });
     }
   }, [alreadySignedIn, navigate]);
+
+  useEffect(() => {
+    const { hasError, hasPendingExchange } = parseAuthCallbackParams();
+    if (hasError) {
+      setCallbackError(toHouseCallbackError());
+      // Strip the error (and anything alongside it) so a refresh, share,
+      // or browser-history replay of this URL never re-shows a stale
+      // error or carries a token/code in the visible address bar.
+      window.history.replaceState(window.history.state, "", window.location.pathname);
+      return;
+    }
+    if (hasPendingExchange) {
+      setIsFinishingSignIn(true);
+    }
+  }, []);
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -76,6 +124,22 @@ function SignInPage() {
               />
               <p className="text-sm text-ink-muted">You're signed in — taking you to Stoop…</p>
             </div>
+          ) : isFinishingSignIn && initializing ? (
+            // A2: the round trip after clicking the email link — Supabase
+            // resolves the session from the URL automatically
+            // (detectSessionInUrl + PKCE, src/lib/supabase.ts). Once that
+            // settles, `initializing` goes false: on success `session` is
+            // already set by then too, so the `alreadySignedIn` branch
+            // above takes over on the next render; on a silent failure
+            // this falls through to the normal form below so the landlord
+            // can just try again.
+            <div className="flex flex-col items-center gap-3 py-6 text-center">
+              <Loader2
+                className="size-6 animate-spin text-brand motion-reduce:animate-none"
+                aria-hidden="true"
+              />
+              <p className="text-sm text-ink-muted">Finishing sign-in…</p>
+            </div>
           ) : !configured ? (
             <div>
               <h1 className="font-display text-[28px] leading-tight tracking-tight text-ink">
@@ -103,6 +167,15 @@ function SignInPage() {
               <p className="mt-2 text-sm leading-relaxed text-ink-muted">
                 Sign in to sort your queue, edit drafts, and check on your properties.
               </p>
+
+              {callbackError && (
+                <p
+                  className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm leading-relaxed text-ink"
+                  role="alert"
+                >
+                  {callbackError}
+                </p>
+              )}
 
               <div className="mt-6 flex flex-col gap-2">
                 <Button

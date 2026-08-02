@@ -203,6 +203,14 @@ function AccountPage() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle className="font-display">Sign out?</AlertDialogTitle>
+            {/* B3 (safety review, #234) — verified this copy against the
+                implementation: AuthProvider.signOut() uses `scope: "local"`,
+                so this literally only ends the session on THIS browser.
+                Other signed-in devices (e.g. the Stoop mobile app) keep
+                their own session and keep delivering alerts — this line
+                would have been false back when `signOut()` used
+                supabase-js's default `scope: "global"`, which revokes the
+                session everywhere at once. */}
             <AlertDialogDescription>
               Your agent keeps working while you're signed out. You'll just stop getting alerts on
               this device.
