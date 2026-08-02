@@ -253,10 +253,13 @@ _DELETE_RETENTION_BATCH_SQL = text(
 # ACCESS EXCLUSIVE — an ALTER TABLE/VACUUM FULL held open — just as
 # readily as the DELETE parks behind a row lock, and an unbounded wait in
 # EITHER stalls the whole ticker, emergency sweep included). SKIP LOCKED
-# covers operator row locks on the DELETE; this covers everything else, Transaction-scoped
-# (SET LOCAL), same precedent as app/agent/graph.py's advisory-lock
-# session. 2s is generous against sub-second app transactions and
-# irrelevant to correctness — a timed-out batch simply retries next tick.
+# covers operator row locks on the DELETE; this covers everything else by
+# failing fast instead of stalling the shared ticker. Transaction-scoped
+# (SET LOCAL — the correct choice under Supavisor transaction pooling; a
+# bare SET would leak to other clients sharing the backend), same
+# precedent as app/agent/graph.py's advisory-lock session. 2s is generous
+# against sub-second app transactions and irrelevant to correctness — a
+# timed-out batch simply retries next tick.
 _SET_LOCK_TIMEOUT_SQL = text("SET LOCAL lock_timeout = '2s'")
 
 
@@ -563,6 +566,15 @@ async def run_unrouted_maintenance_sweep(
         except Exception:  # noqa: BLE001, S110
             pass
 
+    # DELIBERATELY UNGUARDED (#231 safety re-review adjudication, N-2): the
+    # digest raising — e.g. its own lock_timeout — must escape to the
+    # scheduler's per-job _safe_report, which pages loudly. This job runs
+    # LAST, so nothing downstream needs protecting, and the day-stamp is
+    # only advanced on success, so a failed digest retries next tick. Do
+    # NOT wrap this in try/except "for symmetry" with retention above —
+    # retention is swallowed specifically BECAUSE the digest is downstream
+    # of it; swallowing here would convert a loud failure of the reminder
+    # system itself into silence.
     digest_fired = await _maybe_fire_digest(now=effective_now)
 
     log.info(
