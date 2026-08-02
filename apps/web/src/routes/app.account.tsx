@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { queue } from "@/lib/mock-app";
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/auth/AuthProvider";
 
 export const Route = createFileRoute("/app/account")({
   head: () => ({
@@ -27,9 +28,11 @@ export const Route = createFileRoute("/app/account")({
 });
 
 function AccountPage() {
+  const { signOut } = useAuth();
   const [push, setPush] = useState(true);
   const [email, setEmail] = useState(true);
   const [logoutOpen, setLogoutOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
 
   return (
     <PhoneFrame>
@@ -200,6 +203,14 @@ function AccountPage() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle className="font-display">Sign out?</AlertDialogTitle>
+            {/* B3 (safety review, #234) — verified this copy against the
+                implementation: AuthProvider.signOut() uses `scope: "local"`,
+                so this literally only ends the session on THIS browser.
+                Other signed-in devices (e.g. the Stoop mobile app) keep
+                their own session and keep delivering alerts — this line
+                would have been false back when `signOut()` used
+                supabase-js's default `scope: "global"`, which revokes the
+                session everywhere at once. */}
             <AlertDialogDescription>
               Your agent keeps working while you're signed out. You'll just stop getting alerts on
               this device.
@@ -209,8 +220,16 @@ function AccountPage() {
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-brand text-brand-foreground hover:bg-brand/90"
-              onClick={() => {
+              disabled={signingOut}
+              onClick={async () => {
+                setSigningOut(true);
+                // src/routes/app.tsx's route guard picks up the session
+                // change and redirects to /sign-in; the PII fence
+                // (src/auth/AuthProvider.tsx) clears the query cache on
+                // the same SIGNED_OUT event.
+                await signOut();
                 setLogoutOpen(false);
+                setSigningOut(false);
                 toast.success("Signed out", { duration: 1500 });
               }}
             >

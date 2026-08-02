@@ -10,6 +10,7 @@ import {
 
 import appCss from "../styles.css?url";
 import { Toaster } from "@/components/ui/sonner";
+import { AuthProvider } from "@/auth/AuthProvider";
 
 // ADR-5: marketing analytics is Plausible — anonymous, cookieless, no
 // consent banner. Env-gated: unset (current state, no production domain
@@ -73,56 +74,78 @@ function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   );
 }
 
+// B1 (safety review, #234): Plausible is marketing analytics (ADR-5) — the
+// dashboard (/sign-in, /app/*) is never marketing traffic and must never
+// carry the tracking token, on principle and because dashboard sessions
+// are landlord PII-adjacent. Derived from the router's OWN current-match
+// list, which `head()` receives identically on the server and on the
+// client for a given URL, so this can never disagree between SSR and
+// hydration the way reading `window.location` during render would.
+function isDashboardRouteId(routeId: string): boolean {
+  return routeId === "/sign-in" || routeId.startsWith("/app");
+}
+
 export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()({
-  head: () => ({
-    meta: [
-      { charSet: "utf-8" },
-      { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Stoop. — Tenant maintenance, handled for small landlords" },
-      {
-        name: "description",
-        content:
-          "Stoop reads and sorts every tenant text and drafts the reply in your voice. Tenants text. Stoop drafts. You approve.",
-      },
-      { property: "og:title", content: "Stoop. — Tenant maintenance, handled for small landlords" },
-      {
-        property: "og:description",
-        content:
-          "Reads, sorts, and drafts replies for tenant maintenance over SMS — you approve before it sends.",
-      },
-      { property: "og:type", content: "website" },
-      // TODO(domain): og:image must be an absolute URL for scrapers to
-      // resolve it (Facebook/Twitter/LinkedIn don't resolve relative
-      // paths) — swap to `https://<production-domain>/og-image.png` once
-      // the domain exists. Source template: scripts/og-image.html.
-      { property: "og:image", content: "/og-image.png" },
-      { name: "twitter:card", content: "summary_large_image" },
-    ],
-    links: [
-      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
-      { rel: "preconnect", href: "https://fonts.googleapis.com" },
-      { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
-      {
-        rel: "stylesheet",
-        href: "https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap",
-      },
-      { rel: "stylesheet", href: appCss },
-    ],
-    // Same-origin proxy (ADR-5 hard rule — no direct plausible.io script
-    // load, or adblockers strip the analytics signal). See the two
-    // narrowly-guarded routes in src/server.ts: GET /js/script.js and
-    // POST /api/event (data-api below points the script at the same one).
-    scripts: plausibleDomain
-      ? [
-          {
-            defer: true,
-            src: "/js/script.js",
-            "data-domain": plausibleDomain,
-            "data-api": "/api/event",
-          } as React.JSX.IntrinsicElements["script"],
-        ]
-      : undefined,
-  }),
+  head: ({ matches }) => {
+    const activeRouteId = matches[matches.length - 1]?.routeId ?? "/";
+    const includePlausible = Boolean(plausibleDomain) && !isDashboardRouteId(activeRouteId);
+
+    return {
+      meta: [
+        { charSet: "utf-8" },
+        { name: "viewport", content: "width=device-width, initial-scale=1" },
+        { title: "Stoop. — Tenant maintenance, handled for small landlords" },
+        {
+          name: "description",
+          content:
+            "Stoop reads and sorts every tenant text and drafts the reply in your voice. Tenants text. Stoop drafts. You approve.",
+        },
+        {
+          property: "og:title",
+          content: "Stoop. — Tenant maintenance, handled for small landlords",
+        },
+        {
+          property: "og:description",
+          content:
+            "Reads, sorts, and drafts replies for tenant maintenance over SMS — you approve before it sends.",
+        },
+        { property: "og:type", content: "website" },
+        // TODO(domain): og:image must be an absolute URL for scrapers to
+        // resolve it (Facebook/Twitter/LinkedIn don't resolve relative
+        // paths) — swap to `https://<production-domain>/og-image.png` once
+        // the domain exists. Source template: scripts/og-image.html.
+        { property: "og:image", content: "/og-image.png" },
+        { name: "twitter:card", content: "summary_large_image" },
+      ],
+      links: [
+        { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+        { rel: "preconnect", href: "https://fonts.googleapis.com" },
+        { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
+        {
+          rel: "stylesheet",
+          href: "https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap",
+        },
+        { rel: "stylesheet", href: appCss },
+      ],
+      // Same-origin proxy (ADR-5 hard rule — no direct plausible.io script
+      // load, or adblockers strip the analytics signal). See the two
+      // narrowly-guarded routes in src/server.ts: GET /js/script.js and
+      // POST /api/event (data-api below points the script at the same one).
+      // `includePlausible` additionally requires a non-dashboard route
+      // (see `isDashboardRouteId` above) — /sign-in and /app/* never get
+      // the script tag even when a production Plausible domain is set.
+      scripts: includePlausible
+        ? [
+            {
+              defer: true,
+              src: "/js/script.js",
+              "data-domain": plausibleDomain,
+              "data-api": "/api/event",
+            } as React.JSX.IntrinsicElements["script"],
+          ]
+        : undefined,
+    };
+  },
   shellComponent: RootShell,
   component: RootComponent,
   notFoundComponent: NotFoundComponent,
@@ -148,8 +171,10 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <Outlet />
-      <Toaster />
+      <AuthProvider>
+        <Outlet />
+        <Toaster />
+      </AuthProvider>
     </QueryClientProvider>
   );
 }

@@ -25,6 +25,30 @@ function brandedErrorResponse(): Response {
   });
 }
 
+// A8 (safety review, #234): clickjacking defense-in-depth on every
+// response this Worker returns (the app, the 500 page, and the Plausible
+// proxy responses alike) — nothing in this app has a legitimate reason to
+// be framed by another origin, dashboard included (a framed /app or
+// /sign-in is a classic clickjacking setup for tricking a landlord into a
+// misclick). `frame-ancestors 'none'` is the modern CSP replacement for
+// `X-Frame-Options: DENY` and is what actually blocks framing (unlike
+// most other CSP directives, which govern content the page itself loads).
+const SECURITY_HEADERS: Record<string, string> = {
+  "content-security-policy": "frame-ancestors 'none'",
+};
+
+function withSecurityHeaders(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+    headers.set(name, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 // ADR-5 hard rule: analytics events must be proxied through our own domain
 // (loading plausible.io directly loses signal to adblockers). This is the
 // documented Plausible same-origin proxy — see
@@ -138,15 +162,15 @@ async function normalizeCatastrophicSsrResponse(response: Response): Promise<Res
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     const plausibleResponse = await maybeProxyPlausible(request);
-    if (plausibleResponse) return plausibleResponse;
+    if (plausibleResponse) return withSecurityHeaders(plausibleResponse);
 
     try {
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
-      return await normalizeCatastrophicSsrResponse(response);
+      return withSecurityHeaders(await normalizeCatastrophicSsrResponse(response));
     } catch (error) {
       console.error(error);
-      return brandedErrorResponse();
+      return withSecurityHeaders(brandedErrorResponse());
     }
   },
 };
