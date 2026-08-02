@@ -873,6 +873,9 @@
 >    simply the first writer of this combination. No migration needed for
 >    this part.
 
+<!-- DDL-body annotation for v1.19 lives on the unrouted_inbound CREATE
+     TABLE block below (retention marker), per the house annotate-don't-
+     silently-edit convention. -->
 > **v1.19 amendment (2026-08-02)** — no migration required (#231; data
 > -lifecycle policy, doc-first per the #231 safety review's ADVISORY-2).
 > `unrouted_inbound` is no longer retained forever:
@@ -1405,7 +1408,10 @@ CREATE INDEX idx_push_outbox_device   ON push_outbox (device_token_id);
 -- would otherwise be silently dropped -- including a true emergency to a
 -- misconfigured/format-mismatched number. NOT append-only (rule #2 does
 -- not apply) -- resolved_at is set by a human operator, out-of-band, once
--- the number/tenant mismatch is fixed. ADMIN-ONLY: no landlord_id and
+-- the number/tenant mismatch is fixed. v1.19 (#231): RESOLVED rows are
+-- auto-deleted 30 days after resolved_at by the scheduler's maintenance
+-- sweep; UNRESOLVED rows are never auto-deleted (operator purge = #244).
+-- ADMIN-ONLY: no landlord_id and
 -- nothing to EXISTS-join through (no tenant, no case), so app_role gets
 -- NO grant at all here, plus one unconditional-deny RLS policy as
 -- defense-in-depth -- see the v1.17 amendments block above for the full

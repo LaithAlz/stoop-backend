@@ -247,14 +247,17 @@ _DELETE_RETENTION_BATCH_SQL = text(
     """
 )
 
-# Belt-and-braces bound on lock waits inside the retention DELETE (#231
-# safety review, BLOCKING-2): SKIP LOCKED above already steps over
-# operator-held rows, but any OTHER lock this statement could ever wait on
-# fails fast instead of stalling the shared ticker. Transaction-scoped
+# Belt-and-braces bound on lock waits for EVERY session this module
+# opens — the retention DELETE and the digest SELECT alike (#231 safety
+# review, BLOCKING-2 + NEW-1: the digest's count(*) parks behind a queued
+# ACCESS EXCLUSIVE — an ALTER TABLE/VACUUM FULL held open — just as
+# readily as the DELETE parks behind a row lock, and an unbounded wait in
+# EITHER stalls the whole ticker, emergency sweep included). SKIP LOCKED
+# covers operator row locks on the DELETE; this covers everything else, Transaction-scoped
 # (SET LOCAL), same precedent as app/agent/graph.py's advisory-lock
 # session. 2s is generous against sub-second app transactions and
 # irrelevant to correctness — a timed-out batch simply retries next tick.
-_SET_RETENTION_LOCK_TIMEOUT_SQL = text("SET LOCAL lock_timeout = '2s'")
+_SET_LOCK_TIMEOUT_SQL = text("SET LOCAL lock_timeout = '2s'")
 
 
 def _retention_cutoff(now: datetime) -> datetime:
@@ -327,7 +330,7 @@ async def _run_retention_sweep(
             break
 
         async with _acm(get_admin_session)() as session:
-            await session.execute(_SET_RETENTION_LOCK_TIMEOUT_SQL)
+            await session.execute(_SET_LOCK_TIMEOUT_SQL)
             rows = (
                 (
                     await session.execute(
@@ -438,6 +441,7 @@ async def _maybe_fire_digest(*, now: datetime) -> bool:
 
     grace_cutoff = now - timedelta(seconds=_DIGEST_GRACE_SECONDS)
     async with _acm(get_admin_session)() as session:
+        await session.execute(_SET_LOCK_TIMEOUT_SQL)
         row = (
             (await session.execute(_SELECT_UNRESOLVED_AGED_SQL, {"grace_cutoff": grace_cutoff}))
             .mappings()
@@ -540,12 +544,24 @@ async def run_unrouted_maintenance_sweep(
             batch_limit=retention_batch_limit,
         )
     except Exception as exc:
-        log.error("unrouted_retention_sweep_failed", exc_type=type(exc).__name__)
-        sentry_sdk.capture_message(
-            "unrouted_inbound: retention sweep failed (digest still ran)",
-            level="error",
-            extras={"exc_type": type(exc).__name__},
-        )
+        # NEW-2 (#231 safety re-review): the reporting itself must never
+        # re-silence the digest — a Sentry-transport or logging-pipe
+        # failure co-occurs with infrastructure trouble by nature. Same
+        # rationale as app/scheduler.py's _safe_report (not imported here:
+        # scheduler imports this module; a bare nested guard avoids the
+        # cycle for two calls).
+        try:
+            log.error("unrouted_retention_sweep_failed", exc_type=type(exc).__name__)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        try:
+            sentry_sdk.capture_message(
+                "unrouted_inbound: retention sweep failed (digest still ran)",
+                level="error",
+                extras={"exc_type": type(exc).__name__},
+            )
+        except Exception:  # noqa: BLE001, S110
+            pass
 
     digest_fired = await _maybe_fire_digest(now=effective_now)
 

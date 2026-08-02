@@ -587,7 +587,8 @@ async def test_sweep_skips_operator_locked_row_without_blocking_or_deleting(
     MUTANTS KILLED: removing ``FOR UPDATE SKIP LOCKED`` from
     ``_DELETE_RETENTION_BATCH_SQL``'s inner SELECT makes the sweep either
     (a) block behind the operator's row lock until their transaction ends
-    (BLOCKING-2 — this test would hang past its timeout), or (b) once the
+    (BLOCKING-2 — with lock_timeout in place the hang converts to a fast
+    red assertion; there is no pytest-timeout in this suite), or (b) once the
     operator commits, delete the row they just un-resolved (BLOCKING-1 —
     the survival assertion below goes red).
 
@@ -679,3 +680,75 @@ async def test_retention_failure_never_silences_the_digest(
         assert any("awaiting operator reconciliation" in m for m in messages)
     finally:
         await _cleanup(db_session, [aged_unresolved_id])
+
+
+@pytest.mark.integration
+async def test_table_level_lock_never_stalls_the_sweep_on_either_session(
+    db_session: AsyncSession,
+    db_engine: AsyncEngine,
+) -> None:
+    """#231 safety re-review NEW-1 + NEW-4: a held ACCESS EXCLUSIVE table
+    lock (an ALTER TABLE/VACUUM FULL left open in a transaction — the one
+    shape SKIP LOCKED cannot step over) must fail the sweep FAST via
+    ``lock_timeout`` on BOTH sessions it opens, never park the shared
+    ticker behind a human's DDL. MUTANT KILLED: removing
+    ``_SET_LOCK_TIMEOUT_SQL`` from either the retention session or the
+    digest session makes this test exceed its 10s wall bound (the sweep
+    blocks until the DDL transaction ends).
+
+    The digest half is the load-bearing one: pre-fix, retention failed
+    fast at ~2s but the digest's count(*) hung indefinitely — total
+    ticker silence, emergency sweep included.
+    """
+    now = datetime.now(UTC)
+    # One eligible-resolved row (retention target) + one aged-unresolved
+    # row (digest target) so BOTH halves genuinely attempt table access.
+    resolved_id = await factories.insert_unrouted_inbound(
+        db_session,
+        received_at=now - timedelta(days=45),
+        resolved_at=now - timedelta(days=40),
+    )
+    unresolved_id = await factories.insert_unrouted_inbound(
+        db_session,
+        received_at=now - timedelta(hours=3),
+        resolved_at=None,
+    )
+    await db_session.commit()
+
+    import asyncio as _asyncio
+
+    ddl_conn = await db_engine.connect()
+    try:
+        ddl_txn = await ddl_conn.begin()
+        await ddl_conn.execute(text("LOCK TABLE unrouted_inbound IN ACCESS EXCLUSIVE MODE"))
+
+        loop = _asyncio.get_running_loop()
+        started = loop.time()
+        # The sweep must FAIL FAST — either returning (retention's
+        # lock-timeout is contained by its own except; digest skipped) or
+        # raising from the digest's own lock-timeout (contained one level
+        # up by the scheduler's per-job guard, which pages loudly). Both
+        # are bounded-and-visible; only a HANG is the failure mode this
+        # test exists to forbid. 10s = 5x the 2s per-session lock_timeout.
+        raised: Exception | None = None
+        try:
+            outcome = await _asyncio.wait_for(run_unrouted_maintenance_sweep(now=now), timeout=10.0)
+        except TimeoutError:
+            pytest.fail(
+                "sweep HUNG behind a held ACCESS EXCLUSIVE lock — a"
+                " lock_timeout is missing from one of its sessions"
+            )
+        except Exception as exc:  # noqa: BLE001 — digest lock-timeout path
+            raised = exc
+        elapsed = loop.time() - started
+
+        assert elapsed < 10.0
+        if raised is None:
+            assert outcome.deleted_count == 0  # nothing deletable under the lock
+            assert outcome.digest_fired is False
+
+        await ddl_txn.rollback()
+    finally:
+        await ddl_conn.close()
+
+    await _cleanup(db_session, [resolved_id, unresolved_id])
