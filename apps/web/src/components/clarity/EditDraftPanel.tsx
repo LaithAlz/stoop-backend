@@ -49,7 +49,7 @@ export function EditDraftPanel({
         onChange={(e) => setBody(e.target.value)}
         disabled={submitting}
         rows={4}
-        className="min-h-32 w-full rounded-clarity-lg rounded-tr-clarity-sm border-[1.5px] border-clarity-brand-border bg-clarity-brand-soft p-4 font-clarity-serif text-[15.5px] italic leading-relaxed text-clarity-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-clarity-brand disabled:opacity-70"
+        className="min-h-32 w-full rounded-clarity-lg rounded-tr-clarity-sm border-[1.5px] border-clarity-brand-border bg-clarity-brand-soft p-4 font-clarity-serif text-[15.5px] italic leading-relaxed text-clarity-ink disabled:opacity-70"
       />
       <div className="mt-[15px] grid grid-cols-[auto_1fr] gap-2.5">
         <button
