@@ -127,25 +127,25 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   // `onError` for a throw from ANY of them). So "clear the optimistic
   // state" here is now only ever a response to the server actually
   // rejecting the call, never to our own post-success code slipping.
+  //
+  // NEW-2 (safety review round 3, #234 PR 2): `onSettled()` runs on EVERY
+  // failure now, not just the codes that provably changed server state. A
+  // `network_error` can mean "request applied, response lost" — the only
+  // honest response is to re-ask the server what actually happened rather
+  // than leave a card whose real state is unknown sitting approvable.
   const handleError = useCallback(
     (error: unknown, ctx: DraftContext) => {
       dispatch({ type: "cleared", draftId: ctx.draftId });
       if (error instanceof ApiError && error.code === "draft_stale") {
         showStaleNotice(ctx.caseId, ctx.tenantName);
-        onSettled();
-        return;
+      } else {
+        onNotice(
+          error instanceof ApiError
+            ? toHouseApiError(error)
+            : "Something didn't go through. Try again in a moment.",
+        );
       }
-      onNotice(
-        error instanceof ApiError
-          ? toHouseApiError(error)
-          : "Something didn't go through. Try again in a moment.",
-      );
-      if (
-        error instanceof ApiError &&
-        (error.code === "already_sent" || error.code === "draft_not_undoable")
-      ) {
-        onSettled();
-      }
+      onSettled();
     },
     [onNotice, onSettled, showStaleNotice],
   );
@@ -249,13 +249,38 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       }
     },
     onError: (error, ctx) => {
-      // A7 (safety review, #234 PR 2): this used to unconditionally close
-      // the editor here (`setEditingContext(null)`) on ANY failure — from
-      // a dropped connection to `draft_stale` — throwing away whatever
-      // the landlord had just typed. Leave it open with the text intact;
-      // the landlord decides whether to retry Send or tap Cancel
-      // themselves (Cancel already closes it deliberately, as a
-      // landlord-initiated action).
+      // NEW-4 (safety review round 3, #234 PR 2): a 404'd draft means the
+      // thing being edited no longer exists server-side — with A7 keeping
+      // the editor pinned open, leaving it up would invite retrying
+      // forever against a draft that's gone. Closing it here is the one
+      // case where discarding the typed text is correct.
+      if (error instanceof ApiError && error.code === "draft_not_found") {
+        setEditingContext(null);
+        handleError(error, ctx);
+        return;
+      }
+      // NEW-2 (safety review round 3, #234 PR 2): an AMBIGUOUS failure —
+      // network error (status 0) or 5xx — can mean the edit-and-send
+      // actually applied server-side and only the response was lost. The
+      // API's approve path is idempotent for a draft already in the
+      // approved family (it returns 200 WITHOUT applying a new body), so
+      // a retype-and-resend after a lost response would silently send the
+      // FIRST text while showing a countdown for the second. Say so, and
+      // let the unconditional refetch below bring back the honest state
+      // (if the edit applied, the card leaves the queue).
+      if (error instanceof ApiError && (error.status === 0 || error.status >= 500)) {
+        dispatch({ type: "cleared", draftId: ctx.draftId });
+        onNotice("That may have gone through — give it a moment to update before sending again.");
+        onSettled();
+        return;
+      }
+      // A7 (safety review, #234 PR 2): everything else used to
+      // unconditionally close the editor here (`setEditingContext(null)`)
+      // on ANY failure — from a dropped connection to `draft_stale` —
+      // throwing away whatever the landlord had just typed. Leave it open
+      // with the text intact; the landlord decides whether to retry Send
+      // or tap Cancel themselves (Cancel already closes it deliberately,
+      // as a landlord-initiated action).
       handleError(error, ctx);
     },
     onSettled: (_data, _error, ctx) => clearBusy(ctx.draftId),

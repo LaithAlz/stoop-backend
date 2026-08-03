@@ -17,7 +17,17 @@ interface EmergencyBannerProps {
    *  still-mocked conversation thread keeps passing its own mock ids. */
   conversationId?: string;
   headline: string;
-  subtext: string;
+  /** Optional as of round 3 (NEW-5) — Home passes nothing while the
+   *  headline fallback already carries the property label. */
+  subtext?: string;
+  /** NEW-1 (safety review round 3, #234 PR 2): the tenant's own words,
+   *  rendered inside the banner. With navigation gone until PR 3 (B3
+   *  above), a banner without these is "someone needs you now" with no
+   *  way to learn what happened and exactly one tappable thing — the
+   *  button that silences the escalation chain. Same "{name} said"
+   *  label pattern as DecisionCard's tenant-message block. */
+  tenantFirstName?: string;
+  tenantMessage?: string;
   /** Present only when this card carries a non-null `notification_id`
    *  (api-contracts.md Queue v1.15 amendment) — omit entirely to render
    *  the plain informational banner, e.g. from the still-mocked
@@ -50,6 +60,8 @@ export function EmergencyBanner({
   conversationId,
   headline,
   subtext,
+  tenantFirstName,
+  tenantMessage,
   onAcknowledge,
   acknowledging = false,
   className,
@@ -61,9 +73,11 @@ export function EmergencyBanner({
         <strong className="block font-clarity-serif text-[15px] font-bold leading-snug">
           {headline}
         </strong>
-        <span className="mt-0.5 block font-clarity-sans text-xs font-semibold opacity-90">
-          {subtext}
-        </span>
+        {subtext && (
+          <span className="mt-0.5 block font-clarity-sans text-xs font-semibold opacity-90">
+            {subtext}
+          </span>
+        )}
       </span>
       <span
         className="ml-auto size-2 shrink-0 animate-pulse rounded-full bg-white motion-reduce:animate-none"
@@ -89,6 +103,18 @@ export function EmergencyBanner({
         </Link>
       ) : (
         <div className="flex items-center gap-3 px-4 py-3.5">{content}</div>
+      )}
+      {tenantMessage && (
+        <div className="border-t border-black/15 px-4 py-3">
+          {tenantFirstName && (
+            <span className="mb-1 block font-clarity-sans text-[11px] font-bold uppercase tracking-[0.02em] opacity-85">
+              {tenantFirstName} said
+            </span>
+          )}
+          <p className="font-clarity-sans text-[14px] font-semibold leading-relaxed">
+            {tenantMessage}
+          </p>
+        </div>
       )}
       {onAcknowledge && (
         <button

@@ -39,9 +39,15 @@ export function emergencyHeadline(
  * live banner doesn't navigate until PR 3 lands the live cases screen, so
  * any tap promise would be a dead end on the emergency path. Property
  * label only.
+ *
+ * NEW-5 (round 3): `null` while `title` is null (#197's title-writing
+ * half unshipped) — the fallback headline already ends in the property
+ * label, and rendering it twice in a row reads broken exactly where
+ * calm matters most. The banner shows the tenant's own message below
+ * either way (NEW-1).
  */
-export function emergencySubtext(item: Pick<QueueItem, "property_label">): string {
-  return item.property_label;
+export function emergencySubtext(item: Pick<QueueItem, "title" | "property_label">): string | null {
+  return item.title ? item.property_label : null;
 }
 
 // ---------------------------------------------------------------------------

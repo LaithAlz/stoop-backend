@@ -93,11 +93,11 @@ export function entryFor(state: QueueEntriesState, draftId: string): QueueEntry 
  * server's clock once, at receipt time, by `computeUndoExpiresAt` below).
  * Never re-parses a server timestamp here (B2).
  *
- * A3 (safety review, #234 PR 2): `undoExpiresAtClient` can be `NaN` if the
- * approve response's own `undo_until` was unparsable (see
- * `computeUndoExpiresAt`'s fallback) — guarded explicitly so a bad value
- * renders as "no time left" (the undo ticket's `00:00`, never `00:NaN`)
- * instead of propagating a NaN through the countdown and its progress bar.
+ * A3 (safety review, #234 PR 2): guarded against a non-finite
+ * `undoExpiresAtClient` so a bad value renders as "no time left" (the
+ * undo ticket's `00:00`, never `00:NaN`). As of round 3
+ * `computeUndoExpiresAt` always returns a finite number, so this is
+ * belt-and-suspenders against any future caller that doesn't.
  */
 export function secondsRemaining(undoExpiresAtClient: number, now: number = Date.now()): number {
   if (!Number.isFinite(undoExpiresAtClient)) return 0;
@@ -119,6 +119,11 @@ export function totalUndoSeconds(entry: {
   return Math.max(1, Math.round(totalMs / 1000));
 }
 
+/** The contract's own undo window (api-contracts.md: `scheduled_send_at =
+ *  now() + 5s`) — used ONLY as the no-anchor fallback below, never to
+ *  shorten a window the server actually reported. */
+const UNDO_WINDOW_FALLBACK_MS = 5_000;
+
 /**
  * B2 (safety review, #234 PR 2): the one place a server timestamp
  * (`undo_until`) and the server's OWN clock (the approve response's `Date`
@@ -128,12 +133,18 @@ export function totalUndoSeconds(entry: {
  * expiry that's honest even when the client's wall clock is skewed from
  * the server's.
  *
- * Falls back to treating `undo_until` as already being a client-epoch
- * value (the pre-B2 behavior) only when the response carried no usable
- * `Date` header — `Number.isFinite` guards both `Date.parse` calls, so a
- * malformed header or a malformed `undo_until` can never produce a
- * silent NaN that reaches `secondsRemaining` un-guarded (A3 covers that
- * downstream too, belt-and-suspenders).
+ * The no-anchor fallback (round 3): `Date` is NOT a CORS-safelisted
+ * response header, so a browser hands us `null` here unless the API
+ * exposes it (`Access-Control-Expose-Headers: Date` — #251). When the
+ * anchor is missing OR either timestamp is unparsable, the round-2
+ * fallback re-parsed `undo_until` against the client clock — the exact
+ * pre-B2 bug: a client clock 6s fast silently deletes the whole 5s
+ * window. Now it degrades to the contract's full window from receipt
+ * time instead — the landlord always gets their 5 seconds to tap Undo.
+ * Fail-open is correct here because this number only ever gates the
+ * OFFER of undo; the server's DELETE call is the real gate, and a
+ * too-late tap comes back `already_sent`, which flips the card to an
+ * honest "sent" state (useDraftActions.ts).
  */
 export function computeUndoExpiresAt(
   undoUntil: string,
@@ -145,7 +156,7 @@ export function computeUndoExpiresAt(
   if (Number.isFinite(undoUntilMs) && Number.isFinite(serverNowMs)) {
     return receivedAtClient + (undoUntilMs - serverNowMs);
   }
-  return undoUntilMs;
+  return receivedAtClient + UNDO_WINDOW_FALLBACK_MS;
 }
 
 export interface QueueViewRow {

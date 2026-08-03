@@ -202,7 +202,9 @@ function AppQueuePage() {
                 <EmergencyBanner
                   key={item.case_id}
                   headline={emergencyHeadline(item)}
-                  subtext={emergencySubtext(item)}
+                  subtext={emergencySubtext(item) ?? undefined}
+                  tenantFirstName={firstName(item.tenant_name)}
+                  tenantMessage={item.tenant_message}
                   onAcknowledge={
                     hasAcknowledgeableNotification(item)
                       ? () => acknowledge.acknowledge(item.notification_id)

@@ -483,10 +483,12 @@ export interface UndoDraftResponse {
   status: "pending";
 }
 
-/** POST /v1/drafts/{id}/reject response — 200, no documented body fields
- *  beyond the implicit success; typed as unknown-but-present rather than
- *  invented. */
-export type RejectDraftResponse = Record<string, never>;
+/** POST /v1/drafts/{id}/reject response — 200 `{ "status": "rejected" }`
+ *  (api-contracts.md v1.17 amendment; spec-guardian flagged the earlier
+ *  `Record<string, never>` typing as stale against that amendment). */
+export interface RejectDraftResponse {
+  status: "rejected";
+}
 
 // ---------------------------------------------------------------------------
 // Notifications ("Notifications / emergencies" section)
