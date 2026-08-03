@@ -14,9 +14,16 @@ interface ThreadMessageRowProps {
  *  landlord's behalf; an inbound row can be any of the three (a vendor
  *  texting back, or the landlord's own approve-by-SMS command channel
  *  reply, api-contracts.md's Webhooks section — surfaced here rather than
- *  mislabeled as the tenant). */
+ *  mislabeled as the tenant).
+ *
+ * M2 (safety review, #234 PR 3 fix round): an outbound row isn't always
+ * TO the tenant — `drafts.recipient` (schema-v1.md) can be `"vendor"`, and
+ * that reply lands in this same timeline. Labeling it "Sent by Stoop for
+ * you" read as if the TENANT received it, which they didn't. */
 function speakerLabel(entry: TimelineMessageEntry, tenantFirst: string): string {
-  if (entry.direction === "outbound") return "Sent by Stoop for you";
+  if (entry.direction === "outbound") {
+    return entry.party === "vendor" ? "Sent to the vendor" : "Sent by Stoop for you";
+  }
   if (entry.party === "vendor") return "Vendor";
   if (entry.party === "landlord") return "You";
   return tenantFirst;

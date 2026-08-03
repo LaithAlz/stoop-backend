@@ -13,7 +13,7 @@ import { PhoneFrame } from "@/components/stoop/PhoneFrame";
 import { useAuth } from "@/auth/AuthProvider";
 import { useCase } from "@/api/cases";
 import { ApiError, toHouseApiError } from "@/api/errors";
-import type { TimelineEntry, TimelineMessageEntry } from "@/api/types";
+import type { TimelineEntry, TimelineMessageEntry, VulnerableOccupant } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
 import { formatRelativeTime } from "@/lib/relativeTime";
 import { emergencyHeadline } from "@/features/emergency/emergencyBanner";
@@ -36,6 +36,16 @@ function latestMessage(
   return found;
 }
 
+/** M3 (safety review, #234 PR 3 fix round): same blessed wording as
+ *  apps/mobile's TenantFormModal.tsx `VULNERABLE_OPTIONS` — the ONE field
+ *  that can change a 2am drive-over-vs-call-911 decision, rendered here
+ *  verbatim, no invented severity language wrapped around it. */
+const VULNERABLE_LABELS: Record<VulnerableOccupant, string> = {
+  infant: "An infant",
+  elderly: "An elderly person",
+  medical_device: "On powered medical equipment",
+};
+
 /**
  * The emergency takeover — the one screen dark styling is allowed on
  * (per this app's design contract). Wired to `GET /v1/cases/{id}`
@@ -48,11 +58,11 @@ function latestMessage(
  * details, no invented vendor.
  *
  * The vendor dispatch action only renders when `caseDetail.vendor` is
- * non-null — the OLD mock always showed "Dispatch Mike's Plumbing (24/7)"
- * regardless of whether any vendor was actually engaged; that was
- * fabricated. `CaseDetailVendor` (api-contracts.md's Cases section, v1.16
- * amendment) has no `working_hours` field either, so this never claims a
- * vendor is available "24/7".
+ * non-null AND has a phone on file — the OLD mock always showed "Dispatch
+ * Mike's Plumbing (24/7)" regardless of whether any vendor was actually
+ * engaged; that was fabricated. `CaseDetailVendor` (api-contracts.md's
+ * Cases section, v1.16 amendment) has no `working_hours` field either, so
+ * this never claims a vendor is available "24/7".
  */
 function EmergencyPage() {
   const { id } = Route.useParams();
@@ -70,26 +80,54 @@ function EmergencyPage() {
         : undefined,
     [caseDetail],
   );
+  // M2 (safety review, #234 PR 3 fix round): "outbound" alone also matches
+  // a reply Stoop sent to a VENDOR (`drafts.recipient`, schema-v1.md) —
+  // showing that under "Stoop already replied" here would read as if the
+  // TENANT got the safety instructions, when they may not have. Scoped to
+  // `party === "tenant"` so this only ever shows what the tenant was
+  // actually sent.
   const latestStoopReply = useMemo(
     () =>
       caseDetail
-        ? latestMessage(caseDetail.timeline, (m) => m.direction === "outbound")
+        ? latestMessage(
+            caseDetail.timeline,
+            (m) => m.direction === "outbound" && m.party === "tenant",
+          )
         : undefined,
     [caseDetail],
   );
 
   const tenantFirst = firstName(caseDetail?.tenant.name);
-  // `CaseDetailTenant.phone`/`CaseDetailVendor.phone` are typed optional
-  // (src/api/types.ts's own comment: a best-effort read of an undocumented
-  // GET shape, api-contracts.md's v1.16 amendment) even though the schema
-  // itself has both as NOT NULL in practice — guarded defensively rather
-  // than asserted.
-  const tenantPhone = caseDetail?.tenant.phone;
-  const tenantPhoneDigits = tenantPhone ? tenantPhone.replace(/\D/g, "") : "";
-  const vendorPhone = caseDetail?.vendor?.phone;
-  const vendorPhoneDigits = vendorPhone ? vendorPhone.replace(/\D/g, "") : "";
-  const isStillActiveEmergency = caseDetail
-    ? caseDetail.severity === "emergency" && caseDetail.status !== "resolved"
+  // H2 (safety review, #234 PR 3 fix round): the old `.replace(/\D/g, "")`
+  // + `tel:+${digits}` synthesized a country code onto whatever the
+  // landlord typed for `tenants.phone` (never E.164-normalized anywhere —
+  // #232) — a landlord-typed "416-555-0134" became `tel:+4165550134`, a
+  // dead tone at 2am. The stored string is passed through to `tel:`/`sms:`
+  // as-is instead; a browser/OS dialer already understands a plain
+  // 10-digit local number exactly as well as it understands a mistakenly
+  // "+"-prefixed one, and this way we never invent digits that aren't
+  // actually on file.
+  const tenantPhone = caseDetail?.tenant.phone?.trim() || undefined;
+  const vendorPhone = caseDetail?.vendor?.phone?.trim() || undefined;
+  const vulnerableLabel = caseDetail?.tenant.vulnerable_occupant
+    ? VULNERABLE_LABELS[caseDetail.tenant.vulnerable_occupant]
+    : null;
+
+  // H1 (safety review, #234 PR 3 fix round — verified backend-side): a
+  // `null` severity is NOT proof this was never an emergency — it's the
+  // state before `classify_severity` runs, and the permanent state in
+  // degraded mode when classification fails outright; the case row itself
+  // (and Tier-0's phone/SMS chain) can exist before severity is ever
+  // written at all (emergency-prefilter.md). Reading `severity === null`
+  // as "stood down" would show "This case isn't an active emergency
+  // anymore." on a LIVE Tier-0 fire while the landlord's phone is still
+  // ringing — the client must never re-introduce a de-escalation the
+  // backend itself doesn't perform. `null` is therefore clamped to
+  // "still active" here, full stop — this screen has nothing softer to
+  // fall back to display than the takeover chrome itself.
+  const activeEmergency = caseDetail
+    ? caseDetail.status !== "resolved" &&
+      (caseDetail.severity === "emergency" || caseDetail.severity === null)
     : false;
 
   return (
@@ -97,10 +135,17 @@ function EmergencyPage() {
       <div className="flex flex-1 flex-col text-white" style={{ backgroundColor: "#0f1311" }}>
         <header className="bg-emergency px-5 pb-6 pt-4">
           <div className="flex items-center justify-between">
+            {/* LOW (safety review, #234 PR 3 fix round): this used to
+                point at the conversation thread — but the "Stop the
+                calls" acknowledge button lives on Home's banner
+                (src/routes/app.index.tsx; GET /v1/cases/{id} carries no
+                notification_id to ack against, so the thread has none
+                either). Sending the landlord to the thread first is one
+                extra tap AWAY from the one action that silences the
+                escalation chain; Home is the shorter path back to it. */}
             <Link
-              to="/app/conversations/$id"
-              params={{ id }}
-              aria-label="Back to conversation"
+              to="/app"
+              aria-label="Back to Home"
               className="inline-flex size-11 items-center justify-center rounded-full bg-white/15 text-white hover:bg-white/25"
             >
               <ArrowLeft className="size-5" aria-hidden="true" />
@@ -108,7 +153,16 @@ function EmergencyPage() {
             <span className="inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1.5 text-[11px] font-bold uppercase tracking-widest text-white">
               <AlertOctagon className="size-3.5" aria-hidden="true" />
               <span className="inline-flex size-2 animate-pulse rounded-full bg-white motion-reduce:animate-none" />
-              Emergency{caseDetail ? ` · ${formatRelativeTime(caseDetail.opened_at)}` : ""}
+              {/* M1 (safety review, #234 PR 3 fix round): `opened_at` is
+                  when the CASE opened, not when this escalation fired — a
+                  case opened 3 days ago that just escalated read
+                  "Emergency · 3d ago" instead of reflecting the actual
+                  trigger. The latest real tenant message is the closest
+                  honest signal this payload carries for "when". */}
+              Emergency
+              {caseDetail
+                ? ` · ${formatRelativeTime(latestTenantMessage?.at ?? caseDetail.opened_at)}`
+                : ""}
             </span>
             <span className="w-11" />
           </div>
@@ -127,23 +181,38 @@ function EmergencyPage() {
                 </h1>
               </div>
 
-              <a
-                href={`tel:+${tenantPhoneDigits}`}
-                className="mt-5 flex items-center justify-between rounded-2xl bg-white/15 px-4 py-3 text-white hover:bg-white/25"
-              >
-                <span>
+              {tenantPhone ? (
+                <a
+                  href={`tel:${tenantPhone}`}
+                  className="mt-5 flex items-center justify-between rounded-2xl bg-white/15 px-4 py-3 text-white hover:bg-white/25"
+                >
+                  <span>
+                    <span className="block text-[11px] font-bold uppercase tracking-widest text-white/80">
+                      Tenant
+                    </span>
+                    <span className="block text-base font-bold">
+                      {tenantFirst} · {tenantPhone}
+                    </span>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-widest">
+                    <Phone className="size-4" aria-hidden="true" />
+                    Tap to call
+                  </span>
+                </a>
+              ) : (
+                <div className="mt-5 rounded-2xl bg-white/15 px-4 py-3 text-white">
                   <span className="block text-[11px] font-bold uppercase tracking-widest text-white/80">
                     Tenant
                   </span>
                   <span className="block text-base font-bold">
-                    {tenantFirst} · {tenantPhone ?? "no phone on file"}
+                    {tenantFirst} · no phone on file
                   </span>
-                </span>
-                <span className="inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-widest">
-                  <Phone className="size-4" aria-hidden="true" />
-                  Tap to call
-                </span>
-              </a>
+                </div>
+              )}
+
+              {vulnerableLabel && (
+                <p className="mt-3 text-sm font-bold text-white">{vulnerableLabel}</p>
+              )}
             </>
           )}
         </header>
@@ -161,7 +230,13 @@ function EmergencyPage() {
               />
               <p className="text-sm font-medium text-white/80">Loading this emergency…</p>
             </div>
-          ) : caseQuery.isError && !caseDetail ? (
+          ) : !caseDetail ? (
+            // H3 (safety review, #234 PR 3 fix round): belt-and-braces —
+            // renders the SAME error block for a genuine fetch error and
+            // for the "not pending, not error, but still no data" gap a
+            // fixed src/api/client.ts should no longer produce. Previously
+            // this fell through to a bare `null` — a blank dark screen on
+            // the one screen that can least afford to render nothing.
             <div role="alert" className="flex flex-col items-center gap-3 py-16 text-center">
               <p className="text-sm font-medium text-white/80">
                 {caseQuery.error instanceof ApiError
@@ -176,9 +251,9 @@ function EmergencyPage() {
                 Try again
               </button>
             </div>
-          ) : caseDetail ? (
+          ) : (
             <>
-              {!isStillActiveEmergency && (
+              {!activeEmergency && (
                 <div className="mb-6 rounded-2xl border border-white/15 bg-white/[0.04] p-4">
                   <p className="text-sm leading-relaxed text-white/90">
                     This case isn&rsquo;t an active emergency anymore. The details below are what
@@ -232,28 +307,40 @@ function EmergencyPage() {
                 </div>
               )}
             </>
-          ) : null}
+          )}
         </main>
 
         {caseDetail && (
           <div className="space-y-2 border-t border-white/10 bg-black/30 p-4 pb-6">
-            <a
-              href={`tel:+${tenantPhoneDigits}`}
-              className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl bg-white text-lg font-bold uppercase tracking-wide text-ink hover:bg-white/95"
-            >
-              <Phone className="size-5" aria-hidden="true" />
-              Call {tenantFirst} now
-            </a>
-            <a
-              href={`sms:+${tenantPhoneDigits}`}
-              className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/[0.06] text-base font-bold text-white hover:bg-white/15"
-            >
-              <MessageSquare className="size-5" aria-hidden="true" />
-              Text {tenantFirst}
-            </a>
-            {caseDetail.vendor && (
+            {tenantPhone ? (
+              <>
+                <a
+                  href={`tel:${tenantPhone}`}
+                  className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl bg-white text-lg font-bold uppercase tracking-wide text-ink hover:bg-white/95"
+                >
+                  <Phone className="size-5" aria-hidden="true" />
+                  Call {tenantFirst} now
+                </a>
+                <a
+                  href={`sms:${tenantPhone}`}
+                  className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/[0.06] text-base font-bold text-white hover:bg-white/15"
+                >
+                  <MessageSquare className="size-5" aria-hidden="true" />
+                  Text {tenantFirst}
+                </a>
+              </>
+            ) : (
+              // H2 (safety review, #234 PR 3 fix round): no phone on file
+              // — a full-prominence "Call {first} now" with href="tel:+"
+              // was a silent dead tap. Plain, honest line instead of a
+              // broken-looking action.
+              <p className="flex min-h-[60px] w-full items-center justify-center rounded-2xl border border-white/20 bg-white/[0.06] px-4 text-center text-sm font-semibold text-white/80">
+                No phone on file for {tenantFirst} — open the conversation to reply.
+              </p>
+            )}
+            {caseDetail.vendor && vendorPhone && (
               <a
-                href={`tel:+${vendorPhoneDigits}`}
+                href={`tel:${vendorPhone}`}
                 className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/[0.06] text-base font-bold text-white hover:bg-white/15"
               >
                 <Wrench className="size-5" aria-hidden="true" />
