@@ -77,28 +77,52 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   // exactly these ids (the screen threads `isSendUnverified` into its
   // editor) until `resolveUnverifiedSend` below is told what the next
   // SUCCESSFUL read of this draft's true state actually was.
-  const [unverifiedSendIds, setUnverifiedSendIds] = useState<ReadonlySet<string>>(() => new Set());
+  //
+  // F1 (safety re-verify, #252): the value is the queue data GENERATION
+  // this flag was raised against, not just membership. The first cut used
+  // a bare Set and resolved on the next effect flush — but at that instant
+  // `queueQuery.data` is still the last SUCCESSFUL payload, taken BEFORE
+  // the send, which of course still lists the draft. It resolved
+  // "still pending", re-enabled Send about one frame later, and the whole
+  // guard was inert. A resolution is only trustworthy against a read that
+  // completed AFTER the failure, which is what the generation comparison
+  // in src/routes/app.index.tsx enforces.
+  const [unverifiedSendIds, setUnverifiedSendIds] = useState<ReadonlyMap<string, number>>(
+    () => new Map(),
+  );
 
   const resolveUnverifiedSend = useCallback(
     (draftId: string, stillPending: boolean) => {
       setUnverifiedSendIds((prev) => {
         if (!prev.has(draftId)) return prev;
-        const next = new Set(prev);
+        const next = new Map(prev);
         next.delete(draftId);
         return next;
       });
       // Draft still pending → the ambiguous edit-and-send never applied;
       // clearing the flag above already re-enables Send, nothing else to
-      // do. Draft gone → it DID apply — close the editor only if it's
-      // still open on THIS exact draft (a landlord who already moved on,
-      // e.g. Cancel or a tenant-reply draft swap, gets no stale notice
-      // about a draft they're no longer looking at).
+      // do.
       if (stillPending) return;
-      setEditingContext((current) => {
-        if (current?.draftId !== draftId) return current;
-        onNotice("Your earlier reply already went out — this edit wasn't sent.");
-        return null;
-      });
+      // F2 (safety re-verify, #252): the draft leaving the queue does NOT
+      // prove the reply went out. `GET /v1/queue` joins
+      // cases.status='awaiting_approval' with drafts.status='pending', so
+      // a draft also leaves it when a tenant reply made it `stale`, when
+      // it was rejected/cancelled, or when the case transiently left
+      // awaiting_approval mid-graph-rerun. Claiming "your earlier reply
+      // already went out" in those cases tells the landlord the tenant
+      // was answered when nobody was — the silence direction, in the exact
+      // window where a tenant is actively texting. State only what this
+      // read supports and point at the record.
+      onNotice(
+        "This draft isn't waiting to send anymore — open the conversation to see what happened.",
+      );
+      // F4: the notice above is unconditional and OUTSIDE the state
+      // updater. Previously it fired inside `setEditingContext`, so it was
+      // delivered only if the editor happened to still be open on this
+      // draft — a landlord who followed the toast's own advice and tapped
+      // Cancel got no notice at all — and a React state updater can be
+      // invoked more than once, which would have double-toasted.
+      setEditingContext((current) => (current?.draftId === draftId ? null : current));
     },
     [onNotice],
   );
@@ -226,8 +250,17 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
     // window or navigate away and back. Same onSettled() every other
     // server-confirmed transition in this hook already calls.
     onSuccess: (_data, ctx) => {
-      dispatch({ type: "undone", draftId: ctx.draftId });
-      onSettled();
+      // F8 (safety re-verify): guarded like every other post-success
+      // block in this hook (the A1 convention) — react-query routes an
+      // `onSuccess` throw into `onError`, which here is `handleError`,
+      // i.e. a "Something didn't go through" toast after an undo that
+      // actually succeeded.
+      try {
+        dispatch({ type: "undone", draftId: ctx.draftId });
+        onSettled();
+      } catch {
+        onNotice("That went through, but the queue didn't refresh.");
+      }
     },
     onError: (error, ctx) => {
       // M1 senior advisory (mobile, ported here): a 409 `already_sent` on
@@ -324,11 +357,27 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       // request that provably never left the browser, so telling the
       // landlord it "may have gone through" would be the dishonest,
       // silence-inducing direction for those two codes specifically.
-      if (error instanceof ApiError && (error.code === "network_error" || error.status >= 500)) {
+      // F5 (safety re-verify, #252): an unparsable 2xx body counts as
+      // ambiguous too — the server answered 2xx, so the edit-and-send
+      // DEFINITELY applied; we just couldn't read the confirmation. That
+      // is the one case where a retype-and-resend is most certain to
+      // deliver the wrong body, so it must raise the guard rather than
+      // fall through to "try again in a moment".
+      if (
+        error instanceof ApiError &&
+        (error.code === "network_error" ||
+          error.status >= 500 ||
+          (error.code === "unknown_error" && error.status >= 200 && error.status < 300))
+      ) {
         dispatch({ type: "cleared", draftId: ctx.draftId });
         // R3-1: track this draft as unverified so Send stays disabled
         // until a later successful read resolves it one way or the other.
-        setUnverifiedSendIds((prev) => new Set(prev).add(ctx.draftId));
+        // F1: stamped with `Date.now()`, which is directly comparable to
+        // TanStack's `dataUpdatedAt` (same clock, same units) — the screen
+        // refuses to resolve against any read that didn't complete AFTER
+        // this moment. No plumbing needed for the query's generation.
+        const failedAt = Date.now();
+        setUnverifiedSendIds((prev) => new Map(prev).set(ctx.draftId, failedAt));
         onNotice("That may have gone through — give it a moment to update before sending again.");
         onSettled();
         return;

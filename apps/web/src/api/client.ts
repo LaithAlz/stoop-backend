@@ -166,7 +166,25 @@ async function apiRequestInternal<T>(
     return { data: undefined as T, dateHeader };
   }
 
-  const text = await response.text();
+  // F5 (safety re-verify, #252): reading the body is inside its own
+  // try/catch mapped to `network_error`. It used to sit OUTSIDE the fetch
+  // try/catch above, so a connection dropped AFTER response headers — the
+  // classic "the response was lost" case, and the one the approve loop's
+  // whole ambiguity guard exists for — rejected here as a raw TypeError.
+  // Callers saw a non-ApiError, showed "Something didn't go through. Try
+  // again in a moment.", and never raised the unverified-send flag: an
+  // explicit invitation to retype and resend a reply that may already
+  // have gone out.
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    throw new ApiError(0, {
+      code: "network_error",
+      message: "Couldn't reach Stoop. Check your connection and try again.",
+      request_id: "req_local",
+    });
+  }
   const parsed = text.length > 0 ? safeJsonParse(text) : null;
 
   if (!response.ok) {

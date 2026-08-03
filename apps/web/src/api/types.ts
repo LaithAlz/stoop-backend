@@ -313,7 +313,16 @@ export interface QueueCounts {
 export interface QueueItem {
   case_id: string;
   draft_id: string;
-  severity: Severity;
+  /** F3 (safety re-verify, #252): NULLABLE. The backend types this
+   *  `QueueSeverity | None` and deliberately keeps such cards ("never
+   *  fabricated, never silently dropped" — app/routers/queue.py), so a
+   *  card whose classification failed or hasn't run arrives with a null
+   *  severity. This was typed non-null, and `plaqueConfig[severity]`
+   *  then threw at render — taking out the whole Home screen, live
+   *  emergency banners included, exactly when classification is degraded.
+   *  Same bug class as PR 5's F1: a frontend type overstating what the
+   *  API guarantees. */
+  severity: Severity | null;
   /** Agent-written, per-case; null until #197's title work lands (per this
    *  work's own brief) — never client-templated. */
   title: string | null;

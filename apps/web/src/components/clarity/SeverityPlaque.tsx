@@ -18,13 +18,19 @@ const plaqueConfig: Record<
 };
 
 interface SeverityPlaqueProps {
-  severity: Severity;
+  severity: Severity | null;
   size?: "default" | "sm";
   className?: string;
 }
 
 export function SeverityPlaque({ severity, size = "default", className }: SeverityPlaqueProps) {
-  const cfg = plaqueConfig[severity];
+  // F3 (safety re-verify, #252): an out-of-vocabulary or absent severity
+  // must render nothing rather than throw — an unguarded lookup here took
+  // the entire screen down through the root error boundary, and the state
+  // that triggers it (classification failed) is precisely when the screen
+  // must stay up.
+  const cfg = plaqueConfig[severity as Severity] as (typeof plaqueConfig)[Severity] | undefined;
+  if (!cfg) return null;
   return (
     <span
       className={cn(

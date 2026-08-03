@@ -72,12 +72,28 @@ export function EditDraftPanel({
           type="button"
           onClick={() => onSend(body.trim())}
           disabled={!canSend}
+          aria-describedby={sendDisabled ? `${fieldId}-unverified` : undefined}
           className="flex min-h-[52px] items-center justify-center gap-2 rounded-clarity-md border-[1.5px] border-clarity-brand-deep bg-clarity-brand font-clarity-sans text-base font-extrabold text-clarity-brand-on shadow-clarity-banner transition-transform duration-150 ease-clarity hover:-translate-y-px motion-reduce:transition-none motion-reduce:hover:translate-y-0 disabled:opacity-60"
         >
           <Check className="size-4" aria-hidden="true" />
           {submitting ? "Sending…" : "Send edited version"}
         </button>
       </div>
+      {/* F6 (safety re-verify, #252): a dimmed button with no explanation
+          is not enough for a blocked SAFETY control — once the guard
+          resolves only against a genuinely newer read, Send can stay dead
+          for a whole poll interval (or longer while the API is down,
+          which is the safe direction but only if it's understandable).
+          The toast that raised it is gone in four seconds; this isn't. */}
+      {sendDisabled && !submitting && (
+        <p
+          id={`${fieldId}-unverified`}
+          role="status"
+          className="mt-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
+        >
+          Checking whether your last reply went out — you&apos;ll be able to send again in a moment.
+        </p>
+      )}
     </div>
   );
 }

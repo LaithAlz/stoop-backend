@@ -23,7 +23,7 @@ const DEFAULT_WHY = "I drafted this from your house rules and past replies.";
 type DecisionCardStatus = "pending" | "sending" | "sent" | "editing";
 
 interface DecisionCardProps {
-  severity: Severity;
+  severity: Severity | null;
   tenantName: string;
   propertyLabel: string;
   timestamp: string;

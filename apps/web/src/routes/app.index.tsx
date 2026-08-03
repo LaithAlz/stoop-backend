@@ -94,17 +94,26 @@ function AppQueuePage() {
   // ambiguous-failure branch against THIS successful queue read — still
   // listed as a card means the edit never applied (re-enable Send); gone
   // means it did (close the editor + notice if it's still open on it).
+  //
+  // F1 (safety re-verify, #252): resolve ONLY against a read that
+  // completed after the failure. Without the `dataUpdatedAt` comparison
+  // this effect fired on the very next commit — when `queueQuery.data` is
+  // still the last successful payload from BEFORE the send, which of
+  // course still lists the draft — so it resolved "still pending",
+  // re-enabled Send about one frame later, and the guard did nothing at
+  // all. `isFetching` alone isn't sufficient; the generation is.
   useEffect(() => {
     if (!queueQuery.data) return;
     const freshIds = new Set(queueQuery.data.items.map((item) => item.draft_id));
-    for (const draftId of draftActions.unverifiedSendIds) {
+    for (const [draftId, failedAt] of draftActions.unverifiedSendIds) {
+      if (queueQuery.dataUpdatedAt <= failedAt) continue;
       draftActions.resolveUnverifiedSend(draftId, freshIds.has(draftId));
     }
     // draftActions.resolveUnverifiedSend is stable (useCallback, [onNotice]
     // only) — unverifiedSendIds is the real dependency besides the query
     // data itself.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queueQuery.data, draftActions.unverifiedSendIds]);
+  }, [queueQuery.data, queueQuery.dataUpdatedAt, draftActions.unverifiedSendIds]);
 
   const items = useMemo(() => queueQuery.data?.items ?? [], [queueQuery.data]);
   // Rule #1: the emergency line is never paywalled, throttled, or gated —
