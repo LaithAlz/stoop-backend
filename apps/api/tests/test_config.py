@@ -174,6 +174,11 @@ def test_production_with_app_database_url_succeeds(monkeypatch: pytest.MonkeyPat
         # gate (see test_production_without_public_base_url_raises) would
         # otherwise refuse to construct this Settings instance at all.
         public_base_url="https://api.stoop.example",
+        # Required alongside environment="production" -- the #251 F2a boot
+        # gate (see test_production_with_localhost_dashboard_origin_raises)
+        # would otherwise refuse to construct this Settings instance at all
+        # (the dashboard_origins default is two localhost origins).
+        dashboard_origins="https://app.stoop.example",
     )
     assert s.is_production is True
     assert s.app_database_url == "postgresql+asyncpg://app_role:secret@h:6543/db"
@@ -220,6 +225,10 @@ def test_is_production_property(monkeypatch: pytest.MonkeyPatch) -> None:
         # Required alongside environment="production" -- see the
         # public_base_url boot-gate tests below.
         public_base_url="https://api.stoop.example",
+        # Required alongside environment="production" -- the #251 F2a boot
+        # gate (see test_production_with_localhost_dashboard_origin_raises)
+        # would otherwise refuse to construct this Settings instance at all.
+        dashboard_origins="https://app.stoop.example",
     )
     assert s_prod.is_production is True
 
@@ -307,6 +316,10 @@ def test_production_with_public_base_url_succeeds(monkeypatch: pytest.MonkeyPatc
         supabase_jwt_issuer="https://x.supabase.co/auth/v1",
         supabase_service_role_key="key",
         twilio_auth_token="test-twilio-auth-token",  # noqa: S106
+        # Required alongside environment="production" -- the #251 F2a boot
+        # gate (see test_production_with_localhost_dashboard_origin_raises)
+        # would otherwise refuse to construct this Settings instance at all.
+        dashboard_origins="https://app.stoop.example",
     )
     assert s.is_production is True
     assert s.public_base_url == "https://api.stoop.example"
@@ -586,6 +599,10 @@ def test_production_with_valid_twilio_account_sid_succeeds(
         supabase_service_role_key="key",
         twilio_auth_token="test-twilio-auth-token",  # noqa: S106
         twilio_account_sid="AC" + "0" * 32,  # noqa: S106
+        # Required alongside environment="production" -- the #251 F2a boot
+        # gate (see test_production_with_localhost_dashboard_origin_raises)
+        # would otherwise refuse to construct this Settings instance at all.
+        dashboard_origins="https://app.stoop.example",
     )
     assert s.twilio_account_sid == "AC" + "0" * 32
 
@@ -740,3 +757,178 @@ def test_dashboard_origins_wildcard_is_rejected(
 
     assert "DASHBOARD_ORIGINS" in str(exc_info.value)
     assert "*" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# dashboard_origins shape validation (safety review, #251 F2b) — every
+# non-blank entry must be a bare `scheme://host[:port]` origin, in EVERY
+# environment (mirrors _normalize_twilio_account_sid's "no safe unset
+# fallback, so validate always" pattern, not the production-only gates).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "malformed_value",
+    [
+        "https://app.stoop.example/",  # trailing slash
+        "https://app.stoop.example/dashboard",  # path suffix
+        "Https://app.stoop.example",  # mixed-case scheme
+        "https://App.Stoop.Example",  # mixed-case host
+        "https://app.stoop.example;evil",  # stray semicolon
+        "app.stoop.example",  # bare host, no scheme
+        "ftp://app.stoop.example",  # non-http(s) scheme
+        "https://*.stoop.example",  # wildcard subdomain -- F3's flagged case
+    ],
+    ids=[
+        "trailing_slash",
+        "path_suffix",
+        "mixed_case_scheme",
+        "mixed_case_host",
+        "semicolon",
+        "bare_host_no_scheme",
+        "non_http_scheme",
+        "wildcard_subdomain",
+    ],
+)
+def test_dashboard_origins_malformed_entry_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, malformed_value: str
+) -> None:
+    """A malformed entry silently parses into an allowlist entry that can
+    never match a real browser Origin header -- the net effect is an
+    empty allowlist with zero startup signal. Refuse to boot instead,
+    in every environment (#251 F2b)."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _build_settings(dashboard_origins=malformed_value)
+
+    assert "DASHBOARD_ORIGINS" in str(exc_info.value)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "valid_value",
+    [
+        "http://localhost:5173,http://localhost:3000",  # the dev default
+        "https://app.stoop.example",
+        "https://app.stoop.example,https://staging.stoop.example",
+        "http://127.0.0.1:5173",
+        "https://app.stoop.example:8443",
+    ],
+    ids=["dev_default", "single_https", "two_https", "ipv4_with_port", "https_with_port"],
+)
+def test_dashboard_origins_well_shaped_entries_are_accepted(
+    monkeypatch: pytest.MonkeyPatch, valid_value: str
+) -> None:
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    s = _build_settings(dashboard_origins=valid_value)
+
+    assert s.dashboard_origins == valid_value
+
+
+# ---------------------------------------------------------------------------
+# Production boot gate: non-empty, non-localhost DASHBOARD_ORIGINS
+# (safety review, #251 F2a) — mirrors _require_app_database_url_in_
+# production / _require_public_base_url_in_production's exact gating
+# pattern (production-only; dev/staging keep the local-dev default).
+# ---------------------------------------------------------------------------
+
+
+def _build_production_settings(**overrides: object) -> Settings:
+    """Same helper as ``_build_settings`` but pre-filled with the OTHER
+    production boot-gate requirements (``app_database_url``,
+    ``public_base_url``) so each test below only has to override
+    ``dashboard_origins``."""
+    base: dict[str, object] = {
+        "environment": "production",
+        "app_database_url": "postgresql+asyncpg://app_role:secret@h:6543/db",
+        "public_base_url": "https://api.stoop.example",
+    }
+    base.update(overrides)
+    return _build_settings(**base)
+
+
+@pytest.mark.unit
+def test_production_with_unset_dashboard_origins_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verified previously-false-safe behavior: ENVIRONMENT=production
+    with DASHBOARD_ORIGINS left UNSET used to boot clean on the
+    http://localhost:... dev default -- an allowlist that can never match
+    a real production browser Origin, i.e. effectively empty, with zero
+    startup signal. Must now refuse to boot (#251 F2a)."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _build_production_settings()
+
+    message = str(exc_info.value)
+    assert "DASHBOARD_ORIGINS" in message
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("empty_value", ["", "   "], ids=["empty_string", "whitespace_only"])
+def test_production_with_empty_dashboard_origins_raises(
+    monkeypatch: pytest.MonkeyPatch, empty_value: str
+) -> None:
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _build_production_settings(dashboard_origins=empty_value)
+
+    assert "DASHBOARD_ORIGINS" in str(exc_info.value)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "local_value",
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://app.stoop.example,http://localhost:3000",
+    ],
+    ids=["localhost_alone", "loopback_ip", "mixed_with_real_origin"],
+)
+def test_production_with_localhost_dashboard_origin_raises(
+    monkeypatch: pytest.MonkeyPatch, local_value: str
+) -> None:
+    """A local dev origin anywhere in the allowlist must refuse to boot
+    in production, even alongside an otherwise-valid real origin (#251
+    F2a)."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _build_production_settings(dashboard_origins=local_value)
+
+    message = str(exc_info.value)
+    assert "DASHBOARD_ORIGINS" in message
+    assert "local" in message.lower()
+
+
+@pytest.mark.unit
+def test_production_with_real_dashboard_origins_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    s = _build_production_settings(dashboard_origins="https://app.stoop.example")
+
+    assert s.is_production is True
+    assert s.dashboard_origins_list == ["https://app.stoop.example"]
+
+
+@pytest.mark.unit
+def test_non_production_with_localhost_dashboard_origins_is_fine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The localhost/empty-allowlist gate is production-only -- dev/
+    staging keep working with the documented local-dev default (#251
+    F2a)."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    for env in ("dev", "staging"):
+        s = _build_settings(environment=env)
+        assert s.dashboard_origins_list == [
+            "http://localhost:5173",
+            "http://localhost:3000",
+        ]

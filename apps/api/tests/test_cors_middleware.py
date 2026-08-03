@@ -203,3 +203,76 @@ async def test_no_origin_header_on_webhook_route_gains_no_cors_headers() -> None
     assert cors_headers == [], (
         f"unexpected CORS headers on an Origin-less webhook POST: {cors_headers}"
     )
+
+
+# ---------------------------------------------------------------------------
+# F6 (#251 safety review) -- a HOSTILE Origin on the real webhook route.
+# Twilio itself never sends an Origin header (covered above); this proves
+# that even if some OTHER caller sent one, signature verification still
+# 403s and no Access-Control-Allow-Origin is ever added for a disallowed
+# origin -- an inert Access-Control-Expose-Headers is expected (Starlette's
+# CORSMiddleware sets it unconditionally whenever Origin is present, see
+# its own `simple_headers`/`send()`), so this asserts specifically on ACAO
+# absence, not "no CORS headers at all".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_webhook_with_hostile_origin_still_403s_and_gets_no_acao() -> None:
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/webhooks/twilio/sms", data={}, headers={"Origin": _DISALLOWED_ORIGIN}
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "invalid_signature"
+    assert "access-control-allow-origin" not in response.headers
+
+
+# ---------------------------------------------------------------------------
+# F1 (#251 safety review, HIGH) -- an unhandled 500 is sent by Starlette's
+# ServerErrorMiddleware, which sits OUTSIDE CORSMiddleware (installed
+# Starlette version: 1.3.1) -- app/main.py's _unhandled_exception_handler
+# sets Access-Control-Allow-Origin/Vary/X-Request-ID on that response
+# itself, Origin-gated the same way CORSMiddleware gates every other
+# response. Exercised via GET /_debug/error (non-production only router,
+# same endpoint tests/test_main_error_envelope.py's own 500 tests use).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_unhandled_500_with_allowed_origin_gets_acao_and_request_id() -> None:
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
+    ) as client:
+        response = await client.get("/_debug/error", headers={"Origin": _ALLOWED_ORIGIN})
+
+    assert response.status_code == 500
+    assert response.headers.get("access-control-allow-origin") == _ALLOWED_ORIGIN
+    assert response.headers.get("vary") == "Origin"
+    assert response.headers.get("x-request-id"), "X-Request-ID missing from a 500 response"
+
+
+@pytest.mark.unit
+async def test_unhandled_500_with_no_origin_gains_no_cors_headers() -> None:
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
+    ) as client:
+        response = await client.get("/_debug/error")
+
+    assert response.status_code == 500
+    cors_headers = [h for h in response.headers if h.lower().startswith("access-control-")]
+    assert cors_headers == [], f"unexpected CORS headers on an Origin-less 500: {cors_headers}"
+
+
+@pytest.mark.unit
+async def test_unhandled_500_with_disallowed_origin_gains_no_acao() -> None:
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
+    ) as client:
+        response = await client.get("/_debug/error", headers={"Origin": _DISALLOWED_ORIGIN})
+
+    assert response.status_code == 500
+    assert "access-control-allow-origin" not in response.headers
