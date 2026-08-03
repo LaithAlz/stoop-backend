@@ -48,6 +48,11 @@ interface DecisionCardProps {
   staleNotice?: string;
   /** True while the edit-and-send mutation for THIS card is in flight. */
   editSubmitting?: boolean;
+  /** R3-1 (safety review round 3 follow-up, issue #252): true while THIS
+   *  card's last edit-and-send ended in an ambiguous failure and hasn't
+   *  been resolved against a fresh queue read yet — see EditDraftPanel's
+   *  own comment on `sendDisabled`. */
+  sendUnverified?: boolean;
   /** A2 (safety review, #234 PR 2): true while ANY mutation for this
    *  card's draft is in flight — disables the Edit/Skip/Approve row and
    *  the Undo tap so two actions can't race on the same draft. */
@@ -83,6 +88,7 @@ export function DecisionCard({
   totalSeconds = 5,
   staleNotice,
   editSubmitting = false,
+  sendUnverified = false,
   actionsBusy = false,
   onApprove,
   onEdit,
@@ -144,6 +150,7 @@ export function DecisionCard({
           tenantName={tenantName}
           initialBody={draftMessage}
           submitting={editSubmitting}
+          sendDisabled={sendUnverified}
           onCancel={() => onCancelEdit?.()}
           onSend={(body) => onSubmitEdit?.(body)}
         />

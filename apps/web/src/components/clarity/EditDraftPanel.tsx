@@ -6,6 +6,13 @@ interface EditDraftPanelProps {
   tenantName: string;
   initialBody: string;
   submitting?: boolean;
+  /** R3-1 (safety review round 3 follow-up, issue #252): true while THIS
+   *  draft's last edit-and-send ended in an ambiguous failure (network
+   *  drop / 5xx) that hasn't been resolved against a fresh server read
+   *  yet — disables Send ONLY (not Cancel, not the textarea) so a
+   *  retype-and-resend can't silently overwrite an already-delivered body
+   *  while its fate is still unknown. */
+  sendDisabled?: boolean;
   onCancel: () => void;
   onSend: (body: string) => void;
   className?: string;
@@ -30,13 +37,14 @@ export function EditDraftPanel({
   tenantName,
   initialBody,
   submitting = false,
+  sendDisabled = false,
   onCancel,
   onSend,
   className,
 }: EditDraftPanelProps) {
   const [body, setBody] = useState(initialBody);
   const fieldId = useId();
-  const canSend = body.trim().length > 0 && !submitting;
+  const canSend = body.trim().length > 0 && !submitting && !sendDisabled;
 
   return (
     <div className={cn(className)}>
