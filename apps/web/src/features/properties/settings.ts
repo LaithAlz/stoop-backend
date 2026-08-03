@@ -15,7 +15,6 @@
  *
  * Same discipline as src/features/account/profileEdit.ts's
  * `buildMeUpdatePayload` (#234 PR 5, five safety-review rounds):
- * - Never an explicit empty string / null. Blank means "don't touch it".
  * - Phone is normalized via src/lib/phone.ts's `toE164` before it's ever
  *   sent — never the raw text.
  * - An unchanged value is omitted, so re-saving the form with nothing
@@ -28,16 +27,32 @@
  * so this form prefills both and can skip sending a value that hasn't
  * changed.
  *
- * Neither `backup_contact` nor `quiet_hours` can be explicitly CLEARED
- * back to null through this builder: `UpdatePropertyInput`'s fields are
- * typed as the full object (`BackupContact`/`QuietHours`), not
- * `| null` — matching api-contracts.md's documented PATCH body, which
- * gives no shape for "unset this". A landlord who blanks both fields in a
- * pair that was previously set is NOT clearing it — the pair is simply
- * left out of the payload and the existing value stays on the property.
- * The form surfaces this honestly (see `backupContactClearAttempted`/
+ * `house_rules` is NOT "blank means don't touch" — it's the one field of
+ * the three actually consumed downstream (verbatim into the draft prompt,
+ * `apps/api/app/agent/nodes/draft_response.py`), and `UpdatePropertyInput.
+ * house_rules?: string` (not `| null`) already accepts an empty string,
+ * which the backend writes straight through. Blanking it and saving DOES
+ * clear it (B4, safety review): the earlier `length > 0` guard silently
+ * dropped a deliberate clear from the payload, so a landlord who wiped a
+ * retracted house rule and saved got either a false "Saved" or "Nothing
+ * to update." while the old text quietly reappeared from the next server
+ * echo — with Stoop still quoting the retracted rule to tenants.
+ *
+ * `backup_contact`/`quiet_hours` genuinely ARE "blank-both means don't
+ * touch it" — neither can be explicitly CLEARED back to null through this
+ * builder: `UpdatePropertyInput`'s fields for them are typed as the full
+ * object (`BackupContact`/`QuietHours`), not `| null` — matching
+ * api-contracts.md's documented PATCH body, which gives no shape for
+ * "unset this" on either. A landlord who blanks both fields in a pair
+ * that was previously set is NOT clearing it — the pair is simply left
+ * out of the payload and the existing value stays on the property. The
+ * form surfaces this honestly (see `backupContactClearAttempted`/
  * `quietHoursClearAttempted` below) rather than silently no-op'ing like a
- * successful clear.
+ * successful clear. (The backend DOES accept `backup_contact: null`
+ * per properties.py's own comment — but shipping that clear needs a
+ * doc-first api-contracts.md amendment plus a backend test confirming
+ * `_backup_phone` reads a stored JSON `null` as `None`, not the string
+ * `"null"`; tracked separately, not this PR.)
  */
 import type { BackupContact, Property, QuietHours, UpdatePropertyInput } from "@/api/types";
 import { toE164 } from "@/lib/phone";
@@ -118,6 +133,23 @@ export function backupContactClearAttempted(
   );
 }
 
+/**
+ * M1 (safety review): a `backup_contact` already stored with an
+ * undialable phone (a pre-`toE164` row, or one written by a path that
+ * never validated) is invisible until the landlord happens to open this
+ * form and re-submit — the settings form only prefills it, and the
+ * property detail page renders the contact's name without ever looking
+ * at `.phone`, so both screens silently assert a redundancy that may not
+ * exist. Callers on BOTH screens run this against the loaded/current
+ * `backup_contact` (not the live, still-being-typed form values, which
+ * already get their own `backupContactError`) and show a persistent
+ * warning when it's `true`.
+ */
+export function backupContactPhoneLooksInvalid(contact: BackupContact | null): boolean {
+  if (contact === null) return false;
+  return toE164(contact.phone ?? "") === null;
+}
+
 export function quietHoursClearAttempted(form: PropertySettingsForm, current: Property): boolean {
   return (
     current.quiet_hours !== null &&
@@ -138,8 +170,12 @@ export function buildPropertySettingsPayload(
 ): UpdatePropertyInput | null {
   const payload: UpdatePropertyInput = {};
 
+  // B4: no `.length > 0` guard here — a blank house_rules that differs
+  // from the current value is a deliberate clear, not "don't touch it"
+  // (see the module docstring above). `UpdatePropertyInput.house_rules`
+  // already accepts `""`.
   const houseRules = form.houseRules.trim();
-  if (houseRules.length > 0 && houseRules !== (current.house_rules ?? "")) {
+  if (houseRules !== (current.house_rules ?? "")) {
     payload.house_rules = houseRules;
   }
 

@@ -55,13 +55,27 @@ export function createProperty(input: CreatePropertyInput): Promise<Property> {
   return apiRequest<Property>("/v1/properties", { method: "POST", body: input });
 }
 
+/** How long a property write may hang before we stop waiting on it —
+ *  same bound and reasoning as src/api/me.ts's `updateMe` (#234 PR 5,
+ *  R2): `backup_contact` is the emergency chain's second phone, and the
+ *  settings form (issue #261) disables every field while this is
+ *  in-flight, so an unbounded stall would freeze the whole screen for the
+ *  browser's own stall window instead of surfacing the ambiguous-failure
+ *  branch (B2, safety review). An abort maps to `network_error` (status
+ *  0), which src/routes/app.properties_.$id_.settings.tsx's
+ *  `isAmbiguousFailure` already treats as ambiguous, not a definite
+ *  failure. */
+const UPDATE_PROPERTY_TIMEOUT_MS = 20_000;
+
 /** PATCH /v1/properties/{id} — "same fields + quiet_hours, heating_season"
- *  (Properties section). Not wired to any web screen this PR — kept for
- *  parity with the mobile client and the next PR that needs it. */
+ *  (Properties section). Wired to the property settings form (issue
+ *  #261: backup_contact/quiet_hours/house_rules) — no longer just kept
+ *  for mobile-client parity. */
 export function updateProperty(id: string, input: UpdatePropertyInput): Promise<Property> {
   return apiRequest<Property>(`/v1/properties/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: input,
+    signal: AbortSignal.timeout(UPDATE_PROPERTY_TIMEOUT_MS),
   });
 }
 

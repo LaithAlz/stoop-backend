@@ -31,11 +31,19 @@ export const DELETE_PROPERTY_CONFIRM_LABEL = "Delete property";
  * (schema-v1.md: `tenants.property_id`/`cases.property_id`, both
  * `ON DELETE RESTRICT`) BEFORE the landlord ever clicks delete — the
  * confirm-copy said nothing while a caption below the button carried the
- * only hint. This does not claim completeness: `messages.property_id` and
- * `trust_metrics.property_id` are also `RESTRICT` (api-contracts.md's
- * v1.9 amendment) and aren't independently visible on this page, so a
- * property with neither a known tenant row nor an open case can still
- * 409. The function therefore only ever ASSERTS a block when one is
+ * only hint. This does not claim completeness — several blockers stay
+ * invisible even with this fix:
+ * - `openCaseCount` (from `property.open_case_count`, `app/routers/
+ *   properties.py`'s `_OPEN_CASE_COUNT_JOIN`) counts OPEN cases only. A
+ *   property whose only case is CLOSED reads `openCaseCount: 0` here, but
+ *   `cases.property_id` is `ON DELETE RESTRICT` regardless of `status` —
+ *   the row still blocks the delete via 409 `has_dependents`, and this
+ *   copy stays silent about it until the landlord actually tries.
+ * - `messages.property_id` and `trust_metrics.property_id` are also
+ *   `RESTRICT` (api-contracts.md's v1.9 amendment) and aren't
+ *   independently visible on this page at all.
+ * So a property with neither a known tenant row nor a known OPEN case can
+ * still 409. The function therefore only ever ASSERTS a block when one is
  * actually known (deterministic — `RESTRICT` means present rows always
  * block); it never asserts success by omission.
  *

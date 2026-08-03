@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ArrowLeft, Loader2 } from "lucide-react";
@@ -15,6 +15,7 @@ import type { Property, UpdatePropertyInput } from "@/api/types";
 import {
   backupContactClearAttempted,
   backupContactError,
+  backupContactPhoneLooksInvalid,
   buildPropertySettingsPayload,
   propertySettingsFormFromProperty,
   quietHoursClearAttempted,
@@ -72,6 +73,11 @@ export const Route = createFileRoute("/app/properties_/$id_/settings")({
 function PropertySettingsPage() {
   const { id } = Route.useParams();
   const { session } = useAuth();
+  // B1 (HIGH, safety review): lifted here (not local to SettingsForm) so
+  // the header back control below can react to it — the header is the
+  // ONE way off this screen, and it must stop being a plain navigable
+  // link while a PATCH to `backup_contact` is actually in flight.
+  const [saving, setSaving] = useState(false);
 
   const propertyQuery = useProperty(id, { enabled: Boolean(session) });
   const property = propertyQuery.data;
@@ -79,13 +85,29 @@ function PropertySettingsPage() {
   return (
     <PhoneFrame>
       <header className="sticky top-0 z-10 flex items-center justify-between border-b border-border bg-canvas/95 px-4 py-3 backdrop-blur">
-        <Link
-          to="/app/properties/$id"
-          params={{ id }}
-          className="flex size-10 items-center justify-center -ml-2"
-        >
-          <ArrowLeft className="size-5" />
-        </Link>
+        {saving ? (
+          // B1: NOT a disabled `<Link>` (Radix/TanStack's Link has no
+          // native disabled state and would still be focusable/clickable
+          // via keyboard) — swapped for a genuinely inert element for the
+          // bounded duration of the save, mirroring app.account.tsx's
+          // EditProfileDialog closeButtonClassName approach for the same
+          // "can't abandon an in-flight write to a safety-relevant field"
+          // problem.
+          <span
+            aria-disabled="true"
+            className="flex size-10 items-center justify-center -ml-2 opacity-50"
+          >
+            <ArrowLeft className="size-5" />
+          </span>
+        ) : (
+          <Link
+            to="/app/properties/$id"
+            params={{ id }}
+            className="flex size-10 items-center justify-center -ml-2"
+          >
+            <ArrowLeft className="size-5" />
+          </Link>
+        )}
       </header>
 
       <div className="flex-1 overflow-y-auto pb-24">
@@ -111,6 +133,16 @@ function PropertySettingsPage() {
             >
               Try again
             </Button>
+            {/* LOW (safety review): the header's own back arrow still
+                targets this same property (which just failed to load),
+                so a landlord stuck here had no escape that doesn't retry
+                the identical failing request first. */}
+            <Link
+              to="/app/properties"
+              className="text-sm font-medium text-ink-muted underline underline-offset-2"
+            >
+              Back to properties
+            </Link>
           </div>
         ) : property ? (
           <>
@@ -132,7 +164,7 @@ function PropertySettingsPage() {
               </h1>
             </div>
 
-            <SettingsForm id={id} property={property} />
+            <SettingsForm id={id} property={property} onSavingChange={setSaving} />
           </>
         ) : null}
       </div>
@@ -152,19 +184,51 @@ function isAmbiguousFailure(error: unknown): boolean {
 const AMBIGUOUS_NOTICE =
   "That may have gone through — give it a moment to update before trying again.";
 
-function SettingsForm({ id, property }: { id: string; property: Property }) {
+function SettingsForm({
+  id,
+  property,
+  onSavingChange,
+}: {
+  id: string;
+  property: Property;
+  onSavingChange: (saving: boolean) => void;
+}) {
   const queryClient = useQueryClient();
 
   const [form, setForm] = useState<PropertySettingsForm>(() =>
     propertySettingsFormFromProperty(property),
   );
   const [current, setCurrent] = useState<Property>(property);
+  // M2 (safety review): whether the landlord has typed anything since
+  // mount or the last successful save. Gates the re-seed effect below —
+  // never overwrite an in-progress, not-yet-saved edit, even to deliver
+  // fresher server data.
+  const [dirty, setDirty] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
   // L6-shaped latch (src/routes/app.properties_.add.tsx) — synchronous,
   // unlike a `mutation.isPending` read from the render closure, so two
   // submits inside one frame can't both PATCH.
   const submitLatch = useRef(false);
+
+  // M2 (MEDIUM, safety review): without this, `form`/`current` were seeded
+  // ONCE from the `property` prop (the `useState` lazy initializers above)
+  // and never again — a background refetch (window refocus, another tab's
+  // edit, or this screen's OWN ambiguous-failure invalidate below) could
+  // deliver fresher data that the screen would never actually show,
+  // making the ambiguous notice's "give it a moment to update" false on a
+  // screen structurally incapable of updating. Only re-seeds while
+  // `!dirty` — an edit already in progress is never silently overwritten.
+  useEffect(() => {
+    if (dirty) return;
+    setCurrent(property);
+    setForm(propertySettingsFormFromProperty(property));
+  }, [property, dirty]);
+
+  function updateForm(patch: Partial<PropertySettingsForm>) {
+    setDirty(true);
+    setForm((f) => ({ ...f, ...patch }));
+  }
 
   const mutation = useMutation({
     mutationFn: (input: UpdatePropertyInput) => updateProperty(id, input),
@@ -176,23 +240,31 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
       // screen — same "show what was actually saved" discipline as
       // app.account.tsx's profile edit closing on success.
       setForm(propertySettingsFormFromProperty(updated));
+      setDirty(false);
       setServerError(null);
       toast.success("Saved", { duration: 1500 });
     },
     onError: (error) => {
-      if (isAmbiguousFailure(error)) {
-        setServerError(AMBIGUOUS_NOTICE);
-        void queryClient.invalidateQueries({ queryKey: propertyQueryKey(id) });
-        return;
-      }
-      setServerError(
-        error instanceof ApiError
+      const message = isAmbiguousFailure(error)
+        ? AMBIGUOUS_NOTICE
+        : error instanceof ApiError
           ? toHouseApiError(error)
-          : "Something didn't go through. Try again in a moment.",
-      );
+          : "Something didn't go through. Try again in a moment.";
+      setServerError(message);
+      // B1 (HIGH, safety review): local `serverError` state is lost the
+      // instant this component unmounts — e.g. the landlord taps the back
+      // arrow right after Save — while the PATCH itself still lands
+      // server-side, silently. A toast is rendered at the app root
+      // (src/routes/__root.tsx's `<Toaster>`), so it survives navigation
+      // the way local state structurally can't.
+      toast.error(message);
+      if (isAmbiguousFailure(error)) {
+        void queryClient.invalidateQueries({ queryKey: propertyQueryKey(id) });
+      }
     },
     onSettled: () => {
       submitLatch.current = false;
+      onSavingChange(false);
     },
   });
 
@@ -200,6 +272,11 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
   const quietError = quietHoursError(form);
   const backupCleared = backupContactClearAttempted(form, current);
   const quietCleared = quietHoursClearAttempted(form, current);
+  // M1 (MEDIUM, safety review): checked against `current` (the last
+  // known-good STORED value), not the live `form` text — a separate
+  // concern from `backupError`, which only validates what's being typed
+  // right now.
+  const storedBackupPhoneInvalid = backupContactPhoneLooksInvalid(current.backup_contact);
 
   function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -215,6 +292,7 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
       return;
     }
     submitLatch.current = true;
+    onSavingChange(true);
     mutation.mutate(payload);
   }
 
@@ -224,12 +302,31 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
       <section className="flex flex-col gap-3 rounded-2xl border border-border bg-card p-4">
         <div>
           <h2 className="font-display text-[16px] text-ink">Backup contact</h2>
+          {/* M3 (MEDIUM, safety review): the earlier version only disclosed
+              the call — a landlord consenting on a third party's behalf
+              needs to know that person also gets a text (property
+              address, what happened, an ack link) per
+              apps/api/app/agent/emergency_chain.py's `render_backup_alert_
+              sms`, and that the landlord+backup cycle repeats every 15
+              minutes until someone acknowledges. */}
           <p className="mt-1 text-[13px] leading-relaxed text-ink-muted">
             The second number I call during a real emergency, in case yours is ever wrong, off, or
             you just don&rsquo;t pick up. I call you first, every time — if there&rsquo;s no answer,
-            I call this number about ten minutes later. Optional, but strongly recommended.
+            I call this number about ten minutes later. They&rsquo;ll also get a text with the
+            address and what happened, and a link to let me know they&rsquo;ve got it. Optional, but
+            strongly recommended.
           </p>
         </div>
+
+        {/* M1 (MEDIUM, safety review): a stored-but-undialable number was
+            otherwise invisible until this form happened to be opened and
+            re-submitted — this warns as soon as the section loads. */}
+        {storedBackupPhoneInvalid && (
+          <p role="alert" className="text-[13px] font-medium text-urgent">
+            The phone number on file for your backup contact doesn&rsquo;t look valid — I may not be
+            able to reach them in an emergency. Fix it below.
+          </p>
+        )}
 
         <div>
           <Label
@@ -241,7 +338,7 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
           <Input
             id="settings-backup-name"
             value={form.backupName}
-            onChange={(e) => setForm((f) => ({ ...f, backupName: e.target.value }))}
+            onChange={(e) => updateForm({ backupName: e.target.value })}
             placeholder="Jordan (super)"
             autoComplete="name"
             disabled={mutation.isPending}
@@ -261,7 +358,7 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
           <Input
             id="settings-backup-phone"
             value={form.backupPhone}
-            onChange={(e) => setForm((f) => ({ ...f, backupPhone: e.target.value }))}
+            onChange={(e) => updateForm({ backupPhone: e.target.value })}
             placeholder="(416) 555-0177"
             inputMode="tel"
             autoComplete="tel"
@@ -277,9 +374,15 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
             {backupError}
           </p>
         ) : backupCleared ? (
+          // B3 (safety review): the earlier line was a dead end ("can't be
+          // cleared" with no next step). A real clear needs a doc-first
+          // api-contracts.md amendment plus a backend test (tracked
+          // separately, not this PR — see features/properties/settings.ts's
+          // module docstring) — until then, this points at the one path
+          // that actually works.
           <p className="text-xs text-ink-muted">
-            Backup contact can&rsquo;t be cleared from this form — leaving both fields blank keeps
-            the one already on file.
+            Backup contact can&rsquo;t be cleared from this form yet — contact support if you need
+            it removed.
           </p>
         ) : null}
       </section>
@@ -306,7 +409,7 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
               id="settings-quiet-start"
               type="time"
               value={form.quietStart}
-              onChange={(e) => setForm((f) => ({ ...f, quietStart: e.target.value }))}
+              onChange={(e) => updateForm({ quietStart: e.target.value })}
               disabled={mutation.isPending}
               className="mt-1 h-11"
               aria-invalid={submitted && Boolean(quietError) ? true : undefined}
@@ -324,7 +427,7 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
               id="settings-quiet-end"
               type="time"
               value={form.quietEnd}
-              onChange={(e) => setForm((f) => ({ ...f, quietEnd: e.target.value }))}
+              onChange={(e) => updateForm({ quietEnd: e.target.value })}
               disabled={mutation.isPending}
               className="mt-1 h-11"
               aria-invalid={submitted && Boolean(quietError) ? true : undefined}
@@ -361,7 +464,7 @@ function SettingsForm({ id, property }: { id: string; property: Property }) {
           <Textarea
             id="settings-house-rules"
             value={form.houseRules}
-            onChange={(e) => setForm((f) => ({ ...f, houseRules: e.target.value }))}
+            onChange={(e) => updateForm({ houseRules: e.target.value })}
             placeholder="Visitor parking is behind the building, 48 hours max. Garbage day is Thursday."
             disabled={mutation.isPending}
             rows={5}

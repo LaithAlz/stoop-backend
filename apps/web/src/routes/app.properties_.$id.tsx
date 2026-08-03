@@ -32,6 +32,7 @@ import { ApiError, toHouseApiError } from "@/api/errors";
 import type { CaseSummary, Tenant, VulnerableOccupant } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
 import { formatRelativeTime } from "@/lib/relativeTime";
+import { backupContactPhoneLooksInvalid } from "@/features/properties/settings";
 import {
   NO_NUMBER_BODY,
   NO_NUMBER_TITLE,
@@ -170,12 +171,19 @@ function PropertyHub() {
       void navigate({ to: "/app/properties" });
     },
     onError: (error) => {
+      // LOW (safety review, #258 follow-up): invalidated unconditionally
+      // now, not just on the ambiguous branch — `property_not_found` in
+      // particular means the row is ALREADY gone (e.g. deleted from
+      // another tab/device a moment earlier), a "delete actually
+      // succeeded, this attempt just reported a definite failure" case
+      // the list should still reconcile against. Harmless on every other
+      // failure code too (just a background refetch of an unchanged list).
+      void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
       if (isAmbiguousFailure(error)) {
         // H2: on DELETE specifically, "may have gone through" means the
         // building's line may already be severed — send them to the list,
         // which is the honest read, instead of asserting failure.
         toast(AMBIGUOUS_NOTICE);
-        void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
         setDeleteConfirmOpen(false);
         return;
       }
@@ -300,6 +308,17 @@ function PropertyHub() {
                       ? `Backup contact: ${property.backup_contact.name}`
                       : "No backup contact set yet"}
                   </p>
+                  {/* M1 (safety review, #261 follow-up): this caption used
+                      to name the backup contact without ever checking
+                      `.phone` — asserting a redundancy for the emergency
+                      chain's second number that may not actually be
+                      dialable. */}
+                  {backupContactPhoneLooksInvalid(property.backup_contact) && (
+                    <p className="mt-0.5 text-[12px] font-medium text-urgent">
+                      Their number doesn&rsquo;t look valid — I may not be able to reach them in an
+                      emergency.
+                    </p>
+                  )}
                 </div>
                 <ChevronRight className="size-4 shrink-0 text-ink-muted/70" />
               </Link>
