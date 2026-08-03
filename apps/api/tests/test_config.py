@@ -945,7 +945,11 @@ def test_production_with_plaintext_http_dashboard_origin_raises(
 
     message = str(exc_info.value)
     assert "DASHBOARD_ORIGINS" in message
-    assert "https" in message.lower()
+    # Assert on a token unique to THIS gate's message. The shape validator's
+    # message also contains "https", so the looser check would stay green if
+    # a refactor moved the rejection there and the production gate silently
+    # stopped covering it (safety review, #255).
+    assert "#255" in message
 
 
 @pytest.mark.unit
@@ -965,7 +969,11 @@ def test_production_with_mixed_https_and_plaintext_dashboard_origins_raises(
 
     message = str(exc_info.value)
     assert "DASHBOARD_ORIGINS" in message
-    assert "https" in message.lower()
+    # Assert on a token unique to THIS gate's message. The shape validator's
+    # message also contains "https", so the looser check would stay green if
+    # a refactor moved the rejection there and the production gate silently
+    # stopped covering it (safety review, #255).
+    assert "#255" in message
 
 
 @pytest.mark.unit
