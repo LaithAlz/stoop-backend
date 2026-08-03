@@ -225,17 +225,36 @@ def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONRespon
     call, the same shape every other Sentry call in this codebase uses
     (never ``capture_exception`` — that would serialize the exception's own
     ``str()``/args, the same risk this handler's ``message`` field already
-    avoids). Explicit, not implicit: registering a custom handler for
-    ``Exception`` means this exception is now "handled" as far as
-    Starlette's ``ExceptionMiddleware`` is concerned, so it is caught
-    BEFORE it would otherwise propagate to ``ServerErrorMiddleware`` —
-    the boundary Sentry's ``StarletteIntegration``/``FastApiIntegration``
-    ordinarily hooks for automatic capture. Paging explicitly here removes
-    any dependency on that implicit behavior still firing once a handler
-    intercepts the exception first, matching every OTHER failure path in
-    this codebase (``app/agent/graph_entry.py``,
-    ``app/routers/webhooks/twilio.py``, ...), none of which rely on
-    Sentry's automatic capture either.
+    avoids).
+
+    Mechanism (CORRECTED — safety review, 2026-08-03, #251 F1; the
+    previous version of this paragraph was wrong): registering a handler
+    for ``Exception`` here does NOT make ``ExceptionMiddleware`` treat the
+    exception as "handled" and stop it from ever reaching
+    ``ServerErrorMiddleware``. Verified directly against the installed
+    Starlette version (1.3.1): ``Starlette.build_middleware_stack``
+    special-cases the ``Exception``/``500`` key — it is pulled OUT of the
+    dict handed to ``ExceptionMiddleware`` and passed instead as
+    ``ServerErrorMiddleware``'s own ``handler=`` kwarg.
+    ``ServerErrorMiddleware`` is the OUTERMOST layer of the entire ASGI
+    stack — above every ``add_middleware`` call in ``create_app`` below,
+    including ``CORSMiddleware`` and ``RequestIDMiddleware`` (see
+    ``create_app``'s own docstring, step "3b") — so THIS function IS what
+    builds the actual 500 response, and ``ServerErrorMiddleware`` sends
+    that response directly, bypassing both of those middlewares' own
+    response-shaping logic entirely (their ``send()`` wrappers are never
+    invoked for it). That is precisely why this handler sets
+    ``Access-Control-Allow-Origin``/``Vary``/``X-Request-ID`` itself,
+    below — nothing upstream adds them for this one response shape, the
+    ONE error class where the dashboard most needs a readable response
+    (a real outage). Sentry's own ``StarletteIntegration``/
+    ``FastApiIntegration`` ordinarily hooks this same
+    ``ServerErrorMiddleware`` boundary for automatic capture; paging
+    explicitly via ``sentry_sdk.capture_message`` above removes any
+    dependency on that automatic behavior still firing once a handler is
+    installed, matching every OTHER failure path in this codebase
+    (``app/agent/graph_entry.py``, ``app/routers/webhooks/twilio.py``,
+    ...), none of which rely on Sentry's automatic capture either.
     """
     request_id: str | None = structlog.contextvars.get_contextvars().get("request_id")
     log.error(
@@ -249,7 +268,7 @@ def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONRespon
         level="error",
         extras={"exc_type": type(exc).__name__, "request_id": request_id},
     )
-    return JSONResponse(
+    response = JSONResponse(
         status_code=500,
         content={
             "error": {
@@ -259,6 +278,29 @@ def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONRespon
             }
         },
     )
+
+    # #251 safety review, F1 (HIGH): this response is sent directly by
+    # ServerErrorMiddleware, OUTSIDE CORSMiddleware/RequestIDMiddleware
+    # (see this docstring's "Mechanism" section above) — without this,
+    # every 500 from an allowed browser origin would arrive with no
+    # Access-Control-Allow-Origin, get silently discarded by the
+    # browser's own CORS enforcement, and surface to the landlord as a
+    # generic network error instead of a readable "something's wrong"
+    # message — the silence direction, during the one failure class
+    # (a real outage) where it matters most. Origin-gated the exact same
+    # way CORSMiddleware itself gates every other response: no Origin
+    # header (webhooks, server-to-server calls) or a disallowed Origin ->
+    # add nothing, preserving the same webhook invariance CORSMiddleware
+    # guarantees elsewhere (app/config.py's dashboard_origins_list is the
+    # single source of truth for "allowed", same as CORSMiddleware's own
+    # allow_origins= below).
+    origin = request.headers.get("origin")
+    if origin is not None and origin in settings.dashboard_origins_list:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        if request_id is not None:
+            response.headers["X-Request-ID"] = request_id
+    return response
 
 
 def create_app() -> fastapi.FastAPI:
@@ -275,24 +317,33 @@ def create_app() -> fastapi.FastAPI:
       3. add RequestIDMiddleware
       3b. add CORSMiddleware (#251) — origin allowlist from
           ``settings.dashboard_origins_list`` (env ``DASHBOARD_ORIGINS``,
-          never ``'*'``). Added AFTER RequestIDMiddleware so it ends up the
-          OUTERMOST layer: Starlette's ``add_middleware`` inserts each new
-          entry at the front of ``user_middleware``, and
+          never ``'*'``). Added AFTER RequestIDMiddleware so it wraps
+          OUTERMOST among the two ``add_middleware`` calls in this
+          function: Starlette's ``add_middleware`` inserts each new entry
+          at the front of ``user_middleware``, and
           ``build_middleware_stack`` wraps that list in reverse — so the
-          LAST middleware added wraps everything else, running first on the
-          way in and last on the way out. That matters here because CORS
-          headers must land on every response this process ever sends,
-          including 401/422/500s shaped by the exception handlers below,
-          not just 2xx ones — otherwise a browser would surface a CORS
-          error and hide the real status/body from the dashboard. A
-          request with no ``Origin`` header (every webhook and
-          server-to-server call) passes straight through untouched — no
-          header is added or removed, Twilio signature verification is
-          unaffected (verified directly against the installed Starlette
-          version's ``CORSMiddleware.__call__``). Preflight ``OPTIONS``
-          requests are answered entirely inside ``CORSMiddleware`` and
-          never reach ``RequestIDMiddleware``/the router/auth — expected:
-          that's the browser's own preflight check, not a real API call.
+          LAST middleware added here wraps the other, running first on the
+          way in and last on the way out. That covers every 2xx/4xx
+          response — including 401/422 from the exception handlers below —
+          CORS headers land on all of them via this middleware. It does
+          NOT cover every response this process ever sends: a genuinely
+          UNHANDLED exception is caught by ``ServerErrorMiddleware``,
+          which Starlette installs OUTSIDE every ``add_middleware`` layer
+          entirely — CORRECTED (safety review, 2026-08-03, #251 F1; a
+          prior version of this note wrongly claimed 500s were covered
+          too, verified false on the installed Starlette version, 1.3.1)
+          — see ``_unhandled_exception_handler``'s own docstring for the
+          full mechanism; that one response shape bypasses CORSMiddleware
+          and sets its own Origin-gated CORS headers explicitly instead of
+          inheriting them here. A request with no ``Origin`` header (every
+          webhook and server-to-server call) passes straight through this
+          middleware untouched — no header is added or removed, Twilio
+          signature verification is unaffected (verified directly against
+          the installed Starlette version's ``CORSMiddleware.__call__``).
+          Preflight ``OPTIONS`` requests are answered entirely inside
+          ``CORSMiddleware`` and never reach ``RequestIDMiddleware``/the
+          router/auth — expected: that's the browser's own preflight
+          check, not a real API call.
       4. register AuthError exception handler (401 → standard envelope)
       4b. register AppError exception handler (status_code → standard envelope)
       4c. register RequestValidationError exception handler (422 → standard
@@ -342,20 +393,53 @@ def create_app() -> fastapi.FastAPI:
     application.add_middleware(RequestIDMiddleware)
 
     # CORS (#251) — origin allowlist ONLY, never '*' (settings.py's
-    # _reject_wildcard_dashboard_origin refuses to boot on a literal '*').
-    # Added AFTER RequestIDMiddleware so it wraps OUTERMOST — see this
-    # function's own docstring, "3b", for the full ordering rationale.
+    # _reject_wildcard_dashboard_origin refuses to boot on a literal '*';
+    # _validate_dashboard_origin_shapes and
+    # _require_non_local_dashboard_origins_in_production, #251 safety
+    # review F2, close the "boots clean, allowlist quietly matches
+    # nothing" failure class too). Added AFTER RequestIDMiddleware so it
+    # wraps OUTERMOST — see this function's own docstring, "3b", for the
+    # full ordering rationale (including what it does NOT cover — an
+    # unhandled 500, see _unhandled_exception_handler, #251 F1).
     # allow_credentials=False: this API authenticates via a bearer JWT
     # (Authorization header), never cookies, so there is nothing for
     # browser credential-mode CORS to protect here.
+    #
+    # F4 (#251 safety review): "X-Request-ID" is in allow_headers because
+    # RequestIDMiddleware explicitly honors a client-supplied correlation
+    # id (app/middleware/request_id.py) — without it here, a browser
+    # preflight silently 400s the instant the dashboard ever sends that
+    # header, while curl/httpx (no preflight) keep working fine. THE TRAP:
+    # any FUTURE client-sent header (e.g. an Idempotency-Key) or method
+    # (e.g. PUT) must be added to allow_headers/allow_methods HERE, or the
+    # exact same silent-in-browsers-only failure recurs.
+    #
+    # F5 (#251 safety review, no code change — no cache exists today):
+    # Starlette's CORSMiddleware only sends `Vary: Origin` on responses to
+    # an ALLOWED origin (see its own `send()` — the header is set inside
+    # `allow_explicit_origin`, never unconditionally). If a shared/HTTP
+    # cache is ever put in front of this API, a disallowed-origin response
+    # could be cached and replayed to an allowed origin without a `Vary`
+    # signal telling the cache not to. Add an unconditional `Vary: Origin`
+    # (or `Cache-Control: no-store` on `/v1/*`) at that point — not needed
+    # while every response is generated fresh, per-request, as it is now.
     application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.dashboard_origins_list,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
         expose_headers=["Date"],
         allow_credentials=False,
     )
+
+    # F2c (#251 safety review): the allowlist itself is logged once at
+    # boot — origins are non-sensitive (settings.py's dashboard_origins
+    # field docstring), and this is the cheapest possible signal for "did
+    # my DASHBOARD_ORIGINS actually take effect", catching a
+    # copy-paste/env-var-name typo (e.g. a Fly secret set on the wrong
+    # app) well before the first confused "the dashboard can't load"
+    # report.
+    log.info("cors_allowlist", origins=settings.dashboard_origins_list)
 
     # Register the AuthError handler so any router can raise AuthError and
     # get the standard 401 envelope without boilerplate.

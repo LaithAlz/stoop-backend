@@ -28,6 +28,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Settings._require_valid_twilio_account_sid_format_in_production below.
 _TWILIO_ACCOUNT_SID_RE = re.compile(r"^AC[0-9a-fA-F]{32}$")
 
+# A single DASHBOARD_ORIGINS entry must be a bare `scheme://host[:port]`
+# origin: lowercase http/https scheme, a lowercase dotted hostname (or an
+# IPv4 address -- each dot-separated label is just an alphanumeric/hyphen
+# run under this same pattern), an optional numeric port, nothing else --
+# no trailing slash, no path, no wildcard. All-environments shape gate, see
+# Settings._validate_dashboard_origin_shapes below.
+_DASHBOARD_ORIGIN_RE = re.compile(
+    r"^(?P<scheme>https?)://"
+    r"(?P<host>[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*)"
+    r"(?::(?P<port>[0-9]{1,5}))?$"
+)
+
 
 class Settings(BaseSettings):
     """All Phase 1 environment variables, validated at startup."""
@@ -307,9 +319,15 @@ class Settings(BaseSettings):
             "boot on a literal '*'). Parsed into `dashboard_origins_list` "
             "(below) -- entries are comma-split, surrounding whitespace on "
             "each entry is stripped, blank entries are dropped. An empty/"
-            "blank value is a SAFE default (an empty allowlist -- "
-            "CORSMiddleware then permits zero browser origins), never a "
-            "startup crash and never a silent fallback to '*'."
+            "blank value is a SAFE default in dev/staging (an empty "
+            "allowlist -- CORSMiddleware then permits zero browser "
+            "origins), never a startup crash and never a silent fallback "
+            "to '*' -- but REQUIRED, non-empty, and non-localhost when "
+            "ENVIRONMENT=production (safety review, #251 F2 --  see "
+            "_require_non_local_dashboard_origins_in_production below). "
+            "Every entry must be shaped exactly `scheme://host[:port]` "
+            "(lowercase, http or https, no trailing slash, no path) -- see "
+            "_validate_dashboard_origin_shapes below."
         ),
     )
 
@@ -328,12 +346,71 @@ class Settings(BaseSettings):
         copy-pasted ``'*'`` (a common CORS "quick fix" reflex) before it
         ever reaches ``CORSMiddleware``, the same fail-fast-at-startup
         discipline every other boot gate in this class already applies.
+
+        Conscious tradeoff (safety review, #251 F3): this refuses to BOOT
+        the whole process over what is, by itself, only a browser-facing
+        misconfiguration -- a bare ``'*'`` here would take down emergency
+        SMS/voice intake too, since the process never starts. Kept anyway,
+        for two reasons: (1) consistency with the RLS/Twilio boot gates
+        already in this class (``_require_app_database_url_in_production``,
+        ``_require_valid_twilio_account_sid_format_in_production``) --
+        this codebase's established answer to "a config value could
+        silently make a safety/security property false" is fail-closed at
+        startup, not fail-open into a degraded runtime; and (2) ``'*'``
+        genuinely lets ANY site's JS read every authenticated response --
+        materially worse than the failure mode ``_validate_dashboard_
+        origin_shapes`` below guards (a merely-wrong-shaped entry, which
+        that validator now also catches, closing the class of
+        accepted-but-useless entries like ``https://*.host`` at the SAME
+        deploy-config stage, before a rolling deploy could mask it behind
+        a still-serving previous instance).
         """
         if any(origin.strip() == "*" for origin in v.split(",")):
             raise ValueError(
                 "DASHBOARD_ORIGINS must never contain '*' -- CORS uses a "
                 "fixed origin allowlist, never a wildcard (#251)."
             )
+        return v
+
+    @field_validator("dashboard_origins", mode="after")
+    @classmethod
+    def _validate_dashboard_origin_shapes(cls, v: str) -> str:
+        """Reject any non-blank ``DASHBOARD_ORIGINS`` entry that isn't a
+        bare ``scheme://host[:port]`` origin (safety review, #251 F2b).
+
+        Verified empirically against the un-gated version of this field:
+        every plausible misconfiguration -- a trailing slash
+        (``https://app.stoop.example/``), a path suffix
+        (``https://app.stoop.example/dashboard``), mixed case
+        (``Https://App.Stoop.Example``), a stray semicolon, a bare host
+        with no scheme (``app.stoop.example``), or an accepted-but-useless
+        wildcard subdomain (``https://*.host`` -- a shape Starlette's
+        ``CORSMiddleware`` treats as a literal string to compare against
+        ``Origin``, never a pattern, so it can never actually match a real
+        browser ``Origin`` header) -- silently parses into
+        ``dashboard_origins_list`` as one more entry that then NEVER
+        matches any real browser ``Origin`` header. The net runtime effect
+        is identical to an empty allowlist (the dashboard is silently
+        bricked), but with zero startup signal -- exactly the "discovered
+        by customer complaint" failure mode this validator closes, by
+        refusing to boot instead.
+
+        ``_DASHBOARD_ORIGIN_RE`` intentionally allows only lowercase
+        scheme/host characters, digits, hyphens, and dots, an optional
+        numeric port, and nothing else -- both ``localhost`` and IPv4
+        addresses like ``127.0.0.1`` match its ``host`` group (each
+        dot-separated label is just an alphanumeric/hyphen run), so the
+        dev default and every real production origin validate the same
+        way, through the same regex.
+        """
+        for origin in (o.strip() for o in v.split(",")):
+            if origin and not _DASHBOARD_ORIGIN_RE.match(origin):
+                raise ValueError(
+                    f"DASHBOARD_ORIGINS entry {origin!r} is not a valid origin -- "
+                    "expected 'scheme://host[:port]' (lowercase, http or https "
+                    "scheme, no trailing slash, no path, no wildcard) -- refusing "
+                    "to boot with a malformed CORS allowlist entry (#251)."
+                )
         return v
 
     @property
@@ -345,6 +422,18 @@ class Settings(BaseSettings):
         startup or silently falling back to ``'*'``.
         """
         return [origin.strip() for origin in self.dashboard_origins.split(",") if origin.strip()]
+
+    # NOTE: the production boot gate for dashboard_origins
+    # (_require_non_local_dashboard_origins_in_production) is declared at
+    # the BOTTOM of this class, alongside the other production boot gates
+    # (_require_app_database_url_in_production et al), not here next to
+    # this field's other validators -- see that method's own docstring for
+    # why the ORDER of `@model_validator(mode="after")` methods matters
+    # (pydantic v2 runs them as a fail-fast chain in declaration order; the
+    # first one to raise is the ONLY error reported, so this validator
+    # must be declared AFTER the pre-existing gates to avoid masking
+    # THEIR error messages in the (unrelated) production scenarios they
+    # each individually test).
 
     # ------------------------------------------------------------------
     # Convenience properties
@@ -511,6 +600,64 @@ class Settings(BaseSettings):
                 "(expected 'AC' followed by 32 hex characters) -- refusing to boot "
                 "in production with what looks like a placeholder or typo'd value."
             )
+        return self
+
+    # ------------------------------------------------------------------
+    # Production boot gate (safety review, #251 F2a — dashboard_origins)
+    # -- declared LAST among the `@model_validator(mode="after")` methods
+    # in this class, deliberately: pydantic v2 runs them as a fail-fast
+    # chain in DECLARATION order (the first one to raise is the ONLY
+    # error reported -- verified empirically while building this gate),
+    # so this must run AFTER _require_app_database_url_in_production /
+    # _require_public_base_url_in_production /
+    # _require_valid_twilio_account_sid_format_in_production above, or it
+    # would mask THEIR error messages for any production Settings
+    # construction that also happens to leave DASHBOARD_ORIGINS at its
+    # (production-invalid) localhost default -- exactly the failure mode
+    # that broke several pre-existing tests in tests/test_config.py the
+    # first time this validator was declared earlier in the class.
+    # ------------------------------------------------------------------
+
+    @model_validator(mode="after")
+    def _require_non_local_dashboard_origins_in_production(self) -> Settings:
+        """Refuse to boot in production with an empty CORS allowlist, or
+        one that still points at a local dev origin (safety review, #251
+        F2a) -- mirrors ``_require_app_database_url_in_production``'s /
+        ``_require_public_base_url_in_production``'s exact gating pattern
+        (production-only; dev/staging keep the documented local-dev
+        fallback unchanged).
+
+        Verified empirically: ``ENVIRONMENT=production`` with
+        ``DASHBOARD_ORIGINS`` left UNSET booted clean on the dev default
+        (``http://localhost:5173,http://localhost:3000``) before this
+        gate existed -- a production deploy would silently serve CORS
+        headers for two origins that can never be a real browser's
+        ``Origin`` in production, i.e. an allowlist that is effectively
+        empty, with no startup signal. This gate closes that specific
+        "boots clean, dashboard is silently bricked" failure mode by
+        checking each entry's HOST (the part between ``://`` and an
+        optional ``:port``, after ``_validate_dashboard_origin_shapes``
+        above has already guaranteed that shape) against ``localhost``/
+        ``127.``-prefixed loopback addresses.
+        """
+        if self.environment != "production":
+            return self
+        origins = self.dashboard_origins_list
+        if not origins:
+            raise ValueError(
+                "DASHBOARD_ORIGINS is required when ENVIRONMENT=production "
+                "(#251) -- refusing to boot with an empty CORS allowlist; "
+                "the dashboard would be unable to read ANY response."
+            )
+        for origin in origins:
+            host = origin.split("://", 1)[-1].split(":", 1)[0]
+            if host == "localhost" or host.startswith("127."):
+                raise ValueError(
+                    f"DASHBOARD_ORIGINS entry {origin!r} looks like a local dev "
+                    "origin (localhost/127.0.0.1) -- refusing to boot in "
+                    "production with a local origin still in the CORS "
+                    "allowlist (#251)."
+                )
         return self
 
 
