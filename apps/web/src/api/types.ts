@@ -321,7 +321,11 @@ export interface QueueItem {
   tenant_name: string;
   unit: string | null;
   received_at: string;
-  tenant_message: string;
+  /** R3-4 (safety review round 3 follow-up, issue #252): nullable — the
+   *  backend's own `QueueItemResponse` types this `str | None`
+   *  (`app/routers/queue.py`); a media-only first message has no text.
+   *  Previously mistyped here as non-null `string`. */
+  tenant_message: string | null;
   draft_body: string;
   draft_recipient: DraftRecipient;
   /** One warm plain-English sentence for the margin note; null for rows

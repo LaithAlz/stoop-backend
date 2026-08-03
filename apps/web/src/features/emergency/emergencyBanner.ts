@@ -21,7 +21,11 @@ import type { QueueItem } from "@/api/types";
 export function emergencyHeadline(
   item: Pick<QueueItem, "title" | "tenant_name" | "property_label">,
 ): string {
-  if (item.title) return item.title;
+  // R3-3 (safety review round 3 follow-up, issue #252): raw truthiness let
+  // a whitespace-only `title` ("   ") through as-is — a blank-looking
+  // headline instead of the neutral fallback below.
+  const trimmedTitle = item.title?.trim();
+  if (trimmedTitle) return trimmedTitle;
   return `${firstName(item.tenant_name)} needs you now — ${item.property_label}`;
 }
 
@@ -45,6 +49,27 @@ export function emergencyHeadline(
  */
 export function emergencySubtext(item: Pick<QueueItem, "property_label">): string {
   return `${item.property_label} · tap to see what's happening`;
+}
+
+/**
+ * R3-4 (safety review round 3 follow-up, issue #252): `tenant_message` is
+ * `string | null` on the API (a media-only first message has no text) but
+ * was mistyped `string` here, so a media-only emergency's banner would
+ * render with NO "{name} said" block at all — exactly the ack-only banner
+ * a prior safety-review round (fix commit 438a22e, "tenant words on the
+ * emergency banner") added this block specifically to eliminate. Falls
+ * back to the same
+ * `media_note ?? "Sent a photo"` pattern DecisionCard already uses for its
+ * photo pill; `undefined` (no block at all) only when there's neither text
+ * nor a photo to show.
+ */
+export function emergencyTenantMessage(
+  item: Pick<QueueItem, "tenant_message" | "has_media" | "media_note">,
+): string | undefined {
+  const trimmedMessage = item.tenant_message?.trim();
+  if (trimmedMessage) return trimmedMessage;
+  if (item.has_media) return item.media_note ?? "Sent a photo";
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
