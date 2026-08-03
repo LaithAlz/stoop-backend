@@ -179,6 +179,14 @@ async def run_async_migrations() -> None:
     connectable = create_async_engine(
         get_url(),
         echo=False,
+        # Rule 5 (safety review, 2026-08-03, finding 2 residual): SQLAlchemy
+        # renders bound parameters into exception text by default, so ANY
+        # error from a migration statement — a lock timeout, a constraint
+        # violation, a typo'd table — prints the values it was binding.
+        # Migration 0017 binds phone numbers, alembic prints tracebacks to
+        # stderr, and the migration tests interpolate that stderr into their
+        # own failure messages. One flag keeps PII out of all of it.
+        hide_parameters=True,
         # Supavisor/PgBouncer transaction-mode pooler compatibility — see
         # the module docstring and the comment above
         # ``_ASYNCPG_POOLER_CONNECT_ARGS``.

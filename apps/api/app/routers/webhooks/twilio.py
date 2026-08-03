@@ -464,9 +464,15 @@ def _canonical_for_matching(number: str) -> str:
     property is WHY a currently-routable message (``From``/``To`` already
     exactly matching a stored canonical value) can never become unroutable
     by this change — canonicalizing an already-canonical value is always a
-    no-op, so this function can only ever ADD matches (a previously
-    -drifted format that now canonicalizes to the stored value), never
-    REMOVE one. Non-ASCII digit input is a separate, since-closed finding
+    no-op, so for those values this function can only ever ADD matches (a
+    previously-drifted format that now canonicalizes to the stored value),
+    never REMOVE one. Stated precisely, because the unqualified version
+    isn't true (safety review, 2026-08-03): a stored NON-canonical value
+    that byte-matched a NON-canonical inbound could lose its match. That
+    pair is unreachable from Twilio, which delivers ``+<digits>`` — and
+    migration 0017 canonicalizes the stored side anyway — but the
+    guarantee is about the values Twilio actually sends, not about every
+    conceivable string. Non-ASCII digit input is a separate, since-closed finding
     from the same review — see ``app.phone``'s own module docstring,
     "Non-ASCII 'digit' characters"."""
     return to_e164(number) or number

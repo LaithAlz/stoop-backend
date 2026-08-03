@@ -91,12 +91,21 @@ def is_plausible_nanp(digits: str) -> bool:
 
 
 def _contains_non_ascii_digit(value: str) -> bool:
-    """``True`` iff *value* contains a character Python's own (Unicode
-    -aware) ``str.isdigit()`` considers a digit but which is not plain
-    ASCII ``0``-``9`` — e.g. ``"١"`` (Arabic-Indic one) or ``"٤"``
-    (Arabic-Indic four). See module docstring, "Non-ASCII 'digit'
-    characters"."""
-    return any(ch.isdigit() and not ch.isascii() for ch in value)
+    """``True`` iff *value* contains a character Python considers numeric
+    but which is not plain ASCII ``0``-``9`` — e.g. ``"١"`` (Arabic-Indic
+    one), ``"٤"`` (Arabic-Indic four), ``"４"`` (fullwidth four).
+
+    Uses ``str.isnumeric()`` rather than ``str.isdigit()`` (safety review,
+    2026-08-03, finding 1 residual): ``isdigit()`` misses CJK numerals —
+    ``"一"`` and ``"〇"`` are literally one and zero, i.e. exactly "a
+    character a human plausibly meant as a digit", which is this guard's
+    whole rationale. Without this they were silently STRIPPED and the
+    remainder accepted, so ``"+一4165551234"`` became ``"+4165551234"`` —
+    a different, still-plausible number stored on the field the escalation
+    chain dials. The ``not ch.isascii()`` conjunct keeps ``0``-``9`` out of
+    it, and no legitimate phone character (``+ - ( ) . space x``) is
+    numeric, so this rejects nothing real."""
+    return any(ch.isnumeric() and not ch.isascii() for ch in value)
 
 
 def to_e164(raw: str) -> str | None:
