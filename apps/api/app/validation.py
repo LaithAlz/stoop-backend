@@ -12,6 +12,15 @@ and raises an uncaught ``IntegrityError`` (``NotNullViolation``) — a raw
 ``update_*`` handler calls it, right after ``model_dump(exclude_unset=True)``
 and before building any SQL, so the rejection is always fail-closed (no
 write attempted) and always the same code/message shape.
+
+``normalize_blank_to_null`` (#260) is a small sibling: some not-nullable
+-by-business-rule fields (today: ``phone`` — the emergency-call target,
+schema-v1.md) must reject an explicit empty string exactly like an
+explicit ``null``, since an empty string clears the column just as
+effectively. Callers opt a field in explicitly (never all fields
+implicitly) and run this BEFORE ``reject_explicit_null`` so the empty
+-string case collapses onto the exact same code/message path as the null
+case, rather than needing a second, parallel error shape.
 """
 
 from __future__ import annotations
@@ -38,4 +47,24 @@ def reject_explicit_null(provided: dict[str, Any], *, not_nullable_fields: list[
             )
 
 
-__all__: list[str] = ["reject_explicit_null"]
+def normalize_blank_to_null(provided: dict[str, Any], *, fields: list[str]) -> None:
+    """Mutate *provided* in place: for each name in *fields*, an explicit
+    empty (or whitespace-only) string value becomes ``None`` (#260).
+
+    Intended to run immediately before ``reject_explicit_null`` with the
+    SAME field included in that call's ``not_nullable_fields`` — the two
+    together make ``""`` 422 with the exact same code and message an
+    explicit ``null`` already gets, rather than silently writing a blank
+    string to a column whose business rule says it must never be cleared
+    by accident (e.g. ``landlords.phone``, the emergency-call target).
+    Only touches fields explicitly listed — never a blanket string-empties
+    -to-null pass over the whole body, which would wrongly affect genuinely
+    nullable free-text fields (``notes``, ``house_rules``, …).
+    """
+    for field in fields:
+        value = provided.get(field)
+        if field in provided and isinstance(value, str) and value.strip() == "":
+            provided[field] = None
+
+
+__all__: list[str] = ["normalize_blank_to_null", "reject_explicit_null"]
