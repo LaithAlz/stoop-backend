@@ -26,6 +26,14 @@ import type {
  *  create/delete refreshes them all. */
 export const propertiesQueryKey = ["properties"] as const;
 
+/** One property's detail read. Exported so a caller that must drop
+ *  exactly this property's cache (e.g. after a delete — a prefix
+ *  invalidate would refetch the still-mounted detail and 404 it) doesn't
+ *  hand-assemble the key. */
+export function propertyQueryKey(id: string) {
+  return [...propertiesQueryKey, "detail", id] as const;
+}
+
 export interface ListPropertiesParams {
   cursor?: string;
   limit?: number;
@@ -91,7 +99,7 @@ export interface UsePropertyOptions {
 
 export function useProperty(id: string | undefined, { enabled = true }: UsePropertyOptions = {}) {
   return useQuery({
-    queryKey: [...propertiesQueryKey, "detail", id],
+    queryKey: propertyQueryKey(id ?? "none"),
     queryFn: () => getProperty(id as string),
     enabled: Boolean(id) && enabled,
   });

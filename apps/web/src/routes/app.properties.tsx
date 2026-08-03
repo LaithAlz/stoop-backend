@@ -60,8 +60,15 @@ function PropertiesPage() {
             <p className="font-mono text-[10px] font-bold uppercase tracking-widest text-ink-muted">
               Properties
             </p>
+            {/* M2 (safety review, #234 PR 4): `items.length` counts LOADED
+                pages only — it read "20 properties" for 45, and a
+                confident "0 properties" above both the loading state and
+                the error takeover. The count only appears once the list
+                is genuinely complete. */}
             <h1 className="font-display text-[26px] leading-tight tracking-tight text-ink">
-              {items.length} {items.length === 1 ? "property" : "properties"}
+              {!propertiesQuery.isPending && propertiesQuery.data && !propertiesQuery.hasNextPage
+                ? `${items.length} ${items.length === 1 ? "property" : "properties"}`
+                : "Properties"}
             </h1>
           </div>
           <Button

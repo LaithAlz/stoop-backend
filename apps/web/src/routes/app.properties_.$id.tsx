@@ -18,8 +18,13 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { useAuth } from "@/auth/AuthProvider";
-import { deleteProperty, propertiesQueryKey, useProperty } from "@/api/properties";
-import { useTenants } from "@/api/tenants";
+import {
+  deleteProperty,
+  propertiesQueryKey,
+  propertyQueryKey,
+  useProperty,
+} from "@/api/properties";
+import { tenantsQueryKey, useTenants } from "@/api/tenants";
 import { revokeTrust } from "@/api/trust";
 import { useCasesList } from "@/api/cases";
 import { useQueue } from "@/api/queue";
@@ -27,7 +32,12 @@ import { ApiError, toHouseApiError } from "@/api/errors";
 import type { CaseSummary, Tenant, VulnerableOccupant } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
 import { formatRelativeTime } from "@/lib/relativeTime";
-import { formatStoopNumber } from "@/features/properties/stoopNumber";
+import {
+  NO_NUMBER_BODY,
+  NO_NUMBER_TITLE,
+  NUMBER_CAPTION,
+  formatStoopNumber,
+} from "@/features/properties/stoopNumber";
 import {
   DELETE_PROPERTY_CONFIRM_LABEL,
   DELETE_PROPERTY_MESSAGE,
@@ -103,6 +113,18 @@ function PropertyHub() {
   const [revokeConfirmOpen, setRevokeConfirmOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
 
+  // H2 (safety review, #234 PR 4): a status-0 (`network_error`) or 5xx
+  // failure is AMBIGUOUS — the request may well have applied server-side
+  // and only the response was lost. Reporting it as a definite failure is
+  // the dishonest direction on both of these actions (one severs a
+  // building's tenant line, the other turns auto-send off). Same branch
+  // and the same house line the approve loop already uses
+  // (src/features/queue/useDraftActions.ts).
+  const isAmbiguousFailure = (error: unknown) =>
+    error instanceof ApiError && (error.status === 0 || error.status >= 500);
+  const AMBIGUOUS_NOTICE =
+    "That may have gone through — give it a moment to update before trying again.";
+
   const revokeMutation = useMutation({
     mutationFn: () => revokeTrust(id, "property"),
     onSuccess: (result) => {
@@ -110,12 +132,20 @@ function PropertyHub() {
       setRevokeConfirmOpen(false);
     },
     onError: (error) => {
+      if (isAmbiguousFailure(error)) {
+        toast(AMBIGUOUS_NOTICE);
+        void queryClient.invalidateQueries({ queryKey: propertyQueryKey(id) });
+        setRevokeConfirmOpen(false);
+        return;
+      }
       toast(
         error instanceof ApiError
           ? toHouseApiError(error)
           : "Something didn't go through. Try again in a moment.",
       );
-      setRevokeConfirmOpen(false);
+      // L5 (safety review): a DEFINITE revoke failure means auto-send is
+      // still ON — closing the dialog reads as success to anyone who
+      // misses the toast, so the dialog stays open for a real refusal.
     },
   });
 
@@ -124,11 +154,27 @@ function PropertyHub() {
   // the approve/undo path — src/features/queue/useDraftActions.ts).
   const deleteMutation = useMutation({
     mutationFn: () => deleteProperty(id),
-    onSuccess: () => {
+    onSuccess: async () => {
+      // L1 (safety review): drop THIS property's cached detail/tenant
+      // reads rather than invalidating them — a prefix invalidate refetches
+      // the still-mounted detail, 404s, and paints "Couldn't refresh just
+      // now" over a fully-rendered deleted property. Navigate first, then
+      // let the list refetch.
+      queryClient.removeQueries({ queryKey: propertyQueryKey(id) });
+      queryClient.removeQueries({ queryKey: tenantsQueryKey(id) });
+      await navigate({ to: "/app/properties" });
       void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
-      void navigate({ to: "/app/properties" });
     },
     onError: (error) => {
+      if (isAmbiguousFailure(error)) {
+        // H2: on DELETE specifically, "may have gone through" means the
+        // building's line may already be severed — send them to the list,
+        // which is the honest read, instead of asserting failure.
+        toast(AMBIGUOUS_NOTICE);
+        void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
+        setDeleteConfirmOpen(false);
+        return;
+      }
       toast(
         error instanceof ApiError
           ? toHouseApiError(error)
@@ -199,9 +245,21 @@ function PropertyHub() {
                 {property.twilio_number ? (
                   formatStoopNumber(property.twilio_number)
                 ) : (
-                  <span className="italic">No Stoop number yet</span>
+                  <span className="italic">{NO_NUMBER_TITLE}</span>
                 )}
               </p>
+              {/* H3 (safety review, #234 PR 4): a null `twilio_number`
+                  means tenants texting this property reach NOBODY — there
+                  is no emergency line for this building and no
+                  re-provision endpoint in the contract. The ported helper
+                  already carries the honest wording for both states; a
+                  bare "No Stoop number yet" (with its implied "coming
+                  soon") was the only thing rendering. */}
+              {property.twilio_number ? (
+                <p className="mt-1 text-[12px] text-ink-muted">{NUMBER_CAPTION}</p>
+              ) : (
+                <p className="mt-1 text-[12px] font-medium text-urgent">{NO_NUMBER_BODY}</p>
+              )}
               {property.open_case_count > 0 && (
                 <p className="mt-1 text-[12px] font-medium text-urgent">
                   {property.open_case_count === 1
@@ -216,18 +274,40 @@ function PropertyHub() {
               <h2 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-widest text-ink-muted">
                 Tenants
               </h2>
+              {/* H1 (safety review, #234 PR 4): the error branch below is
+                  gated on `!tenantsQuery.data`, and a failed BACKGROUND
+                  refetch shows this strip instead of replacing the panel.
+                  Blanking it would take the unit numbers and the
+                  vulnerable-occupant flags ("On powered medical
+                  equipment") off screen because a refresh blipped — the
+                  wrong failure direction on the one panel that says which
+                  unit needs help first. */}
+              {tenantsQuery.isError && tenantsQuery.data && (
+                <div
+                  role="status"
+                  className="mb-2 rounded-2xl border border-border bg-surface px-4 py-2.5 text-[13px] font-medium text-ink-muted"
+                >
+                  Couldn&apos;t refresh just now — showing the last update.
+                </div>
+              )}
               <div className="overflow-hidden rounded-2xl border border-border bg-card">
                 {tenantsQuery.isPending ? (
                   <div className="flex items-center justify-center px-4 py-8">
                     <Loader2 className="size-5 animate-spin text-brand motion-reduce:animate-none" />
                   </div>
-                ) : tenantsQuery.isError ? (
+                ) : tenantsQuery.isError && !tenantsQuery.data ? (
                   <p className="px-4 py-5 text-[13px] text-ink-muted">
                     {tenantsQuery.error instanceof ApiError
                       ? toHouseApiError(tenantsQuery.error)
                       : "Couldn't load the tenants here. Try refreshing."}
                   </p>
                 ) : tenants.length === 0 ? (
+                  // Deliberately SHORTER than mobile's version ("… Add them
+                  // so Stoop knows who's texting in.") — copy-guardian
+                  // ruling, #234 PR 4: this screen ships no tenant-add UI
+                  // yet, and an instruction pointing at an affordance that
+                  // doesn't exist here is a dead promise. Restore mobile's
+                  // full line when the tenant-add flow lands.
                   <p className="px-4 py-5 text-[13px] text-ink-muted">No tenants on file yet.</p>
                 ) : (
                   tenants.map((tenant, i) => (
@@ -236,7 +316,11 @@ function PropertyHub() {
                       <div className="flex min-h-14 items-center justify-between gap-3 px-4 py-3">
                         <div className="min-w-0 flex-1">
                           <p className="text-[14px] font-medium text-ink">
-                            {tenant.name ?? "Unnamed tenant"}
+                            {/* Fallback via the same seam mobile uses
+                                (firstName → "Your tenant") — copy-guardian
+                                caught "Unnamed tenant" as an unreviewed
+                                drift from that blessed register. */}
+                            {tenant.name ?? firstName(tenant.name)}
                             {tenant.unit ? ` — Unit ${tenant.unit}` : ""}
                           </p>
                           <p className="mt-0.5 font-mono text-[12px] text-ink-muted">

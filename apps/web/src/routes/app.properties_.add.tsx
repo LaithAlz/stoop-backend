@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft } from "lucide-react";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
@@ -82,25 +82,61 @@ function AddPropertyPage() {
     onSuccess: (property) => {
       // Both the list and any future onboarding gate key off this root.
       void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
-      void navigate({ to: "/app/properties/$id", params: { id: property.id } });
+      // L3 (safety review, #234 PR 4): a 2xx whose body somehow carried no
+      // id would navigate to `/app/properties/undefined` AFTER a real
+      // number purchase — land on the list instead, where the new property
+      // actually shows up.
+      if (property?.id) {
+        void navigate({ to: "/app/properties/$id", params: { id: property.id } });
+      } else {
+        void navigate({ to: "/app/properties" });
+      }
     },
     onError: (error) => {
+      // H2 (safety review, #234 PR 4): a status-0/5xx failure here is
+      // AMBIGUOUS — this POST buys a real phone number, so "check your
+      // connection and try again" can be inviting a retry against a
+      // purchase that already succeeded. (The backend dedupes on
+      // (landlord, address) and releases the loser's number, so a retry
+      // converges to `duplicate_property` rather than double-billing —
+      // this is an honesty fix, not a money leak.) Say what's actually
+      // known and point at the list, which is the honest read.
+      if (error instanceof ApiError && (error.status === 0 || error.status >= 500)) {
+        setServerError(
+          "That may have gone through — check your properties list before adding it again.",
+        );
+        void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
+        return;
+      }
       setServerError(
         error instanceof ApiError
           ? toHouseApiError(error)
           : "Something didn't go through. Try again in a moment.",
       );
     },
+    // Releases L6's latch after every attempt so a genuine retry (a
+    // corrected field, say) isn't locked out.
+    onSettled: () => {
+      submitLatch.current = false;
+    },
   });
 
   const fieldErrors = validate({ label, addressLine1, city, areaCode });
   const valid = Object.keys(fieldErrors).length === 0;
 
+  // L6 (safety review, #234 PR 4): `mutation.isPending` is read from the
+  // render closure, so two submits inside one frame (double Enter) both
+  // pass the guard and both POST — each buying a number, the second
+  // caught by the unique index and released only best-effort. A ref latch
+  // is synchronous and can't be raced that way.
+  const submitLatch = useRef(false);
+
   function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setSubmitted(true);
     setServerError(null);
-    if (!valid || mutation.isPending) return;
+    if (!valid || mutation.isPending || submitLatch.current) return;
+    submitLatch.current = true;
     const input: CreatePropertyInput = {
       label: label.trim(),
       address_line1: addressLine1.trim(),
