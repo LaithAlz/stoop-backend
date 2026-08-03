@@ -110,6 +110,20 @@ def _fresh_phone() -> str:
     return f"+1416{uuid.uuid4().int % 10_000_000:07d}"
 
 
+def _fresh_valid_nanp_phone() -> str:
+    """Like ``_fresh_phone()``, but GUARANTEES the result passes
+    ``app.phone.is_plausible_nanp`` (fixed ``555`` exchange — ``_fresh_
+    phone()``'s raw random 7-digit suffix can occasionally land on an
+    exchange code starting ``0``/``1`` or an N11-shaped one, which
+    ``is_plausible_nanp`` correctly rejects). Only the #232
+    canonicalization tests below need this: they are the only tests in
+    this file that round-trip a seeded number through ``app.phone.
+    to_e164`` (via the webhook's own canonicalize-before-match step, #232)
+    rather than just comparing two raw strings for equality."""
+    line = uuid.uuid4().int % 10_000
+    return f"+1416555{line:04d}"
+
+
 async def _insert_landlord(session: AsyncSession, *, phone: str | None = None) -> str:
     landlord_id = str(uuid.uuid4())
     await session.execute(
@@ -1176,6 +1190,154 @@ async def test_inactive_tenant_not_matched_persists_with_null_tenant_id(
         )
         assert row["party"] == "tenant"
         assert row["tenant_id"] is None
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #232 — E.164 canonicalization at match time: a formerly-unroutable
+# format-drifted `To`/`From` now routes correctly instead of dead-lettering
+# (property lookup) or losing tenant correlation (active-tenant lookup).
+# The STORED value is always canonical (write-time validation, #260, plus
+# migration 0017 for pre-existing rows) — these tests drift the INBOUND
+# Twilio param instead, since that's the side #232's fix actually changes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_formerly_unroutable_to_format_now_routes_instead_of_dead_lettering(
+    db_session: AsyncSession,
+) -> None:
+    """Before #232: an inbound `To` that isn't a byte-for-byte match for
+    the stored (canonical) `properties.twilio_number` dead-lettered into
+    `unrouted_inbound` even though it's the SAME number, just formatted
+    differently. After #232: the webhook canonicalizes `To` before the
+    lookup, so this now routes normally."""
+    landlord_id = await _insert_landlord(db_session)
+    canonical_to = _fresh_valid_nanp_phone()  # e.g. "+1416555XXXX" — stored as-is
+    await _insert_property(db_session, landlord_id, twilio_number=canonical_to)
+
+    # Same number Twilio would never actually send this way in practice,
+    # but a stored/inbound mismatch of THIS shape is exactly what #232's
+    # safety review flagged (spacing/+1-vs-1/punctuation drift) — drop the
+    # leading "+1" to simulate the drift.
+    drifted_to = canonical_to.removeprefix("+1")
+    assert drifted_to != canonical_to
+
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid, from_number=_fresh_phone(), to_number=drifted_to, body="hello"
+    )
+
+    try:
+        response = await _post_sms(params)
+        assert response.status_code == 200
+
+        message_row = (
+            (
+                await db_session.execute(
+                    text("SELECT landlord_id, party FROM messages WHERE twilio_sid = :sid"),
+                    {"sid": message_sid},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        assert message_row is not None, "formerly-unroutable message must now route to `messages`"
+        assert str(message_row["landlord_id"]) == landlord_id
+        assert message_row["party"] == "tenant"
+
+        dead_letter_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM unrouted_inbound WHERE twilio_sid = :sid"),
+                {"sid": message_sid},
+            )
+        ).scalar_one()
+        assert dead_letter_count == 0, "must NOT also dead-letter a successfully-routed message"
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_formerly_unmatchable_from_format_now_resolves_active_tenant(
+    db_session: AsyncSession,
+) -> None:
+    """Same class of fix on the `From` side: a drifted inbound `From` that
+    doesn't byte-match the stored (canonical) `tenants.phone` used to
+    persist with `tenant_id IS NULL` (unknown sender) even though it's the
+    SAME tenant. After #232 it resolves correctly."""
+    landlord_id = await _insert_landlord(db_session)
+    to_number = _fresh_phone()
+    canonical_tenant_phone = _fresh_valid_nanp_phone()
+    property_id = await _insert_property(db_session, landlord_id, twilio_number=to_number)
+    tenant_id = await _insert_tenant(
+        db_session, landlord_id, property_id, phone=canonical_tenant_phone, active=True
+    )
+
+    drifted_from = canonical_tenant_phone.removeprefix("+1")
+    assert drifted_from != canonical_tenant_phone
+
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid, from_number=drifted_from, to_number=to_number, body="hello"
+    )
+
+    try:
+        response = await _post_sms(params)
+        assert response.status_code == 200
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT party, tenant_id FROM messages WHERE twilio_sid = :sid"),
+                    {"sid": message_sid},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["party"] == "tenant"
+        assert str(row["tenant_id"]) == tenant_id
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_genuinely_unknown_to_number_still_dead_letters(db_session: AsyncSession) -> None:
+    """Regression guard: #232's canonicalize-before-match change must not
+    make a truly unrelated `To` number match anything — a random, never
+    -provisioned number still dead-letters exactly as before (#170)."""
+    landlord_id = await _insert_landlord(db_session)
+    # A property exists, but the inbound `To` matches no property at all —
+    # not even after canonicalization.
+    await _insert_property(db_session, landlord_id, twilio_number=_fresh_phone())
+
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid,
+        from_number=_fresh_phone(),
+        to_number=_fresh_phone(),
+        body="hello",
+    )
+
+    try:
+        response = await _post_sms(params)
+        assert response.status_code == 200
+
+        message_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM messages WHERE twilio_sid = :sid"), {"sid": message_sid}
+            )
+        ).scalar_one()
+        assert message_count == 0
+
+        dead_letter_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM unrouted_inbound WHERE twilio_sid = :sid"),
+                {"sid": message_sid},
+            )
+        ).scalar_one()
+        assert dead_letter_count == 1
     finally:
         await _cleanup(db_session, landlord_id)
 
