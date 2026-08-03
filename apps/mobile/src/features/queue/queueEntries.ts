@@ -15,9 +15,23 @@
  */
 import type { QueueItem } from "@/api/types";
 
+/**
+ * `undoExpiresAtClient` / `approvedAtClient` are both DEVICE `Date.now()`
+ * epoch milliseconds — never a raw server timestamp string. #250: the
+ * previous shape stored the server's `undo_until` string here and compared
+ * it directly against `new Date()` at render time, silently mixing the
+ * server's clock with the device's — a device clock a couple of minutes
+ * fast would swallow the whole undo window with no error (and a slow one
+ * would inflate it past what the server honors, so a tap "succeeds"
+ * client-side then 409s). `computeUndoExpiresAt` below is the ONE place
+ * that crosses clocks (using the approve response's own `Date` header as
+ * the anchor); everything downstream of it — this reducer,
+ * `secondsRemaining`, `totalUndoSeconds` — works purely in device-clock
+ * numbers.
+ */
 export type QueueEntry =
   | { status: "idle" }
-  | { status: "sending"; undoUntil: string; approvedAt: string }
+  | { status: "sending"; undoExpiresAtClient: number; approvedAtClient: number }
   | { status: "sent" }
   | { status: "skipped" };
 
@@ -26,7 +40,7 @@ export type QueueEntry =
 export type QueueEntriesState = Record<string, QueueEntry>;
 
 export type QueueEntriesAction =
-  | { type: "approved"; draftId: string; undoUntil: string; approvedAt: string }
+  | { type: "approved"; draftId: string; undoExpiresAtClient: number; approvedAtClient: number }
   | { type: "undone"; draftId: string }
   | { type: "expired"; draftId: string }
   | { type: "skipped"; draftId: string }
@@ -44,8 +58,8 @@ export function queueEntriesReducer(
         ...state,
         [action.draftId]: {
           status: "sending",
-          undoUntil: action.undoUntil,
-          approvedAt: action.approvedAt,
+          undoExpiresAtClient: action.undoExpiresAtClient,
+          approvedAtClient: action.approvedAtClient,
         },
       };
     case "expired": {
@@ -71,20 +85,75 @@ export function entryFor(state: QueueEntriesState, draftId: string): QueueEntry 
   return state[draftId] ?? IDLE;
 }
 
-/** Seconds left in the undo window, clamped to >= 0 — derived from the
- *  server's `undo_until` (api-contracts.md: "the undo window is data"),
- *  never a client-local constant. */
-export function secondsRemaining(undoUntil: string, now: Date = new Date()): number {
-  const diffMs = new Date(undoUntil).getTime() - now.getTime();
+/**
+ * Seconds left in the undo window, clamped to >= 0 — a pure device-clock
+ * delta against `undoExpiresAtClient` (itself already anchored to the
+ * server's clock once, at receipt time, by `computeUndoExpiresAt` below).
+ * Never re-parses a server timestamp here (#250).
+ *
+ * Guarded against a non-finite `undoExpiresAtClient` so a bad value renders
+ * as "no time left" (the undo ticket's `00:00`, never `00:NaN`) —
+ * `computeUndoExpiresAt` always returns a finite number, so this is
+ * belt-and-suspenders against any future caller that doesn't.
+ */
+export function secondsRemaining(undoExpiresAtClient: number, now: number = Date.now()): number {
+  if (!Number.isFinite(undoExpiresAtClient)) return 0;
+  const diffMs = undoExpiresAtClient - now;
   return Math.max(0, Math.round(diffMs / 1000));
 }
 
 /** For the undo ticket's progress bar only (a visual nicety) — the actual
  *  gate on whether Undo still works is the server's `undo_until`, checked
- *  by the DELETE call itself, not this number. */
-export function totalUndoSeconds(entry: { undoUntil: string; approvedAt: string }): number {
-  const totalMs = new Date(entry.undoUntil).getTime() - new Date(entry.approvedAt).getTime();
+ *  by the DELETE call itself, not this number. Guarded the same way as
+ *  `secondsRemaining` — an unparsable window falls back to `1` (a full,
+ *  already-elapsed bar) rather than a NaN-driven width. */
+export function totalUndoSeconds(entry: {
+  undoExpiresAtClient: number;
+  approvedAtClient: number;
+}): number {
+  const totalMs = entry.undoExpiresAtClient - entry.approvedAtClient;
+  if (!Number.isFinite(totalMs)) return 1;
   return Math.max(1, Math.round(totalMs / 1000));
+}
+
+/** The contract's own undo window (api-contracts.md: `scheduled_send_at =
+ *  now() + 5s`) — used ONLY as the no-anchor fallback below, never to
+ *  shorten a window the server actually reported. */
+const UNDO_WINDOW_FALLBACK_MS = 5_000;
+
+/**
+ * #250: the one place a server timestamp (`undo_until`) and the server's
+ * OWN clock (the approve response's `Date` header) meet — everything after
+ * this returns is pure device-clock math. `windowMs` is how long the server
+ * itself thinks the undo window lasts; adding that to the DEVICE's
+ * `Date.now()` at receipt time gives an expiry that's honest even when the
+ * device's wall clock is skewed from the server's.
+ *
+ * The no-anchor fallback: React Native's `fetch` exposes every response
+ * header (unlike a browser, which strips anything not CORS-safelisted —
+ * `Date` isn't, which is why the web port needed this same fallback, #234
+ * PR 2 round 3), so the anchor should normally be present here. But a
+ * missing or unparsable header is still handled the same fail-open way,
+ * for whatever malformed-response case reaches this far: fall back to the
+ * contract's full window from receipt time, rather than re-parsing
+ * `undo_until` against the device clock — that re-parse was the original
+ * #250 bug (a device clock a few minutes fast would silently delete the
+ * whole window). Fail-open is safe here because this number only ever
+ * gates the OFFER of undo; the server's DELETE call is the real gate, and
+ * a too-late tap comes back `already_sent`, which flips the card to an
+ * honest "sent" state (useDraftActions.ts).
+ */
+export function computeUndoExpiresAt(
+  undoUntil: string,
+  serverDateHeader: string | null | undefined,
+  receivedAtClient: number = Date.now(),
+): number {
+  const undoUntilMs = Date.parse(undoUntil);
+  const serverNowMs = serverDateHeader ? Date.parse(serverDateHeader) : NaN;
+  if (Number.isFinite(undoUntilMs) && Number.isFinite(serverNowMs)) {
+    return receivedAtClient + (undoUntilMs - serverNowMs);
+  }
+  return receivedAtClient + UNDO_WINDOW_FALLBACK_MS;
 }
 
 export interface QueueViewRow {

@@ -68,13 +68,36 @@ function safeJsonParse(text: string): unknown {
   }
 }
 
+/** #250: the response envelope for a caller that needs the server's OWN
+ *  clock alongside the body — e.g. anchoring the undo countdown to
+ *  `undo_until` without ever mixing it with the device's wall clock (a
+ *  device clock a couple of minutes fast would otherwise silently swallow
+ *  the whole undo window — see src/features/queue/queueEntries.ts's
+ *  `computeUndoExpiresAt`). `dateHeader` is the raw `Date` response header,
+ *  unparsed (`null` if the response somehow didn't carry one) — the caller
+ *  decides how to parse/guard it. Ported from apps/web/src/api/client.ts
+ *  (#234 PR 2's B2 finding, itself ported from this file originally — #250
+ *  closes the same gap at the mobile source). */
+export interface ApiResponseEnvelope<T> {
+  data: T;
+  dateHeader: string | null;
+}
+
 /**
  * Fetch + parse one `/v1` call. Resolves the JSON body on 2xx (or
  * `undefined` on a 204); throws `ApiError` on everything else, including a
  * dropped connection (mapped to the stable `network_error` code so callers
  * never have to special-case a raw `TypeError`).
+ *
+ * Shared by both exported entry points below — `apiRequest` (unchanged
+ * signature, every existing caller) and `apiRequestWithDate` (#250's new
+ * variant) — so there is exactly one place that builds headers, calls
+ * `fetch`, and maps a non-2xx response to `ApiError`.
  */
-export async function apiRequest<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+async function apiRequestInternal<T>(
+  path: string,
+  options: ApiRequestOptions = {},
+): Promise<ApiResponseEnvelope<T>> {
   const headers: Record<string, string> = {
     Accept: "application/json",
     ...(await authHeader()),
@@ -102,8 +125,16 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     });
   }
 
+  // Optional-chained: this line runs on EVERY response (204s included) and
+  // sits outside the try/catch that maps transport failures, so a
+  // hypothetical `Response` without `headers` would throw a raw TypeError
+  // past the client — degrading typed `ApiError` handling on paths that
+  // include the emergency acknowledge. Unreachable with RN's fetch; the
+  // guard costs nothing (#250 safety review).
+  const dateHeader = response.headers?.get("date") ?? null;
+
   if (response.status === 204) {
-    return undefined as T;
+    return { data: undefined as T, dateHeader };
   }
 
   const text = await response.text();
@@ -120,5 +151,22 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     throw new ApiError(response.status, coerceErrorBody(parsed, response.status));
   }
 
-  return parsed as T;
+  return { data: parsed as T, dateHeader };
+}
+
+/** The default entry point — every caller before #250, unchanged signature. */
+export async function apiRequest<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+  const { data } = await apiRequestInternal<T>(path, options);
+  return data;
+}
+
+/** #250's variant for a caller that needs the response's `Date` header
+ *  alongside the body (today: the approve/edit-and-send undo countdown,
+ *  src/api/drafts.ts). Everything else about the request/error handling is
+ *  identical to `apiRequest` above. */
+export async function apiRequestWithDate<T>(
+  path: string,
+  options: ApiRequestOptions = {},
+): Promise<ApiResponseEnvelope<T>> {
+  return apiRequestInternal<T>(path, options);
 }

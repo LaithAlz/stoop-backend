@@ -2,11 +2,14 @@
  * Pure logic tests for the Home queue's local state machine — no
  * React/RN/network involved (see queueEntries.ts's docstring). Covers the
  * issue #210 M1 brief's explicit ask: the approve→undo countdown state
- * machine, and the skip-muted state persisting past a server refetch.
+ * machine, and the skip-muted state persisting past a server refetch; and
+ * issue #250's `computeUndoExpiresAt` — the one place the server's clock
+ * and the device's clock meet, plus its no-anchor fallback.
  */
 import type { QueueItem } from "@/api/types";
 import {
   buildQueueView,
+  computeUndoExpiresAt,
   draftStaleNotice,
   pruneSkippedSnapshots,
   queueEntriesReducer,
@@ -38,27 +41,27 @@ function makeItem(overrides: Partial<QueueItem> = {}): QueueItem {
 }
 
 describe("queueEntriesReducer — approve/undo state machine", () => {
-  it("moves a draft into 'sending' with the server's own undo_until on approve", () => {
+  it("moves a draft into 'sending' with the device-clock-anchored expiry on approve", () => {
     const state = queueEntriesReducer(
       {},
       {
         type: "approved",
         draftId: "draft-1",
-        undoUntil: "2026-07-16T08:00:05Z",
-        approvedAt: "2026-07-16T08:00:00Z",
+        undoExpiresAtClient: 1_000_005_000,
+        approvedAtClient: 1_000_000_000,
       },
     );
     expect(state["draft-1"]).toEqual({
       status: "sending",
-      undoUntil: "2026-07-16T08:00:05Z",
-      approvedAt: "2026-07-16T08:00:00Z",
+      undoExpiresAtClient: 1_000_005_000,
+      approvedAtClient: 1_000_000_000,
     });
   });
 
   it("undo clears the local entry back to no override (idle)", () => {
     const sending = queueEntriesReducer(
       {},
-      { type: "approved", draftId: "draft-1", undoUntil: "x", approvedAt: "y" },
+      { type: "approved", draftId: "draft-1", undoExpiresAtClient: 5, approvedAtClient: 0 },
     );
     const undone = queueEntriesReducer(sending, { type: "undone", draftId: "draft-1" });
     expect(undone["draft-1"]).toBeUndefined();
@@ -70,22 +73,100 @@ describe("queueEntriesReducer — approve/undo state machine", () => {
 
     const sending = queueEntriesReducer(
       {},
-      { type: "approved", draftId: "draft-1", undoUntil: "x", approvedAt: "y" },
+      { type: "approved", draftId: "draft-1", undoExpiresAtClient: 5, approvedAtClient: 0 },
     );
     const sent = queueEntriesReducer(sending, { type: "expired", draftId: "draft-1" });
     expect(sent["draft-1"]).toEqual({ status: "sent" });
   });
 
   it("secondsRemaining clamps at zero and never goes negative", () => {
-    const now = new Date("2026-07-16T08:00:10Z");
-    expect(secondsRemaining("2026-07-16T08:00:05Z", now)).toBe(0);
-    expect(secondsRemaining("2026-07-16T08:00:15Z", now)).toBe(5);
+    const now = new Date("2026-07-16T08:00:10Z").getTime();
+    expect(secondsRemaining(new Date("2026-07-16T08:00:05Z").getTime(), now)).toBe(0);
+    expect(secondsRemaining(new Date("2026-07-16T08:00:15Z").getTime(), now)).toBe(5);
   });
 
-  it("totalUndoSeconds derives the ticket's progress-bar denominator from the two server timestamps", () => {
+  it("secondsRemaining renders '00:00', never NaN, for a non-finite expiry", () => {
+    expect(secondsRemaining(NaN)).toBe(0);
+  });
+
+  it("totalUndoSeconds derives the ticket's progress-bar denominator from the two device-clock numbers", () => {
     expect(
-      totalUndoSeconds({ approvedAt: "2026-07-16T08:00:00Z", undoUntil: "2026-07-16T08:00:05Z" }),
+      totalUndoSeconds({
+        approvedAtClient: new Date("2026-07-16T08:00:00Z").getTime(),
+        undoExpiresAtClient: new Date("2026-07-16T08:00:05Z").getTime(),
+      }),
     ).toBe(5);
+  });
+
+  it("totalUndoSeconds falls back to a full, already-elapsed bar (1) rather than NaN", () => {
+    expect(totalUndoSeconds({ approvedAtClient: NaN, undoExpiresAtClient: 5 })).toBe(1);
+  });
+});
+
+describe("computeUndoExpiresAt — issue #250 (the one place the two clocks meet)", () => {
+  it("anchors to the server's own clock, not the device's — a fast device clock no longer swallows the window", () => {
+    // The device thinks it's 08:02:00 (2 minutes fast); the server's own
+    // Date header says the real time is 08:00:00, and it granted a 5s
+    // window (undo_until 08:00:05). The old bug did
+    // `new Date(undo_until) - Date.now()`, which here would already be
+    // negative — an instant, silent zero-second window. The fix instead
+    // reads the 5s the SERVER granted and applies it to the device's own
+    // receipt time, so the landlord still gets a real 5 seconds.
+    const deviceNow = new Date("2026-07-16T08:02:00Z").getTime();
+    const expiresAt = computeUndoExpiresAt(
+      "2026-07-16T08:00:05Z",
+      "2026-07-16T08:00:00Z",
+      deviceNow,
+    );
+    expect(expiresAt).toBe(deviceNow + 5_000);
+    expect(secondsRemaining(expiresAt, deviceNow)).toBe(5);
+  });
+
+  it("a slow device clock still gets exactly the server's granted window, not an inflated one", () => {
+    // Device clock is 3 minutes slow relative to the server.
+    const deviceNow = new Date("2026-07-16T07:57:00Z").getTime();
+    const expiresAt = computeUndoExpiresAt(
+      "2026-07-16T08:00:05Z",
+      "2026-07-16T08:00:00Z",
+      deviceNow,
+    );
+    expect(expiresAt).toBe(deviceNow + 5_000);
+  });
+
+  it("falls back to the contract's full 5s window from receipt when the Date header is missing", () => {
+    const deviceNow = new Date("2026-07-16T08:02:00Z").getTime();
+    const expiresAt = computeUndoExpiresAt("2026-07-16T08:00:05Z", null, deviceNow);
+    expect(expiresAt).toBe(deviceNow + 5_000);
+  });
+
+  it("falls back the same way when the Date header is present but unparsable", () => {
+    const deviceNow = new Date("2026-07-16T08:02:00Z").getTime();
+    const expiresAt = computeUndoExpiresAt("2026-07-16T08:00:05Z", "not-a-date", deviceNow);
+    expect(expiresAt).toBe(deviceNow + 5_000);
+  });
+
+  it("falls back the same way when undo_until itself is unparsable", () => {
+    const deviceNow = new Date("2026-07-16T08:02:00Z").getTime();
+    const expiresAt = computeUndoExpiresAt("not-a-date", "2026-07-16T08:00:00Z", deviceNow);
+    expect(expiresAt).toBe(deviceNow + 5_000);
+  });
+
+  it("never re-parses undo_until against the device clock on fallback (the original #250 bug)", () => {
+    // If the fallback wrongly fell back to `new Date(undo_until) -
+    // Date.now()`, a device clock far in the future would make this
+    // negative/zero. It must instead be the full 5s window from receipt.
+    const deviceNow = new Date("2030-01-01T00:00:00Z").getTime();
+    const expiresAt = computeUndoExpiresAt("2026-07-16T08:00:05Z", null, deviceNow);
+    expect(expiresAt).toBeGreaterThan(deviceNow);
+    expect(secondsRemaining(expiresAt, deviceNow)).toBe(5);
+  });
+
+  it("defaults receivedAtClient to Date.now() when not passed", () => {
+    const before = Date.now();
+    const expiresAt = computeUndoExpiresAt("2026-07-16T08:00:05Z", "2026-07-16T08:00:00Z");
+    const after = Date.now();
+    expect(expiresAt).toBeGreaterThanOrEqual(before + 5_000);
+    expect(expiresAt).toBeLessThanOrEqual(after + 5_000);
   });
 });
 

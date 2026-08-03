@@ -4,12 +4,21 @@
  * screen's approve/undo/skip state machine (src/features/queue/
  * queueEntries.ts) wraps these in its own `useMutation` calls so the
  * optimistic local state and the network call are decided in one place.
+ *
+ * #250: approve and edit-and-send both return an `undo_until` that
+ * useDraftActions.ts needs to anchor to the SERVER's own clock (never the
+ * device's), so both go through `apiRequestWithDate` instead of the plain
+ * `apiRequest` — see src/api/client.ts's `ApiResponseEnvelope` and
+ * queueEntries.ts's `computeUndoExpiresAt` call site. Undo and reject carry
+ * no such countdown and stay on the plain client.
  */
-import { apiRequest } from "./client";
+import { apiRequest, apiRequestWithDate, type ApiResponseEnvelope } from "./client";
 import type { ApproveDraftResponse, RejectDraftResponse, UndoDraftResponse } from "./types";
 
-export function approveDraft(draftId: string): Promise<ApproveDraftResponse> {
-  return apiRequest<ApproveDraftResponse>(`/v1/drafts/${draftId}/approve`, { method: "POST" });
+export function approveDraft(draftId: string): Promise<ApiResponseEnvelope<ApproveDraftResponse>> {
+  return apiRequestWithDate<ApproveDraftResponse>(`/v1/drafts/${draftId}/approve`, {
+    method: "POST",
+  });
 }
 
 /** DELETE .../approve — cancels within the undo window (api-contracts.md:
@@ -26,8 +35,11 @@ export function rejectDraft(draftId: string, note?: string): Promise<RejectDraft
   });
 }
 
-export function editAndSendDraft(draftId: string, body: string): Promise<ApproveDraftResponse> {
-  return apiRequest<ApproveDraftResponse>(`/v1/drafts/${draftId}/edit-and-send`, {
+export function editAndSendDraft(
+  draftId: string,
+  body: string,
+): Promise<ApiResponseEnvelope<ApproveDraftResponse>> {
+  return apiRequestWithDate<ApproveDraftResponse>(`/v1/drafts/${draftId}/edit-and-send`, {
     method: "POST",
     body: { body },
   });

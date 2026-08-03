@@ -203,7 +203,7 @@ export default function CaseDetailScreen() {
                   ) : null}
                   {draftEntry.status === "sending" ? (
                     <UndoTicket
-                      secondsLeft={secondsRemaining(draftEntry.undoUntil)}
+                      secondsLeft={secondsRemaining(draftEntry.undoExpiresAtClient)}
                       totalSeconds={totalUndoSeconds(draftEntry)}
                       onUndo={() =>
                         draftActions.undo({
