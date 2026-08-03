@@ -498,6 +498,12 @@ function EditProfileForm({
               if (nameError) setNameError(null);
             }}
             autoComplete="name"
+            // A1 (safety re-verify): frozen while the write is in flight,
+            // matching Cancel and the X. The dialog now deliberately holds
+            // open for up to 20s on a stalled connection — a landlord who
+            // spots a typo and starts correcting mid-save would otherwise
+            // watch the OLD value land and the dialog close on "Saved".
+            disabled={mutation.isPending}
             className="mt-1 h-12"
             // R5: the name error belongs ON the name field — it used to
             // land in the generic slot at the foot of the form, which a
@@ -526,6 +532,9 @@ function EditProfileForm({
             placeholder="(416) 555-0134"
             inputMode="tel"
             autoComplete="tel"
+            // A1: same freeze as the name field above — this one more so,
+            // since it's the emergency callback number.
+            disabled={mutation.isPending}
             className="mt-1 h-12"
             aria-invalid={submitted && Boolean(phoneError) ? true : undefined}
             aria-describedby={submitted && phoneError ? "me-phone-err" : "me-phone-help"}
