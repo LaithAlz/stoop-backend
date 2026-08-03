@@ -1,6 +1,6 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
-import { Check, Pencil, AlertOctagon, PhoneCall, Wrench, ChevronRight } from "lucide-react";
+import { Check, Pencil, AlertOctagon, PhoneCall, Wrench } from "lucide-react";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
 import { AppTabBar } from "@/components/stoop/AppTabBar";
 import { queue } from "@/lib/mock-app";
@@ -173,10 +173,18 @@ const META: Record<EventKind, { icon: typeof Check; tint: string }> = {
   call: { icon: PhoneCall, tint: "bg-brand-muted text-brand" },
 };
 
+// Safety review (#234 PR 3 fix round, LOW): this screen is still 100% mock
+// data (`events` above) — `conversationId` values like "c-maria-flood"
+// aren't real case ids, and app.conversations.$id.tsx is wired to the LIVE
+// `GET /v1/cases/{id}` now. Linking there with a mock id used to be a
+// harmless dead end against a mock loader; it's now a guaranteed
+// 404/`case_not_found` against the real API. Rendered as a plain,
+// non-navigating row (no `<Link>`, no chevron affordance) until this
+// screen itself gets a live-data PR (#256-adjacent follow-up).
 function EventRow({ event }: { event: ActivityEvent }) {
   const meta = META[event.kind];
   const Icon = meta.icon;
-  const body = (
+  return (
     <div className="flex items-start gap-3 rounded-2xl border border-border bg-card p-4">
       <div className={cn("flex size-9 shrink-0 items-center justify-center rounded-xl", meta.tint)}>
         <Icon className="size-4" />
@@ -193,14 +201,6 @@ function EventRow({ event }: { event: ActivityEvent }) {
           {event.property}
         </p>
       </div>
-      {event.conversationId && <ChevronRight className="mt-1 size-4 text-ink-muted/70" />}
     </div>
-  );
-  return event.conversationId ? (
-    <Link to="/app/conversations/$id" params={{ id: event.conversationId }} className="block">
-      {body}
-    </Link>
-  ) : (
-    body
   );
 }

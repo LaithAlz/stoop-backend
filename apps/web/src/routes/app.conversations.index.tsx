@@ -8,7 +8,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { useCasesList } from "@/api/cases";
 import { useQueue } from "@/api/queue";
 import { ApiError, toHouseApiError } from "@/api/errors";
-import type { CaseStatus } from "@/api/types";
+import type { CaseStatus, CaseSummary } from "@/api/types";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/conversations/")({
@@ -45,10 +45,20 @@ function ConversationsIndexPage() {
   // own (differently-scoped) case count.
   const queueQuery = useQueue({ enabled: Boolean(session) });
 
-  const items = useMemo(
-    () => casesQuery.data?.pages.flatMap((page) => page.items) ?? [],
-    [casesQuery.data],
-  );
+  // LOW (safety review, #234 PR 3 fix round): `GET /v1/cases`'s sort key
+  // (`last_activity_at`) is a MUTABLE cursor per api-contracts.md's own A3
+  // amendment — a case bumped by new activity between page fetches can
+  // "skip ahead" and land on more than one already-fetched page. Deduping
+  // by id (last write wins) keeps the list from showing the same case
+  // twice; re-fetching page 1 is that amendment's own documented remedy
+  // for a stale cursor, not something a client needs to special-case.
+  const items = useMemo(() => {
+    const byId = new Map<string, CaseSummary>();
+    for (const page of casesQuery.data?.pages ?? []) {
+      for (const item of page.items) byId.set(item.id, item);
+    }
+    return Array.from(byId.values());
+  }, [casesQuery.data]);
 
   return (
     <PhoneFrame>
@@ -116,7 +126,12 @@ function ConversationsIndexPage() {
             </div>
           ) : (
             <>
-              {casesQuery.isError && (
+              {/* LOW (safety review, #234 PR 3 fix round): a failed
+                  `fetchNextPage()` also flips this query's own `isError` —
+                  excluded here (`!casesQuery.isFetchNextPageError`) so a
+                  load-more failure shows ONLY its own message below the
+                  list, not this unrelated "couldn't refresh" strip too. */}
+              {casesQuery.isError && !casesQuery.isFetchNextPageError && (
                 <div
                   role="status"
                   className="mb-3.5 rounded-clarity-md border border-clarity-line-strong bg-clarity-panel px-4 py-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
@@ -138,7 +153,17 @@ function ConversationsIndexPage() {
               )}
 
               {casesQuery.hasNextPage && (
-                <div className="mt-4 flex justify-center">
+                <div className="mt-4 flex flex-col items-center gap-2">
+                  {casesQuery.isFetchNextPageError && (
+                    <p
+                      role="alert"
+                      className="font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
+                    >
+                      {casesQuery.error instanceof ApiError
+                        ? toHouseApiError(casesQuery.error)
+                        : "Couldn't load more. Try again."}
+                    </p>
+                  )}
                   <button
                     type="button"
                     onClick={() => void casesQuery.fetchNextPage()}
