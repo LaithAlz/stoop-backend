@@ -16,6 +16,7 @@ import structlog.contextvars
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
 
 from app.agent.checkpointer import close_checkpointer, setup_checkpointer
 from app.config import settings
@@ -272,6 +273,26 @@ def create_app() -> fastapi.FastAPI:
       2. init_sentry()              — no-op unless SENTRY_DSN is set
       2b. init_langsmith_tracing()  — no-op unless LANGSMITH_API_KEY is set
       3. add RequestIDMiddleware
+      3b. add CORSMiddleware (#251) — origin allowlist from
+          ``settings.dashboard_origins_list`` (env ``DASHBOARD_ORIGINS``,
+          never ``'*'``). Added AFTER RequestIDMiddleware so it ends up the
+          OUTERMOST layer: Starlette's ``add_middleware`` inserts each new
+          entry at the front of ``user_middleware``, and
+          ``build_middleware_stack`` wraps that list in reverse — so the
+          LAST middleware added wraps everything else, running first on the
+          way in and last on the way out. That matters here because CORS
+          headers must land on every response this process ever sends,
+          including 401/422/500s shaped by the exception handlers below,
+          not just 2xx ones — otherwise a browser would surface a CORS
+          error and hide the real status/body from the dashboard. A
+          request with no ``Origin`` header (every webhook and
+          server-to-server call) passes straight through untouched — no
+          header is added or removed, Twilio signature verification is
+          unaffected (verified directly against the installed Starlette
+          version's ``CORSMiddleware.__call__``). Preflight ``OPTIONS``
+          requests are answered entirely inside ``CORSMiddleware`` and
+          never reach ``RequestIDMiddleware``/the router/auth — expected:
+          that's the browser's own preflight check, not a real API call.
       4. register AuthError exception handler (401 → standard envelope)
       4b. register AppError exception handler (status_code → standard envelope)
       4c. register RequestValidationError exception handler (422 → standard
@@ -319,6 +340,22 @@ def create_app() -> fastapi.FastAPI:
     )
 
     application.add_middleware(RequestIDMiddleware)
+
+    # CORS (#251) — origin allowlist ONLY, never '*' (settings.py's
+    # _reject_wildcard_dashboard_origin refuses to boot on a literal '*').
+    # Added AFTER RequestIDMiddleware so it wraps OUTERMOST — see this
+    # function's own docstring, "3b", for the full ordering rationale.
+    # allow_credentials=False: this API authenticates via a bearer JWT
+    # (Authorization header), never cookies, so there is nothing for
+    # browser credential-mode CORS to protect here.
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.dashboard_origins_list,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+        expose_headers=["Date"],
+        allow_credentials=False,
+    )
 
     # Register the AuthError handler so any router can raise AuthError and
     # get the standard 401 envelope without boilerplate.

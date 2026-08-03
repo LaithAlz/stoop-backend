@@ -293,6 +293,60 @@ class Settings(BaseSettings):
     """Sentry DSN.  Leave unset (or blank) to disable Sentry entirely."""
 
     # ------------------------------------------------------------------
+    # CORS (dashboard origins — #251; not sensitive, no secrets)
+    # ------------------------------------------------------------------
+
+    dashboard_origins: str = Field(
+        default="http://localhost:5173,http://localhost:3000",
+        description=(
+            "Comma-separated allowlist of browser origins permitted to call "
+            "this API cross-origin (app/main.py's CORSMiddleware, #251) -- "
+            "e.g. the web dashboard's Vite dev server. NEVER '*' -- CORS "
+            "here is a fixed origin allowlist, never a wildcard (see "
+            "_reject_wildcard_dashboard_origin below, which refuses to "
+            "boot on a literal '*'). Parsed into `dashboard_origins_list` "
+            "(below) -- entries are comma-split, surrounding whitespace on "
+            "each entry is stripped, blank entries are dropped. An empty/"
+            "blank value is a SAFE default (an empty allowlist -- "
+            "CORSMiddleware then permits zero browser origins), never a "
+            "startup crash and never a silent fallback to '*'."
+        ),
+    )
+
+    @field_validator("dashboard_origins", mode="after")
+    @classmethod
+    def _reject_wildcard_dashboard_origin(cls, v: str) -> str:
+        """Refuse a literal ``*`` anywhere in ``DASHBOARD_ORIGINS`` (#251).
+
+        CORS for the dashboard is a fixed origin allowlist, never a
+        wildcard. This API never uses cookies (``allow_credentials=False``,
+        ``app/main.py``), so browsers wouldn't honor a bare ``'*'`` for a
+        credentialed request anyway -- but the quieter, real risk is that a
+        wildcard would let ANY website's JavaScript read this API's
+        authenticated bearer-token responses cross-origin, not just the
+        intended dashboard. Refusing at config-parse time catches a
+        copy-pasted ``'*'`` (a common CORS "quick fix" reflex) before it
+        ever reaches ``CORSMiddleware``, the same fail-fast-at-startup
+        discipline every other boot gate in this class already applies.
+        """
+        if any(origin.strip() == "*" for origin in v.split(",")):
+            raise ValueError(
+                "DASHBOARD_ORIGINS must never contain '*' -- CORS uses a "
+                "fixed origin allowlist, never a wildcard (#251)."
+            )
+        return v
+
+    @property
+    def dashboard_origins_list(self) -> list[str]:
+        """Parsed ``dashboard_origins`` -- comma-separated, whitespace
+        -tolerant, blank entries dropped (#251). ``""`` or a whitespace
+        -only value parses to ``[]``, so ``CORSMiddleware`` ends up with an
+        empty allowlist (permits no browser origins) rather than crashing
+        startup or silently falling back to ``'*'``.
+        """
+        return [origin.strip() for origin in self.dashboard_origins.split(",") if origin.strip()]
+
+    # ------------------------------------------------------------------
     # Convenience properties
     # ------------------------------------------------------------------
 
