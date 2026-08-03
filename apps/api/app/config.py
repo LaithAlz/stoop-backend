@@ -322,9 +322,10 @@ class Settings(BaseSettings):
             "blank value is a SAFE default in dev/staging (an empty "
             "allowlist -- CORSMiddleware then permits zero browser "
             "origins), never a startup crash and never a silent fallback "
-            "to '*' -- but REQUIRED, non-empty, and non-localhost when "
-            "ENVIRONMENT=production (safety review, #251 F2 --  see "
-            "_require_non_local_dashboard_origins_in_production below). "
+            "to '*' -- but REQUIRED, non-empty, non-localhost, and https:// "
+            "when ENVIRONMENT=production (safety review, #251 F2 / #255 N1 "
+            "-- see _require_non_local_dashboard_origins_in_production "
+            "below). "
             "Every entry must be shaped exactly `scheme://host[:port]` "
             "(lowercase, http or https, no trailing slash, no path) -- see "
             "_validate_dashboard_origin_shapes below."
@@ -620,9 +621,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _require_non_local_dashboard_origins_in_production(self) -> Settings:
-        """Refuse to boot in production with an empty CORS allowlist, or
-        one that still points at a local dev origin (safety review, #251
-        F2a) -- mirrors ``_require_app_database_url_in_production``'s /
+        """Refuse to boot in production with an empty CORS allowlist, one
+        that still points at a local dev origin, or one that isn't
+        ``https://`` (safety review, #251 F2a; #255 N1) -- mirrors
+        ``_require_app_database_url_in_production``'s /
         ``_require_public_base_url_in_production``'s exact gating pattern
         (production-only; dev/staging keep the documented local-dev
         fallback unchanged).
@@ -639,6 +641,17 @@ class Settings(BaseSettings):
         optional ``:port``, after ``_validate_dashboard_origin_shapes``
         above has already guaranteed that shape) against ``localhost``/
         ``127.``-prefixed loopback addresses.
+
+        #255 N1 (safety re-verify of #251/#254): the checks above still
+        let a plaintext ``http://`` production origin through -- anyone in
+        a network position to control that origin (e.g. on the same
+        network as, or upstream of, a landlord's browser) could read this
+        API's authenticated responses cross-origin. Every entry must start
+        ``https://`` in production; dev/staging keep using
+        ``http://localhost:...`` unchanged. Checked AFTER the localhost
+        check above (not before) so an entry that is both local AND
+        plaintext (e.g. the dev default itself) still raises the more
+        specific "local dev origin" message.
         """
         if self.environment != "production":
             return self
@@ -657,6 +670,14 @@ class Settings(BaseSettings):
                     "origin (localhost/127.0.0.1) -- refusing to boot in "
                     "production with a local origin still in the CORS "
                     "allowlist (#251)."
+                )
+            if not origin.startswith("https://"):
+                raise ValueError(
+                    f"DASHBOARD_ORIGINS entry {origin!r} is not https:// -- "
+                    "refusing to boot in production with a plaintext CORS "
+                    "origin (#255); anyone in a network position to control "
+                    "that origin could read this API's authenticated "
+                    "responses cross-origin."
                 )
         return self
 

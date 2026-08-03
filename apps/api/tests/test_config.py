@@ -894,7 +894,11 @@ def test_production_with_localhost_dashboard_origin_raises(
 ) -> None:
     """A local dev origin anywhere in the allowlist must refuse to boot
     in production, even alongside an otherwise-valid real origin (#251
-    F2a)."""
+    F2a). Every parametrized value here is also plaintext ``http://`` --
+    this doubles as coverage that the localhost check (declared first in
+    the production model_validator's loop) still raises its own specific
+    message ahead of the https:// check added below (#255 N1), rather
+    than being masked by it."""
     monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
 
     with pytest.raises(ValidationError) as exc_info:
@@ -917,13 +921,82 @@ def test_production_with_real_dashboard_origins_succeeds(
     assert s.dashboard_origins_list == ["https://app.stoop.example"]
 
 
+# ---------------------------------------------------------------------------
+# Production boot gate: https:// required (safety review, #255 N1 --
+# follow-up from the #251 safety re-verify). Mirrors the localhost gate
+# tests above exactly; same helper, same assertion style.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_production_with_plaintext_http_dashboard_origin_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-local, but plaintext ``http://`` origin must refuse to boot
+    in production (#255 N1) -- anyone in a network position to control
+    that origin could read this API's authenticated responses
+    cross-origin. Before this gate, only empty/local allowlists were
+    rejected; a real-looking ``http://`` production origin sailed
+    through."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _build_production_settings(dashboard_origins="http://app.stoop.example")
+
+    message = str(exc_info.value)
+    assert "DASHBOARD_ORIGINS" in message
+    assert "https" in message.lower()
+
+
+@pytest.mark.unit
+def test_production_with_mixed_https_and_plaintext_dashboard_origins_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plaintext entry anywhere in the allowlist must refuse to boot,
+    even alongside an otherwise-valid https:// origin -- same
+    "every entry, not just the first" guarantee the localhost gate
+    already provides (#255 N1)."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _build_production_settings(
+            dashboard_origins="https://app.stoop.example,http://other.stoop.example"
+        )
+
+    message = str(exc_info.value)
+    assert "DASHBOARD_ORIGINS" in message
+    assert "https" in message.lower()
+
+
+@pytest.mark.unit
+def test_production_with_multiple_https_dashboard_origins_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every entry https:// -> boots clean (#255 N1); mirrors
+    ``test_production_with_real_dashboard_origins_succeeds`` above but with
+    more than one origin, proving the new check runs for the WHOLE list,
+    not just origins[0]."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    s = _build_production_settings(
+        dashboard_origins="https://app.stoop.example,https://admin.stoop.example"
+    )
+
+    assert s.is_production is True
+    assert s.dashboard_origins_list == [
+        "https://app.stoop.example",
+        "https://admin.stoop.example",
+    ]
+
+
 @pytest.mark.unit
 def test_non_production_with_localhost_dashboard_origins_is_fine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The localhost/empty-allowlist gate is production-only -- dev/
-    staging keep working with the documented local-dev default (#251
-    F2a)."""
+    """The localhost/empty-allowlist gate -- and the https:// gate (#255
+    N1) -- are both production-only: dev/staging keep working with the
+    documented local-dev default (``http://localhost:...``, plaintext AND
+    local) unchanged (#251 F2a)."""
     monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
 
     for env in ("dev", "staging"):
