@@ -65,7 +65,22 @@ function toHouseInitTimeoutNotice(): string {
 // evidence for it is three layers deep in the router. Recording the
 // detection outside React removes the dependency on that coincidence
 // entirely: a remount re-reads this and renders the notice again.
+//
+// SSR INVARIANT (safety re-verify): this module-scope value is shared
+// across requests in a warm Cloudflare Worker isolate — the exact hazard
+// src/auth/AuthProvider.tsx warns about. It is safe ONLY because both
+// writes below are browser-only (a mount effect and a submit handler), so
+// the server-side value stays `false` forever, SSR renders no notice, and
+// hydration matches. Never write this from a loader, `beforeLoad`, or a
+// server function: that turns it into cross-request state bleed.
 let crossDeviceNoticeLatch = false;
+
+// Mount counter for the latch. A remount goes 1 → 0 → 1 within a single
+// commit, so the microtask below still sees a live mount and keeps the
+// latch; a genuine navigation away (this page links to itself from the
+// nav and footer) leaves 0 and clears it, so returning later can't show
+// a stale "we couldn't finish that sign-in".
+let signInMounts = 0;
 
 function parseAuthCallbackParams(): { hasError: boolean; hasPendingExchange: boolean } {
   if (typeof window === "undefined") return { hasError: false, hasPendingExchange: false };
@@ -123,7 +138,22 @@ function SignInPage() {
   const alreadySignedIn = !initializing && session !== null;
 
   useEffect(() => {
+    signInMounts += 1;
+    return () => {
+      signInMounts -= 1;
+      queueMicrotask(() => {
+        if (signInMounts === 0) crossDeviceNoticeLatch = false;
+      });
+    };
+  }, []);
+
+  useEffect(() => {
     if (alreadySignedIn) {
+      // A session landing invalidates any stale notice outright —
+      // otherwise a landlord who signs out later is greeted with
+      // "we couldn't finish that sign-in" right after a deliberate,
+      // successful sign-out.
+      crossDeviceNoticeLatch = false;
       void navigate({ to: "/app", replace: true });
     }
   }, [alreadySignedIn, navigate]);
