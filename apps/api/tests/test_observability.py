@@ -27,6 +27,31 @@ import structlog
 import structlog.contextvars
 from httpx import ASGITransport
 
+# Force app.main's module-level `app = create_app()` (and therefore the
+# FIRST-ever real call of app.main's structlog logger proxy — #251's new
+# `log.info("cors_allowlist", ...)` line in create_app()) to happen HERE,
+# at collection time, rather than lazily inside a test function body below.
+# Rationale: cache_logger_on_first_use=True (app/observability.py) freezes
+# a module-level `structlog.get_logger(__name__)` proxy to whatever
+# logger/processors are active on its FIRST real invocation, for the rest
+# of the process (same hazard tests/test_request_id_middleware.py's own
+# module docstring documents for a different logger). Several tests below
+# call `_reconfigure_structlog_to_stdout()`, which redirects structlog to
+# a `capsys`-captured `sys.stdout` that is closed once that test's own
+# `capsys` fixture tears down. When this file is run STANDALONE (e.g.
+# `pytest tests/test_observability.py`), app.main was previously imported
+# lazily inside individual test function bodies — after an EARLIER test in
+# this same file had already called `_reconfigure_structlog_to_stdout()` —
+# so app.main's logger proxy would freeze to that already-doomed stream,
+# and `test_debug_endpoints_not_registered_in_production`'s later
+# `create_app()` call would raise `ValueError: I/O operation on closed
+# file` the moment it logged. Importing app.main at MODULE level here
+# matches what already happens for free in the full suite (some OTHER
+# test file's top-level `from app.main import app` always runs during
+# collection, well before any test function executes) — not a new
+# behavior, just making this one file's standalone-run behavior match the
+# full suite's.
+import app.main  # noqa: F401
 from app.config import Settings
 from app.observability import _scrub_event, init_langsmith_tracing, init_sentry
 
@@ -615,14 +640,17 @@ async def test_debug_endpoints_not_registered_in_production(
     so that ``create_app()`` sees ``is_production=True``.  This avoids
     module-reload side-effects while still exercising the gating logic.
     """
-    # app_database_url AND public_base_url are both required alongside
-    # environment="production" (the #22 and #40/#152 boot gates in
-    # app/config.py) — otherwise Settings construction itself raises
-    # ValidationError before this test can even get going.
+    # app_database_url, public_base_url, AND dashboard_origins are all
+    # required alongside environment="production" (the #22, #40/#152, and
+    # #251 F2a boot gates in app/config.py) — otherwise Settings
+    # construction itself raises ValidationError before this test can even
+    # get going (dashboard_origins defaults to two localhost origins,
+    # invalid in production — #251 F2a).
     prod_settings = _make_fresh_settings(
         environment="production",
         app_database_url="postgresql+asyncpg://app_role:secret@h:6543/db",
         public_base_url="https://api.stoop.example",
+        dashboard_origins="https://app.stoop.example",
     )
 
     from app.main import create_app
