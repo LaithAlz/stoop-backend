@@ -355,28 +355,50 @@ def _canonicalize_backup_contact(
     ``_backup_phone``) is a free-form ``jsonb`` blob with no DB-level shape
     enforcement — only its ``phone`` key is a phone number, so only that
     key is validated here, in place, leaving everything else (including a
-    missing/absent ``phone`` key, or a non-string one — not this
-    endpoint's job to police the whole shape) untouched.
+    missing ``phone`` key entirely) untouched.
 
-    A present-but-BLANK ``phone`` (``""``/whitespace-only) is left as-is
-    rather than rejected: ``_backup_phone`` already treats an empty string
-    as "no backup contact configured" (falsy check), the same safe no-op
-    as a missing key — there is no not-nullable business rule for this
+    A present-but-BLANK ``phone`` (``""``/whitespace-only) — or an
+    explicit JSON ``null`` — is left as-is rather than rejected:
+    ``_backup_phone`` already treats either as "no backup contact
+    configured" (falsy/non-``str`` check), the same safe no-op as a
+    missing key — there is no not-nullable business rule for this
     OPTIONAL escalation field the way there is for ``landlords.phone``, so
-    #260's null-equivalence treatment does not apply here. A present,
-    NON-blank value that cannot be canonicalized (a typo, a dropped digit)
-    IS rejected — that is exactly the "reaches Twilio and silently fails"
-    failure mode #260 exists to close, and staying silent about it here
-    would leave a landlord believing their backup contact will be reached
-    when it never will.
+    #260's null-equivalence treatment does not apply here.
+
+    A present, NON-blank ``str`` that cannot be canonicalized (a typo, a
+    dropped digit) IS rejected — that is exactly the "reaches Twilio and
+    silently fails" failure mode #260 exists to close, and staying silent
+    about it here would leave a landlord believing their backup contact
+    will be reached when it never will.
+
+    **Safety review, 2026-08-03, finding 3 — SHOULD-FIX:** a present ``phone`` that is neither a
+    (blank-or-non-blank) ``str`` NOR ``null`` — e.g. ``{"phone":
+    4165551234}``, a JSON NUMBER, an ordinary client-side type bug — used
+    to sail through untouched (``isinstance(phone, str)`` was simply
+    ``False``, same branch as "blank/missing"). That silently stores a
+    ``backup_contact`` that LOOKS configured (present, non-null) while
+    ``_backup_phone`` returns ``None`` for it (not a ``str``) — the T+10m
+    escalation step never fires, with nothing landlord-visible saying so.
+    Now REJECTED (422 ``invalid_field``), distinctly from the safe-no-op
+    blank/null case.
     """
     if backup_contact is None:
         return None
-    phone = backup_contact.get("phone")
-    if isinstance(phone, str) and phone.strip():
-        canonical = canonicalize_phone(phone, field="backup_contact.phone")
-        return {**backup_contact, "phone": canonical}
-    return backup_contact
+    if "phone" not in backup_contact:
+        return backup_contact
+    phone = backup_contact["phone"]
+    if phone is None:
+        return backup_contact
+    if not isinstance(phone, str):
+        raise AppError(
+            status_code=422,
+            code="invalid_field",
+            message="backup_contact.phone must be a valid, dialable phone number.",
+        )
+    if not phone.strip():
+        return backup_contact
+    canonical = canonicalize_phone(phone, field="backup_contact.phone")
+    return {**backup_contact, "phone": canonical}
 
 
 def _row_to_property(row: RowMapping) -> PropertyResponse:
