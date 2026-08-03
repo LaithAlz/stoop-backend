@@ -56,13 +56,16 @@
   Starlette version. **Supersedes nothing** — extends the v1.19 precedent
   to the one remaining gap (a genuinely unexpected server-side failure)
   rather than replacing any existing documented behavior.
-- **v1.22 amendment (2026-08-03 — #251 implementation):** the API now
-  registers Starlette's `CORSMiddleware` (`app/main.py`) so the web
-  dashboard can call `/v1/*` cross-origin with an `Authorization` bearer
-  header. Allowed origins come from an env-configured allowlist
-  (`DASHBOARD_ORIGINS`, comma-separated — `app/config.py`'s
-  `dashboard_origins`/`dashboard_origins_list`; dev default
-  `http://localhost:5173,http://localhost:3000`) — **never `*`**, and
+- **v1.22 amendment (2026-08-03 — #251 implementation, revised same-day
+  after safety review):** the API now registers Starlette's
+  `CORSMiddleware` (`app/main.py`) so the web dashboard can call `/v1/*`
+  cross-origin with an `Authorization` bearer header. Allowed origins come
+  from an env-configured allowlist (`DASHBOARD_ORIGINS`, comma-separated —
+  `app/config.py`'s `dashboard_origins`/`dashboard_origins_list`; dev
+  default `http://localhost:5173,http://localhost:3000`) — **never `*`**
+  (boot refuses a literal wildcard, any entry not shaped exactly
+  `scheme://host[:port]`, and — only when `ENVIRONMENT=production` — an
+  empty allowlist or any `localhost`/`127.0.0.1` entry), and
   `allow_credentials=False` (this API authenticates via bearer JWT, never
   cookies). `Access-Control-Expose-Headers: Date` is also set — the
   dashboard's undo-countdown UX anchors to the response `Date` header,
@@ -70,6 +73,19 @@
   with no `Origin` header (every webhook and server-to-server call) is
   completely unaffected — no CORS header is added or removed, and Twilio
   signature verification is untouched.
+  **One documented exception, corrected during safety review:** CORS
+  headers land on every response `CORSMiddleware` itself wraps (every
+  2xx/4xx, including the v1.19/v1.21 `422`/`500`-shaped envelopes raised
+  as `RequestValidationError`/handled `AppError`) — but a genuinely
+  **unhandled** exception (the v1.21 catch-all path) is sent by
+  Starlette's `ServerErrorMiddleware`, which sits OUTSIDE `CORSMiddleware`
+  in this Starlette version (1.3.1) and therefore bypasses it entirely.
+  `app/main.py`'s `_unhandled_exception_handler` sets
+  `Access-Control-Allow-Origin`/`Vary: Origin`/`X-Request-ID` on that one
+  response shape itself, gated on the same `DASHBOARD_ORIGINS` allowlist
+  (nothing added for no/disallowed `Origin`) — so a real outage still
+  reaches the dashboard as a readable error instead of a CORS failure the
+  browser silently discards as a generic network error.
 - IDs are uuids as strings. Timestamps ISO-8601 UTC (`2026-06-11T14:02:00Z`).
 - **Pagination**: `?limit=` (default 25, max 100) + `?cursor=`; responses
   carry `"next_cursor": string|null`. Lists are newest-first.
