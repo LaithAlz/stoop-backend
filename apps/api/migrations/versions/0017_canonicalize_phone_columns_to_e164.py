@@ -49,9 +49,58 @@ For each of the five phone-bearing locations above, in `upgrade()`:
    **left completely untouched** — see "UNCANONICALIZABLE ROWS" below.
 
 Each table's before/after counts (rows scanned / rows updated / rows left
-uncanonicalizable) are logged via ``structlog`` — **counts and ids only,
-never the phone values themselves** (never-break rule #5, which explicitly
-also applies to migrations).
+uncanonicalizable / rows skipped as collisions, see "COLLISIONS" below) are
+logged via ``structlog`` — **counts and ids only, never the phone values
+themselves** (never-break rule #5, which explicitly also applies to
+migrations).
+
+COLLISIONS — SKIPPED, NEVER LET A UNIQUE VIOLATION ABORT THE MIGRATION
+------------------------------------------------------------------------
+**Safety review, 2026-08-03, finding 2 — SHOULD-FIX.** Three of the five locations this migration
+touches are UNIQUE-constrained: ``properties.twilio_number`` (globally
+unique), ``tenants`` (``UNIQUE (property_id, phone)``), ``vendors``
+(``UNIQUE (landlord_id, phone)``). Two rows whose stored values differ
+only in FORMATTING — the single most likely shape of pre-existing dirty
+data — canonicalize to the SAME target value. Blindly ``UPDATE``-ing both
+would raise ``UniqueViolationError`` mid-loop (same class as migration
+0016's own pre-existing-duplicates edge case, documented in that
+migration's docstring) — INSIDE Alembic's transactional DDL, so the ENTIRE
+migration rolls back and ``alembic upgrade head`` fails outright.
+Additionally, Postgres's own unique-violation ``DETAIL`` text embeds the
+colliding value (``Key (phone)=(+1416...) already exists``) — letting that
+reach a driver exception, migration stderr, or (worse) a caller that
+interpolates it into a message would be a rule-#5 violation (a phone
+number in migration/CI output).
+
+Closed by grouping BEFORE issuing any ``UPDATE``, not by catching the
+``IntegrityError`` after the fact: every row's canonical value is computed
+first, then grouped by ``(scope, canonical_value)`` — ``scope`` is the
+constraint's own scoping column (``property_id`` for ``tenants``,
+``landlord_id`` for ``vendors``, a constant for the globally-unique
+``properties.twilio_number`` and the unconstrained ``landlords.phone``).
+ANY group with more than one row — including a row that's already
+independently stored in its canonical form, if some OTHER row's
+canonicalized value collides with it — is skipped ENTIRELY (not one
+"winner" picked; adjudicating which of several differently-formatted
+strings is the "real" number is an operator judgment call, never a
+migration's). This makes a ``UniqueViolationError`` from this migration's
+own writes structurally unreachable — every ``UPDATE`` this migration
+issues targets a canonical value no OTHER row (touched or untouched) in
+the same scope also maps to. Skipped rows are logged as
+``collision_skipped=<count>`` plus their row ids (``collision_row_ids`` —
+ids only, never values, same rule-#5 discipline as everywhere else in this
+migration) so an operator can find and manually adjudicate them — the
+same "logged, not auto-resolved" posture as the uncanonicalizable-row
+handling below. ``tenants``/``vendors``' scoping is intentionally an
+over-approximation for the (unconstrained) ``landlords.phone`` and the
+(globally-unique) ``properties.twilio_number`` cases — both simply use a
+single constant scope, which is exactly correct for a global-uniqueness
+column and harmlessly conservative for a column with no uniqueness
+constraint at all (it can only ever cause a false-positive "collision"
+skip, never a missed one, and ``landlords.phone`` has no constraint to
+violate regardless). ``properties.backup_contact.phone`` carries no
+uniqueness constraint at all (it is one key inside a ``jsonb`` blob, not
+its own column) — no collision handling is needed or applied there.
 
 UNCANONICALIZABLE ROWS — LEFT AS-IS, NEVER NULLED, NEVER DELETED
 ------------------------------------------------------------------------
@@ -118,6 +167,7 @@ canonicalization is idempotent and downgrade doesn't undo it.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import structlog
 from alembic import op
@@ -138,39 +188,85 @@ depends_on: str | Sequence[str] | None = None
 # ---------------------------------------------------------------------------
 # Simple text columns: landlords.phone, properties.twilio_number,
 # tenants.phone, vendors.phone — same shape, one shared helper.
+#
+# The third tuple element is the UNIQUE constraint's own scoping column
+# (``None`` = a single, constant scope — correct for both the globally
+# -unique ``properties.twilio_number`` and the unconstrained ``landlords.
+# phone``; see the module docstring's "COLLISIONS" section for why an
+# unconstrained column being treated as one global scope is harmless).
 # ---------------------------------------------------------------------------
 
-_SIMPLE_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("landlords", "phone"),
-    ("properties", "twilio_number"),
-    ("tenants", "phone"),
-    ("vendors", "phone"),
+_SIMPLE_COLUMNS: tuple[tuple[str, str, str | None], ...] = (
+    ("landlords", "phone", None),
+    ("properties", "twilio_number", None),
+    ("tenants", "phone", "property_id"),
+    ("vendors", "phone", "landlord_id"),
 )
 
+# A single, constant scope value for the two columns above with no
+# per-row scoping column (see ``_SIMPLE_COLUMNS``'s own comment).
+_GLOBAL_SCOPE = "__global__"
 
-def _canonicalize_simple_column(bind: Connection, *, table: str, column: str) -> None:
+
+def _canonicalize_simple_column(
+    bind: Connection, *, table: str, column: str, scope_column: str | None
+) -> None:
     """Canonicalize every non-null value in ``<table>.<column>`` — see
-    module docstring. ``table``/``column`` are always one of the fixed,
-    hardcoded pairs in ``_SIMPLE_COLUMNS`` above (never request/row data),
-    so building the SQL text with an f-string here is safe (no injection
-    surface) — the alternative (four fully duplicated near-identical
-    functions) was rejected as needless repetition for genuinely
-    hand-written, migration-local SQL.
+    module docstring, including "COLLISIONS" for the grouping logic below.
+    ``table``/``column``/``scope_column`` are always one of the fixed,
+    hardcoded triples in ``_SIMPLE_COLUMNS`` above (never request/row
+    data), so building the SQL text with an f-string here is safe (no
+    injection surface) — the alternative (four fully duplicated
+    near-identical functions) was rejected as needless repetition for
+    genuinely hand-written, migration-local SQL.
     """
-    select_sql = text(f"SELECT id, {column} AS value FROM {table} WHERE {column} IS NOT NULL")  # noqa: S608
+    scope_select = f", {scope_column} AS scope" if scope_column is not None else ""
+    select_stmt = (
+        f"SELECT id, {column} AS value{scope_select} "  # noqa: S608
+        f"FROM {table} WHERE {column} IS NOT NULL"
+    )
+    select_sql = text(select_stmt)
     update_sql = text(f"UPDATE {table} SET {column} = :value WHERE id = :id")  # noqa: S608
 
     rows = bind.execute(select_sql).mappings().all()
-    updated = 0
+
+    original_by_id: dict[Any, str] = {}
+    scope_by_id: dict[Any, Any] = {}
+    canonical_by_id: dict[Any, str] = {}
     unparseable = 0
     for row in rows:
+        row_id = row["id"]
         value: str = row["value"]
+        original_by_id[row_id] = value
+        scope_by_id[row_id] = row["scope"] if scope_column is not None else _GLOBAL_SCOPE
         canonical = to_e164(value)
         if canonical is None:
             unparseable += 1
             continue
-        if canonical != value:
-            bind.execute(update_sql, {"id": row["id"], "value": canonical})
+        canonical_by_id[row_id] = canonical
+
+    # Group by (scope, canonical value) BEFORE issuing any UPDATE — see
+    # module docstring, "COLLISIONS". A group with more than one row means
+    # two (or more) stored values collapse to the SAME canonical target
+    # within the SAME uniqueness scope; every row in that group is skipped,
+    # not just the "extra" ones, since there is no safe way to pick a
+    # winner here.
+    ids_by_key: dict[tuple[Any, str], list[Any]] = {}
+    for row_id, canonical in canonical_by_id.items():
+        key = (scope_by_id[row_id], canonical)
+        ids_by_key.setdefault(key, []).append(row_id)
+
+    updated = 0
+    collision_skipped = 0
+    collision_row_ids: list[str] = []
+    for (_scope, canonical), ids in ids_by_key.items():
+        if len(ids) > 1:
+            collision_skipped += len(ids)
+            collision_row_ids.extend(str(row_id) for row_id in ids)
+            continue
+        row_id = ids[0]
+        if canonical != original_by_id[row_id]:
+            bind.execute(update_sql, {"id": row_id, "value": canonical})
             updated += 1
 
     log.info(
@@ -180,6 +276,8 @@ def _canonicalize_simple_column(bind: Connection, *, table: str, column: str) ->
         scanned=len(rows),
         updated=updated,
         left_uncanonicalizable=unparseable,
+        collision_skipped=collision_skipped,
+        collision_row_ids=collision_row_ids,
     )
 
 
@@ -233,11 +331,21 @@ def _canonicalize_backup_contact_phone(bind: Connection) -> None:
 def upgrade() -> None:
     """Canonicalize every existing phone-bearing value this migration can
     confidently canonicalize; leave anything it cannot exactly as-is (see
-    module docstring, "UNCANONICALIZABLE ROWS")."""
+    module docstring, "UNCANONICALIZABLE ROWS"), and never let two rows
+    colliding on the same canonical value abort the migration (see
+    "COLLISIONS")."""
     bind: Connection = op.get_bind()
 
-    for table, column in _SIMPLE_COLUMNS:
-        _canonicalize_simple_column(bind, table=table, column=column)
+    # Cheap insurance (safety review, 2026-08-03, finding 5 — LOW; the
+    # #231 lesson: an unbounded scan+update should never be able to sit
+    # blocked indefinitely behind a lock this migration doesn't otherwise
+    # need) — fails fast and loudly instead of hanging the deploy if some
+    # other session is unexpectedly holding a conflicting lock on one of
+    # these tables.
+    bind.execute(text("SET LOCAL lock_timeout = '3s'"))
+
+    for table, column, scope_column in _SIMPLE_COLUMNS:
+        _canonicalize_simple_column(bind, table=table, column=column, scope_column=scope_column)
     _canonicalize_backup_contact_phone(bind)
 
 

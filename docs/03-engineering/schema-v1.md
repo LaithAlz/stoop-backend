@@ -1175,7 +1175,9 @@ CREATE TABLE properties (
   backup_contact  jsonb,                             -- {name, phone} for escalation T+10m
                                                        --  (v1.21: the "phone" key is E.164,
                                                        --  ENFORCED at write time when present
-                                                       --  and non-blank — app/phone.py)
+                                                       --  and non-blank — app/phone.py;
+                                                       --  migration 0017 canonicalizes
+                                                       --  pre-existing rows)
   created_at      timestamptz NOT NULL DEFAULT now(),
   updated_at      timestamptz NOT NULL DEFAULT now()
 );

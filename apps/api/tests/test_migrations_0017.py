@@ -228,6 +228,195 @@ async def test_upgrade_is_idempotent_on_already_canonical_values() -> None:
 
 
 @pytest.mark.integration
+async def test_upgrade_skips_colliding_rows_without_raising_and_respects_uniqueness_scope() -> None:
+    """Safety review, 2026-08-03, finding 2: two rows whose stored values
+    canonicalize to the SAME target within the SAME uniqueness scope must
+    be SKIPPED (never updated, never raise ``UniqueViolationError`` and
+    abort the whole migration) — ``properties.twilio_number`` (globally
+    unique) and ``tenants`` (``UNIQUE (property_id, phone)``, scoped) both
+    exercise this. A cross-property tenant "collision" (same canonical
+    value, DIFFERENT property_id scope) is not a real constraint conflict
+    at all and must canonicalize normally, proving the scoping is not
+    overly conservative."""
+    engine = create_async_engine(_db_url())
+    landlord_id = str(uuid.uuid4())
+    property_a_id = str(uuid.uuid4())
+    property_b_id = str(uuid.uuid4())
+    property_c_id = str(uuid.uuid4())
+    colliding_property_1 = str(uuid.uuid4())
+    colliding_property_2 = str(uuid.uuid4())
+    same_property_tenant_1 = str(uuid.uuid4())
+    same_property_tenant_2 = str(uuid.uuid4())
+    cross_property_tenant_1 = str(uuid.uuid4())
+    cross_property_tenant_2 = str(uuid.uuid4())
+    try:
+        _alembic("upgrade", "head")
+        _alembic("downgrade", "0016")
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO landlords (id, auth_user_id, email) VALUES (:id, :auth_id, :email)"
+                ),
+                {
+                    "id": landlord_id,
+                    "auth_id": str(uuid.uuid4()),
+                    "email": f"{landlord_id}@example.com",
+                },
+            )
+
+            async def _insert_property(prop_id: str, *, twilio_number: str | None) -> None:
+                await conn.execute(
+                    text(
+                        "INSERT INTO properties "
+                        "(id, landlord_id, label, address_line1, city, twilio_number) "
+                        "VALUES (:id, :landlord_id, 'Test Property', :addr, 'Toronto', "
+                        ":twilio_number)"
+                    ),
+                    {
+                        "id": prop_id,
+                        "landlord_id": landlord_id,
+                        "addr": f"{prop_id} Test St",
+                        "twilio_number": twilio_number,
+                    },
+                )
+
+            # Two properties whose twilio_number values canonicalize to
+            # the SAME target — properties.twilio_number is globally
+            # UNIQUE, so both must be skipped entirely.
+            await _insert_property(colliding_property_1, twilio_number="1-416-555-0301")
+            await _insert_property(colliding_property_2, twilio_number="+14165550301")
+            # A property the tenants below attach to (its own number must
+            # not collide with anything above).
+            await _insert_property(property_a_id, twilio_number=None)
+            await _insert_property(property_b_id, twilio_number=None)
+            await _insert_property(property_c_id, twilio_number=None)
+
+            async def _insert_tenant(tenant_id: str, prop_id: str, *, phone: str) -> None:
+                await conn.execute(
+                    text(
+                        "INSERT INTO tenants (id, landlord_id, property_id, phone) "
+                        "VALUES (:id, :landlord_id, :property_id, :phone)"
+                    ),
+                    {
+                        "id": tenant_id,
+                        "landlord_id": landlord_id,
+                        "property_id": prop_id,
+                        "phone": phone,
+                    },
+                )
+
+            # Same property, same canonical target — a REAL collision
+            # under tenants' UNIQUE (property_id, phone).
+            await _insert_tenant(same_property_tenant_1, property_a_id, phone="1-416-555-0311")
+            await _insert_tenant(same_property_tenant_2, property_a_id, phone="+14165550311")
+            # DIFFERENT properties, same canonical target — NOT a real
+            # collision (different property_id scope); both must
+            # canonicalize normally.
+            await _insert_tenant(cross_property_tenant_1, property_b_id, phone="1-416-555-0321")
+            await _insert_tenant(cross_property_tenant_2, property_c_id, phone="+14165550321")
+
+        # Must complete without raising (UniqueViolationError would abort
+        # the whole migration and fail this alembic invocation).
+        _alembic("upgrade", "head")
+
+        async with engine.connect() as conn:
+            prop1 = (
+                (
+                    await conn.execute(
+                        text("SELECT twilio_number FROM properties WHERE id = :id"),
+                        {"id": colliding_property_1},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            prop2 = (
+                (
+                    await conn.execute(
+                        text("SELECT twilio_number FROM properties WHERE id = :id"),
+                        {"id": colliding_property_2},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            same_1 = (
+                (
+                    await conn.execute(
+                        text("SELECT phone FROM tenants WHERE id = :id"),
+                        {"id": same_property_tenant_1},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            same_2 = (
+                (
+                    await conn.execute(
+                        text("SELECT phone FROM tenants WHERE id = :id"),
+                        {"id": same_property_tenant_2},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            cross_1 = (
+                (
+                    await conn.execute(
+                        text("SELECT phone FROM tenants WHERE id = :id"),
+                        {"id": cross_property_tenant_1},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            cross_2 = (
+                (
+                    await conn.execute(
+                        text("SELECT phone FROM tenants WHERE id = :id"),
+                        {"id": cross_property_tenant_2},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+
+        # Global collision (properties.twilio_number): BOTH left untouched.
+        assert prop1["twilio_number"] == "1-416-555-0301"
+        assert prop2["twilio_number"] == "+14165550301"
+
+        # Same-property collision (tenants, real UNIQUE conflict): BOTH
+        # left untouched.
+        assert same_1["phone"] == "1-416-555-0311"
+        assert same_2["phone"] == "+14165550311"
+
+        # Cross-property "collision" (different scope, no real conflict):
+        # BOTH canonicalized normally.
+        assert cross_1["phone"] == "+14165550321"
+        assert cross_2["phone"] == "+14165550321"
+    finally:
+        async with engine.begin() as conn:
+            for tenant_id in (
+                same_property_tenant_1,
+                same_property_tenant_2,
+                cross_property_tenant_1,
+                cross_property_tenant_2,
+            ):
+                await conn.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
+            for prop_id in (
+                colliding_property_1,
+                colliding_property_2,
+                property_a_id,
+                property_b_id,
+                property_c_id,
+            ):
+                await conn.execute(text("DELETE FROM properties WHERE id = :id"), {"id": prop_id})
+            await conn.execute(text("DELETE FROM landlords WHERE id = :id"), {"id": landlord_id})
+        await engine.dispose()
+
+
+@pytest.mark.integration
 async def test_downgrade_to_0016_is_noop_and_reupgrade_restores_head() -> None:
     """Round-trip (``apps/api/CLAUDE.md``: "down/up must round-trip"):
     this migration issues no DDL, so ``downgrade()`` is a deliberate
