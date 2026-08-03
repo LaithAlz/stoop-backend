@@ -412,7 +412,13 @@ function EditProfileForm({
     },
   });
 
-  const phoneError = phoneLooksValid(phone) ? null : "Use a 10-digit phone number.";
+  // Copy-guardian (#234 PR 5, round 2): the message has to describe what
+  // `phoneLooksValid` actually accepts — the F2/F3 fixes widened it past
+  // plain 10 digits, and an error narrower than the rule tells a landlord
+  // their valid number is wrong.
+  const phoneError = phoneLooksValid(phone)
+    ? null
+    : "Use 10 digits, or 11 starting with 1 for the country code.";
 
   function handleSave(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
