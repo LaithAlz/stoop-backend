@@ -48,6 +48,10 @@ interface DecisionCardProps {
   staleNotice?: string;
   /** True while the edit-and-send mutation for THIS card is in flight. */
   editSubmitting?: boolean;
+  /** A2 (safety review, #234 PR 2): true while ANY mutation for this
+   *  card's draft is in flight — disables the Edit/Skip/Approve row and
+   *  the Undo tap so two actions can't race on the same draft. */
+  actionsBusy?: boolean;
   onApprove?: () => void;
   onEdit?: () => void;
   onSkip?: () => void;
@@ -79,6 +83,7 @@ export function DecisionCard({
   totalSeconds = 5,
   staleNotice,
   editSubmitting = false,
+  actionsBusy = false,
   onApprove,
   onEdit,
   onSkip,
@@ -157,7 +162,12 @@ export function DecisionCard({
       )}
 
       {isSending && (
-        <UndoTicket secondsLeft={secondsLeft} totalSeconds={totalSeconds} onUndo={onUndo} />
+        <UndoTicket
+          secondsLeft={secondsLeft}
+          totalSeconds={totalSeconds}
+          onUndo={onUndo}
+          undoDisabled={actionsBusy}
+        />
       )}
       {isSent && (
         <p className="mt-3.5 font-clarity-sans text-[13px] font-semibold text-clarity-whenever">
@@ -169,7 +179,12 @@ export function DecisionCard({
           <MarginNote linkHref={whyLinkHref} linkLabel={whyLinkLabel}>
             {why ?? DEFAULT_WHY}
           </MarginNote>
-          <DecisionActions onEdit={onEdit} onSkip={onSkip} onApprove={onApprove} />
+          <DecisionActions
+            onEdit={onEdit}
+            onSkip={onSkip}
+            onApprove={onApprove}
+            disabled={actionsBusy}
+          />
         </>
       )}
     </article>

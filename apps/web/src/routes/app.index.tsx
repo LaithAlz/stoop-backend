@@ -59,6 +59,11 @@ function AppQueuePage() {
   const queueQuery = useQueue({ enabled: Boolean(session) });
 
   const [skippedSnapshots, setSkippedSnapshots] = useState<Record<string, QueueItem>>({});
+  // A7 (safety review, #234 PR 2): the item whose editor is open, captured
+  // at open time — buildQueueView pins it so a background poll that drops
+  // the row can't unmount the editor mid-type. Cleared as soon as the
+  // editor closes (the effect below).
+  const [editingSnapshot, setEditingSnapshot] = useState<QueueItem | null>(null);
 
   const onNotice = useCallback((message: string) => toast(message), []);
   const onSettled = useCallback(() => void queueQuery.refetch(), [queueQuery]);
@@ -92,9 +97,20 @@ function AppQueuePage() {
     () => items.filter((item) => item.severity !== "emergency"),
     [items],
   );
+  const editingContext = draftActions.editingContext;
+  useEffect(() => {
+    if (!editingContext) setEditingSnapshot(null);
+  }, [editingContext]);
+
   const rows = useMemo(
-    () => buildQueueView(decisionItems, entries, skippedSnapshots),
-    [decisionItems, entries, skippedSnapshots],
+    () =>
+      buildQueueView(
+        decisionItems,
+        entries,
+        skippedSnapshots,
+        editingContext ? editingSnapshot : null,
+      ),
+    [decisionItems, entries, skippedSnapshots, editingContext, editingSnapshot],
   );
 
   const needYou = queueQuery.data?.counts.total ?? 0;
@@ -112,7 +128,19 @@ function AppQueuePage() {
     });
   }
 
-  const showAllClear = queueQuery.isSuccess && rows.length === 0 && emergencyItems.length === 0;
+  function handleOpenEditor(item: QueueItem) {
+    setEditingSnapshot(item);
+    draftActions.openEditor(
+      { draftId: item.draft_id, caseId: item.case_id, tenantName: item.tenant_name },
+      item.draft_body,
+    );
+  }
+
+  // `Boolean(data)`, not `isSuccess` — during a failed background refetch
+  // (B1 below) the last successful payload is still what's on screen, and
+  // an empty one still honestly means "all clear as of the last update"
+  // (the refresh strip right above says exactly that).
+  const showAllClear = Boolean(queueQuery.data) && rows.length === 0 && emergencyItems.length === 0;
 
   return (
     <PhoneFrame>
@@ -122,7 +150,13 @@ function AppQueuePage() {
         </GreetingHeader>
 
         <main className="flex-1 overflow-y-auto px-[18px] py-4">
-          {queueQuery.isLoading ? (
+          {/* A9 (safety review, #234 PR 2): `isPending`, not `isLoading` —
+              a query that's gated off (`enabled: false`, e.g. the brief
+              session-settling gap) has isLoading false but has never
+              fetched, and used to fall through to the content branch and
+              render an EMPTY queue as if the server had said "all clear".
+              isPending is true until a first result actually exists. */}
+          {queueQuery.isPending ? (
             <div
               role="status"
               aria-live="polite"
@@ -136,7 +170,7 @@ function AppQueuePage() {
                 Loading your queue…
               </p>
             </div>
-          ) : queueQuery.isError ? (
+          ) : queueQuery.isError && !queueQuery.data ? (
             <div role="alert" className="flex flex-col items-center gap-3 py-16 text-center">
               <p className="font-clarity-sans text-sm font-semibold text-clarity-ink-dim">
                 {queueQuery.error instanceof ApiError
@@ -153,10 +187,20 @@ function AppQueuePage() {
             </div>
           ) : (
             <>
+              {/* B1 (safety review, #234 PR 2): the full error takeover
+                  above only ever renders when NO data has ever loaded.
+                  TanStack Query keeps the last successful payload through
+                  a failed background refetch — blanking the whole screen
+                  (including a live emergency banner and its ack button)
+                  over a transient refetch error is the wrong failure
+                  direction, so a refetch failure renders as this quiet
+                  strip over the preserved data instead. B3: the banners/
+                  cards below deliberately carry no conversation links
+                  until PR 3 wires the live cases screen — see each
+                  component's own comment. */}
               {emergencyItems.map((item) => (
                 <EmergencyBanner
                   key={item.case_id}
-                  conversationId={item.case_id}
                   headline={emergencyHeadline(item)}
                   subtext={emergencySubtext(item)}
                   onAcknowledge={
@@ -172,6 +216,15 @@ function AppQueuePage() {
                 />
               ))}
 
+              {queueQuery.isError && (
+                <div
+                  role="status"
+                  className="mb-3.5 rounded-clarity-md border border-clarity-line-strong bg-clarity-panel px-4 py-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
+                >
+                  Couldn&apos;t refresh just now — showing the last update.
+                </div>
+              )}
+
               {showAllClear ? (
                 <AllClearState message="I'm watching your messages — go enjoy your day. I'll text you if anything needs you." />
               ) : (
@@ -183,6 +236,7 @@ function AppQueuePage() {
                         row={row}
                         draftActions={draftActions}
                         onSkip={handleSkip}
+                        onOpenEditor={handleOpenEditor}
                       />
                     ))}
                   </div>
@@ -202,17 +256,18 @@ function QueueRow({
   row,
   draftActions,
   onSkip,
+  onOpenEditor,
 }: {
   row: QueueViewRow;
   draftActions: ReturnType<typeof useDraftActions>;
   onSkip: (item: QueueItem) => void;
+  onOpenEditor: (item: QueueItem) => void;
 }) {
   const { item, entry } = row;
 
   if (entry.status === "skipped") {
     return (
       <SkippedCard
-        conversationId={item.case_id}
         tenantName={firstName(item.tenant_name)}
         propertyLabel={item.property_label}
         timestamp={formatRelativeTime(item.received_at)}
@@ -229,7 +284,7 @@ function QueueRow({
         : isEditingThis
           ? "editing"
           : "pending";
-  const secondsLeft = entry.status === "sending" ? secondsRemaining(entry.undoUntil) : 0;
+  const secondsLeft = entry.status === "sending" ? secondsRemaining(entry.undoExpiresAtClient) : 0;
   const totalSeconds = entry.status === "sending" ? totalUndoSeconds(entry) : 5;
   const ctx = { draftId: item.draft_id, caseId: item.case_id, tenantName: item.tenant_name };
   // Live `unit` is a bare label ("2", "4", "A") — composed with the
@@ -249,14 +304,14 @@ function QueueRow({
       photoNote={item.has_media ? (item.media_note ?? "Sent a photo") : undefined}
       draftMessage={item.draft_body}
       why={item.why}
-      conversationId={item.case_id}
       status={cardStatus}
       secondsLeft={secondsLeft}
       totalSeconds={totalSeconds}
       staleNotice={draftActions.staleNotices[item.case_id]}
       editSubmitting={draftActions.isEditSubmitting}
+      actionsBusy={draftActions.isBusy(item.draft_id)}
       onApprove={() => draftActions.approve(ctx)}
-      onEdit={() => draftActions.openEditor(ctx, item.draft_body)}
+      onEdit={() => onOpenEditor(item)}
       onSkip={() => onSkip(item)}
       onUndo={() => draftActions.undo(ctx)}
       onCancelEdit={() => draftActions.cancelEditor()}

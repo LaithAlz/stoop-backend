@@ -8,7 +8,14 @@ import {
 } from "@/features/emergency/emergencyBanner";
 
 interface EmergencyBannerProps {
-  conversationId: string;
+  /** B3 (safety review, #234 PR 2): optional — when absent the banner
+   *  renders as a plain, non-navigating block instead of a `<Link>`. Home
+   *  (src/routes/app.index.tsx) omits it while the conversation/emergency
+   *  routes still read mock-app.ts: a live case UUID pushed into a mock
+   *  loader dead-ends on "Alert not found." — exactly on the emergency
+   *  path. PR 3 (live cases screen) restores navigation there. The
+   *  still-mocked conversation thread keeps passing its own mock ids. */
+  conversationId?: string;
   headline: string;
   subtext: string;
   /** Present only when this card carries a non-null `notification_id`
@@ -27,8 +34,10 @@ interface EmergencyBannerProps {
 }
 
 /**
- * The one thing on Home that's never buried below the fold — links
- * straight into the emergency takeover (docs/mockups/07 `.em-banner`).
+ * The one thing on Home that's never buried below the fold — with a
+ * `conversationId`, links straight into the emergency takeover
+ * (docs/mockups/07 `.em-banner`); without one it's informational + ack
+ * only (see the prop's B3 comment).
  * Rule #1: the emergency line is never paywalled, throttled, or gated, so
  * this banner has no dismiss control. `onAcknowledge` (v1.15 amendment,
  * ported from apps/mobile's #237) is a deliberate, labeled action a
@@ -45,6 +54,24 @@ export function EmergencyBanner({
   acknowledging = false,
   className,
 }: EmergencyBannerProps) {
+  const content = (
+    <>
+      <TriangleAlert className="size-[22px] shrink-0" aria-hidden="true" />
+      <span className="min-w-0 flex-1">
+        <strong className="block font-clarity-serif text-[15px] font-bold leading-snug">
+          {headline}
+        </strong>
+        <span className="mt-0.5 block font-clarity-sans text-xs font-semibold opacity-90">
+          {subtext}
+        </span>
+      </span>
+      <span
+        className="ml-auto size-2 shrink-0 animate-pulse rounded-full bg-white motion-reduce:animate-none"
+        aria-hidden="true"
+      />
+    </>
+  );
+
   return (
     <div
       className={cn(
@@ -52,25 +79,17 @@ export function EmergencyBanner({
         className,
       )}
     >
-      <Link
-        to="/app/conversations/$id/emergency"
-        params={{ id: conversationId }}
-        className="flex items-center gap-3 px-4 py-3.5 no-underline"
-      >
-        <TriangleAlert className="size-[22px] shrink-0" aria-hidden="true" />
-        <span className="min-w-0 flex-1">
-          <strong className="block font-clarity-serif text-[15px] font-bold leading-snug">
-            {headline}
-          </strong>
-          <span className="mt-0.5 block font-clarity-sans text-xs font-semibold opacity-90">
-            {subtext}
-          </span>
-        </span>
-        <span
-          className="ml-auto size-2 shrink-0 animate-pulse rounded-full bg-white motion-reduce:animate-none"
-          aria-hidden="true"
-        />
-      </Link>
+      {conversationId ? (
+        <Link
+          to="/app/conversations/$id/emergency"
+          params={{ id: conversationId }}
+          className="flex items-center gap-3 px-4 py-3.5 no-underline"
+        >
+          {content}
+        </Link>
+      ) : (
+        <div className="flex items-center gap-3 px-4 py-3.5">{content}</div>
+      )}
       {onAcknowledge && (
         <button
           type="button"

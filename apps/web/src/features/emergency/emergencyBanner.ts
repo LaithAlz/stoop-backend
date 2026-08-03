@@ -34,9 +34,14 @@ export function emergencyHeadline(
  * (`"{property} · tap to call {tenant} now"`, src/lib/mock-app.ts's
  * `title`-adjacent wiring in the old app.index.tsx), which made exactly
  * that promise — flagged for copy-guardian in the PR report.
+ *
+ * B3 (safety review, #234 PR 2): no "tap to …" wording of any kind — the
+ * live banner doesn't navigate until PR 3 lands the live cases screen, so
+ * any tap promise would be a dead end on the emergency path. Property
+ * label only.
  */
 export function emergencySubtext(item: Pick<QueueItem, "property_label">): string {
-  return `${item.property_label} · tap to see what's happening`;
+  return item.property_label;
 }
 
 // ---------------------------------------------------------------------------

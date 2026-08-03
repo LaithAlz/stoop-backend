@@ -19,9 +19,21 @@
  */
 import type { QueueItem } from "@/api/types";
 
+/**
+ * `undoExpiresAtClient` / `approvedAtClient` are both CLIENT `Date.now()`
+ * epoch milliseconds — never a raw server timestamp string. B2 (safety
+ * review, #234 PR 2): the previous shape stored the server's `undo_until`
+ * string here and compared it directly against `new Date()` at render
+ * time, silently mixing the server's clock with the client's — a client
+ * clock a couple of minutes fast would swallow the whole undo window with
+ * no error. `computeUndoExpiresAt` below is the ONE place that crosses
+ * clocks (using the approve response's own `Date` header as the anchor);
+ * everything downstream of it — this reducer, `secondsRemaining`,
+ * `totalUndoSeconds` — works purely in client-clock numbers.
+ */
 export type QueueEntry =
   | { status: "idle" }
-  | { status: "sending"; undoUntil: string; approvedAt: string }
+  | { status: "sending"; undoExpiresAtClient: number; approvedAtClient: number }
   | { status: "sent" }
   | { status: "skipped" };
 
@@ -30,7 +42,7 @@ export type QueueEntry =
 export type QueueEntriesState = Record<string, QueueEntry>;
 
 export type QueueEntriesAction =
-  | { type: "approved"; draftId: string; undoUntil: string; approvedAt: string }
+  | { type: "approved"; draftId: string; undoExpiresAtClient: number; approvedAtClient: number }
   | { type: "undone"; draftId: string }
   | { type: "expired"; draftId: string }
   | { type: "skipped"; draftId: string }
@@ -48,8 +60,8 @@ export function queueEntriesReducer(
         ...state,
         [action.draftId]: {
           status: "sending",
-          undoUntil: action.undoUntil,
-          approvedAt: action.approvedAt,
+          undoExpiresAtClient: action.undoExpiresAtClient,
+          approvedAtClient: action.approvedAtClient,
         },
       };
     case "expired": {
@@ -75,20 +87,65 @@ export function entryFor(state: QueueEntriesState, draftId: string): QueueEntry 
   return state[draftId] ?? IDLE;
 }
 
-/** Seconds left in the undo window, clamped to >= 0 — derived from the
- *  server's `undo_until` (api-contracts.md: "the undo window is data"),
- *  never a client-local constant. */
-export function secondsRemaining(undoUntil: string, now: Date = new Date()): number {
-  const diffMs = new Date(undoUntil).getTime() - now.getTime();
+/**
+ * Seconds left in the undo window, clamped to >= 0 — a pure client-clock
+ * delta against `undoExpiresAtClient` (itself already anchored to the
+ * server's clock once, at receipt time, by `computeUndoExpiresAt` below).
+ * Never re-parses a server timestamp here (B2).
+ *
+ * A3 (safety review, #234 PR 2): `undoExpiresAtClient` can be `NaN` if the
+ * approve response's own `undo_until` was unparsable (see
+ * `computeUndoExpiresAt`'s fallback) — guarded explicitly so a bad value
+ * renders as "no time left" (the undo ticket's `00:00`, never `00:NaN`)
+ * instead of propagating a NaN through the countdown and its progress bar.
+ */
+export function secondsRemaining(undoExpiresAtClient: number, now: number = Date.now()): number {
+  if (!Number.isFinite(undoExpiresAtClient)) return 0;
+  const diffMs = undoExpiresAtClient - now;
   return Math.max(0, Math.round(diffMs / 1000));
 }
 
 /** For the undo ticket's progress bar only (a visual nicety) — the actual
  *  gate on whether Undo still works is the server's `undo_until`, checked
- *  by the DELETE call itself, not this number. */
-export function totalUndoSeconds(entry: { undoUntil: string; approvedAt: string }): number {
-  const totalMs = new Date(entry.undoUntil).getTime() - new Date(entry.approvedAt).getTime();
+ *  by the DELETE call itself, not this number. A3: guarded the same way as
+ *  `secondsRemaining` — an unparsable window falls back to `1` (a full,
+ *  already-elapsed bar) rather than a NaN-driven width. */
+export function totalUndoSeconds(entry: {
+  undoExpiresAtClient: number;
+  approvedAtClient: number;
+}): number {
+  const totalMs = entry.undoExpiresAtClient - entry.approvedAtClient;
+  if (!Number.isFinite(totalMs)) return 1;
   return Math.max(1, Math.round(totalMs / 1000));
+}
+
+/**
+ * B2 (safety review, #234 PR 2): the one place a server timestamp
+ * (`undo_until`) and the server's OWN clock (the approve response's `Date`
+ * header) meet — everything after this returns is pure client-clock math.
+ * `windowMs` is how long the server itself thinks the undo window lasts;
+ * adding that to the CLIENT's `Date.now()` at receipt time gives an
+ * expiry that's honest even when the client's wall clock is skewed from
+ * the server's.
+ *
+ * Falls back to treating `undo_until` as already being a client-epoch
+ * value (the pre-B2 behavior) only when the response carried no usable
+ * `Date` header — `Number.isFinite` guards both `Date.parse` calls, so a
+ * malformed header or a malformed `undo_until` can never produce a
+ * silent NaN that reaches `secondsRemaining` un-guarded (A3 covers that
+ * downstream too, belt-and-suspenders).
+ */
+export function computeUndoExpiresAt(
+  undoUntil: string,
+  serverDateHeader: string | null | undefined,
+  receivedAtClient: number = Date.now(),
+): number {
+  const undoUntilMs = Date.parse(undoUntil);
+  const serverNowMs = serverDateHeader ? Date.parse(serverDateHeader) : NaN;
+  if (Number.isFinite(undoUntilMs) && Number.isFinite(serverNowMs)) {
+    return receivedAtClient + (undoUntilMs - serverNowMs);
+  }
+  return undoUntilMs;
 }
 
 export interface QueueViewRow {
@@ -101,12 +158,14 @@ export interface QueueViewRow {
  * item that has fallen out of the server's `items` (the common case — the
  * queue only lists cases still needing action) is kept visible from its
  * last-known snapshot, muted, per the founder ruling; nothing else
- * persists past its server row disappearing.
+ * persists past its server row disappearing — EXCEPT the item currently
+ * open in the edit-and-send panel (`pinnedEditingItem`, A7 below).
  */
 export function buildQueueView(
   items: QueueItem[],
   entries: QueueEntriesState,
   skippedSnapshots: Record<string, QueueItem>,
+  pinnedEditingItem?: QueueItem | null,
 ): QueueViewRow[] {
   const seen = new Set(items.map((item) => item.draft_id));
   const rows: QueueViewRow[] = items.map((item) => ({
@@ -119,6 +178,18 @@ export function buildQueueView(
       const snapshot = skippedSnapshots[draftId];
       if (snapshot) rows.push({ item: snapshot, entry });
     }
+  }
+
+  // A7 (safety review, #234 PR 2): a routine 20s background poll must
+  // never unmount an open editor out from under the landlord mid-type. If
+  // the item they're editing has fallen out of the server's fresh
+  // `items` (e.g. it briefly drops off the list on an unrelated field
+  // update), keep rendering it from its last-known snapshot — the caller
+  // (src/routes/app.index.tsx) only ever passes one in while that draft's
+  // editor is actually open, and stops as soon as the landlord closes or
+  // submits it.
+  if (pinnedEditingItem && !seen.has(pinnedEditingItem.draft_id)) {
+    rows.push({ item: pinnedEditingItem, entry: entryFor(entries, pinnedEditingItem.draft_id) });
   }
 
   return rows;

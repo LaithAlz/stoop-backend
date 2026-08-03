@@ -50,10 +50,23 @@ export function useAcknowledge({ onNotice }: UseAcknowledgeOptions) {
 
   return {
     acknowledge: (notificationId: string) => mutation.mutate(notificationId),
-    /** Scoped to the specific notification id — a landlord with more than
-     *  one live emergency card must only see the button they tapped
-     *  change state, never every card at once. */
+    /**
+     * Scoped to the specific notification id — a landlord with more than
+     * one live emergency card must only see the button they tapped change
+     * state, never every card at once.
+     *
+     * A4 (safety review, #234 PR 2): an explicit `mutation.status` string
+     * check, not a truthiness read of `.isPending` — and covers BOTH
+     * "request in flight" (`"pending"`) and "request just succeeded"
+     * (`"success"`), so the button stays disabled through the gap between
+     * a successful ack and the invalidated queue query actually
+     * re-fetching (what makes the banner disappear). No confirm dialog
+     * added — acknowledge stays a single, un-confirmed tap either way;
+     * this only guards against a second tap on the same banner while the
+     * first is still settling.
+     */
     isAcknowledging: (notificationId: string) =>
-      mutation.isPending && mutation.variables === notificationId,
+      (mutation.status === "pending" || mutation.status === "success") &&
+      mutation.variables === notificationId,
   };
 }

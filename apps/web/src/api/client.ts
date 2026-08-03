@@ -103,14 +103,34 @@ function safeJsonParse(text: string): unknown {
   }
 }
 
+/** B2 (safety review, #234 PR 2): the response envelope for callers that
+ *  need the server's OWN clock alongside the body — e.g. anchoring the
+ *  undo countdown to `undo_until` without ever mixing it with the
+ *  client's wall clock (a client clock a couple of minutes fast would
+ *  otherwise silently swallow the whole undo window). `dateHeader` is the
+ *  raw `Date` response header, unparsed (`null` if the response somehow
+ *  didn't carry one) — the caller decides how to parse/guard it. */
+export interface ApiResponseEnvelope<T> {
+  data: T;
+  dateHeader: string | null;
+}
+
 /**
  * Fetch + parse one `/v1` call. Resolves the JSON body on 2xx (or
  * `undefined` on a 204); throws `ApiError` on everything else, including a
  * dropped connection (mapped to the stable `network_error` code so callers
  * never have to special-case a raw `TypeError`) or an unconfigured API URL
  * (`not_configured`, thrown before any `fetch` happens).
+ *
+ * Shared by both exported entry points below — `apiRequest` (unchanged
+ * signature, every existing caller) and `apiRequestWithDate` (B2's new
+ * variant) — so there is exactly one place that builds headers, calls
+ * `fetch`, and maps a non-2xx response to `ApiError`.
  */
-export async function apiRequest<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+async function apiRequestInternal<T>(
+  path: string,
+  options: ApiRequestOptions = {},
+): Promise<ApiResponseEnvelope<T>> {
   const apiUrl = requireApiUrl();
 
   const headers: Record<string, string> = {
@@ -140,8 +160,10 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     });
   }
 
+  const dateHeader = response.headers.get("date");
+
   if (response.status === 204) {
-    return undefined as T;
+    return { data: undefined as T, dateHeader };
   }
 
   const text = await response.text();
@@ -179,5 +201,22 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     throw new ApiError(response.status, coerceErrorBody(parsed, response.status));
   }
 
-  return parsed as T;
+  return { data: parsed as T, dateHeader };
+}
+
+/** The default entry point — every caller before B2, unchanged signature. */
+export async function apiRequest<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+  const { data } = await apiRequestInternal<T>(path, options);
+  return data;
+}
+
+/** B2's variant for a caller that needs the response's `Date` header
+ *  alongside the body (today: the approve/edit-and-send undo countdown,
+ *  src/api/drafts.ts). Everything else about the request/error handling
+ *  is identical to `apiRequest` above. */
+export async function apiRequestWithDate<T>(
+  path: string,
+  options: ApiRequestOptions = {},
+): Promise<ApiResponseEnvelope<T>> {
+  return apiRequestInternal<T>(path, options);
 }

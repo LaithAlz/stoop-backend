@@ -8,7 +8,8 @@
  */
 export * from "./types";
 export * from "./errors";
-export { apiRequest } from "./client";
+export { apiRequest, apiRequestWithDate } from "./client";
+export type { ApiResponseEnvelope } from "./client";
 export * from "./queue";
 export * from "./drafts";
 export * from "./notifications";
