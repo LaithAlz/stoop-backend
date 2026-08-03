@@ -100,6 +100,13 @@ export function toHouseApiError(error: ApiError): string {
       return "No phone numbers were available just now, so nothing was set up. Try a different area code, or try again in a few minutes.";
     case "provisioning_failed":
       return "Setting up this property's phone number didn't work, so nothing was saved. Try again.";
+    // R4 (#258 follow-up): a 500 config error (PUBLIC_BASE_URL unset,
+    // api-contracts.md's Properties v1.12 amendment) — permanent until
+    // someone fixes the deployment, not a per-request glitch. Without a
+    // bespoke line this fell to the generic "try again in a moment" next
+    // to a Try-again button that can never succeed while it's broken.
+    case "public_base_url_unconfigured":
+      return "Setting up phone numbers is broken on our end right now, so nothing was saved. Contact support — trying again won't help.";
     // --- Property delete (DELETE /v1/properties/{id}) ---
     case "has_open_cases":
       return "This property still has open cases, so it can't be deleted yet.";

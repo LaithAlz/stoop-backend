@@ -2,7 +2,7 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ArrowLeft, Loader2, MessageSquare, Phone } from "lucide-react";
+import { ArrowLeft, ChevronRight, Loader2, MessageSquare, Phone } from "lucide-react";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
 import { AppTabBar } from "@/components/stoop/AppTabBar";
 import { SeverityBadge } from "@/components/stoop/SeverityBadge";
@@ -32,6 +32,7 @@ import { ApiError, toHouseApiError } from "@/api/errors";
 import type { CaseSummary, Tenant, VulnerableOccupant } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
 import { formatRelativeTime } from "@/lib/relativeTime";
+import { backupContactPhoneLooksInvalid } from "@/features/properties/settings";
 import {
   NO_NUMBER_BODY,
   NO_NUMBER_TITLE,
@@ -40,8 +41,8 @@ import {
 } from "@/features/properties/stoopNumber";
 import {
   DELETE_PROPERTY_CONFIRM_LABEL,
-  DELETE_PROPERTY_MESSAGE,
   DELETE_PROPERTY_TITLE,
+  deletePropertyMessage,
 } from "@/features/properties/deleteProperty";
 import {
   revokeConfirmation,
@@ -113,15 +114,23 @@ function PropertyHub() {
   const [revokeConfirmOpen, setRevokeConfirmOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
 
-  // H2 (safety review, #234 PR 4): a status-0 (`network_error`) or 5xx
-  // failure is AMBIGUOUS — the request may well have applied server-side
-  // and only the response was lost. Reporting it as a definite failure is
-  // the dishonest direction on both of these actions (one severs a
-  // building's tenant line, the other turns auto-send off). Same branch
-  // and the same house line the approve loop already uses
-  // (src/features/queue/useDraftActions.ts).
+  // H2 (safety review, #234 PR 4): a dropped-connection or 5xx failure is
+  // AMBIGUOUS — the request may well have applied server-side and only the
+  // response was lost. Reporting it as a definite failure is the dishonest
+  // direction on both of these actions (one severs a building's tenant
+  // line, the other turns auto-send off).
+  //
+  // R1 (safety re-verify, #261): the canonical three-clause predicate,
+  // shared with src/features/queue/useDraftActions.ts. NOT a bare
+  // `status === 0` — `not_configured`/`server_context` carry status 0 but
+  // are thrown before any `fetch`, so nothing about them is ambiguous. And
+  // an unparsable 2xx body (`unknown_error` with a 2xx status) IS
+  // ambiguous: the server answered, so the write landed.
   const isAmbiguousFailure = (error: unknown) =>
-    error instanceof ApiError && (error.status === 0 || error.status >= 500);
+    error instanceof ApiError &&
+    (error.code === "network_error" ||
+      error.status >= 500 ||
+      (error.code === "unknown_error" && error.status >= 200 && error.status < 300));
   const AMBIGUOUS_NOTICE =
     "That may have gone through — give it a moment to update before trying again.";
 
@@ -170,12 +179,28 @@ function PropertyHub() {
       void navigate({ to: "/app/properties" });
     },
     onError: (error) => {
+      // LOW (safety review, #258 follow-up): invalidated unconditionally
+      // now, not just on the ambiguous branch — `property_not_found` in
+      // particular means the row is ALREADY gone (e.g. deleted from
+      // another tab/device a moment earlier), a "delete actually
+      // succeeded, this attempt just reported a definite failure" case
+      // the list should still reconcile against. Harmless on every other
+      // failure code too (just a background refetch of an unchanged list).
+      //
+      // LOW (safety re-review): scoped to the LIST key specifically, NOT
+      // the root `propertiesQueryKey` — that prefix-matches THIS exact
+      // property's still-mounted detail query (`propertyQueryKey(id)` is
+      // `[...propertiesQueryKey, "detail", id]`) and would refetch/404 it,
+      // exactly the failure mode `onSuccess`'s own L1 comment above
+      // already avoids via `removeQueries` instead of a prefix
+      // invalidate. This delete attempt FAILED (this branch only runs on
+      // `onError`), so the property is still meant to be showing here.
+      void queryClient.invalidateQueries({ queryKey: [...propertiesQueryKey, "list"] });
       if (isAmbiguousFailure(error)) {
         // H2: on DELETE specifically, "may have gone through" means the
         // building's line may already be severed — send them to the list,
         // which is the honest read, instead of asserting failure.
         toast(AMBIGUOUS_NOTICE);
-        void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
         setDeleteConfirmOpen(false);
         return;
       }
@@ -190,6 +215,12 @@ function PropertyHub() {
 
   const property = propertyQuery.data;
   const tenants: Tenant[] = (tenantsQuery.data?.items ?? []).filter((t) => t.active);
+  // L4 (#258 follow-up): the RAW row count, not the active-only `tenants`
+  // list above — a soft-deleted tenant row (`active = false`) still blocks
+  // the delete via `tenants.property_id`'s `ON DELETE RESTRICT`
+  // (schema-v1.md), so it still counts as a known blocker here even
+  // though it's hidden from the Tenants panel above.
+  const allTenantCount = tenantsQuery.data?.items.length ?? 0;
   const recentCases: CaseSummary[] = recentCasesQuery.data?.pages[0]?.items ?? [];
 
   const revokeCopy = revokeConfirmation("property");
@@ -272,6 +303,43 @@ function PropertyHub() {
                 </p>
               )}
             </div>
+
+            {/* Settings — backup_contact/quiet_hours/house_rules (issue
+                #261), the real replacement for the deleted mock "Manage"
+                section's Settings link (this file's own docstring). */}
+            <section className="px-4 pt-4">
+              <h2 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-widest text-ink-muted">
+                Settings
+              </h2>
+              <Link
+                to="/app/properties/$id/settings"
+                params={{ id }}
+                className="flex min-h-11 items-center justify-between gap-4 rounded-2xl border border-border bg-card px-4 py-4 transition hover:border-brand/30"
+              >
+                <div className="min-w-0">
+                  <p className="text-[14px] font-medium text-ink">
+                    Backup contact, quiet hours &amp; house rules
+                  </p>
+                  <p className="mt-0.5 text-[12px] text-ink-muted">
+                    {property.backup_contact
+                      ? `Backup contact: ${property.backup_contact.name}`
+                      : "No backup contact set yet"}
+                  </p>
+                  {/* M1 (safety review, #261 follow-up): this caption used
+                      to name the backup contact without ever checking
+                      `.phone` — asserting a redundancy for the emergency
+                      chain's second number that may not actually be
+                      dialable. */}
+                  {backupContactPhoneLooksInvalid(property.backup_contact) && (
+                    <p className="mt-0.5 text-[12px] font-medium text-urgent">
+                      Their number doesn&rsquo;t look valid — I may not be able to reach them in an
+                      emergency.
+                    </p>
+                  )}
+                </div>
+                <ChevronRight className="size-4 shrink-0 text-ink-muted/70" />
+              </Link>
+            </section>
 
             {/* Tenants */}
             <section className="px-4 pt-4">
@@ -459,7 +527,12 @@ function PropertyHub() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle className="font-display">{DELETE_PROPERTY_TITLE}</AlertDialogTitle>
-            <AlertDialogDescription>{DELETE_PROPERTY_MESSAGE}</AlertDialogDescription>
+            <AlertDialogDescription>
+              {deletePropertyMessage({
+                tenantCount: allTenantCount,
+                openCaseCount: property?.open_case_count ?? 0,
+              })}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={deleteMutation.isPending}>Cancel</AlertDialogCancel>
