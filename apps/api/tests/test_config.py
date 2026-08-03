@@ -607,3 +607,136 @@ def test_non_production_with_malformed_twilio_account_sid_is_fine() -> None:
             twilio_account_sid="not-a-real-sid",  # noqa: S106
         )
         assert s.twilio_account_sid == "not-a-real-sid"
+
+
+# ---------------------------------------------------------------------------
+# dashboard_origins / dashboard_origins_list (#251 — CORS for the dashboard)
+# ---------------------------------------------------------------------------
+
+
+def _build_settings(**overrides: object) -> Settings:
+    """Construct a ``Settings`` instance with every OTHER required field
+    filled with a placeholder, so each test below only has to specify the
+    ``dashboard_origins``-related override(s) it actually cares about."""
+    base: dict[str, object] = {
+        "_env_file": None,
+        "database_url": "postgresql+asyncpg://u:p@h:5432/db",
+        "supabase_url": "https://x.supabase.co",
+        "supabase_jwks_url": "https://x.supabase.co/auth/v1/.well-known/jwks.json",
+        "supabase_jwt_issuer": "https://x.supabase.co/auth/v1",
+        "supabase_service_role_key": "key",
+        "twilio_auth_token": "test-twilio-auth-token",
+        "anthropic_api_key": "sk-ant-test",
+    }
+    base.update(overrides)
+    return Settings(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+def test_dashboard_origins_default_is_the_dev_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset ``DASHBOARD_ORIGINS`` -> the documented dev default, parsed
+    into a two-item list."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    s = _build_settings()
+
+    assert s.dashboard_origins == "http://localhost:5173,http://localhost:3000"
+    assert s.dashboard_origins_list == [
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ]
+
+
+@pytest.mark.unit
+def test_dashboard_origins_env_var_comma_separated_parses_to_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real ``DASHBOARD_ORIGINS`` env var (not a direct kwarg) is read
+    and parsed the same way -- proves the env-var plumbing itself, not
+    just the parsing property."""
+    monkeypatch.setenv(
+        "DASHBOARD_ORIGINS", "https://app.stoop.example,https://staging.stoop.example"
+    )
+
+    s = _build_settings()
+
+    assert s.dashboard_origins_list == [
+        "https://app.stoop.example",
+        "https://staging.stoop.example",
+    ]
+
+
+@pytest.mark.unit
+def test_dashboard_origins_whitespace_around_entries_is_tolerated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Surrounding whitespace on each comma-separated entry is stripped."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    s = _build_settings(
+        dashboard_origins="  https://app.stoop.example ,\thttps://staging.stoop.example\n"
+    )
+
+    assert s.dashboard_origins_list == [
+        "https://app.stoop.example",
+        "https://staging.stoop.example",
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("blank_value", ["", "   ", "\t\n"], ids=["empty", "spaces", "tab_newline"])
+def test_dashboard_origins_empty_parses_to_no_origins(
+    monkeypatch: pytest.MonkeyPatch, blank_value: str
+) -> None:
+    """An empty/whitespace-only value is SAFE — an empty allowlist, never
+    a startup crash and never a silent fallback to '*'."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    s = _build_settings(dashboard_origins=blank_value)
+
+    assert s.dashboard_origins_list == []
+
+
+@pytest.mark.unit
+def test_dashboard_origins_drops_blank_entries_between_commas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stray double-comma / trailing comma doesn't produce a blank
+    entry in the parsed list."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    s = _build_settings(dashboard_origins="http://localhost:5173,,http://localhost:3000,")
+
+    assert s.dashboard_origins_list == [
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ]
+
+
+@pytest.mark.unit
+def test_dashboard_origins_single_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    s = _build_settings(dashboard_origins="https://app.stoop.example")
+
+    assert s.dashboard_origins_list == ["https://app.stoop.example"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "wildcard_value",
+    ["*", "http://localhost:5173,*", " * "],
+    ids=["bare", "mixed_with_real_origin", "whitespace_padded"],
+)
+def test_dashboard_origins_wildcard_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, wildcard_value: str
+) -> None:
+    """CORS here is a fixed origin allowlist, never a wildcard — a literal
+    '*' anywhere in DASHBOARD_ORIGINS must refuse to boot (#251)."""
+    monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _build_settings(dashboard_origins=wildcard_value)
+
+    assert "DASHBOARD_ORIGINS" in str(exc_info.value)
+    assert "*" in str(exc_info.value)
