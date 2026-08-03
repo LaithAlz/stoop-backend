@@ -35,11 +35,17 @@ describe("useDraftActions — undo 409 already_sent (M1 advisory)", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     // A live, not-yet-expired window so the entry stays "sending" until
-    // the undo outcome decides otherwise.
+    // the undo outcome decides otherwise. #250: approveDraft now resolves
+    // the { data, dateHeader } envelope, not the bare body — dateHeader
+    // matches "now" so computeUndoExpiresAt's device-clock math lines up
+    // with the plain 60s window these tests expect.
     mockApprove.mockResolvedValue({
-      status: "approved",
-      scheduled_send_at: new Date(Date.now() + 60_000).toISOString(),
-      undo_until: new Date(Date.now() + 60_000).toISOString(),
+      data: {
+        status: "approved",
+        scheduled_send_at: new Date(Date.now() + 60_000).toISOString(),
+        undo_until: new Date(Date.now() + 60_000).toISOString(),
+      },
+      dateHeader: new Date().toUTCString(),
     });
   });
 

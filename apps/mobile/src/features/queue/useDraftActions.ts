@@ -18,7 +18,12 @@ import { useMutation } from "@tanstack/react-query";
 import { approveDraft, editAndSendDraft, rejectDraft, undoDraftApprove } from "@/api/drafts";
 import { ApiError, toHouseApiError } from "@/api/errors";
 import { firstName } from "@/lib/tenantName";
-import { draftStaleNotice, queueEntriesReducer, secondsRemaining } from "./queueEntries";
+import {
+  computeUndoExpiresAt,
+  draftStaleNotice,
+  queueEntriesReducer,
+  secondsRemaining,
+} from "./queueEntries";
 
 export interface DraftContext {
   draftId: string;
@@ -84,13 +89,19 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
 
   const approveMutation = useMutation({
     mutationFn: (ctx: DraftContext) => approveDraft(ctx.draftId),
-    onSuccess: (data, ctx) =>
+    onSuccess: (result, ctx) => {
+      const approvedAtClient = Date.now();
       dispatch({
         type: "approved",
         draftId: ctx.draftId,
-        undoUntil: data.undo_until,
-        approvedAt: new Date().toISOString(),
-      }),
+        undoExpiresAtClient: computeUndoExpiresAt(
+          result.data.undo_until,
+          result.dateHeader,
+          approvedAtClient,
+        ),
+        approvedAtClient,
+      });
+    },
     onError: handleError,
   });
 
@@ -121,12 +132,17 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
 
   const editMutation = useMutation({
     mutationFn: (ctx: DraftContext & { body: string }) => editAndSendDraft(ctx.draftId, ctx.body),
-    onSuccess: (data, ctx) => {
+    onSuccess: (result, ctx) => {
+      const approvedAtClient = Date.now();
       dispatch({
         type: "approved",
         draftId: ctx.draftId,
-        undoUntil: data.undo_until,
-        approvedAt: new Date().toISOString(),
+        undoExpiresAtClient: computeUndoExpiresAt(
+          result.data.undo_until,
+          result.dateHeader,
+          approvedAtClient,
+        ),
+        approvedAtClient,
       });
       setEditingContext(null);
     },
@@ -152,7 +168,7 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   // `secondsRemaining` reads) only moves the outcome between ticks.
   useEffect(() => {
     for (const [draftId, entry] of Object.entries(entries)) {
-      if (entry.status === "sending" && secondsRemaining(entry.undoUntil) <= 0) {
+      if (entry.status === "sending" && secondsRemaining(entry.undoExpiresAtClient) <= 0) {
         dispatch({ type: "expired", draftId });
       }
     }

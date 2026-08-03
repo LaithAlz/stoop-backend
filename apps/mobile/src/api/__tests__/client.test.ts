@@ -1,10 +1,13 @@
 /**
- * apiRequest unit tests — fetch mocked, NO real network (hard rule). Covers
- * the issue #210 M1 brief's explicit list: envelope parsing, auth header
- * injection, 401 handling, and the `draft_stale` extra-field
- * (`fresh_draft_id`) passthrough.
+ * apiRequest / apiRequestWithDate unit tests — fetch mocked, NO real
+ * network (hard rule). Covers the issue #210 M1 brief's explicit list:
+ * envelope parsing, auth header injection, 401 handling, and the
+ * `draft_stale` extra-field (`fresh_draft_id`) passthrough; plus issue
+ * #250's `apiRequestWithDate` variant, which surfaces the response's own
+ * `Date` header for the undo-countdown anchor
+ * (src/features/queue/queueEntries.ts's `computeUndoExpiresAt`).
  */
-import { apiRequest } from "@/api/client";
+import { apiRequest, apiRequestWithDate } from "@/api/client";
 import { ApiError } from "@/api/errors";
 
 jest.mock("@/lib/env", () => ({
@@ -23,12 +26,13 @@ jest.mock("@/lib/supabase", () => ({
   },
 }));
 
-function jsonResponse(status: number, body: unknown): Response {
+function jsonResponse(status: number, body: unknown, dateHeader: string | null = null): Response {
   return {
     status,
     ok: status >= 200 && status < 300,
     text: () => Promise.resolve(JSON.stringify(body)),
-  } as Response;
+    headers: { get: (name: string) => (name.toLowerCase() === "date" ? dateHeader : null) },
+  } as unknown as Response;
 }
 
 describe("apiRequest", () => {
@@ -107,5 +111,47 @@ describe("apiRequest", () => {
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).code).toBe("network_error");
     expect((error as ApiError).message).not.toMatch(/TypeError/);
+  });
+});
+
+describe("apiRequestWithDate (#250 — the undo-countdown anchor)", () => {
+  beforeEach(() => {
+    jest.resetAllMocks();
+    mockGetSession.mockResolvedValue({ data: { session: null } });
+    mockSignOut.mockResolvedValue({ error: null });
+    globalThis.fetch = jest.fn();
+  });
+
+  it("resolves both the parsed body and the raw Date response header", async () => {
+    (globalThis.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(200, { undo_until: "2026-07-16T08:00:05Z" }, "Thu, 16 Jul 2026 08:00:00 GMT"),
+    );
+
+    const result = await apiRequestWithDate<{ undo_until: string }>("/v1/drafts/draft-1/approve", {
+      method: "POST",
+    });
+
+    expect(result.data).toEqual({ undo_until: "2026-07-16T08:00:05Z" });
+    expect(result.dateHeader).toBe("Thu, 16 Jul 2026 08:00:00 GMT");
+  });
+
+  it("returns a null dateHeader (never throws) when the response carries none", async () => {
+    (globalThis.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { ok: true }, null));
+
+    const result = await apiRequestWithDate("/v1/drafts/draft-1/approve", { method: "POST" });
+
+    expect(result.dateHeader).toBeNull();
+  });
+
+  it("still throws a typed ApiError on a non-2xx, same as apiRequest", async () => {
+    (globalThis.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(409, {
+        error: { code: "draft_stale", message: "stale.", request_id: "req_1" },
+      }),
+    );
+
+    await expect(
+      apiRequestWithDate("/v1/drafts/draft-1/approve", { method: "POST" }),
+    ).rejects.toMatchObject({ code: "draft_stale" });
   });
 });

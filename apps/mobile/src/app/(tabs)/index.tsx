@@ -141,7 +141,8 @@ export default function HomeScreen() {
 
     const cardStatus =
       entry.status === "sending" ? "sending" : entry.status === "sent" ? "sent" : "idle";
-    const secondsLeft = entry.status === "sending" ? secondsRemaining(entry.undoUntil) : 0;
+    const secondsLeft =
+      entry.status === "sending" ? secondsRemaining(entry.undoExpiresAtClient) : 0;
     const totalSeconds = entry.status === "sending" ? totalUndoSeconds(entry) : 5;
     const ctx = { draftId: item.draft_id, caseId: item.case_id, tenantName: item.tenant_name };
 
