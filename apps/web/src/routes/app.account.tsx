@@ -314,12 +314,15 @@ function EditProfileDialog({
   current: LandlordMe;
 }) {
   // F4 (safety review, #234 PR 5): a dismissal while the PATCH is in
-  // flight unmounts EditProfileForm, which tears down its useMutation
-  // observer — `onSuccess`/`onError` never run, while the request itself
-  // still lands server-side. On the field that decides where emergency
-  // calls ring (and which GET /v1/me never echoes back, so the landlord
-  // can't check), that is a silent wrong-state in both directions. The
-  // dialog is held open until the write resolves.
+  // flight unmounts EditProfileForm, so its `setServerError` becomes a
+  // no-op on a dead tree — the failure is swallowed entirely while the
+  // request still lands server-side (R6: the mutation's own callbacks DO
+  // still run; it's the state updates they make that go nowhere). On the
+  // field that decides where emergency calls ring — and which
+  // GET /v1/me never echoes back, so the landlord can't check — that is a
+  // silent wrong-state. The dialog holds open until the write resolves,
+  // bounded by src/api/me.ts's 20s timeout (R2) so a stalled connection
+  // can't trap anyone here.
   const [saving, setSaving] = useState(false);
 
   return (
@@ -332,6 +335,11 @@ function EditProfileDialog({
     >
       <DialogContent
         className="border-border bg-canvas"
+        // R2: the shared DialogContent renders its own X, which routes
+        // through the guarded `onOpenChange` above — leaving it visibly
+        // enabled while it does nothing is worse than disabling it, so it
+        // is hidden for the (bounded) duration of the write.
+        closeButtonClassName={saving ? "hidden" : undefined}
         onEscapeKeyDown={(e) => {
           if (saving) e.preventDefault();
         }}
@@ -371,6 +379,7 @@ function EditProfileForm({
   const [phone, setPhone] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
+  const [nameError, setNameError] = useState<string | null>(null);
   // Same double-submit latch as src/routes/app.properties_.add.tsx (L6) —
   // a ref is synchronous where `mutation.isPending` read from the render
   // closure isn't.
@@ -418,22 +427,31 @@ function EditProfileForm({
   // their valid number is wrong.
   const phoneError = phoneLooksValid(phone)
     ? null
-    : "Use 10 digits, or 11 starting with 1 for the country code.";
+    : // R3: the rule also accepts a +country number, so the message says
+      // so — a landlord with an international mobile was being told their
+      // valid number was wrong.
+      "Use 10 digits, 11 starting with 1, or + and your country code.";
 
   function handleSave(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setSubmitted(true);
     setServerError(null);
+    setNameError(null);
     if (phoneError || mutation.isPending || submitLatch.current) return;
     // F7 (safety review, #234 PR 5): a deliberately-blanked name produced
     // no payload, so the dialog just closed with the old name still in the
     // header — a silent no-op that reads as success. Say what happened
-    // instead of pretending it worked.
-    if (name.trim().length === 0 && (current.full_name ?? "").length > 0) {
-      setServerError("Your name can't be blank.");
+    // instead of pretending it worked. R5: this is a NAME-field error and
+    // must not block a phone edit in the same submit — the phone is the
+    // safety-relevant field, so it goes through and the notice says the
+    // name specifically didn't.
+    const nameCleared = name.trim().length === 0 && (current.full_name ?? "").length > 0;
+    const payload = buildMeUpdatePayload({ name, phone }, { full_name: current.full_name });
+    if (nameCleared && !payload) {
+      setNameError("Your name can't be blank.");
       return;
     }
-    const payload = buildMeUpdatePayload({ name, phone }, { full_name: current.full_name });
+    setNameError(nameCleared ? "Your name can't be blank, so only your number was saved." : null);
     if (!payload) {
       onClose();
       return;
@@ -464,7 +482,17 @@ function EditProfileForm({
             onChange={(e) => setName(e.target.value)}
             autoComplete="name"
             className="mt-1 h-12"
+            // R5: the name error belongs ON the name field — it used to
+            // land in the generic slot at the foot of the form, which a
+            // screen reader never associates with the offending input.
+            aria-invalid={nameError ? true : undefined}
+            aria-describedby={nameError ? "me-name-err" : undefined}
           />
+          {nameError && (
+            <p id="me-name-err" role="alert" className="mt-1.5 text-xs text-destructive">
+              {nameError}
+            </p>
+          )}
         </div>
 
         <div>

@@ -47,7 +47,10 @@ export function buildMeUpdatePayload(
     // un-dialable — and `_execute_action` swallows a bad-number failure by
     // design, so the landlord's phone would simply never ring, forever,
     // with no error anywhere.
-    payload.phone = toE164(phone);
+    const e164 = toE164(phone);
+    // R1: an unnormalizable number is never sent. The form blocks this
+    // earlier, but the builder must be safe on its own.
+    if (e164) payload.phone = e164;
   }
 
   return Object.keys(payload).length > 0 ? payload : null;
@@ -60,13 +63,33 @@ export function buildMeUpdatePayload(
  * than refusing the edit, because the failure surfaces at 2am instead of
  * here.
  */
-export function toE164(phone: string): string {
+export function toE164(phone: string): string | null {
   const trimmed = phone.trim();
-  if (/^\+\d{8,15}$/.test(trimmed)) return trimmed;
+  // R3 (safety re-verify): the +country test runs on the PUNCTUATION-
+  // STRIPPED string, so "+44 20 7946 0958" is accepted the same as
+  // "+442079460958" — a landlord with an international mobile shouldn't
+  // have to guess our spacing rules.
+  const plus = trimmed.startsWith("+");
   const digits = trimmed.replace(/\D/g, "");
-  if (digits.length === 10) return `+1${digits}`;
-  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
-  return `+${digits}`;
+  if (plus) return digits.length >= 8 && digits.length <= 15 ? `+${digits}` : null;
+  if (digits.length === 10 && isPlausibleNanp(digits)) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1") && isPlausibleNanp(digits.slice(1))) {
+    return `+${digits}`;
+  }
+  // R1 (safety re-verify): returns NULL rather than `+${digits}`. The old
+  // fallback could emit a bare "+" (or a digit-soup like "+416555013422"
+  // from "416-555-0134 x22") onto the field emergency calls ring — it was
+  // unreachable only because a guard in a THIRD file ran first, which is
+  // exactly the validator/builder split that produced F2. Now no caller
+  // can write an undialable value regardless of discipline.
+  return null;
+}
+
+/** R4: NANP area code and exchange both start 2-9 — three characters of
+ *  regex that catch a dropped or mistyped digit before it becomes a
+ *  permanently un-ringable emergency number. */
+function isPlausibleNanp(digits: string): boolean {
+  return /^[2-9]\d{2}[2-9]\d{6}$/.test(digits);
 }
 
 /**
@@ -84,7 +107,8 @@ export function toE164(phone: string): string {
 export function phoneLooksValid(phone: string): boolean {
   const trimmed = phone.trim();
   if (trimmed.length === 0) return true;
-  if (/^\+\d{8,15}$/.test(trimmed)) return true;
-  const digits = trimmed.replace(/\D/g, "");
-  return digits.length === 10 || (digits.length === 11 && digits.startsWith("1"));
+  // Single source of truth with the normalizer (R1): valid means exactly
+  // "toE164 can produce something dialable", so the two can never disagree
+  // the way the pre-F2 pair did.
+  return toE164(trimmed) !== null;
 }

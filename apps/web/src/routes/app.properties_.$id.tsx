@@ -76,18 +76,18 @@ const VULNERABLE_LABELS: Record<VulnerableOccupant, string> = {
  * for the first load, a full takeover ONLY when `isError && !data`, a quiet
  * refresh strip otherwise.
  *
- * The old "Manage" section's links to Settings / Trust dashboard
- * (app.properties_.$id_.settings.tsx / app.properties_.$id_.trust.tsx) are
- * DROPPED here, not ported: both sub-screens are keyed to mock property ids
- * (`propertyConfigs[id]` / `"main4"`) and 404 for every real, live property
- * id — the exact "guaranteed dead end" PR 3's own safety review already
- * flagged and removed for mock conversation links (see that PR's report).
- * Their real functional overlap with the live contract — the trust-ladder
- * revoke action — is wired directly on this page instead (below); the rest
- * of those two mock screens (autonomy-mode tiers, house rules editor, lease
- * facts, vendors, FAQ, notification prefs, severity overrides) has no
- * backing in api-contracts.md/schema-v1.md at all and stays out of scope,
- * flagged in the PR report as a contract gap, not invented here.
+ * The old "Manage" section's links to a Settings / Trust dashboard are
+ * DROPPED here, not ported: both sub-screens were keyed to mock property
+ * ids and 404'd for every real, live property id — the "guaranteed dead
+ * end" class PR 3's own safety review flagged for mock conversation
+ * links. Their real functional overlap with the live contract — the
+ * trust-ladder revoke action — is wired directly on this page instead
+ * (below); the rest of what those screens showed (autonomy-mode tiers,
+ * house rules editor, lease facts, vendors, FAQ, notification prefs,
+ * severity overrides) has no backing in api-contracts.md/schema-v1.md at
+ * all. Both files were deleted outright in #234 PR 5 along with
+ * mock-property.ts — one of them let a landlord believe they had
+ * graduated a property to auto-send when it wrote nothing at all.
  *
  * "Recent conversations" is wired live via `GET /v1/cases?property_id=`
  * (api-contracts.md's Cases section documents this filter param) —
