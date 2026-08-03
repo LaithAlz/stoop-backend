@@ -119,10 +119,10 @@
 `voice_profile` are **nullable** on this response, and `full_name` is
 null on the ordinary path, not just in theory: `landlords.full_name`
 carries no `NOT NULL` (schema-v1.md) and is populated from the auth
-user's `user_metadata.full_name`, which magic-link sign-in never sets —
-so every landlord who signed up through the web dashboard's OTP flow
-reads back `"full_name": null` until they set one. A client that assumed
-otherwise crashed its whole account screen for that (majority) case.
+user's `user_metadata.full_name` — which nothing in the magic-link flow
+sets — so any landlord whose auth user carries no name metadata reads
+back `"full_name": null` until they set one through `PATCH`. A client
+that assumed otherwise crashed its whole account screen for that case.
 `email` is likewise declared nullable by the response model, though a 200
 cannot currently carry a null one — the 403 `email_required` above
 fail-closes before any write, and `landlords.email` is `NOT NULL`.

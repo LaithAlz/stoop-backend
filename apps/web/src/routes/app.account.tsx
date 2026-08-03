@@ -393,6 +393,10 @@ function EditProfileForm({
       onClose();
     },
     onError: (error, variables) => {
+      // N2: drop the pre-submit "only your number will be saved" notice —
+      // nothing was saved, and leaving it up would contradict whichever
+      // failure line renders below.
+      setNameError(null);
       // H2-style ambiguity check (src/routes/app.properties_.$id.tsx) — a
       // status-0/5xx failure here doesn't prove the write didn't land.
       if (error instanceof ApiError && (error.status === 0 || error.status >= 500)) {
@@ -451,7 +455,15 @@ function EditProfileForm({
       setNameError("Your name can't be blank.");
       return;
     }
-    setNameError(nameCleared ? "Your name can't be blank, so only your number was saved." : null);
+    // N2 (safety re-verify): FUTURE tense, because this runs BEFORE the
+    // write. The past-tense version was asserted pre-submit and, on a
+    // failure, sat on screen contradicting the ambiguous-failure notice
+    // right below it — claiming the number saved while the other line
+    // asked the landlord to save it again. `onError` clears it so only
+    // the honest line remains.
+    setNameError(
+      nameCleared ? "Your name can't be blank, so only your number will be saved." : null,
+    );
     if (!payload) {
       onClose();
       return;
@@ -479,7 +491,12 @@ function EditProfileForm({
           <Input
             id="me-name"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => {
+              setName(e.target.value);
+              // N5: clear the error as they type the fix, rather than
+              // leaving it under the field until the next submit.
+              if (nameError) setNameError(null);
+            }}
             autoComplete="name"
             className="mt-1 h-12"
             // R5: the name error belongs ON the name field — it used to

@@ -71,7 +71,17 @@ export function toE164(phone: string): string | null {
   // have to guess our spacing rules.
   const plus = trimmed.startsWith("+");
   const digits = trimmed.replace(/\D/g, "");
-  if (plus) return digits.length >= 8 && digits.length <= 15 ? `+${digits}` : null;
+  if (plus) {
+    // N1 (safety re-verify): the international escape hatch must NOT
+    // disable the NANP gate for NANP numbers. "+1416555013" — one digit
+    // dropped, the likeliest typo there is — was being accepted and
+    // stored, while the same typo without the plus was correctly
+    // rejected. A +1 number gets exactly the same scrutiny as a bare one.
+    if (digits.startsWith("1")) {
+      return digits.length === 11 && isPlausibleNanp(digits.slice(1)) ? `+${digits}` : null;
+    }
+    return digits.length >= 8 && digits.length <= 15 ? `+${digits}` : null;
+  }
   if (digits.length === 10 && isPlausibleNanp(digits)) return `+1${digits}`;
   if (digits.length === 11 && digits.startsWith("1") && isPlausibleNanp(digits.slice(1))) {
     return `+${digits}`;
@@ -85,11 +95,14 @@ export function toE164(phone: string): string | null {
   return null;
 }
 
-/** R4: NANP area code and exchange both start 2-9 — three characters of
- *  regex that catch a dropped or mistyped digit before it becomes a
- *  permanently un-ringable emergency number. */
+/** R4: NANP area code and exchange both start 2-9, and neither is an N11
+ *  service code (411/911/…), which is never assignable (N3) — cheap
+ *  regex that catches a dropped or mistyped digit before it becomes a
+ *  permanently un-ringable emergency number. Deliberately permissive
+ *  about everything else: rejecting a real number here is its own
+ *  failure, since this is the field a landlord uses to be reachable. */
 function isPlausibleNanp(digits: string): boolean {
-  return /^[2-9]\d{2}[2-9]\d{6}$/.test(digits);
+  return /^(?!\d11)[2-9]\d{2}(?!\d11)[2-9]\d{6}$/.test(digits);
 }
 
 /**
