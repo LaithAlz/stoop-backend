@@ -21,7 +21,6 @@ import { Route as AppRouteImport } from './routes/app'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AppIndexRouteImport } from './routes/app.index'
 import { Route as AppPropertiesRouteImport } from './routes/app.properties'
-import { Route as AppActivityRouteImport } from './routes/app.activity'
 import { Route as AppAccountRouteImport } from './routes/app.account'
 import { Route as AppConversationsIndexRouteImport } from './routes/app.conversations.index'
 import { Route as AppPropertiesAddRouteImport } from './routes/app.properties_.add'
@@ -91,11 +90,6 @@ const AppPropertiesRoute = AppPropertiesRouteImport.update({
   path: '/properties',
   getParentRoute: () => AppRoute,
 } as any)
-const AppActivityRoute = AppActivityRouteImport.update({
-  id: '/activity',
-  path: '/activity',
-  getParentRoute: () => AppRoute,
-} as any)
 const AppAccountRoute = AppAccountRouteImport.update({
   id: '/account',
   path: '/account',
@@ -150,7 +144,6 @@ export interface FileRoutesByFullPath {
   '/sign-in': typeof SignInRoute
   '/terms': typeof TermsRoute
   '/app/account': typeof AppAccountRoute
-  '/app/activity': typeof AppActivityRoute
   '/app/properties': typeof AppPropertiesRoute
   '/app/': typeof AppIndexRoute
   '/app/conversations/$id': typeof AppConversationsIdRoute
@@ -172,7 +165,6 @@ export interface FileRoutesByTo {
   '/sign-in': typeof SignInRoute
   '/terms': typeof TermsRoute
   '/app/account': typeof AppAccountRoute
-  '/app/activity': typeof AppActivityRoute
   '/app/properties': typeof AppPropertiesRoute
   '/app': typeof AppIndexRoute
   '/app/conversations/$id': typeof AppConversationsIdRoute
@@ -196,7 +188,6 @@ export interface FileRoutesById {
   '/sign-in': typeof SignInRoute
   '/terms': typeof TermsRoute
   '/app/account': typeof AppAccountRoute
-  '/app/activity': typeof AppActivityRoute
   '/app/properties': typeof AppPropertiesRoute
   '/app/': typeof AppIndexRoute
   '/app/conversations/$id': typeof AppConversationsIdRoute
@@ -221,7 +212,6 @@ export interface FileRouteTypes {
     | '/sign-in'
     | '/terms'
     | '/app/account'
-    | '/app/activity'
     | '/app/properties'
     | '/app/'
     | '/app/conversations/$id'
@@ -243,7 +233,6 @@ export interface FileRouteTypes {
     | '/sign-in'
     | '/terms'
     | '/app/account'
-    | '/app/activity'
     | '/app/properties'
     | '/app'
     | '/app/conversations/$id'
@@ -266,7 +255,6 @@ export interface FileRouteTypes {
     | '/sign-in'
     | '/terms'
     | '/app/account'
-    | '/app/activity'
     | '/app/properties'
     | '/app/'
     | '/app/conversations/$id'
@@ -377,13 +365,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppPropertiesRouteImport
       parentRoute: typeof AppRoute
     }
-    '/app/activity': {
-      id: '/app/activity'
-      path: '/activity'
-      fullPath: '/app/activity'
-      preLoaderRoute: typeof AppActivityRouteImport
-      parentRoute: typeof AppRoute
-    }
     '/app/account': {
       id: '/app/account'
       path: '/account'
@@ -445,7 +426,6 @@ declare module '@tanstack/react-router' {
 
 interface AppRouteChildren {
   AppAccountRoute: typeof AppAccountRoute
-  AppActivityRoute: typeof AppActivityRoute
   AppPropertiesRoute: typeof AppPropertiesRoute
   AppIndexRoute: typeof AppIndexRoute
   AppConversationsIdRoute: typeof AppConversationsIdRoute
@@ -459,7 +439,6 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppAccountRoute: AppAccountRoute,
-  AppActivityRoute: AppActivityRoute,
   AppPropertiesRoute: AppPropertiesRoute,
   AppIndexRoute: AppIndexRoute,
   AppConversationsIdRoute: AppConversationsIdRoute,
