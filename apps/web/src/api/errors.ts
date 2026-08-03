@@ -77,6 +77,14 @@ export function toHouseApiError(error: ApiError): string {
       return "That draft isn't there anymore.";
     case "case_not_found":
       return "That conversation isn't there anymore.";
+    // M1 (safety review, #234 PR 4): the global 422 handler's code
+    // (api-contracts.md's error envelope) — reached whenever a route param
+    // isn't the shape the API expects, e.g. a bookmarked/hand-typed
+    // non-UUID property or case id. Without a line of its own it fell to
+    // the generic "try again in a moment" beside a Try-again button that
+    // can never succeed — a permanent dead end dressed as a transient one.
+    case "invalid_request":
+      return "That link doesn't point to anything on your account.";
     case "rate_limited":
       return "Too many tries — wait a moment and try again.";
     case "account_deleted":
