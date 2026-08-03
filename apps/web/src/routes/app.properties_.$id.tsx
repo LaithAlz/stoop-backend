@@ -114,15 +114,23 @@ function PropertyHub() {
   const [revokeConfirmOpen, setRevokeConfirmOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
 
-  // H2 (safety review, #234 PR 4): a status-0 (`network_error`) or 5xx
-  // failure is AMBIGUOUS — the request may well have applied server-side
-  // and only the response was lost. Reporting it as a definite failure is
-  // the dishonest direction on both of these actions (one severs a
-  // building's tenant line, the other turns auto-send off). Same branch
-  // and the same house line the approve loop already uses
-  // (src/features/queue/useDraftActions.ts).
+  // H2 (safety review, #234 PR 4): a dropped-connection or 5xx failure is
+  // AMBIGUOUS — the request may well have applied server-side and only the
+  // response was lost. Reporting it as a definite failure is the dishonest
+  // direction on both of these actions (one severs a building's tenant
+  // line, the other turns auto-send off).
+  //
+  // R1 (safety re-verify, #261): the canonical three-clause predicate,
+  // shared with src/features/queue/useDraftActions.ts. NOT a bare
+  // `status === 0` — `not_configured`/`server_context` carry status 0 but
+  // are thrown before any `fetch`, so nothing about them is ambiguous. And
+  // an unparsable 2xx body (`unknown_error` with a 2xx status) IS
+  // ambiguous: the server answered, so the write landed.
   const isAmbiguousFailure = (error: unknown) =>
-    error instanceof ApiError && (error.status === 0 || error.status >= 500);
+    error instanceof ApiError &&
+    (error.code === "network_error" ||
+      error.status >= 500 ||
+      (error.code === "unknown_error" && error.status >= 200 && error.status < 300));
   const AMBIGUOUS_NOTICE =
     "That may have gone through — give it a moment to update before trying again.";
 

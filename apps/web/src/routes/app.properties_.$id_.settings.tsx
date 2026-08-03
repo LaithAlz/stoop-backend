@@ -185,12 +185,26 @@ function PropertySettingsPage() {
 }
 
 /**
- * H2-shaped ambiguity check, same branch as app.properties_.$id.tsx and
- * src/routes/app.account.tsx's edit form: a status-0/5xx failure doesn't
- * prove the PATCH didn't land server-side.
+ * Ambiguity check — the canonical three-clause predicate (R3-2/F5, now
+ * shared with src/features/queue/useDraftActions.ts and app.account.tsx).
+ *
+ * R1 (safety re-verify, #261): this file kept the older `status === 0 ||
+ * status >= 500` form, which is wrong in BOTH directions. Over-inclusive:
+ * `not_configured` and `server_context` also carry status 0 but are
+ * thrown BEFORE any `fetch` — telling a landlord their backup contact
+ * "may have gone through" for a request that provably never left the
+ * browser is the dishonest, silence-inducing direction, on the emergency
+ * chain's second phone. Under-inclusive: an unparsable 2xx body throws
+ * `ApiError(200, "unknown_error")`, which scored as a DEFINITE failure —
+ * but the server answered 2xx, so the write landed.
  */
 function isAmbiguousFailure(error: unknown): boolean {
-  return error instanceof ApiError && (error.status === 0 || error.status >= 500);
+  if (!(error instanceof ApiError)) return false;
+  return (
+    error.code === "network_error" ||
+    error.status >= 500 ||
+    (error.code === "unknown_error" && error.status >= 200 && error.status < 300)
+  );
 }
 
 const AMBIGUOUS_NOTICE =
