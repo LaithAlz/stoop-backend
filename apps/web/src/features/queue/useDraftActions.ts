@@ -68,6 +68,41 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   // skip tap on the same card.
   const [busyDraftIds, setBusyDraftIds] = useState<ReadonlySet<string>>(() => new Set());
 
+  // R3-1 (safety review round 3, #234 PR 2 follow-up, issue #252): draft
+  // ids whose edit-and-send just hit an AMBIGUOUS failure (network_error/
+  // 5xx — R3-2 below) — the request may have already applied server-side,
+  // and the API's approve-family idempotent 200 means a retype-and-resend
+  // on this same draft would silently deliver the FIRST body while the
+  // screen shows a countdown for the second. Send stays disabled for
+  // exactly these ids (the screen threads `isSendUnverified` into its
+  // editor) until `resolveUnverifiedSend` below is told what the next
+  // SUCCESSFUL read of this draft's true state actually was.
+  const [unverifiedSendIds, setUnverifiedSendIds] = useState<ReadonlySet<string>>(() => new Set());
+
+  const resolveUnverifiedSend = useCallback(
+    (draftId: string, stillPending: boolean) => {
+      setUnverifiedSendIds((prev) => {
+        if (!prev.has(draftId)) return prev;
+        const next = new Set(prev);
+        next.delete(draftId);
+        return next;
+      });
+      // Draft still pending → the ambiguous edit-and-send never applied;
+      // clearing the flag above already re-enables Send, nothing else to
+      // do. Draft gone → it DID apply — close the editor only if it's
+      // still open on THIS exact draft (a landlord who already moved on,
+      // e.g. Cancel or a tenant-reply draft swap, gets no stale notice
+      // about a draft they're no longer looking at).
+      if (stillPending) return;
+      setEditingContext((current) => {
+        if (current?.draftId !== draftId) return current;
+        onNotice("Your earlier reply already went out — this edit wasn't sent.");
+        return null;
+      });
+    },
+    [onNotice],
+  );
+
   const markBusy = useCallback((draftId: string) => {
     setBusyDraftIds((prev) => {
       if (prev.has(draftId)) return prev;
@@ -182,7 +217,18 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
 
   const undoMutation = useMutation({
     mutationFn: (ctx: DraftContext) => undoDraftApprove(ctx.draftId),
-    onSuccess: (_data, ctx) => dispatch({ type: "undone", draftId: ctx.draftId }),
+    // #256 comment item 2 (safety re-verify): this used to only clear the
+    // local overlay — fine for Home, which self-heals on the queue's own
+    // 20s poll (src/api/queue.ts), but the conversation thread's
+    // `useCase` has no polling at all. Without this, a restored `pending`
+    // draft's cached timeline entry stayed stuck on the undo's stale
+    // "approved" snapshot until the landlord happened to refocus the
+    // window or navigate away and back. Same onSettled() every other
+    // server-confirmed transition in this hook already calls.
+    onSuccess: (_data, ctx) => {
+      dispatch({ type: "undone", draftId: ctx.draftId });
+      onSettled();
+    },
     onError: (error, ctx) => {
       // M1 senior advisory (mobile, ported here): a 409 `already_sent` on
       // undo means the reply genuinely went out — the honest card state is
@@ -260,16 +306,29 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
         return;
       }
       // NEW-2 (safety review round 3, #234 PR 2): an AMBIGUOUS failure —
-      // network error (status 0) or 5xx — can mean the edit-and-send
-      // actually applied server-side and only the response was lost. The
-      // API's approve path is idempotent for a draft already in the
-      // approved family (it returns 200 WITHOUT applying a new body), so
-      // a retype-and-resend after a lost response would silently send the
-      // FIRST text while showing a countdown for the second. Say so, and
-      // let the unconditional refetch below bring back the honest state
-      // (if the edit applied, the card leaves the queue).
-      if (error instanceof ApiError && (error.status === 0 || error.status >= 500)) {
+      // network error or 5xx — can mean the edit-and-send actually applied
+      // server-side and only the response was lost. The API's approve path
+      // is idempotent for a draft already in the approved family (it
+      // returns 200 WITHOUT applying a new body), so a retype-and-resend
+      // after a lost response would silently send the FIRST text while
+      // showing a countdown for the second. Say so, and let the
+      // unconditional refetch below bring back the honest state (if the
+      // edit applied, the card leaves the queue).
+      //
+      // R3-2 (safety review round 3 follow-up, issue #252): ambiguity is
+      // about whether the server actually NAMED a documented failure —
+      // `network_error` (a genuinely dropped connection/timeout) or a real
+      // 5xx — never a bare `status === 0`. `server_context`/`not_configured`
+      // (src/api/client.ts) also carry status 0, but both are thrown BEFORE
+      // any `fetch` call is made; there is nothing ambiguous about a
+      // request that provably never left the browser, so telling the
+      // landlord it "may have gone through" would be the dishonest,
+      // silence-inducing direction for those two codes specifically.
+      if (error instanceof ApiError && (error.code === "network_error" || error.status >= 500)) {
         dispatch({ type: "cleared", draftId: ctx.draftId });
+        // R3-1: track this draft as unverified so Send stays disabled
+        // until a later successful read resolves it one way or the other.
+        setUnverifiedSendIds((prev) => new Set(prev).add(ctx.draftId));
         onNotice("That may have gone through — give it a moment to update before sending again.");
         onSettled();
         return;
@@ -315,6 +374,15 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
      *  THIS draft id specifically — never a global "something is
      *  happening" flag. */
     isBusy: (draftId: string) => busyDraftIds.has(draftId),
+    /** R3-1: true while THIS draft's last edit-and-send ended in an
+     *  ambiguous failure and hasn't been resolved yet — the screen should
+     *  keep its Send control disabled for exactly this draft id. */
+    isSendUnverified: (draftId: string) => unverifiedSendIds.has(draftId),
+    /** R3-1: every draft id currently unverified — a caller iterates this
+     *  against its own next successful read to call `resolveUnverifiedSend`
+     *  below (see src/routes/app.index.tsx). */
+    unverifiedSendIds,
+    resolveUnverifiedSend,
     approve: (ctx: DraftContext) => {
       markBusy(ctx.draftId);
       approveMutation.mutate(ctx);
