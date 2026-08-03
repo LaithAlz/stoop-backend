@@ -65,7 +65,10 @@
   default `http://localhost:5173,http://localhost:3000`) — **never `*`**
   (boot refuses a literal wildcard, any entry not shaped exactly
   `scheme://host[:port]`, and — only when `ENVIRONMENT=production` — an
-  empty allowlist or any `localhost`/`127.0.0.1` entry), and
+  empty allowlist, any `localhost`/`127.0.0.1` entry, or any entry that
+  is not `https://` (#255: a plaintext production origin would let
+  anyone in a network position to control it read this API's
+  authenticated responses cross-origin)), and
   `allow_credentials=False` (this API authenticates via bearer JWT, never
   cookies). `Access-Control-Expose-Headers: Date` is also set — the
   dashboard's undo-countdown UX anchors to the response `Date` header,
