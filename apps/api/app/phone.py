@@ -17,12 +17,30 @@ webhook's exact-string comparison, misrouting (or, since #170,
 dead-lettering into ``unrouted_inbound``) a message that should have
 reached a real property/tenant (#232).
 
-``to_e164`` below is a byte-for-byte behavioral port of
+``to_e164`` below is an ASCII-digits-only behavioral port of
 ``apps/web/src/features/account/profileEdit.ts``'s ``toE164`` (landed for
 issue #234 PR 5) — client and server must never disagree about what is
-dialable. Read that file's own comments for the safety-review history
-(F2/F3/N1/R1/R3/R4) that produced these exact rules; it is not repeated
-here.
+dialable, for the ASCII input this codebase actually expects. Read that
+file's own comments for the safety-review history (F2/F3/N1/R1/R3/R4)
+that produced these exact rules; it is not repeated here.
+
+**Non-ASCII "digit" characters are REJECTED, never silently stripped or
+matched (safety review, 2026-08-03, finding 1 — BLOCKING).** Python's ``\\d``/
+``\\D`` are Unicode-aware by default (``\\d`` matches the full Unicode
+``Nd`` category — Arabic-Indic, Devanagari, fullwidth digits, …), unlike
+JavaScript's, which are always ASCII-only. Left unguarded, a value like
+``"+١4165551234"`` (one Arabic-Indic ``1`` ahead of an otherwise
+ordinary Toronto number) would parse differently in each language: this
+module's regexes now carry ``re.ASCII`` so ``\\d``/``\\D`` behave exactly
+like JavaScript's (a non-ASCII digit is "not a digit" to either regex, so
+it is stripped as punctuation would be, same as the TS side) — but
+SILENTLY dropping what a human plausibly intended as a real digit is its
+own hazard (it can shift the remaining digits into a DIFFERENT,
+still-plausible-looking number instead of failing loudly). ``to_e164``
+therefore rejects outright, before any other processing, if the input
+contains ANY character that is a digit under Python's own (Unicode-aware)
+``str.isdigit()`` but is not plain ASCII ``0``-``9`` — never silently
+dropped, never coerced.
 
 Canonicalization policy (mirrors the TS implementation exactly)
 ------------------------------------------------------------------------
@@ -58,14 +76,27 @@ import re
 
 from app.errors import AppError
 
-_NON_DIGIT_RE = re.compile(r"\D+")
-_NANP_RE = re.compile(r"^(?!\d11)[2-9]\d{2}(?!\d11)[2-9]\d{6}$")
+# re.ASCII (safety-review finding, #232/#260 follow-up): without it, \d/\D
+# are Unicode-aware (\d matches the full Nd category — Arabic-Indic,
+# Devanagari, fullwidth digits, …), unlike JavaScript's, which are always
+# ASCII-only — see module docstring, "Non-ASCII 'digit' characters".
+_NON_DIGIT_RE = re.compile(r"\D+", re.ASCII)
+_NANP_RE = re.compile(r"^(?!\d11)[2-9]\d{2}(?!\d11)[2-9]\d{6}$", re.ASCII)
 
 
 def is_plausible_nanp(digits: str) -> bool:
     """``True`` iff *digits* (exactly 10 digits, no country code) is a
     plausible NANP subscriber number — see module docstring."""
     return _NANP_RE.match(digits) is not None
+
+
+def _contains_non_ascii_digit(value: str) -> bool:
+    """``True`` iff *value* contains a character Python's own (Unicode
+    -aware) ``str.isdigit()`` considers a digit but which is not plain
+    ASCII ``0``-``9`` — e.g. ``"١"`` (Arabic-Indic one) or ``"٤"``
+    (Arabic-Indic four). See module docstring, "Non-ASCII 'digit'
+    characters"."""
+    return any(ch.isdigit() and not ch.isascii() for ch in value)
 
 
 def to_e164(raw: str) -> str | None:
@@ -76,6 +107,12 @@ def to_e164(raw: str) -> str | None:
     Pure, no I/O — safe to call from a route handler, a migration, or the
     Twilio webhook's routing-match path alike.
     """
+    if _contains_non_ascii_digit(raw):
+        # Never silently strip/ignore a non-ASCII digit character —
+        # rejecting outright is the only safe response (see module
+        # docstring); checked before anything else, including .strip().
+        return None
+
     trimmed = raw.strip()
     plus = trimmed.startswith("+")
     digits = _NON_DIGIT_RE.sub("", trimmed)

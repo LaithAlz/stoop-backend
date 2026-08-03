@@ -77,10 +77,27 @@ def test_to_e164_accepts(raw: str, expected: str) -> None:
         # A bare "+" with nothing else (R1 regression: must never emit a
         # bare "+" onto the emergency-call field).
         "+",
+        # Safety-review finding: Python's \d/\D are Unicode-aware by
+        # default (unlike JavaScript's, always ASCII-only) — one
+        # Arabic-Indic "١" (digit one) ahead of an otherwise ordinary
+        # Toronto number must never be silently stripped/coerced into
+        # "+14165551234" (mismatched vs. what a caller actually sent) or
+        # accepted with the non-ASCII digit still embedded.
+        "+١4165551234",
+        # All-Arabic-Indic-digit rendering of "+442079460958" (a UK
+        # number) — same class of rejection.
+        "+٤٤٢٠٧٩٤٦٠٩٥٨",
     ],
 )
 def test_to_e164_rejects(raw: str) -> None:
     assert to_e164(raw) is None
+
+
+@pytest.mark.unit
+def test_to_e164_rejects_non_ascii_digit_even_when_otherwise_well_formed() -> None:
+    """Same finding, no leading ``+`` — the bare-10-digit branch must not
+    silently drop a single non-ASCII digit character either."""
+    assert to_e164("416555۴234") is None  # ۴ = extended arabic-indic 4
 
 
 @pytest.mark.unit
