@@ -154,16 +154,20 @@ function PropertyHub() {
   // the approve/undo path — src/features/queue/useDraftActions.ts).
   const deleteMutation = useMutation({
     mutationFn: () => deleteProperty(id),
-    onSuccess: async () => {
+    onSuccess: () => {
       // L1 (safety review): drop THIS property's cached detail/tenant
       // reads rather than invalidating them — a prefix invalidate refetches
       // the still-mounted detail, 404s, and paints "Couldn't refresh just
-      // now" over a fully-rendered deleted property. Navigate first, then
-      // let the list refetch.
+      // now" over a fully-rendered deleted property.
       queryClient.removeQueries({ queryKey: propertyQueryKey(id) });
       queryClient.removeQueries({ queryKey: tenantsQueryKey(id) });
-      await navigate({ to: "/app/properties" });
+      // R2 (safety re-verify): NOT awaited. react-query awaits onSuccess
+      // inside the same try that routes into onError, so a rejected or
+      // interrupted navigation would report "Something didn't go through"
+      // for a delete that already severed the building's line. Invalidate
+      // first so the list is stale either way, then navigate.
       void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
+      void navigate({ to: "/app/properties" });
     },
     onError: (error) => {
       if (isAmbiguousFailure(error)) {
@@ -319,8 +323,12 @@ function PropertyHub() {
                             {/* Fallback via the same seam mobile uses
                                 (firstName → "Your tenant") — copy-guardian
                                 caught "Unnamed tenant" as an unreviewed
-                                drift from that blessed register. */}
-                            {tenant.name ?? firstName(tenant.name)}
+                                drift from that blessed register. Called
+                                unconditionally: `tenants.name` is
+                                unconstrained nullable text, and `??` alone
+                                would let an empty string render a blank
+                                name line. */}
+                            {firstName(tenant.name)}
                             {tenant.unit ? ` — Unit ${tenant.unit}` : ""}
                           </p>
                           <p className="mt-0.5 font-mono text-[12px] text-ink-muted">

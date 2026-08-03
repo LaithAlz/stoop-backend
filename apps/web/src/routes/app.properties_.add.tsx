@@ -43,6 +43,26 @@ function validate(fields: {
 }
 
 /**
+ * R1 (safety re-verify, #234 PR 4): every refusal this endpoint documents.
+ * Each carries its own house line (src/api/errors.ts) and means, DEFINITELY,
+ * that nothing was created — the server runs its compensating number
+ * release before answering. Three of them are 5xx-coded
+ * (`no_numbers_available` 503, `provisioning_failed` 502,
+ * `public_base_url_unconfigured` 500), which is exactly why HTTP status
+ * alone can't decide whether a failure was ambiguous here: classifying by
+ * status swallowed "try a different area code" — the one instruction that
+ * would have worked — and sent the landlord looking for a property that
+ * was never created.
+ */
+const DEFINITE_CREATE_CODES = new Set([
+  "no_numbers_available",
+  "provisioning_failed",
+  "public_base_url_unconfigured",
+  "property_limit_reached",
+  "duplicate_property",
+]);
+
+/**
  * Add a property — the real provisioning flow (`POST /v1/properties`,
  * api-contracts.md v1.12), ported from apps/mobile/src/features/properties/
  * PropertyForm.tsx (campaign issue #234 PR 4) onto plain web form controls.
@@ -101,7 +121,20 @@ function AddPropertyPage() {
       // converges to `duplicate_property` rather than double-billing —
       // this is an honesty fix, not a money leak.) Say what's actually
       // known and point at the list, which is the honest read.
-      if (error instanceof ApiError && (error.status === 0 || error.status >= 500)) {
+      //
+      // R1 (safety re-verify): ambiguity is about whether the server TOLD
+      // US what happened — not about the status class. Provisioning's own
+      // refusals are 5xx-coded (`no_numbers_available` 503,
+      // `provisioning_failed` 502, `public_base_url_unconfigured` 500) and
+      // are DEFINITE: the server ran its compensating release and knows
+      // nothing was saved. Swallowing those cost the landlord the one
+      // instruction that works ("try a different area code") and sent them
+      // hunting for a property that was never created.
+      if (
+        error instanceof ApiError &&
+        !DEFINITE_CREATE_CODES.has(error.code) &&
+        (error.status === 0 || error.status >= 500)
+      ) {
         setServerError(
           "That may have gone through — check your properties list before adding it again.",
         );

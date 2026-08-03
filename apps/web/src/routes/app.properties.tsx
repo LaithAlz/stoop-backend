@@ -8,7 +8,7 @@ import { usePropertiesList } from "@/api/properties";
 import { useQueue } from "@/api/queue";
 import { ApiError, toHouseApiError } from "@/api/errors";
 import type { Property } from "@/api/types";
-import { formatStoopNumber } from "@/features/properties/stoopNumber";
+import { NO_NUMBER_TITLE, formatStoopNumber } from "@/features/properties/stoopNumber";
 
 export const Route = createFileRoute("/app/properties")({
   head: () => ({
@@ -164,7 +164,7 @@ function PropertiesPage() {
                             >
                               {p.twilio_number
                                 ? formatStoopNumber(p.twilio_number)
-                                : "No Stoop number yet"}
+                                : NO_NUMBER_TITLE}
                             </span>
                             {p.open_case_count > 0 && (
                               <span className="rounded-full bg-urgent-soft px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-widest text-urgent">
