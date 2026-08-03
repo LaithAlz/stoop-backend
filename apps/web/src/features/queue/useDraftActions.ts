@@ -93,12 +93,19 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
 
   const resolveUnverifiedSend = useCallback(
     (draftId: string, stillPending: boolean) => {
+      // F12 (safety re-verify round 2): read membership BEFORE the update.
+      // The early-out below lives inside the state updater, so it stops the
+      // map write but not the notice — today's only caller iterates the map
+      // so it can't misfire, but this is exported API and the planned
+      // thread wiring would call it per-draft-per-read, double-toasting.
+      const wasFlagged = unverifiedSendIds.has(draftId);
       setUnverifiedSendIds((prev) => {
         if (!prev.has(draftId)) return prev;
         const next = new Map(prev);
         next.delete(draftId);
         return next;
       });
+      if (!wasFlagged) return;
       // Draft still pending → the ambiguous edit-and-send never applied;
       // clearing the flag above already re-enables Send, nothing else to
       // do.
@@ -124,7 +131,7 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       // invoked more than once, which would have double-toasted.
       setEditingContext((current) => (current?.draftId === draftId ? null : current));
     },
-    [onNotice],
+    [onNotice, unverifiedSendIds],
   );
 
   const markBusy = useCallback((draftId: string) => {

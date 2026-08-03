@@ -8,10 +8,11 @@ import { GreetingHeader } from "@/components/clarity/GreetingHeader";
 import { CountsStrip } from "@/components/clarity/CountsStrip";
 import { EmergencyBanner } from "@/components/clarity/EmergencyBanner";
 import { DecisionCard } from "@/components/clarity/DecisionCard";
+import { UNVERIFIED_SEND_NOTICE } from "@/components/clarity/EditDraftPanel";
 import { SkippedCard } from "@/components/clarity/SkippedCard";
 import { AllClearState } from "@/components/clarity/AllClearState";
 import { useAuth } from "@/auth/AuthProvider";
-import { useQueue } from "@/api/queue";
+import { QUEUE_REFETCH_INTERVAL_MS, useQueue } from "@/api/queue";
 import { ApiError, toHouseApiError } from "@/api/errors";
 import type { QueueItem } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
@@ -102,12 +103,35 @@ function AppQueuePage() {
   // course still lists the draft — so it resolved "still pending",
   // re-enabled Send about one frame later, and the guard did nothing at
   // all. `isFetching` alone isn't sufficient; the generation is.
+  //
+  // F11 (safety re-verify round 2, #252): the two directions need
+  // DIFFERENT evidence, because the server request outlives the client's
+  // error. `POST /v1/drafts/{id}/edit-and-send` synchronously resumes the
+  // LangGraph thread under a per-case lock — hundreds of ms to seconds —
+  // and the ambiguous triggers (edge 504, client timeout, dropped
+  // connection) all leave the origin still working. So a read completing
+  // 200ms after the failure can honestly report the draft still `pending`
+  // while the origin commits a second later. Resolving "still pending" on
+  // that read re-enables Send permanently, and the retype-and-resend
+  // lands on the idempotent 200 that discards the new body.
+  //   gone          → definitive on the FIRST post-failure read (the
+  //                   editor closes either way; a resend can only 409 or
+  //                   hit the idempotent 200).
+  //   still pending → only trustworthy once a full poll interval has
+  //                   elapsed past the failure, by which time an
+  //                   in-flight commit has long landed. Costs one extra
+  //                   poll of dead Send under the explanatory line —
+  //                   the safe direction, by construction.
   useEffect(() => {
     if (!queueQuery.data) return;
     const freshIds = new Set(queueQuery.data.items.map((item) => item.draft_id));
     for (const [draftId, failedAt] of draftActions.unverifiedSendIds) {
       if (queueQuery.dataUpdatedAt <= failedAt) continue;
-      draftActions.resolveUnverifiedSend(draftId, freshIds.has(draftId));
+      const stillPending = freshIds.has(draftId);
+      if (stillPending && queueQuery.dataUpdatedAt <= failedAt + QUEUE_REFETCH_INTERVAL_MS) {
+        continue;
+      }
+      draftActions.resolveUnverifiedSend(draftId, stillPending);
     }
     // draftActions.resolveUnverifiedSend is stable (useCallback, [onNotice]
     // only) — unverifiedSendIds is the real dependency besides the query
@@ -118,14 +142,23 @@ function AppQueuePage() {
   const items = useMemo(() => queueQuery.data?.items ?? [], [queueQuery.data]);
   // Rule #1: the emergency line is never paywalled, throttled, or gated —
   // every emergency renders its own banner, never just the first one.
-  const emergencyItems = useMemo(
-    () => items.filter((item) => item.severity === "emergency"),
-    [items],
-  );
-  const decisionItems = useMemo(
-    () => items.filter((item) => item.severity !== "emergency"),
-    [items],
-  );
+  //
+  // F10 (safety re-verify round 2, #252): severity is NOT the only
+  // emergency signal available here. `notification_id` is populated only
+  // when the case has an UNACKNOWLEDGED emergency-call notification
+  // (app/routers/queue.py's third LATERAL) — an authoritative "this
+  // landlord's phone is ringing about this case" flag, and the Home
+  // analogue of the `emergency_triggered` audit row the thread already
+  // keys on. Without it, a card whose severity is null (a defensive
+  // classification miss) or written LOWER than emergency (the clamp
+  // failure this same PR fixed on the thread's plaque) rendered as an
+  // ordinary decision card: no banner, and — worse — no acknowledge
+  // button at all, while the escalation chain was still calling. The
+  // dashboard has to agree with the phone.
+  const isEmergencyCard = (item: QueueItem) =>
+    item.severity === "emergency" || item.notification_id !== null;
+  const emergencyItems = useMemo(() => items.filter(isEmergencyCard), [items]);
+  const decisionItems = useMemo(() => items.filter((item) => !isEmergencyCard(item)), [items]);
   const editingContext = draftActions.editingContext;
   useEffect(() => {
     if (!editingContext) setEditingSnapshot(null);
@@ -341,10 +374,22 @@ function QueueRow({
       status={cardStatus}
       secondsLeft={secondsLeft}
       totalSeconds={totalSeconds}
-      staleNotice={draftActions.staleNotices[item.case_id]}
+      // F7 (safety re-verify round 2, #252): with the guard actually
+      // holding, Cancel is the only live control in the editor — so it
+      // becomes the path of least resistance, and behind it the card
+      // used to return to a full action row with Approve enabled and no
+      // marking at all. One tap there sends the ORIGINAL, un-edited body:
+      // exactly the wording the landlord opened the editor to fix. The
+      // card now carries the same explanation and the same block.
+      staleNotice={
+        draftActions.staleNotices[item.case_id] ??
+        (draftActions.isSendUnverified(item.draft_id) ? UNVERIFIED_SEND_NOTICE : undefined)
+      }
       editSubmitting={draftActions.isEditSubmitting}
       sendUnverified={draftActions.isSendUnverified(item.draft_id)}
-      actionsBusy={draftActions.isBusy(item.draft_id)}
+      actionsBusy={
+        draftActions.isBusy(item.draft_id) || draftActions.isSendUnverified(item.draft_id)
+      }
       onApprove={() => draftActions.approve(ctx)}
       onEdit={() => onOpenEditor(item)}
       onSkip={() => onSkip(item)}

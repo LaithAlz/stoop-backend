@@ -2,6 +2,13 @@ import { useId, useState } from "react";
 import { Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+/** Shown wherever an ambiguous edit-and-send has blocked a send control —
+ *  inside this editor, and on the card itself once the landlord cancels
+ *  out of the editor (F7, src/routes/app.index.tsx). One string, so the
+ *  two surfaces can't drift. */
+export const UNVERIFIED_SEND_NOTICE =
+  "Checking whether your last reply went out — you'll be able to send again in a moment.";
+
 interface EditDraftPanelProps {
   tenantName: string;
   initialBody: string;
@@ -91,7 +98,7 @@ export function EditDraftPanel({
           role="status"
           className="mt-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
         >
-          Checking whether your last reply went out — you&apos;ll be able to send again in a moment.
+          {UNVERIFIED_SEND_NOTICE}
         </p>
       )}
     </div>
