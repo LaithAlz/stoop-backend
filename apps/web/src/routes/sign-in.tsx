@@ -31,9 +31,41 @@ function toHouseCallbackError(): string {
 // left sitting in the address bar. Ordinary behavior (request the link on
 // a laptop, open the email on a phone), not an attack, so the copy stays
 // blame-free and just names what to do next.
+// F1 (safety review, #248): the guard below can't actually distinguish
+// WHY the exchange produced no session. Cross-device (no verifier) is the
+// common case, but the same landing also covers a superseded verifier
+// (two links requested, the older one opened), an already-consumed code
+// (double-click / duplicate tab), a GoTrue rejection, and a legacy
+// implicit link — three of which happen ON the right device. Asserting
+// "wrong device" would be confidently wrong there and would send the
+// landlord back to the laptop to hit the same wall. So: hedge the cause,
+// keep the remedy, which is correct on every one of those paths.
 function toHouseCrossDeviceNotice(): string {
-  return "That link has to be opened on the device you asked for it from — send yourself a new one below.";
+  return "We couldn't finish that sign-in here. Links have to be opened on the same device you asked for them from — send yourself a new one below.";
 }
+
+// F2 (safety review, #248): the 10s watchdog path. Distinct from the
+// above — here the session check never came back at all, so nothing is
+// known about the link. `retryInit` cannot rescue this one: auth-js
+// memoizes `initializePromise`, so a retry re-awaits the SAME hung
+// promise and lands in the same silence 10s later. Only a reload
+// re-runs the exchange, so that's what this says — and the caller
+// deliberately does NOT strip `?code=` on this path, so the reload can
+// still complete the sign-in.
+function toHouseInitTimeoutNotice(): string {
+  return "We couldn't finish signing you in just now — check your connection and reload this page.";
+}
+
+// F-runtime (safety review, #248): survives a remount. The notice is
+// triggered by a URL that the same effect then strips, and the strip goes
+// through TanStack's patched `window.history.replaceState`, which fires a
+// router load. That happens not to remount this route today (no
+// `loaderDeps`, no `remountDeps`, so the match key is stable) — but the
+// whole fix would silently become a no-op if that ever changed, and the
+// evidence for it is three layers deep in the router. Recording the
+// detection outside React removes the dependency on that coincidence
+// entirely: a remount re-reads this and renders the notice again.
+let crossDeviceNoticeLatch = false;
 
 function parseAuthCallbackParams(): { hasError: boolean; hasPendingExchange: boolean } {
   if (typeof window === "undefined") return { hasError: false, hasPendingExchange: false };
@@ -78,7 +110,9 @@ function SignInPage() {
   // #248: set once the pending PKCE/implicit exchange this page waited on
   // (`isFinishingSignIn` below) settles with no session — i.e. the plain
   // form is about to render silently. See `toHouseCrossDeviceNotice`.
-  const [crossDeviceNotice, setCrossDeviceNotice] = useState(false);
+  // Initialized FROM the module latch so a remount (see its comment)
+  // re-renders the notice instead of silently losing it.
+  const [crossDeviceNotice, setCrossDeviceNotice] = useState(() => crossDeviceNoticeLatch);
   // A2: starts `false` on both the server and the client's first paint
   // (there's no URL to read during SSR) and only settles in the mount
   // effect below — the same stable-then-settle shape as GreetingHeader
@@ -123,6 +157,7 @@ function SignInPage() {
   // one — misdiagnosing it here would be worse than the prior silence.
   useEffect(() => {
     if (!isFinishingSignIn || initializing || initTimedOut || session) return;
+    crossDeviceNoticeLatch = true;
     setCrossDeviceNotice(true);
     // Same reasoning as the `hasError` strip above: a refresh must not
     // leave `?code=` sitting in the address bar / history, or re-attempt
@@ -141,6 +176,11 @@ function SignInPage() {
       setError(signInError);
       return;
     }
+    // The notice told them to send a new link and they just did — clear
+    // it (and its latch) so it can't sit above "Check your inbox" still
+    // asking for the thing that already happened.
+    crossDeviceNoticeLatch = false;
+    setCrossDeviceNotice(false);
     setSent(true);
   }
 
@@ -177,6 +217,21 @@ function SignInPage() {
                 aria-hidden="true"
               />
               <p className="text-sm text-ink-muted">Finishing sign-in…</p>
+            </div>
+          ) : isFinishingSignIn && initTimedOut ? (
+            // F2 (safety review, #248): the watchdog path used to fall
+            // straight through to the bare form — no spinner, no message,
+            // no way forward — which is the same silence this PR exists to
+            // remove, just narrowed to the flaky-network cause (and flaky
+            // network IS the 2am case). No retry button on purpose:
+            // auth-js memoizes its init promise, so a retry would re-await
+            // the same hung request and go quiet again 10s later. Note
+            // this branch deliberately does NOT strip `?code=` — leaving
+            // it is what makes the reload able to finish the sign-in.
+            <div className="flex flex-col items-center gap-3 py-6 text-center">
+              <p role="alert" className="text-sm leading-relaxed text-ink-muted">
+                {toHouseInitTimeoutNotice()}
+              </p>
             </div>
           ) : !configured ? (
             <div>
@@ -220,10 +275,19 @@ function SignInPage() {
                   this stays in the same honest/no-blame register as the
                   `!configured` box above rather than the `callbackError`
                   alert above. */}
+              {/* F3 (safety review, #248): `role="alert"`, not `status`.
+                  This element is INSERTED when the notice fires, and
+                  live-region announcement on insertion of the region
+                  itself is unreliable for `status` across assistive tech
+                  — which would leave a screen-reader user with exactly
+                  the silence this PR removes for everyone else. The
+                  neutral styling still carries "expected, not a fault";
+                  the role is about whether it gets announced at all.
+                  Matches the sibling `callbackError` block. */}
               {crossDeviceNotice && (
                 <p
                   className="mt-4 rounded-2xl border border-border bg-surface px-4 py-3 text-sm leading-relaxed text-ink-muted"
-                  role="status"
+                  role="alert"
                 >
                   {toHouseCrossDeviceNotice()}
                 </p>
