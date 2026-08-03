@@ -2,7 +2,7 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ArrowLeft, Loader2, MessageSquare, Phone } from "lucide-react";
+import { ArrowLeft, ChevronRight, Loader2, MessageSquare, Phone } from "lucide-react";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
 import { AppTabBar } from "@/components/stoop/AppTabBar";
 import { SeverityBadge } from "@/components/stoop/SeverityBadge";
@@ -272,6 +272,32 @@ function PropertyHub() {
                 </p>
               )}
             </div>
+
+            {/* Settings — backup_contact/quiet_hours/house_rules (issue
+                #261), the real replacement for the deleted mock "Manage"
+                section's Settings link (this file's own docstring). */}
+            <section className="px-4 pt-4">
+              <h2 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-widest text-ink-muted">
+                Settings
+              </h2>
+              <Link
+                to="/app/properties/$id/settings"
+                params={{ id }}
+                className="flex min-h-11 items-center justify-between gap-4 rounded-2xl border border-border bg-card px-4 py-4 transition hover:border-brand/30"
+              >
+                <div className="min-w-0">
+                  <p className="text-[14px] font-medium text-ink">
+                    Backup contact, quiet hours &amp; house rules
+                  </p>
+                  <p className="mt-0.5 text-[12px] text-ink-muted">
+                    {property.backup_contact
+                      ? `Backup contact: ${property.backup_contact.name}`
+                      : "No backup contact set yet"}
+                  </p>
+                </div>
+                <ChevronRight className="size-4 shrink-0 text-ink-muted/70" />
+              </Link>
+            </section>
 
             {/* Tenants */}
             <section className="px-4 pt-4">
