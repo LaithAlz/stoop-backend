@@ -114,4 +114,43 @@ describe("useDraftActions — undo 409 already_sent (M1 advisory)", () => {
     act(() => result.current.undo(ctx));
     await waitFor(() => expect(result.current.entries["draft-1"]).toBeUndefined());
   });
+
+  /**
+   * #250 safety review: the helper's own unit tests (queueEntries.test.ts)
+   * pin `computeUndoExpiresAt`, but the bug this issue fixed lived at the
+   * CALL SITE — and the reviewer demonstrated that reverting these call
+   * sites to `Date.parse(result.data.undo_until)` (the original bug), or
+   * passing `null` instead of `result.dateHeader` (anchor never plumbed),
+   * leaves the entire suite green. This test is what makes the wiring
+   * itself un-revertable: it asserts the landlord-visible symptom — a
+   * device clock 10 minutes fast must NOT collapse the window and jump
+   * the card straight to "Sent." with no undo offered.
+   */
+  it("anchors the stored expiry to the response's Date header, not the device clock", async () => {
+    const serverNow = new Date(Date.now() - 600_000); // device runs 10 min fast
+    mockApprove.mockResolvedValue({
+      data: {
+        status: "approved",
+        scheduled_send_at: new Date(serverNow.getTime() + 5_000).toISOString(),
+        undo_until: new Date(serverNow.getTime() + 5_000).toISOString(),
+      },
+      dateHeader: serverNow.toUTCString(),
+    });
+
+    const { result } = renderHook(
+      () => useDraftActions({ onNotice: jest.fn(), onSettled: jest.fn() }),
+      { wrapper },
+    );
+
+    const before = Date.now();
+    act(() => result.current.approve(ctx));
+    await waitFor(() => expect(result.current.entries["draft-1"]?.status).toBe("sending"));
+
+    const entry = result.current.entries["draft-1"];
+    if (entry?.status !== "sending") throw new Error("expected a sending entry");
+    // Anchored: expiry lands ~5s from RECEIPT on the device clock. Under
+    // the old math it would be 10 minutes in the past → instant expiry.
+    expect(entry.undoExpiresAtClient).toBeGreaterThanOrEqual(before);
+    expect(entry.undoExpiresAtClient).toBeLessThanOrEqual(Date.now() + 6_000);
+  });
 });

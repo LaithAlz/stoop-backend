@@ -125,7 +125,13 @@ async function apiRequestInternal<T>(
     });
   }
 
-  const dateHeader = response.headers.get("date");
+  // Optional-chained: this line runs on EVERY response (204s included) and
+  // sits outside the try/catch that maps transport failures, so a
+  // hypothetical `Response` without `headers` would throw a raw TypeError
+  // past the client — degrading typed `ApiError` handling on paths that
+  // include the emergency acknowledge. Unreachable with RN's fetch; the
+  // guard costs nothing (#250 safety review).
+  const dateHeader = response.headers?.get("date") ?? null;
 
   if (response.status === 204) {
     return { data: undefined as T, dateHeader };
