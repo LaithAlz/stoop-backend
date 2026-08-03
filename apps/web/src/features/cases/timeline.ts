@@ -35,29 +35,38 @@ export function buildTimelineRows(entries: TimelineEntry[], now: Date = new Date
   const rows: TimelineRow[] = [];
   let lastDayKey: string | null = null;
 
-  entries.forEach((entry, index) => {
-    const dayKey = new Date(entry.at).toDateString();
+  // Safety review (#234 PR 3 fix round, LOW): a day-divider must only be
+  // inserted right before the first entry of a new day that ACTUALLY
+  // renders a row — inserting it unconditionally (the old order) could
+  // leave a bare date stamp with nothing under it when every entry from
+  // that day turns out to be a suppressed audit action (auditLabels.ts)
+  // or a non-live draft. Called only once a caller already knows its
+  // entry will push a row.
+  const pushDayDividerIfNeeded = (at: string) => {
+    const dayKey = new Date(at).toDateString();
     if (dayKey !== lastDayKey) {
-      rows.push({
-        kind: "day-divider",
-        key: `day-${dayKey}`,
-        label: formatDayLabel(entry.at, now),
-      });
+      rows.push({ kind: "day-divider", key: `day-${dayKey}`, label: formatDayLabel(at, now) });
       lastDayKey = dayKey;
     }
+  };
 
+  entries.forEach((entry, index) => {
     if (entry.kind === "message") {
+      pushDayDividerIfNeeded(entry.at);
       rows.push({ kind: "message", key: `message-${index}`, entry });
       return;
     }
 
     if (entry.kind === "audit") {
       const label = auditActionLabel(entry.action);
-      if (label) rows.push({ kind: "audit", key: `audit-${index}`, entry, label });
+      if (!label) return;
+      pushDayDividerIfNeeded(entry.at);
+      rows.push({ kind: "audit", key: `audit-${index}`, entry, label });
       return;
     }
 
     if (LIVE_DRAFT_STATUSES.includes(entry.status)) {
+      pushDayDividerIfNeeded(entry.at);
       rows.push({ kind: "draft", key: `draft-${entry.id}`, entry });
     }
   });

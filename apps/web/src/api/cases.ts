@@ -32,8 +32,12 @@ export function getCases(
   return apiRequest<CasesResponse>(`/v1/cases${casesQueryString(params)}`);
 }
 
+/** `id` is always a real case uuid in every current caller (a route param
+ *  or a value the server itself returned), but `encodeURIComponent` here
+ *  (and on `resolveCase` below) is a cheap belt-and-braces path-injection
+ *  guard — safety review, #234 PR 3 fix round, LOW. */
 export function getCase(id: string): Promise<CaseDetail> {
-  return apiRequest<CaseDetail>(`/v1/cases/${id}`);
+  return apiRequest<CaseDetail>(`/v1/cases/${encodeURIComponent(id)}`);
 }
 
 /**
@@ -47,7 +51,7 @@ export function getCase(id: string): Promise<CaseDetail> {
  * before this is ever called — src/features/cases/resolveCase.ts).
  */
 export function resolveCase(id: string): Promise<ResolveCaseResponse> {
-  return apiRequest<ResolveCaseResponse>(`/v1/cases/${id}/resolve`, {
+  return apiRequest<ResolveCaseResponse>(`/v1/cases/${encodeURIComponent(id)}/resolve`, {
     method: "POST",
     body: { reason: "landlord" },
   });

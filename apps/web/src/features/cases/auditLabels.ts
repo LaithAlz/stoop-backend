@@ -6,11 +6,16 @@
  * ("triage" never appears here), plain first-person / plain-English
  * phrasing throughout.
  *
- * Two actions are deliberately suppressed (return `null` — the case-detail
- * screen renders no row for them):
+ * Three actions are deliberately suppressed (return `null` — the
+ * case-detail screen renders no row for them; spec-guardian catch, #234
+ * PR 3 fix round — this comment previously said "two" and omitted the
+ * third):
  * - `message_received` duplicates the adjacent message bubble itself.
  * - `drafted` duplicates the `DraftBubble` the timeline already renders
  *   for that same event.
+ * - `classified` has no entry in `LABELS` below either — its content
+ *   (severity/why) surfaces as the margin note next to the draft, not as
+ *   its own timeline row.
  * Every other action gets a one-line, past-tense, landlord-facing note.
  * This is an interpretive call (api-contracts.md specifies the timeline
  * carries every audit entry, not which ones a client should visually
