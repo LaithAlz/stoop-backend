@@ -11,7 +11,11 @@ function timeOfDayGreeting(date: Date): string {
 }
 
 interface GreetingHeaderProps {
-  name: string;
+  /** Omit when no landlord identity is available yet (the live queue
+   *  screen doesn't wire `GET /v1/me` until the account PR lands) — the
+   *  headline falls back to a plain "Good {x}." with no name, rather than
+   *  a hardcoded placeholder landlord name. */
+  name?: string;
   /** Override the "Good {x}" word; defaults to the current time of day. */
   greeting?: string;
   /** Defaults to the mockup's live-status copy; override only if the
@@ -55,7 +59,8 @@ export function GreetingHeader({
         </span>
       </div>
       <h1 className="mt-3.5 font-clarity-serif text-[27px] font-semibold leading-[1.2] tracking-tight text-clarity-ink">
-        Good {word}, {name}.
+        Good {word}
+        {name ? `, ${name}` : ""}.
       </h1>
       {children}
     </header>

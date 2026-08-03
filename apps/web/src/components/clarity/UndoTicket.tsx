@@ -5,6 +5,10 @@ interface UndoTicketProps {
   secondsLeft: number;
   totalSeconds: number;
   onUndo?: () => void;
+  /** A2 (safety review, #234 PR 2): true while this draft's own undo call
+   *  is already in flight — a second tap mid-request would just double-fire
+   *  the DELETE. */
+  undoDisabled?: boolean;
   className?: string;
 }
 
@@ -13,7 +17,13 @@ interface UndoTicketProps {
  * toast that vanishes (docs/mockups/07 `.ticket`). Nothing else competes
  * with it once a reply is on its way.
  */
-export function UndoTicket({ secondsLeft, totalSeconds, onUndo, className }: UndoTicketProps) {
+export function UndoTicket({
+  secondsLeft,
+  totalSeconds,
+  onUndo,
+  undoDisabled = false,
+  className,
+}: UndoTicketProps) {
   const clamped = Math.max(0, secondsLeft);
   const pct = totalSeconds > 0 ? Math.max(0, Math.min(100, (clamped / totalSeconds) * 100)) : 0;
   const display = `00:${String(clamped).padStart(2, "0")}`;
@@ -41,7 +51,9 @@ export function UndoTicket({ secondsLeft, totalSeconds, onUndo, className }: Und
           <button
             type="button"
             onClick={onUndo}
-            className="min-h-11 px-1.5 font-clarity-sans text-[13.5px] font-extrabold uppercase tracking-[0.03em] text-clarity-emergency underline underline-offset-[3px]"
+            disabled={undoDisabled}
+            aria-busy={undoDisabled}
+            className="min-h-11 px-1.5 font-clarity-sans text-[13.5px] font-extrabold uppercase tracking-[0.03em] text-clarity-emergency underline underline-offset-[3px] disabled:opacity-60"
           >
             Undo
             <span className="sr-only"> the message that's sending — {clamped} seconds left</span>

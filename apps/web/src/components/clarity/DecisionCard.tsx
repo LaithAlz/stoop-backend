@@ -8,6 +8,19 @@ import { MarginNote } from "./MarginNote";
 import { UndoTicket } from "./UndoTicket";
 import { DraftBubble } from "./DraftBubble";
 import { DecisionActions } from "./DecisionActions";
+import { EditDraftPanel } from "./EditDraftPanel";
+
+/** Fallback when `QueueItem.why` is null — rows classified before the
+ *  `summary` audit key shipped (api-contracts.md's Queue v1.1 amendment).
+ *  This is this file's existing Clarity wording (docs/mockups/07),
+ *  unchanged by the live-data port — apps/mobile's own DecisionCard uses
+ *  a DIFFERENT fallback sentence ("I sorted this the best I could — open
+ *  the full view for the details."); the two platforms have quietly
+ *  drifted on this one string. Flagged for copy-guardian in the PR
+ *  report, not resolved here. */
+const DEFAULT_WHY = "I drafted this from your house rules and past replies.";
+
+type DecisionCardStatus = "pending" | "sending" | "sent" | "editing";
 
 interface DecisionCardProps {
   severity: Severity;
@@ -17,19 +30,34 @@ interface DecisionCardProps {
   tenantMessage: string;
   photoNote?: string;
   draftMessage: string;
-  why: string;
+  /** Null falls back to `DEFAULT_WHY` above — see that constant's comment. */
+  why: string | null;
   whyLinkHref?: string;
   whyLinkLabel?: string;
   /** Renders the "Full view" link in the card head when set. */
   conversationId?: string;
-  /** "sending" swaps the actions row for the undo ticket. */
-  status?: "pending" | "sending";
+  /** "sending" swaps the actions row for the undo ticket; "sent" shows a
+   *  brief confirmation note; "editing" swaps the draft bubble for an
+   *  inline editor. */
+  status?: DecisionCardStatus;
   secondsLeft?: number;
   totalSeconds?: number;
+  /** The `draft_stale` one-line notice (src/features/queue/
+   *  queueEntries.ts's `draftStaleNotice`) — shown for a few seconds after
+   *  a concurrent tenant reply invalidates this card's draft mid-action. */
+  staleNotice?: string;
+  /** True while the edit-and-send mutation for THIS card is in flight. */
+  editSubmitting?: boolean;
+  /** A2 (safety review, #234 PR 2): true while ANY mutation for this
+   *  card's draft is in flight — disables the Edit/Skip/Approve row and
+   *  the Undo tap so two actions can't race on the same draft. */
+  actionsBusy?: boolean;
   onApprove?: () => void;
   onEdit?: () => void;
   onSkip?: () => void;
   onUndo?: () => void;
+  onCancelEdit?: () => void;
+  onSubmitEdit?: (body: string) => void;
   className?: string;
 }
 
@@ -53,13 +81,21 @@ export function DecisionCard({
   status = "pending",
   secondsLeft = 5,
   totalSeconds = 5,
+  staleNotice,
+  editSubmitting = false,
+  actionsBusy = false,
   onApprove,
   onEdit,
   onSkip,
   onUndo,
+  onCancelEdit,
+  onSubmitEdit,
   className,
 }: DecisionCardProps) {
   const isSending = status === "sending";
+  const isSent = status === "sent";
+  const isEditing = status === "editing";
+  const isPending = status === "pending";
 
   return (
     <article
@@ -102,20 +138,53 @@ export function DecisionCard({
         )}
       </div>
 
-      <DraftBubble
-        className="mt-2"
-        label={isSending ? `On its way to ${tenantName}` : "I'd like to reply"}
-        body={draftMessage}
-      />
-
-      {isSending ? (
-        <UndoTicket secondsLeft={secondsLeft} totalSeconds={totalSeconds} onUndo={onUndo} />
+      {isEditing ? (
+        <EditDraftPanel
+          className="mt-2"
+          tenantName={tenantName}
+          initialBody={draftMessage}
+          submitting={editSubmitting}
+          onCancel={() => onCancelEdit?.()}
+          onSend={(body) => onSubmitEdit?.(body)}
+        />
       ) : (
+        <DraftBubble
+          className="mt-2"
+          label={isSending ? `On its way to ${tenantName}` : "I'd like to reply"}
+          body={draftMessage}
+        />
+      )}
+
+      {staleNotice && !isEditing && (
+        <p className="mt-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-brand">
+          {staleNotice}
+        </p>
+      )}
+
+      {isSending && (
+        <UndoTicket
+          secondsLeft={secondsLeft}
+          totalSeconds={totalSeconds}
+          onUndo={onUndo}
+          undoDisabled={actionsBusy}
+        />
+      )}
+      {isSent && (
+        <p className="mt-3.5 font-clarity-sans text-[13px] font-semibold text-clarity-whenever">
+          Sent.
+        </p>
+      )}
+      {isPending && (
         <>
           <MarginNote linkHref={whyLinkHref} linkLabel={whyLinkLabel}>
-            {why}
+            {why ?? DEFAULT_WHY}
           </MarginNote>
-          <DecisionActions onEdit={onEdit} onSkip={onSkip} onApprove={onApprove} />
+          <DecisionActions
+            onEdit={onEdit}
+            onSkip={onSkip}
+            onApprove={onApprove}
+            disabled={actionsBusy}
+          />
         </>
       )}
     </article>

@@ -69,6 +69,12 @@ export function toHouseApiError(error: ApiError): string {
       return "That reply already went out — there's nothing left to undo.";
     case "draft_not_undoable":
       return "That draft isn't waiting to send anymore.";
+    // NEW-4 (safety review round 3, #234 PR 2): without a bespoke line, a
+    // 404'd draft got the generic "try again in a moment" — an invitation
+    // to retry forever against a draft that no longer exists (the editor
+    // also closes on this code, useDraftActions.ts).
+    case "draft_not_found":
+      return "That draft isn't there anymore.";
     case "case_not_found":
       return "That conversation isn't there anymore.";
     case "rate_limited":
