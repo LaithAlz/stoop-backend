@@ -399,7 +399,13 @@ function EditProfileForm({
       setNameError(null);
       // H2-style ambiguity check (src/routes/app.properties_.$id.tsx) — a
       // status-0/5xx failure here doesn't prove the write didn't land.
-      if (error instanceof ApiError && (error.status === 0 || error.status >= 500)) {
+      // R3-2 (#252) applied here too: classify on the CODE, not on status
+      // 0. `server_context` and `not_configured` also carry status 0 but
+      // are thrown before any `fetch` happens (src/api/client.ts), so
+      // nothing was sent and "we couldn't confirm it saved" would be
+      // false — on the emergency callback number, in the direction that
+      // discourages a re-save.
+      if (error instanceof ApiError && (error.code === "network_error" || error.status >= 500)) {
         // F5 (safety review, #234 PR 5): "refresh to check" is impossible
         // advice for a phone edit — GET /v1/me deliberately never returns
         // `phone`, so no refresh can confirm it. PATCH is idempotent, so

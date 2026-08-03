@@ -2,10 +2,24 @@ import { useId, useState } from "react";
 import { Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+/** Shown wherever an ambiguous edit-and-send has blocked a send control —
+ *  inside this editor, and on the card itself once the landlord cancels
+ *  out of the editor (F7, src/routes/app.index.tsx). One string, so the
+ *  two surfaces can't drift. */
+export const UNVERIFIED_SEND_NOTICE =
+  "Checking whether your last reply went out — you'll be able to send again in a moment.";
+
 interface EditDraftPanelProps {
   tenantName: string;
   initialBody: string;
   submitting?: boolean;
+  /** R3-1 (safety review round 3 follow-up, issue #252): true while THIS
+   *  draft's last edit-and-send ended in an ambiguous failure (network
+   *  drop / 5xx) that hasn't been resolved against a fresh server read
+   *  yet — disables Send ONLY (not Cancel, not the textarea) so a
+   *  retype-and-resend can't silently overwrite an already-delivered body
+   *  while its fate is still unknown. */
+  sendDisabled?: boolean;
   onCancel: () => void;
   onSend: (body: string) => void;
   className?: string;
@@ -30,13 +44,14 @@ export function EditDraftPanel({
   tenantName,
   initialBody,
   submitting = false,
+  sendDisabled = false,
   onCancel,
   onSend,
   className,
 }: EditDraftPanelProps) {
   const [body, setBody] = useState(initialBody);
   const fieldId = useId();
-  const canSend = body.trim().length > 0 && !submitting;
+  const canSend = body.trim().length > 0 && !submitting && !sendDisabled;
 
   return (
     <div className={cn(className)}>
@@ -64,12 +79,28 @@ export function EditDraftPanel({
           type="button"
           onClick={() => onSend(body.trim())}
           disabled={!canSend}
+          aria-describedby={sendDisabled ? `${fieldId}-unverified` : undefined}
           className="flex min-h-[52px] items-center justify-center gap-2 rounded-clarity-md border-[1.5px] border-clarity-brand-deep bg-clarity-brand font-clarity-sans text-base font-extrabold text-clarity-brand-on shadow-clarity-banner transition-transform duration-150 ease-clarity hover:-translate-y-px motion-reduce:transition-none motion-reduce:hover:translate-y-0 disabled:opacity-60"
         >
           <Check className="size-4" aria-hidden="true" />
           {submitting ? "Sending…" : "Send edited version"}
         </button>
       </div>
+      {/* F6 (safety re-verify, #252): a dimmed button with no explanation
+          is not enough for a blocked SAFETY control — once the guard
+          resolves only against a genuinely newer read, Send can stay dead
+          for a whole poll interval (or longer while the API is down,
+          which is the safe direction but only if it's understandable).
+          The toast that raised it is gone in four seconds; this isn't. */}
+      {sendDisabled && !submitting && (
+        <p
+          id={`${fieldId}-unverified`}
+          role="status"
+          className="mt-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
+        >
+          {UNVERIFIED_SEND_NOTICE}
+        </p>
+      )}
     </div>
   );
 }

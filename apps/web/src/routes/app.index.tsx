@@ -8,10 +8,28 @@ import { GreetingHeader } from "@/components/clarity/GreetingHeader";
 import { CountsStrip } from "@/components/clarity/CountsStrip";
 import { EmergencyBanner } from "@/components/clarity/EmergencyBanner";
 import { DecisionCard } from "@/components/clarity/DecisionCard";
+import { UNVERIFIED_SEND_NOTICE } from "@/components/clarity/EditDraftPanel";
 import { SkippedCard } from "@/components/clarity/SkippedCard";
 import { AllClearState } from "@/components/clarity/AllClearState";
 import { useAuth } from "@/auth/AuthProvider";
-import { useQueue } from "@/api/queue";
+import { QUEUE_REFETCH_INTERVAL_MS, useQueue } from "@/api/queue";
+
+/**
+ * How long past an ambiguous edit-and-send failure a queue read must be
+ * before "the draft is still pending" is trusted enough to re-enable Send
+ * (F11 — see the effect below).
+ *
+ * Sized against the SERVER's worst case, not the poll interval. The API's
+ * per-case advisory lock retries for `_CASE_LOCK_MAX_WAIT_SECONDS = 30s`
+ * (apps/api/app/agent/graph.py) BEFORE the graph resume even begins, so an
+ * edit-and-send can legitimately commit ~30s after the request started
+ * while the client stamped its failure in the first second. One poll
+ * interval was shorter than that ceiling and left a window where a
+ * qualifying read still predated the commit. Two intervals clears it with
+ * margin; the cost is Send staying disabled a little longer under an
+ * on-screen explanation, which is the safe direction by construction.
+ */
+const UNVERIFIED_SETTLE_MS = 2 * QUEUE_REFETCH_INTERVAL_MS;
 import { ApiError, toHouseApiError } from "@/api/errors";
 import type { QueueItem } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
@@ -27,6 +45,7 @@ import { useDraftActions } from "@/features/queue/useDraftActions";
 import {
   emergencyHeadline,
   emergencySubtext,
+  emergencyTenantMessage,
   hasAcknowledgeableNotification,
 } from "@/features/emergency/emergencyBanner";
 import { useAcknowledge } from "@/features/emergency/useAcknowledge";
@@ -88,17 +107,79 @@ function AppQueuePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queueQuery.data, entries]);
 
+  // R3-1 (safety review round 3 follow-up, issue #252): resolve any
+  // edit-and-send left `unverifiedSendIds` by useDraftActions.ts's
+  // ambiguous-failure branch against THIS successful queue read — still
+  // listed as a card means the edit never applied (re-enable Send); gone
+  // means it did (close the editor + notice if it's still open on it).
+  //
+  // F1 (safety re-verify, #252): resolve ONLY against a read that
+  // completed after the failure. Without the `dataUpdatedAt` comparison
+  // this effect fired on the very next commit — when `queueQuery.data` is
+  // still the last successful payload from BEFORE the send, which of
+  // course still lists the draft — so it resolved "still pending",
+  // re-enabled Send about one frame later, and the guard did nothing at
+  // all. `isFetching` alone isn't sufficient; the generation is.
+  //
+  // F11 (safety re-verify round 2, #252): the two directions need
+  // DIFFERENT evidence, because the server request outlives the client's
+  // error. `POST /v1/drafts/{id}/edit-and-send` synchronously resumes the
+  // LangGraph thread under a per-case lock — hundreds of ms to seconds —
+  // and the ambiguous triggers (edge 504, client timeout, dropped
+  // connection) all leave the origin still working. So a read completing
+  // 200ms after the failure can honestly report the draft still `pending`
+  // while the origin commits a second later. Resolving "still pending" on
+  // that read re-enables Send permanently, and the retype-and-resend
+  // lands on the idempotent 200 that discards the new body.
+  //   gone          → definitive on the FIRST post-failure read (the
+  //                   editor closes either way; a resend can only 409 or
+  //                   hit the idempotent 200).
+  //   still pending → only trustworthy once a full poll interval has
+  //                   elapsed past the failure, by which time an
+  //                   in-flight commit has long landed. Costs one extra
+  //                   poll of dead Send under the explanatory line —
+  //                   the safe direction, by construction.
+  useEffect(() => {
+    if (!queueQuery.data) return;
+    const freshIds = new Set(queueQuery.data.items.map((item) => item.draft_id));
+    for (const [draftId, failedAt] of draftActions.unverifiedSendIds) {
+      if (queueQuery.dataUpdatedAt <= failedAt) continue;
+      const stillPending = freshIds.has(draftId);
+      if (stillPending && queueQuery.dataUpdatedAt <= failedAt + UNVERIFIED_SETTLE_MS) {
+        continue;
+      }
+      draftActions.resolveUnverifiedSend(draftId, stillPending);
+    }
+    // `draftActions.resolveUnverifiedSend` is a useCallback over
+    // [onNotice, unverifiedSendIds] — both already covered by the deps
+    // below, so listing the whole `draftActions` object would only add
+    // churn. (It was `[onNotice]` alone until F12 added the membership
+    // read; keeping this comment truthful matters, since every defect
+    // found in this file so far has been a comment asserting a guarantee
+    // the code no longer had.)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queueQuery.data, queueQuery.dataUpdatedAt, draftActions.unverifiedSendIds]);
+
   const items = useMemo(() => queueQuery.data?.items ?? [], [queueQuery.data]);
   // Rule #1: the emergency line is never paywalled, throttled, or gated —
   // every emergency renders its own banner, never just the first one.
-  const emergencyItems = useMemo(
-    () => items.filter((item) => item.severity === "emergency"),
-    [items],
-  );
-  const decisionItems = useMemo(
-    () => items.filter((item) => item.severity !== "emergency"),
-    [items],
-  );
+  //
+  // F10 (safety re-verify round 2, #252): severity is NOT the only
+  // emergency signal available here. `notification_id` is populated only
+  // when the case has an UNACKNOWLEDGED emergency-call notification
+  // (app/routers/queue.py's third LATERAL) — an authoritative "this
+  // landlord's phone is ringing about this case" flag, and the Home
+  // analogue of the `emergency_triggered` audit row the thread already
+  // keys on. Without it, a card whose severity is null (a defensive
+  // classification miss) or written LOWER than emergency (the clamp
+  // failure this same PR fixed on the thread's plaque) rendered as an
+  // ordinary decision card: no banner, and — worse — no acknowledge
+  // button at all, while the escalation chain was still calling. The
+  // dashboard has to agree with the phone.
+  const isEmergencyCard = (item: QueueItem) =>
+    item.severity === "emergency" || item.notification_id !== null;
+  const emergencyItems = useMemo(() => items.filter(isEmergencyCard), [items]);
+  const decisionItems = useMemo(() => items.filter((item) => !isEmergencyCard(item)), [items]);
   const editingContext = draftActions.editingContext;
   useEffect(() => {
     if (!editingContext) setEditingSnapshot(null);
@@ -207,7 +288,7 @@ function AppQueuePage() {
                   headline={emergencyHeadline(item)}
                   subtext={emergencySubtext(item)}
                   tenantFirstName={firstName(item.tenant_name)}
-                  tenantMessage={item.tenant_message}
+                  tenantMessage={emergencyTenantMessage(item)}
                   onAcknowledge={
                     hasAcknowledgeableNotification(item)
                       ? () => acknowledge.acknowledge(item.notification_id)
@@ -307,16 +388,29 @@ function QueueRow({
       tenantName={firstName(item.tenant_name)}
       propertyLabel={propertyLabel}
       timestamp={formatRelativeTime(item.received_at)}
-      tenantMessage={item.tenant_message}
+      tenantMessage={item.tenant_message ?? ""}
       photoNote={item.has_media ? (item.media_note ?? "Sent a photo") : undefined}
       draftMessage={item.draft_body}
       why={item.why}
       status={cardStatus}
       secondsLeft={secondsLeft}
       totalSeconds={totalSeconds}
-      staleNotice={draftActions.staleNotices[item.case_id]}
+      // F7 (safety re-verify round 2, #252): with the guard actually
+      // holding, Cancel is the only live control in the editor — so it
+      // becomes the path of least resistance, and behind it the card
+      // used to return to a full action row with Approve enabled and no
+      // marking at all. One tap there sends the ORIGINAL, un-edited body:
+      // exactly the wording the landlord opened the editor to fix. The
+      // card now carries the same explanation and the same block.
+      staleNotice={
+        draftActions.staleNotices[item.case_id] ??
+        (draftActions.isSendUnverified(item.draft_id) ? UNVERIFIED_SEND_NOTICE : undefined)
+      }
       editSubmitting={draftActions.isEditSubmitting}
-      actionsBusy={draftActions.isBusy(item.draft_id)}
+      sendUnverified={draftActions.isSendUnverified(item.draft_id)}
+      actionsBusy={
+        draftActions.isBusy(item.draft_id) || draftActions.isSendUnverified(item.draft_id)
+      }
       onApprove={() => draftActions.approve(ctx)}
       onEdit={() => onOpenEditor(item)}
       onSkip={() => onSkip(item)}
