@@ -23,3 +23,46 @@ export const DELETE_PROPERTY_MESSAGE =
   "and the number itself is fully released after a 24-hour hold — a release isn't instant.";
 
 export const DELETE_PROPERTY_CONFIRM_LABEL = "Delete property";
+
+/**
+ * L4 (#258 follow-up): the dialog above is pure destruction framing and
+ * never named what's actually blocking a delete, even though the property
+ * detail page already knows two of the FK-`RESTRICT` blockers
+ * (schema-v1.md: `tenants.property_id`/`cases.property_id`, both
+ * `ON DELETE RESTRICT`) BEFORE the landlord ever clicks delete — the
+ * confirm-copy said nothing while a caption below the button carried the
+ * only hint. This does not claim completeness: `messages.property_id` and
+ * `trust_metrics.property_id` are also `RESTRICT` (api-contracts.md's
+ * v1.9 amendment) and aren't independently visible on this page, so a
+ * property with neither a known tenant row nor an open case can still
+ * 409. The function therefore only ever ASSERTS a block when one is
+ * actually known (deterministic — `RESTRICT` means present rows always
+ * block); it never asserts success by omission.
+ *
+ * `tenantCount` must be the RAW tenant-row count (every row the property
+ * detail page's `useTenants` query returns, not the active-only list it
+ * renders) — a soft-deleted tenant (`active = false`) still leaves its
+ * row in place and still blocks the delete via the same FK.
+ */
+export function deletePropertyMessage(knownBlockers: {
+  tenantCount: number;
+  openCaseCount: number;
+}): string {
+  const parts: string[] = [];
+  if (knownBlockers.openCaseCount > 0) {
+    parts.push(
+      knownBlockers.openCaseCount === 1
+        ? "1 open case"
+        : `${knownBlockers.openCaseCount} open cases`,
+    );
+  }
+  if (knownBlockers.tenantCount > 0) {
+    parts.push(
+      knownBlockers.tenantCount === 1
+        ? "1 tenant on file"
+        : `${knownBlockers.tenantCount} tenants on file`,
+    );
+  }
+  if (parts.length === 0) return DELETE_PROPERTY_MESSAGE;
+  return `This property has ${parts.join(" and ")}, so the delete will be blocked until those are cleared. ${DELETE_PROPERTY_MESSAGE}`;
+}

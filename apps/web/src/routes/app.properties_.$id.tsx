@@ -40,8 +40,8 @@ import {
 } from "@/features/properties/stoopNumber";
 import {
   DELETE_PROPERTY_CONFIRM_LABEL,
-  DELETE_PROPERTY_MESSAGE,
   DELETE_PROPERTY_TITLE,
+  deletePropertyMessage,
 } from "@/features/properties/deleteProperty";
 import {
   revokeConfirmation,
@@ -190,6 +190,12 @@ function PropertyHub() {
 
   const property = propertyQuery.data;
   const tenants: Tenant[] = (tenantsQuery.data?.items ?? []).filter((t) => t.active);
+  // L4 (#258 follow-up): the RAW row count, not the active-only `tenants`
+  // list above — a soft-deleted tenant row (`active = false`) still blocks
+  // the delete via `tenants.property_id`'s `ON DELETE RESTRICT`
+  // (schema-v1.md), so it still counts as a known blocker here even
+  // though it's hidden from the Tenants panel above.
+  const allTenantCount = tenantsQuery.data?.items.length ?? 0;
   const recentCases: CaseSummary[] = recentCasesQuery.data?.pages[0]?.items ?? [];
 
   const revokeCopy = revokeConfirmation("property");
@@ -485,7 +491,12 @@ function PropertyHub() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle className="font-display">{DELETE_PROPERTY_TITLE}</AlertDialogTitle>
-            <AlertDialogDescription>{DELETE_PROPERTY_MESSAGE}</AlertDialogDescription>
+            <AlertDialogDescription>
+              {deletePropertyMessage({
+                tenantCount: allTenantCount,
+                openCaseCount: property?.open_case_count ?? 0,
+              })}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={deleteMutation.isPending}>Cancel</AlertDialogCancel>
