@@ -40,6 +40,7 @@ import { entryFor, secondsRemaining, totalUndoSeconds } from "@/features/queue/q
 import { useDraftActions } from "@/features/queue/useDraftActions";
 import { emergencyHeadline, emergencySubtext } from "@/features/emergency/emergencyBanner";
 import { buildTimelineRows, type TimelineRow } from "@/features/cases/timeline";
+import { isEmergencySignal } from "@/features/cases/emergencySignal";
 import {
   RESOLVE_CONFIRM_LABEL,
   RESOLVE_CONFIRM_MESSAGE,
@@ -112,13 +113,50 @@ function ConversationPage() {
 
   const isPendingDraft = (entry: TimelineEntry): entry is TimelineDraftEntry =>
     entry.kind === "draft" && entry.status === "pending";
-  const pendingDraft = caseDetail?.timeline.find(isPendingDraft);
-  const draftId = pendingDraft?.id;
-  const draftBody = pendingDraft?.body;
+  const livePendingDraft = caseDetail?.timeline.find(isPendingDraft);
+
+  // M4 (safety review, #234 PR 3 fix round): `livePendingDraft` is looked
+  // up fresh from `caseDetail.timeline` on every render — the moment an
+  // approve/skip actually applies server-side, that draft's `status`
+  // moves off `"pending"`, so a background refetch mid-action (React
+  // Query's `staleTime`/`refetchOnWindowFocus`) makes `livePendingDraft`
+  // disappear even while the LOCAL overlay (`draftActions.entries`) is
+  // still honestly "sending" with a live 5s undo countdown on screen.
+  // Pinning the id/body the first time we see them — and continuing to
+  // use the pin for as long as the local entry for that id is non-idle —
+  // keeps the footer rendered through that window instead of blanking it
+  // out from under an active Undo ticket. Mirrors Home's own pinned-item
+  // pattern for the identical reason (src/features/queue/queueEntries.ts's
+  // `pinnedEditingItem`).
+  const [pinnedDraft, setPinnedDraft] = useState<{ id: string; body: string } | null>(null);
+  useEffect(() => {
+    if (livePendingDraft) {
+      setPinnedDraft({ id: livePendingDraft.id, body: livePendingDraft.body });
+    }
+    // `livePendingDraft` is a NEW object from `.find()` every render —
+    // depending on the two primitive fields this effect actually reads
+    // (rather than the object reference) is deliberate, not an omission.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [livePendingDraft?.id, livePendingDraft?.body]);
+
+  const pinnedEntry = pinnedDraft ? entryFor(draftActions.entries, pinnedDraft.id) : undefined;
+  const keepPinned = Boolean(!livePendingDraft && pinnedDraft && pinnedEntry?.status !== "idle");
+
+  const draftId = livePendingDraft?.id ?? (keepPinned ? pinnedDraft?.id : undefined);
+  const draftBody = livePendingDraft?.body ?? (keepPinned ? pinnedDraft?.body : undefined);
   const draftEntry = draftId
     ? entryFor(draftActions.entries, draftId)
     : { status: "idle" as const };
-  const isEditingThisDraft = draftId ? draftActions.editingContext?.draftId === draftId : false;
+
+  // M5 (safety review, #234 PR 3 fix round): the editor, once open, must
+  // render from `useDraftActions`' OWN pinned `editingContext` (draft id +
+  // body captured at open time) — never from the live/pinned `draftId`
+  // above. A tenant reply arriving mid-type makes the OLD draft `stale`
+  // and drafts a NEW one with a different id; deriving the editor's
+  // "am I still open for this draft" from the live `draftId` would flip
+  // to false the instant that happens and unmount `EditDraftPanel` with
+  // whatever the landlord had just typed still in it.
+  const editingContext = draftActions.editingContext;
 
   // Once the local approve overlay settles on "sent", the server's own
   // timeline (a real outbound `message` entry replacing the drafted one,
@@ -135,10 +173,20 @@ function ConversationPage() {
   ): entry is Extract<TimelineEntry, { kind: "audit" }> =>
     entry.kind === "audit" && entry.action === "classified";
   const classifiedEntry = caseDetail?.timeline.find(isClassifiedAudit);
-  const why =
-    (classifiedEntry?.payload as ClassifiedAuditPayload | undefined)?.summary ?? DEFAULT_WHY;
+  // M6 (safety review, #234 PR 3 fix round): `payload` is an opaque jsonb
+  // blob (ClassifiedAuditPayload is a read-time cast, never a guaranteed
+  // shape — see that type's own comment in src/api/types.ts) — a
+  // non-string `summary` reaching JSX here would throw at render time and
+  // white-screen the whole thread. Guarded rather than trusted.
+  const rawWhy = (classifiedEntry?.payload as ClassifiedAuditPayload | undefined)?.summary;
+  const why = typeof rawWhy === "string" ? rawWhy : DEFAULT_WHY;
 
   const caseIsOpen = caseDetail ? caseDetail.status !== "resolved" : false;
+  // H1 (safety review, #234 PR 3 fix round): never let a `null` severity
+  // (transient pre-classification, or permanent degraded mode — see
+  // src/features/cases/emergencySignal.ts's full writeup) suppress a real
+  // Tier-0 emergency signal the timeline otherwise carries.
+  const showEmergencyBanner = Boolean(caseDetail && caseIsOpen && isEmergencySignal(caseDetail));
 
   const [resolveConfirmOpen, setResolveConfirmOpen] = useState(false);
   const resolveMutation = useMutation({
@@ -182,7 +230,15 @@ function ConversationPage() {
                 Loading this conversation…
               </p>
             </div>
-          ) : caseQuery.isError && !caseDetail ? (
+          ) : !caseDetail ? (
+            // H3 (safety review, #234 PR 3 fix round): this branch is now
+            // "no data, whatever the reason" (a genuine fetch error, OR —
+            // belt-and-braces — the defensive case a fixed
+            // src/api/client.ts should no longer be able to produce: a 2xx
+            // that somehow resolved to no usable body). Previously this
+            // was `caseQuery.isError && !caseDetail`, with a bare `null`
+            // trailing branch below for the "not error, but also no data"
+            // gap — a blank screen instead of a readable one.
             <div role="alert" className="flex flex-col items-center gap-3 py-16 text-center">
               <p className="font-clarity-sans text-sm font-semibold text-clarity-ink-dim">
                 {caseQuery.error instanceof ApiError
@@ -197,7 +253,7 @@ function ConversationPage() {
                 Try again
               </button>
             </div>
-          ) : caseDetail ? (
+          ) : (
             <>
               {caseQuery.isError && (
                 <div
@@ -208,7 +264,7 @@ function ConversationPage() {
                 </div>
               )}
 
-              {caseDetail.severity === "emergency" && caseIsOpen && (
+              {showEmergencyBanner && (
                 <EmergencyBanner
                   conversationId={caseDetail.id}
                   headline={emergencyHeadline({
@@ -223,57 +279,62 @@ function ConversationPage() {
 
               {rows.map((row) => renderTimelineRow(row, tenantFirst))}
 
-              {draftId && draftBody !== undefined ? (
+              {editingContext ? (
                 <div className="mt-2">
-                  {isEditingThisDraft ? (
-                    <EditDraftPanel
-                      tenantName={tenantFirst}
-                      initialBody={draftBody}
-                      submitting={draftActions.isEditSubmitting}
-                      onCancel={() => draftActions.cancelEditor()}
-                      onSend={(body) => draftActions.submitEdit(body)}
-                    />
-                  ) : (
-                    <DraftFooter
-                      tenantFirst={tenantFirst}
-                      draftBody={draftBody}
-                      draftEntry={draftEntry}
-                      why={why}
-                      staleNotice={draftActions.staleNotices[caseDetail.id]}
-                      isBusy={draftActions.isBusy(draftId)}
-                      onApprove={() =>
-                        draftActions.approve({
-                          draftId,
-                          caseId: caseDetail.id,
-                          tenantName: caseDetail.tenant.name ?? "",
-                        })
-                      }
-                      onEdit={() =>
-                        draftActions.openEditor(
-                          {
-                            draftId,
-                            caseId: caseDetail.id,
-                            tenantName: caseDetail.tenant.name ?? "",
-                          },
-                          draftBody,
-                        )
-                      }
-                      onSkip={() =>
-                        draftActions.skip({
-                          draftId,
-                          caseId: caseDetail.id,
-                          tenantName: caseDetail.tenant.name ?? "",
-                        })
-                      }
-                      onUndo={() =>
-                        draftActions.undo({
-                          draftId,
-                          caseId: caseDetail.id,
-                          tenantName: caseDetail.tenant.name ?? "",
-                        })
-                      }
-                    />
+                  <EditDraftPanel
+                    tenantName={tenantFirst}
+                    initialBody={editingContext.body}
+                    submitting={draftActions.isEditSubmitting}
+                    onCancel={() => draftActions.cancelEditor()}
+                    onSend={(body) => draftActions.submitEdit(body)}
+                  />
+                  {draftActions.staleNotices[caseDetail.id] && (
+                    <p className="mt-2.5 text-right font-clarity-sans text-[13px] font-semibold text-clarity-brand">
+                      {draftActions.staleNotices[caseDetail.id]}
+                    </p>
                   )}
+                </div>
+              ) : draftId && draftBody !== undefined ? (
+                <div className="mt-2">
+                  <DraftFooter
+                    tenantFirst={tenantFirst}
+                    draftBody={draftBody}
+                    draftEntry={draftEntry}
+                    why={why}
+                    staleNotice={draftActions.staleNotices[caseDetail.id]}
+                    isBusy={draftActions.isBusy(draftId)}
+                    onApprove={() =>
+                      draftActions.approve({
+                        draftId,
+                        caseId: caseDetail.id,
+                        tenantName: caseDetail.tenant.name ?? "",
+                      })
+                    }
+                    onEdit={() =>
+                      draftActions.openEditor(
+                        {
+                          draftId,
+                          caseId: caseDetail.id,
+                          tenantName: caseDetail.tenant.name ?? "",
+                        },
+                        draftBody,
+                      )
+                    }
+                    onSkip={() =>
+                      draftActions.skip({
+                        draftId,
+                        caseId: caseDetail.id,
+                        tenantName: caseDetail.tenant.name ?? "",
+                      })
+                    }
+                    onUndo={() =>
+                      draftActions.undo({
+                        draftId,
+                        caseId: caseDetail.id,
+                        tenantName: caseDetail.tenant.name ?? "",
+                      })
+                    }
+                  />
                 </div>
               ) : (
                 <p className="mt-4 font-clarity-sans text-xs leading-relaxed text-clarity-ink-dim">
@@ -301,7 +362,7 @@ function ConversationPage() {
 
               <div ref={bottomRef} />
             </>
-          ) : null}
+          )}
         </main>
 
         <AppTabBar active="conversations" queueCount={queueQuery.data?.counts.total ?? 0} />
@@ -353,6 +414,16 @@ function ThreadHeader({
   tenantFirst: string;
   showPlaque: boolean;
 }) {
+  // H1 (safety review, #234 PR 3 fix round): a `null` severity must not
+  // render as "no plaque" (which reads as "nothing to flag here") when
+  // the timeline actually carries an `emergency_triggered` audit row —
+  // see src/features/cases/emergencySignal.ts's full writeup. Only
+  // fabricates the "Emergency" plaque label from that signal when the
+  // server's own `severity` is genuinely absent; a real, non-null
+  // severity (including a downgraded "urgent"/"routine") always wins.
+  const plaqueSeverity =
+    caseDetail?.severity ?? (caseDetail && isEmergencySignal(caseDetail) ? "emergency" : null);
+
   return (
     <header className="border-b border-clarity-line px-5 pb-3.5 pt-4">
       <div className="flex items-center justify-between gap-2">
@@ -363,7 +434,7 @@ function ThreadHeader({
           <ChevronLeft className="size-[15px]" aria-hidden="true" />
           Conversations
         </Link>
-        {caseDetail?.severity && showPlaque && <SeverityPlaque severity={caseDetail.severity} />}
+        {plaqueSeverity && showPlaque && <SeverityPlaque severity={plaqueSeverity} />}
       </div>
       <h1 className="mt-2 font-clarity-serif text-[19px] font-semibold leading-[1.3] tracking-tight text-clarity-ink">
         {caseDetail
