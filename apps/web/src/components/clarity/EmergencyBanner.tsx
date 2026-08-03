@@ -8,32 +8,32 @@ import {
 } from "@/features/emergency/emergencyBanner";
 
 interface EmergencyBannerProps {
-  /** B3 (safety review, #234 PR 2): optional — when absent the banner
-   *  renders as a plain, non-navigating block instead of a `<Link>`. Home
-   *  (src/routes/app.index.tsx) omits it while the conversation/emergency
-   *  routes still read mock-app.ts: a live case UUID pushed into a mock
-   *  loader dead-ends on "Alert not found." — exactly on the emergency
-   *  path. PR 3 (live cases screen) restores navigation there. The
-   *  still-mocked conversation thread keeps passing its own mock ids. */
+  /** Optional — when absent the banner renders as a plain, non-navigating
+   *  block instead of a `<Link>`. Every current caller passes one: Home
+   *  (src/routes/app.index.tsx, `case_id`) and the conversation thread
+   *  (src/routes/app.conversations.$id.tsx, the case's own `id`) both link
+   *  to the live `/app/conversations/$id/emergency` route (campaign issue
+   *  #234 PR 3). Kept optional rather than required for the rare case a
+   *  future caller renders this informationally only (no known caller does
+   *  today). */
   conversationId?: string;
   headline: string;
-  /** Optional as of round 3 (NEW-5) — Home passes nothing while the
-   *  headline fallback already carries the property label. */
+  /** Optional — a caller with nothing more specific than the headline's
+   *  own fallback (which already carries the property label) can omit
+   *  this rather than repeat it. */
   subtext?: string;
-  /** NEW-1 (safety review round 3, #234 PR 2): the tenant's own words,
-   *  rendered inside the banner. With navigation gone until PR 3 (B3
-   *  above), a banner without these is "someone needs you now" with no
-   *  way to learn what happened and exactly one tappable thing — the
-   *  button that silences the escalation chain. Same "{name} said"
-   *  label pattern as DecisionCard's tenant-message block. */
+  /** The tenant's own words, rendered inside the banner — the "{name}
+   *  said" block gives a banner something to say beyond "someone needs
+   *  you now" even when it's also a `<Link>`. Same "{name} said" label
+   *  pattern as DecisionCard's tenant-message block. */
   tenantFirstName?: string;
   tenantMessage?: string;
   /** Present only when this card carries a non-null `notification_id`
    *  (api-contracts.md Queue v1.15 amendment) — omit entirely to render
-   *  the plain informational banner, e.g. from the still-mocked
-   *  conversation thread (src/routes/app.conversations.$id.tsx), which
-   *  has no ack surface at all (`GET /v1/cases/{id}` carries no
-   *  `notification_id`). */
+   *  the plain informational banner, e.g. from the conversation thread
+   *  (src/routes/app.conversations.$id.tsx), which has no ack surface at
+   *  all (`GET /v1/cases/{id}` carries no `notification_id` — v1.15
+   *  amendment scopes that field to the queue card only). */
   onAcknowledge?: () => void;
   /** True only while THIS banner's own ack call is in flight — the caller
    *  scopes this per notification id (src/features/emergency/
@@ -47,7 +47,7 @@ interface EmergencyBannerProps {
  * The one thing on Home that's never buried below the fold — with a
  * `conversationId`, links straight into the emergency takeover
  * (docs/mockups/07 `.em-banner`); without one it's informational + ack
- * only (see the prop's B3 comment).
+ * only (see the prop's own comment).
  * Rule #1: the emergency line is never paywalled, throttled, or gated, so
  * this banner has no dismiss control. `onAcknowledge` (v1.15 amendment,
  * ported from apps/mobile's #237) is a deliberate, labeled action a

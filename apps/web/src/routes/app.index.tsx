@@ -46,10 +46,12 @@ export const Route = createFileRoute("/app/")({
  * server that only ever lists cases still needing action. Ported from
  * apps/mobile/src/app/(tabs)/index.tsx's same wiring.
  *
- * mock-app.ts is intentionally NOT imported here anymore — conversations/
- * properties/account stay on it until their own PRs land (see the PR
- * report). The empty state below only ever renders once a real,
- * successful fetch says the queue is actually empty.
+ * mock-app.ts is intentionally NOT imported here — the conversation routes
+ * are live too as of campaign issue #234 PR 3 (src/api/cases.ts), so every
+ * card/banner below links straight into them; properties/account stay on
+ * mock-app.ts until their own PRs land (see the PR report). The empty
+ * state below only ever renders once a real, successful fetch says the
+ * queue is actually empty.
  */
 function AppQueuePage() {
   const { session } = useAuth();
@@ -194,15 +196,16 @@ function AppQueuePage() {
                   (including a live emergency banner and its ack button)
                   over a transient refetch error is the wrong failure
                   direction, so a refetch failure renders as this quiet
-                  strip over the preserved data instead. B3: the banners/
-                  cards below deliberately carry no conversation links
-                  until PR 3 wires the live cases screen — see each
-                  component's own comment. */}
+                  strip over the preserved data instead. The banners/cards
+                  below carry a `conversationId` (the card's `case_id`) so
+                  they link into the live conversation routes (campaign
+                  issue #234 PR 3). */}
               {emergencyItems.map((item) => (
                 <EmergencyBanner
                   key={item.case_id}
+                  conversationId={item.case_id}
                   headline={emergencyHeadline(item)}
-                  subtext={emergencySubtext(item) ?? undefined}
+                  subtext={emergencySubtext(item)}
                   tenantFirstName={firstName(item.tenant_name)}
                   tenantMessage={item.tenant_message}
                   onAcknowledge={
@@ -270,6 +273,7 @@ function QueueRow({
   if (entry.status === "skipped") {
     return (
       <SkippedCard
+        conversationId={item.case_id}
         tenantName={firstName(item.tenant_name)}
         propertyLabel={item.property_label}
         timestamp={formatRelativeTime(item.received_at)}
@@ -299,6 +303,7 @@ function QueueRow({
   return (
     <DecisionCard
       severity={item.severity}
+      conversationId={item.case_id}
       tenantName={firstName(item.tenant_name)}
       propertyLabel={propertyLabel}
       timestamp={formatRelativeTime(item.received_at)}
