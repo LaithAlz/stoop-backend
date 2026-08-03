@@ -88,17 +88,29 @@ function PropertySettingsPage() {
         {saving ? (
           // B1: NOT a disabled `<Link>` (Radix/TanStack's Link has no
           // native disabled state and would still be focusable/clickable
-          // via keyboard) — swapped for a genuinely inert element for the
+          // via keyboard) — swapped for a genuinely inert control for the
           // bounded duration of the save, mirroring app.account.tsx's
           // EditProfileDialog closeButtonClassName approach for the same
           // "can't abandon an in-flight write to a safety-relevant field"
           // problem.
-          <span
-            aria-disabled="true"
+          //
+          // LOW (safety review): a bare `<span aria-disabled>` isn't a
+          // real control — no role, not focusable, `aria-disabled` has no
+          // defined meaning on a non-widget element, so it announces
+          // nothing to a keyboard/screen-reader user (who'd otherwise
+          // have zero indication anything is even here). A native
+          // `disabled` `<button>` IS a real control: correctly pulled out
+          // of the tab order (no dead-end focus stop) and, in a browse-
+          // mode pass, announced as an unavailable button — the sr-only
+          // span says why.
+          <button
+            type="button"
+            disabled
             className="flex size-10 items-center justify-center -ml-2 opacity-50"
           >
-            <ArrowLeft className="size-5" />
-          </span>
+            <ArrowLeft className="size-5" aria-hidden="true" />
+            <span className="sr-only">Can&rsquo;t leave while saving.</span>
+          </button>
         ) : (
           <Link
             to="/app/properties/$id"
@@ -164,7 +176,7 @@ function PropertySettingsPage() {
               </h1>
             </div>
 
-            <SettingsForm id={id} property={property} onSavingChange={setSaving} />
+            <SettingsForm id={id} property={property} saving={saving} onSavingChange={setSaving} />
           </>
         ) : null}
       </div>
@@ -187,10 +199,19 @@ const AMBIGUOUS_NOTICE =
 function SettingsForm({
   id,
   property,
+  saving,
   onSavingChange,
 }: {
   id: string;
   property: Property;
+  // LOW (safety review): the PARENT's copy of "is a save in flight",
+  // passed back down (not just written via `onSavingChange`) so a
+  // hypothetical mid-flight remount of this component — a fresh
+  // `useMutation`/`submitLatch` with `isPending`/`.current` both reset to
+  // their initial `false` — still can't fire a second, concurrent PATCH.
+  // `saving` (parent state) survives a remount of THIS component the way
+  // nothing local to it can.
+  saving: boolean;
   onSavingChange: (saving: boolean) => void;
 }) {
   const queryClient = useQueryClient();
@@ -211,17 +232,36 @@ function SettingsForm({
   // submits inside one frame can't both PATCH.
   const submitLatch = useRef(false);
 
-  // M2 (MEDIUM, safety review): without this, `form`/`current` were seeded
-  // ONCE from the `property` prop (the `useState` lazy initializers above)
-  // and never again — a background refetch (window refocus, another tab's
-  // edit, or this screen's OWN ambiguous-failure invalidate below) could
-  // deliver fresher data that the screen would never actually show,
-  // making the ambiguous notice's "give it a moment to update" false on a
-  // screen structurally incapable of updating. Only re-seeds while
-  // `!dirty` — an edit already in progress is never silently overwritten.
+  // F3 (MEDIUM, safety review): `current` is the diff BASELINE for
+  // `buildPropertySettingsPayload`/`backupContactClearAttempted`/
+  // `quietHoursClearAttempted`/`storedBackupPhoneInvalid` — it never
+  // holds anything the landlord is mid-typing (that's `form`, gated on
+  // `!dirty` below), so gating it on `!dirty` too was wrong: `dirty` goes
+  // true on the very first keystroke and stays true until a successful
+  // save, which means a SINGLE `!dirty`-gated effect skipped exactly the
+  // scenario its own original comment cited (the ambiguous-failure
+  // `invalidateQueries` below, which by definition only runs after a
+  // submit, which by definition only happens after typing) — `current`
+  // was stale as a diff baseline in precisely the case that mattered, and
+  // this also produced a post-save re-seed flash (the unconditional
+  // `setCurrent`/`setForm` in `onSuccess` below would render, then this
+  // effect would re-fire and briefly reassert the same values a second
+  // time). Unconditional on `[property]` — always safe, since `current`
+  // is never live-edited text.
+  useEffect(() => {
+    setCurrent(property);
+  }, [property]);
+
+  // M2 (MEDIUM, safety review): without this, `form` was seeded ONCE from
+  // the `property` prop (the `useState` lazy initializer above) and never
+  // again — a background refetch (window refocus, another tab's edit, or
+  // this screen's OWN ambiguous-failure invalidate below) could deliver
+  // fresher data that the screen would never actually show, making the
+  // ambiguous notice's "give it a moment to update" false on a screen
+  // structurally incapable of updating. Only re-seeds while `!dirty` — an
+  // edit already in progress is never silently overwritten.
   useEffect(() => {
     if (dirty) return;
-    setCurrent(property);
     setForm(propertySettingsFormFromProperty(property));
   }, [property, dirty]);
 
@@ -232,6 +272,19 @@ function SettingsForm({
 
   const mutation = useMutation({
     mutationFn: (input: UpdatePropertyInput) => updateProperty(id, input),
+    // F1 (HIGH, safety review): without this, react-query's default
+    // `networkMode: "online"` (src/api/queryClient.ts sets none) means an
+    // OFFLINE attempt never calls `mutationFn` at all — the mutation just
+    // sits paused, `onError`/`onSettled` never fire, `onSavingChange(false)`
+    // (only ever called from `onSettled`) never runs, and `saving` latches
+    // true forever: every field disabled, the Save button stuck on
+    // "Saving…", and the header back control (below) reduced to an inert,
+    // unfocusable button with no way off the screen until connectivity
+    // returns. `"always"` makes an offline attempt actually run
+    // `mutationFn`, which reaches `apiRequest`'s `fetch` and throws
+    // immediately into the existing ambiguous-failure branch — genuinely
+    // bounded, unlike a paused-forever mutation.
+    networkMode: "always",
     onSuccess: (updated) => {
       queryClient.setQueryData(propertyQueryKey(id), updated);
       setCurrent(updated);
@@ -277,12 +330,15 @@ function SettingsForm({
   // concern from `backupError`, which only validates what's being typed
   // right now.
   const storedBackupPhoneInvalid = backupContactPhoneLooksInvalid(current.backup_contact);
+  // LOW (safety review): the guard/disabled checks below read `busy`, not
+  // bare `mutation.isPending` — see the `saving` prop doc comment above.
+  const busy = saving || mutation.isPending;
 
   function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setSubmitted(true);
     setServerError(null);
-    if (backupError || quietError || mutation.isPending || submitLatch.current) return;
+    if (backupError || quietError || busy || submitLatch.current) return;
     const payload = buildPropertySettingsPayload(form, current);
     if (!payload) {
       // Nothing changed (or the only change was a blank-both "clear" the
@@ -302,19 +358,28 @@ function SettingsForm({
       <section className="flex flex-col gap-3 rounded-2xl border border-border bg-card p-4">
         <div>
           <h2 className="font-display text-[16px] text-ink">Backup contact</h2>
-          {/* M3 (MEDIUM, safety review): the earlier version only disclosed
-              the call — a landlord consenting on a third party's behalf
-              needs to know that person also gets a text (property
-              address, what happened, an ack link) per
-              apps/api/app/agent/emergency_chain.py's `render_backup_alert_
-              sms`, and that the landlord+backup cycle repeats every 15
-              minutes until someone acknowledges. */}
+          {/* M3/F4 (safety review): discloses what apps/api/app/agent/
+              emergency_chain.py's `render_backup_alert_sms` actually sends
+              the backup contact at T+10m (and every repeat) — what
+              happened at this property (interpolated below as
+              `current.label`: `render_backup_alert_sms`'s own
+              `property_label` parameter is sourced from `p.label` — the
+              nickname the landlord chose, NOT `address_line1`; F4 caught
+              this copy saying "the address" instead), that the landlord
+              hasn't answered, the tenant's name, and an ask to either call
+              that tenant or tap the ack link. Also discloses the
+              15-minute landlord/backup alternating cycle
+              (`ESCALATION_REPEAT_INTERVAL_MINUTES`) that continues until
+              someone acknowledges. A landlord consenting on a third
+              party's behalf needs to know what that person is actually
+              being asked to do, not just that they're contacted
+              (copy-guardian FAIL on the first version, commit 9ec310b). */}
           <p className="mt-1 text-[13px] leading-relaxed text-ink-muted">
             The second number I call during a real emergency, in case yours is ever wrong, off, or
             you just don&rsquo;t pick up. I call you first, every time — if there&rsquo;s no answer,
             I call this number about ten minutes later. They&rsquo;ll also get a text saying what
-            happened at the address, that you haven&rsquo;t answered, and your tenant&rsquo;s name —
-            asking them to call your tenant or tap a link to say they&rsquo;ve got it. I keep
+            happened at {current.label}, that you haven&rsquo;t answered, and your tenant&rsquo;s
+            name — asking them to call your tenant or tap a link to say they&rsquo;ve got it. I keep
             alternating between you and them every fifteen minutes until one of you does. Optional,
             but strongly recommended.
           </p>
@@ -343,7 +408,7 @@ function SettingsForm({
             onChange={(e) => updateForm({ backupName: e.target.value })}
             placeholder="Jordan (super)"
             autoComplete="name"
-            disabled={mutation.isPending}
+            disabled={busy}
             className="mt-1 h-11"
             aria-invalid={submitted && Boolean(backupError) ? true : undefined}
             aria-describedby={submitted && backupError ? "settings-backup-err" : undefined}
@@ -364,7 +429,7 @@ function SettingsForm({
             placeholder="(416) 555-0177"
             inputMode="tel"
             autoComplete="tel"
-            disabled={mutation.isPending}
+            disabled={busy}
             className="mt-1 h-11"
             aria-invalid={submitted && Boolean(backupError) ? true : undefined}
             aria-describedby={submitted && backupError ? "settings-backup-err" : undefined}
@@ -412,7 +477,7 @@ function SettingsForm({
               type="time"
               value={form.quietStart}
               onChange={(e) => updateForm({ quietStart: e.target.value })}
-              disabled={mutation.isPending}
+              disabled={busy}
               className="mt-1 h-11"
               aria-invalid={submitted && Boolean(quietError) ? true : undefined}
               aria-describedby={submitted && quietError ? "settings-quiet-err" : undefined}
@@ -430,7 +495,7 @@ function SettingsForm({
               type="time"
               value={form.quietEnd}
               onChange={(e) => updateForm({ quietEnd: e.target.value })}
-              disabled={mutation.isPending}
+              disabled={busy}
               className="mt-1 h-11"
               aria-invalid={submitted && Boolean(quietError) ? true : undefined}
               aria-describedby={submitted && quietError ? "settings-quiet-err" : undefined}
@@ -468,7 +533,7 @@ function SettingsForm({
             value={form.houseRules}
             onChange={(e) => updateForm({ houseRules: e.target.value })}
             placeholder="Visitor parking is behind the building, 48 hours max. Garbage day is Thursday."
-            disabled={mutation.isPending}
+            disabled={busy}
             rows={5}
             className="min-h-28 resize-y"
           />
@@ -483,10 +548,10 @@ function SettingsForm({
 
       <Button
         type="submit"
-        disabled={mutation.isPending}
+        disabled={busy}
         className="h-12 justify-center bg-brand text-brand-foreground hover:bg-brand/90"
       >
-        {mutation.isPending ? "Saving…" : "Save settings"}
+        {busy ? "Saving…" : "Save settings"}
       </Button>
     </form>
   );

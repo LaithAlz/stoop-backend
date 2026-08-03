@@ -55,13 +55,22 @@ export function createProperty(input: CreatePropertyInput): Promise<Property> {
   return apiRequest<Property>("/v1/properties", { method: "POST", body: input });
 }
 
-/** How long a property write may hang before we stop waiting on it —
- *  same bound and reasoning as src/api/me.ts's `updateMe` (#234 PR 5,
- *  R2): `backup_contact` is the emergency chain's second phone, and the
- *  settings form (issue #261) disables every field while this is
- *  in-flight, so an unbounded stall would freeze the whole screen for the
- *  browser's own stall window instead of surfacing the ambiguous-failure
- *  branch (B2, safety review). An abort maps to `network_error` (status
+/** How long a property write may hang before we stop waiting on it, ONCE
+ *  the request has actually started — same bound and reasoning as
+ *  src/api/me.ts's `updateMe` (#234 PR 5, R2).
+ *
+ *  F1 (HIGH, safety review): this alone does NOT bound the settings
+ *  form's Save button. src/api/queryClient.ts sets no `networkMode`, so
+ *  mutations default to react-query's `"online"` — while the device is
+ *  offline, the retryer never calls this function's caller at all (the
+ *  mutation stays pending forever; `onError`/`onSettled` never run), so
+ *  this `AbortSignal` never starts counting because nothing here runs.
+ *  The settings form's own `useMutation` call sets
+ *  `networkMode: "always"` for exactly that reason — an offline attempt
+ *  then actually reaches `apiRequest`, whose `fetch` throws immediately
+ *  and maps to `network_error`. This timeout's job is the remaining,
+ *  narrower case: a device that IS online but whose connection stalls
+ *  mid-request. Either way the failure maps to `network_error` (status
  *  0), which src/routes/app.properties_.$id_.settings.tsx's
  *  `isAmbiguousFailure` already treats as ambiguous, not a definite
  *  failure. */

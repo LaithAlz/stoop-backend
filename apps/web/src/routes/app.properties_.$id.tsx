@@ -178,7 +178,16 @@ function PropertyHub() {
       // succeeded, this attempt just reported a definite failure" case
       // the list should still reconcile against. Harmless on every other
       // failure code too (just a background refetch of an unchanged list).
-      void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
+      //
+      // LOW (safety re-review): scoped to the LIST key specifically, NOT
+      // the root `propertiesQueryKey` — that prefix-matches THIS exact
+      // property's still-mounted detail query (`propertyQueryKey(id)` is
+      // `[...propertiesQueryKey, "detail", id]`) and would refetch/404 it,
+      // exactly the failure mode `onSuccess`'s own L1 comment above
+      // already avoids via `removeQueries` instead of a prefix
+      // invalidate. This delete attempt FAILED (this branch only runs on
+      // `onError`), so the property is still meant to be showing here.
+      void queryClient.invalidateQueries({ queryKey: [...propertiesQueryKey, "list"] });
       if (isAmbiguousFailure(error)) {
         // H2: on DELETE specifically, "may have gone through" means the
         // building's line may already be severed — send them to the list,

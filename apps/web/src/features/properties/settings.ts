@@ -174,8 +174,15 @@ export function buildPropertySettingsPayload(
   // from the current value is a deliberate clear, not "don't touch it"
   // (see the module docstring above). `UpdatePropertyInput.house_rules`
   // already accepts `""`.
+  //
+  // LOW (safety review): `current.house_rules` is also `.trim()`ed before
+  // the comparison — without that, a stored value with incidental
+  // surrounding whitespace (this builder always trims before sending, but
+  // nothing guarantees every past/future writer does) compared unequal to
+  // the trimmed form value on every Save, firing a write — and an
+  // audit_log row — for an edit that never happened.
   const houseRules = form.houseRules.trim();
-  if (houseRules !== (current.house_rules ?? "")) {
+  if (houseRules !== (current.house_rules ?? "").trim()) {
     payload.house_rules = houseRules;
   }
 
