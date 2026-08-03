@@ -93,13 +93,27 @@ export interface VoiceProfile {
   samples: string[];
 }
 
-/** GET /v1/me response. */
+/**
+ * GET /v1/me response.
+ *
+ * F1 (safety review, #234 PR 5): `email` and `full_name` are NULLABLE —
+ * the backend's `MeResponse` declares both `str | None` and
+ * `landlords.full_name` is a nullable column fed from the auth user's
+ * `user_metadata.full_name`, which magic-link sign-in never sets. This
+ * type previously claimed both non-null, and the account screen
+ * dereferenced `full_name` — crashing the whole screen for the ORDINARY
+ * web user, including the only path to the phone number emergency calls
+ * ring. Keep these nullable so the compiler catches the next one.
+ */
 export interface LandlordMe {
   id: string;
-  email: string;
-  full_name: string;
+  email: string | null;
+  full_name: string | null;
   timezone: string;
-  voice_profile: VoiceProfile;
+  /** Nullable, same as `full_name` above (the backend's `MeResponse`
+   *  declares `dict | None`). Nothing renders it yet — typed honestly now
+   *  so a future voice-profile editor can't repeat F1's crash. */
+  voice_profile: VoiceProfile | null;
   price_cohort: string;
   subscription_tier: string;
   subscription_status: string;

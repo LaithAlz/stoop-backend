@@ -17,9 +17,10 @@ const tabs: {
 ];
 
 interface AppTabBarProps {
-  /** Leave unset on screens that don't map to any of the four tabs (e.g.
-   * the Activity screen, which is no longer in the tab bar but still has
-   * a live route) — no tab gets highlighted in that case. */
+  /** Leave unset on screens that don't map to any of the four tabs — no
+   * tab gets highlighted in that case. (Every current call site does pass
+   * one; the Activity screen that used to be the exception was deleted in
+   * #234 PR 5, having never had a live endpoint behind it.) */
   active?: TabKey;
   queueCount?: number;
 }
