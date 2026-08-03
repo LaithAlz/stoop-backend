@@ -125,7 +125,8 @@ from app.db.session import get_admin_session
 from app.deps import ACCOUNT_DELETED_CODE, ACCOUNT_DELETED_MESSAGE, require_user
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthUser
-from app.validation import reject_explicit_null
+from app.phone import canonicalize_phone
+from app.validation import normalize_blank_to_null, reject_explicit_null
 
 log = structlog.get_logger(__name__)
 
@@ -392,6 +393,21 @@ async def update_me(
         accident must never happen. A landlord who genuinely wants to clear
         it is a product decision for a future, explicit "clear phone"
         affordance, not this endpoint's implicit behavior today.
+
+        422 ``invalid_field`` if ``phone`` is explicitly set to ``""``
+        (#260) — treated identically to the ``null`` case immediately
+        above (same code, same message): an empty string clears the
+        emergency-call target just as effectively as a JSON ``null``.
+
+        422 ``invalid_field`` if a non-empty ``phone`` cannot be
+        canonicalized to E.164 (#260/#232, ``app.phone.canonicalize_phone``)
+        — the value is REJECTED, never stored un-canonicalized and never
+        silently coerced, so a malformed number can never reach Twilio's
+        ``create_call(to=…)`` (which would fail 21211 and, per
+        ``app/agent/emergency_chain.py``'s ``_execute_action``, degrade
+        silently to a ``status='failed'`` action with no landlord-visible
+        error). A canonicalizable value is stored in its canonical E.164
+        form, not the caller's original text.
     """
     structlog.contextvars.bind_contextvars(auth_user_id=str(user.user_id))
 
@@ -421,7 +437,16 @@ async def update_me(
             created_at=existing["created_at"],
         )
 
+    # #260: an explicit "" clears the emergency-call target exactly as
+    # effectively as an explicit null — collapse it onto the SAME
+    # not-nullable-field rejection below before anything else runs.
+    normalize_blank_to_null(provided, fields=["phone"])
     reject_explicit_null(provided, not_nullable_fields=["timezone", "phone"])
+
+    # #232/#260: a genuinely non-empty phone must canonicalize to E.164
+    # before it is ever written — see app.phone's module docstring.
+    if provided.get("phone") is not None:
+        provided["phone"] = canonicalize_phone(provided["phone"], field="phone")
 
     set_clauses: list[str] = []
     params: dict[str, Any] = {"auth_user_id": str(user.user_id)}

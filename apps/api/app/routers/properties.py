@@ -151,6 +151,7 @@ from app.pagination import (
     decode_cursor,
     paginate_rows,
 )
+from app.phone import canonicalize_phone
 from app.validation import reject_explicit_null
 
 log = structlog.get_logger(__name__)
@@ -346,6 +347,38 @@ def _is_duplicate_property_unique_violation(exc: IntegrityError) -> bool:
     return _DUPLICATE_PROPERTY_CONSTRAINT_NAME in str(exc)
 
 
+def _canonicalize_backup_contact(
+    backup_contact: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """#232/#260: ``backup_contact`` (schema-v1.md: ``{name, phone}`` for
+    the escalation chain's T+10m step, ``app/agent/emergency_chain.py``'s
+    ``_backup_phone``) is a free-form ``jsonb`` blob with no DB-level shape
+    enforcement — only its ``phone`` key is a phone number, so only that
+    key is validated here, in place, leaving everything else (including a
+    missing/absent ``phone`` key, or a non-string one — not this
+    endpoint's job to police the whole shape) untouched.
+
+    A present-but-BLANK ``phone`` (``""``/whitespace-only) is left as-is
+    rather than rejected: ``_backup_phone`` already treats an empty string
+    as "no backup contact configured" (falsy check), the same safe no-op
+    as a missing key — there is no not-nullable business rule for this
+    OPTIONAL escalation field the way there is for ``landlords.phone``, so
+    #260's null-equivalence treatment does not apply here. A present,
+    NON-blank value that cannot be canonicalized (a typo, a dropped digit)
+    IS rejected — that is exactly the "reaches Twilio and silently fails"
+    failure mode #260 exists to close, and staying silent about it here
+    would leave a landlord believing their backup contact will be reached
+    when it never will.
+    """
+    if backup_contact is None:
+        return None
+    phone = backup_contact.get("phone")
+    if isinstance(phone, str) and phone.strip():
+        canonical = canonicalize_phone(phone, field="backup_contact.phone")
+        return {**backup_contact, "phone": canonical}
+    return backup_contact
+
+
 def _row_to_property(row: RowMapping) -> PropertyResponse:
     return PropertyResponse(
         id=row["id"],
@@ -476,6 +509,12 @@ async def create_property(
             message="You already have a property at this address.",
         )
 
+    # #232/#260: another cheap, BEFORE-any-Twilio-call validation (same
+    # placement rationale as the two guards above) — a malformed
+    # backup_contact.phone must never cost a real Twilio purchase before
+    # being rejected.
+    canonical_backup_contact = _canonicalize_backup_contact(body.backup_contact)
+
     try:
         provision_result = await property_provisioning.provision_number(
             area_code=body.area_code, province=effective_province
@@ -510,8 +549,8 @@ async def create_property(
                 "province": body.province,
                 "postal_code": body.postal_code,
                 "house_rules": body.house_rules,
-                "backup_contact": json.dumps(body.backup_contact)
-                if body.backup_contact is not None
+                "backup_contact": json.dumps(canonical_backup_contact)
+                if canonical_backup_contact is not None
                 else None,
                 "twilio_number": provision_result.phone_number,
                 "twilio_sid": provision_result.twilio_sid,
@@ -655,6 +694,12 @@ async def update_property(
             "heating_season",
         ],
     )
+
+    # #232/#260: canonicalize backup_contact.phone in place BEFORE the
+    # generic jsonb-dump loop below picks it up — same helper/behavior as
+    # create_property (_canonicalize_backup_contact's own docstring).
+    if "backup_contact" in provided:
+        provided["backup_contact"] = _canonicalize_backup_contact(provided["backup_contact"])
 
     set_clauses: list[str] = []
     params: dict[str, Any] = {"id": prop_id, "landlord_id": landlord_id}

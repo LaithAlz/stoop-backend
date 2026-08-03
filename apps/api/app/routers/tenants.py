@@ -23,6 +23,15 @@ collides is caught (``IntegrityError``) and surfaced as 409
 ``duplicate_phone`` rather than a raw 500 — see ``api-contracts.md``'s
 Tenants & Vendors amendment for the same contract addition on the vendors
 side.
+
+E.164 canonicalization (#232/#260, api-contracts.md's v1.24 amendment):
+``phone`` is canonicalized via ``app.phone.canonicalize_phone`` on both
+create and update — a value that cannot be canonicalized 422s
+``invalid_field`` rather than reaching the ``tenants.phone`` column
+(and, downstream, ``draft_sender.py``'s outbound-SMS lookup / the
+``/sms`` webhook's routing match) un-dialable. An explicit ``phone: ""``
+on update is treated identically to an explicit ``null`` (``phone`` is
+``NOT NULL`` in schema-v1.md) — same 422 ``invalid_field``.
 """
 
 from __future__ import annotations
@@ -40,7 +49,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import Landlord, require_landlord
 from app.errors import AppError
-from app.validation import reject_explicit_null
+from app.phone import canonicalize_phone
+from app.validation import normalize_blank_to_null, reject_explicit_null
 
 router = APIRouter(prefix="/v1", tags=["tenants"])
 
@@ -207,6 +217,8 @@ async def create_tenant(
 
     await _get_property_or_404(session, landlord_id=landlord_id, property_id=str(property_id))
 
+    canonical_phone = canonicalize_phone(body.phone, field="phone")
+
     try:
         result = await session.execute(
             _INSERT_SQL,
@@ -214,7 +226,7 @@ async def create_tenant(
                 "landlord_id": landlord_id,
                 "property_id": str(property_id),
                 "name": body.name,
-                "phone": body.phone,
+                "phone": canonical_phone,
                 "unit": body.unit,
                 "vulnerable_occupant": body.vulnerable_occupant,
                 "notes": body.notes,
@@ -242,7 +254,13 @@ async def update_tenant(
     provided = body.model_dump(exclude_unset=True)
     if provided:
         # phone is NOT NULL in schema-v1.md (senior review on PR #195, B3).
+        # #260: "" is rejected identically to an explicit null.
+        normalize_blank_to_null(provided, fields=["phone"])
         reject_explicit_null(provided, not_nullable_fields=["phone"])
+
+        # #232/#260: a genuinely non-empty phone must canonicalize to E.164.
+        if provided.get("phone") is not None:
+            provided["phone"] = canonicalize_phone(provided["phone"], field="phone")
 
         set_clauses = [f"{field} = :{field}" for field in provided]
         set_clauses.append("updated_at = now()")
