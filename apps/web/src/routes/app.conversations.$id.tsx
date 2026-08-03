@@ -11,6 +11,7 @@ import { DayDivider } from "@/components/clarity/DayDivider";
 import { ThreadMessageRow } from "@/components/clarity/ThreadMessageRow";
 import { AuditMetaLine } from "@/components/clarity/AuditMetaLine";
 import { DraftBubble } from "@/components/clarity/DraftBubble";
+import { StaleDraftBubble } from "@/components/clarity/StaleDraftBubble";
 import { DecisionActions } from "@/components/clarity/DecisionActions";
 import { MarginNote } from "@/components/clarity/MarginNote";
 import { UndoTicket } from "@/components/clarity/UndoTicket";
@@ -429,7 +430,16 @@ function renderTimelineRow(row: TimelineRow, tenantFirst: string) {
     return <ThreadMessageRow key={row.key} entry={row.entry} tenantFirst={tenantFirst} />;
   if (row.kind === "audit")
     return <AuditMetaLine key={row.key} label={row.label} at={row.entry.at} />;
-  return null; // "draft" rows render via the pinned footer below, not inline.
+  // "draft" rows: a live PENDING draft renders via the pinned footer below,
+  // never inline (that would duplicate the one actionable bubble at the
+  // foot of the thread). A `stale` draft has no footer — nothing else
+  // duplicates it — so it renders here as a muted, non-sendable bubble
+  // (issue #256: conversation-model.md's stale-draft rule, "kept in the
+  // audit trail, never shown as sendable again").
+  if (row.kind === "draft" && row.entry.status === "stale") {
+    return <StaleDraftBubble key={row.key} className="ml-auto max-w-[83%]" body={row.entry.body} />;
+  }
+  return null;
 }
 
 function ThreadHeader({
@@ -444,12 +454,22 @@ function ThreadHeader({
   // H1 (safety review, #234 PR 3 fix round): a `null` severity must not
   // render as "no plaque" (which reads as "nothing to flag here") when
   // the timeline actually carries an `emergency_triggered` audit row —
-  // see src/features/cases/emergencySignal.ts's full writeup. Only
-  // fabricates the "Emergency" plaque label from that signal when the
-  // server's own `severity` is genuinely absent; a real, non-null
-  // severity (including a downgraded "urgent"/"routine") always wins.
+  // see src/features/cases/emergencySignal.ts's full writeup.
+  //
+  // #256 comment item 1 (safety re-verify): the ORIGINAL version of this
+  // let a real, non-null `severity` always win over the Tier-0 signal —
+  // correct for the ordinary "null until classified" case, but wrong for
+  // the clamp-failure case emergencySignal.ts's own writeup documents: a
+  // Tier-0 trigger fired AND the backend's never-de-escalate clamp still
+  // somehow wrote a severity below "emergency". That combination has to
+  // read as an active emergency HERE too — the banner right below this
+  // header already does (`showEmergencyBanner` uses the same
+  // `isEmergencySignal`, unconditionally), so the plaque one line above it
+  // must never show a calmer word ("Routine") directly over an emergency
+  // banner. `isEmergencySignal` wins outright now; the written severity is
+  // only consulted once that signal is false.
   const plaqueSeverity =
-    caseDetail?.severity ?? (caseDetail && isEmergencySignal(caseDetail) ? "emergency" : null);
+    caseDetail && isEmergencySignal(caseDetail) ? "emergency" : (caseDetail?.severity ?? null);
 
   return (
     <header className="border-b border-clarity-line px-5 pb-3.5 pt-4">
