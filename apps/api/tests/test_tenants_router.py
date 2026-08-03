@@ -226,6 +226,63 @@ async def test_update_phone_explicit_null_rejected(session: AsyncSession) -> Non
 
 
 @pytest.mark.integration
+async def test_update_phone_empty_string_rejected_like_null(session: AsyncSession) -> None:
+    """#260: ``""`` is treated identically to an explicit ``null``."""
+    landlord_id = await factories.insert_landlord(session)
+    property_id = await factories.insert_property(session, landlord_id)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        created = await create_tenant(
+            uuid.UUID(property_id), TenantCreateRequest(phone="+14165550010"), (landlord, session)
+        )
+        with pytest.raises(AppError) as exc_info:
+            await update_tenant(created.id, TenantUpdateRequest(phone=""), (landlord, session))
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "invalid_field"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_tenant_malformed_phone_rejected_422(session: AsyncSession) -> None:
+    """#232/#260: a non-canonicalizable phone 422s rather than reaching
+    ``tenants.phone`` un-dialable."""
+    landlord_id = await factories.insert_landlord(session)
+    property_id = await factories.insert_property(session, landlord_id)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_tenant(
+                uuid.UUID(property_id), TenantCreateRequest(phone="n/a"), (landlord, session)
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "invalid_field"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_and_update_tenant_phone_normalizes_to_e164(session: AsyncSession) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    property_id = await factories.insert_property(session, landlord_id)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        created = await create_tenant(
+            uuid.UUID(property_id),
+            TenantCreateRequest(phone="(416) 555-0011"),
+            (landlord, session),
+        )
+        assert created.phone == "+14165550011"
+
+        updated = await update_tenant(
+            created.id, TenantUpdateRequest(phone="416-555-0012"), (landlord, session)
+        )
+        assert updated.phone == "+14165550012"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_duplicate_phone_on_create_returns_409(session: AsyncSession) -> None:
     """``UNIQUE (property_id, phone)`` (senior review on PR #195, A1)."""
     landlord_id = await factories.insert_landlord(session)

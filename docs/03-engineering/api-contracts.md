@@ -89,6 +89,30 @@
   (nothing added for no/disallowed `Origin`) — so a real outage still
   reaches the dashboard as a readable error instead of a CORS failure the
   browser silently discards as a generic network error.
+- **v1.24 amendment (2026-08-03 — #232/#260 implementation):** every
+  phone-bearing write endpoint — `PATCH /v1/me` (`phone`), `POST/PATCH
+  /v1/tenants`, `POST/PATCH /v1/vendors`, `POST/PATCH /v1/properties`
+  (`backup_contact.phone`, when present and non-blank) — now canonicalizes
+  to E.164 server-side and 422s `invalid_field` (the existing code, a new
+  per-endpoint message) on anything it cannot confidently canonicalize
+  (`app/phone.py::to_e164` — mirrors `apps/web/src/features/account/
+  profileEdit.ts`'s `toE164`, #234 PR 5, rule-for-rule, so client and
+  server never disagree about what's dialable). A canonicalizable value is
+  stored in its canonical form, not the caller's original text. `phone:
+  ""` is now rejected identically to an explicit `null` (same code, same
+  message) for every not-nullable-by-business-rule phone field — today,
+  `PATCH /v1/me`'s `phone` (see that section's null-phone note, PR #195
+  A4) and `POST/PATCH /v1/tenants`/`/v1/vendors`' `phone` (DB `NOT NULL`,
+  their sections' own v1.9/v1.10 amendments — this adds the FORMAT check
+  on top of the existing null/duplicate checks there, not a new failure
+  mode). `properties.backup_contact.phone` is the one exception: it is an
+  OPTIONAL escalation field with no not-nullable rule, so a blank value is
+  left as-is (already a safe no-op downstream), while a present, malformed
+  one is still rejected. The `/webhooks/twilio/sms` route (see "Webhooks"
+  below) canonicalizes inbound `From`/`To` the same way before matching —
+  see that section's own note. Closes #260; schema-v1.md's v1.21 amendment
+  is the matching schema-doc update, and migration 0017 backfills
+  pre-existing rows.
 - IDs are uuids as strings. Timestamps ISO-8601 UTC (`2026-06-11T14:02:00Z`).
 - **Pagination**: `?limit=` (default 25, max 100) + `?cursor=`; responses
   carry `"next_cursor": string|null`. Lists are newest-first.
@@ -137,11 +161,20 @@ confirm-by-refetch is not available for that field.
 `PATCH /v1/me` — body: any of `full_name`, `phone`, `timezone`,
 `voice_profile`. Emergency notifications are not a settable preference.
 `phone` is stored as E.164 (schema-v1.md: "E.164; emergency calls go
-here") and handed to Twilio's `create_call(to=…)` verbatim — a value in
-any other shape is accepted by the API today but is undialable, and the
-escalation chain swallows that failure by design, so the landlord's phone
-simply never rings. Clients must normalize before sending; server-side
-validation is tracked in #260.
+here") and handed to Twilio's `create_call(to=…)` verbatim. An explicit
+JSON `null` for `phone` 422s `invalid_field` (senior review on PR #195,
+A4) — `landlords.phone` IS nullable in schema-v1.md, so this is a
+deliberate BUSINESS rule, not a DB constraint: silently clearing the
+emergency-call target via a JSON-null accident must never happen. Server
+-side FORMAT validation now enforces the E.164 claim too (Conventions
+section's v1.24 amendment, closing #260): a non-empty `phone` is
+canonicalized to E.164 on write, and 422s `invalid_field` if it cannot be
+— a value in any other shape is REJECTED, never stored un-canonicalized
+and never silently coerced, so it can never reach Twilio's `create_call
+(to=…)` undialable (previously the escalation chain would swallow that
+failure by design, so the landlord's phone would simply never ring, with
+no visible error anywhere). `phone: ""` is rejected identically to the
+explicit-`null` case above (same 422 `invalid_field`, same message).
 
 **v1.9 amendment (2026-07-12 — #57 implementation):** `PATCH` never
 lazily provisions — a caller with no live `landlords` row (never
@@ -313,6 +346,19 @@ amendment above, which is now stale on both points:
   block, so this case pages and releases exactly like every other
   post-purchase DB failure already documented in the v1.12 amendment above.
 
+**v1.24 amendment (2026-08-03 — #232/#260 implementation; see the
+Conventions section's own v1.24 amendment for the full cross-endpoint
+contract):** `backup_contact`'s `phone` key (when present and non-blank)
+is now canonicalized to E.164 server-side on `POST`/`PATCH` and 422s
+`invalid_field` on anything unparseable — checked as one of the cheap,
+BEFORE-any-Twilio-call guards on `POST` (module docstring, "Pre-Twilio
+-call money guards"), alongside the property-cap/duplicate-address checks
+above, so a malformed backup-contact phone never costs a real Twilio
+purchase before being rejected. A present-but-BLANK `phone` is left as-is
+(not rejected) — `backup_contact` is an optional escalation field with no
+not-nullable business rule, and the escalation chain already treats a
+blank value as "no backup contact configured," a safe no-op.
+
 ## Tenants & Vendors
 
 `GET/POST /v1/properties/{id}/tenants` · `PATCH/DELETE /v1/tenants/{id}`
@@ -343,6 +389,15 @@ update on either resource 409s with code `duplicate_phone` on a unique
 -constraint collision — `tenants` has `UNIQUE (property_id, phone)`,
 `vendors` has `UNIQUE (landlord_id, phone)` (schema-v1.md) — instead of a
 raw 500 on the underlying `IntegrityError`.
+
+**v1.24 amendment (2026-08-03 — #232/#260 implementation; see the
+Conventions section's own v1.24 amendment for the full cross-endpoint
+contract):** `phone` on both resources is now canonicalized to E.164
+server-side on create/update and 422s `invalid_field` on anything
+unparseable — a NEW failure mode alongside the existing null-rejection
+(`phone` is DB `NOT NULL` on both tables) and `duplicate_phone` checks
+above, not a replacement for either. On `PATCH`, an explicit `phone: ""`
+is treated identically to an explicit `null` — same 422 `invalid_field`.
 
 ## Queue (the dashboard's main read)
 
@@ -927,6 +982,26 @@ that changes.
     unlike the old "stores nothing" rationale, the durable write is the
     point and a retry can succeed. Covers a number that isn't provisioned
     yet or has been released.
+  - **E.164 canonicalization at match time** (#232, closing the "Deferred,
+    NOT part of this amendment" note in schema-v1.md's v1.17 amendments
+    block, point 5): the `properties.twilio_number` lookup above, and the
+    landlord-channel/active-tenant phone comparisons in the "Routing
+    predicate after Tier-0" bullet above, now canonicalize the inbound
+    `From`/`To`
+    (`app/phone.py::to_e164`) BEFORE comparing — a format-drifted `From`/
+    `To` (spacing, `+1` vs `1`, punctuation) can no longer misroute a
+    message or dead-letter it into `unrouted_inbound` unnecessarily,
+    regardless of which side (the stored value or the inbound param)
+    drifted. Falls back to the raw value if canonicalization itself fails,
+    which only ever degrades back to the pre-#232 exact-string comparison
+    for that one request — never worse. This does NOT change what gets
+    PERSISTED: the `unrouted_inbound.from_number`/`to_number` columns
+    above stay the raw, un-canonicalized Twilio values (ops-recovery only)
+    — canonicalization here is a matching-only concern. Every stored
+    phone value this matches against is itself canonicalized at write
+    time (Conventions section's v1.24 amendment; migration 0017 backfills
+    pre-existing rows), so the comparison is canonical-vs-canonical on the
+    happy path.
   - **Out-of-order delivery / timestamp ordering** (#40 contract note):
     the inbound SMS webhook payload Twilio sends carries no per-message
     timestamp field to order by, and `messages` has no `sent_at` column

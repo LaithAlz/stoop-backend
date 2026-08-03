@@ -434,6 +434,220 @@ async def test_update_not_nullable_text_field_explicit_null_rejected(
 
 
 @pytest.mark.integration
+async def test_create_property_malformed_backup_contact_phone_rejected_422(
+    session: AsyncSession,
+) -> None:
+    """#232/#260: ``backup_contact.phone`` feeds the escalation chain's
+    T+10m step (``app/agent/emergency_chain.py``) — a non-canonicalizable
+    value 422s BEFORE any Twilio number is purchased (module docstring:
+    "Pre-Twilio-call money guards")."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Backup phone test",
+                    address_line1="1 Backup St",
+                    city="Toronto",
+                    backup_contact={"name": "Neighbour", "phone": "n/a"},
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "invalid_field"
+
+        # No property row created, and (module docstring) no number purchased.
+        count = (
+            await session.execute(
+                text("SELECT COUNT(*) FROM properties WHERE landlord_id = :lid"),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert count == 0
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_backup_contact_phone_normalizes_to_e164(
+    session: AsyncSession,
+) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        created = await create_property(
+            PropertyCreateRequest(
+                label="Backup phone normalize test",
+                address_line1="2 Backup St",
+                city="Toronto",
+                backup_contact={"name": "Neighbour", "phone": "(416) 555-0177"},
+            ),
+            (landlord, session),
+        )
+        assert created.backup_contact is not None
+        assert created.backup_contact["phone"] == "+14165550177"
+        assert created.backup_contact["name"] == "Neighbour"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_update_backup_contact_phone_normalizes_and_rejects(session: AsyncSession) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(
+                label="Backup phone update test", address_line1="3 Backup St", city="Toronto"
+            ),
+            (landlord, session),
+        )
+
+        updated = await update_property(
+            prop.id,
+            PropertyUpdateRequest(backup_contact={"name": "Neighbour", "phone": "416-555-0188"}),
+            (landlord, session),
+        )
+        assert updated.backup_contact is not None
+        assert updated.backup_contact["phone"] == "+14165550188"
+
+        with pytest.raises(AppError) as exc_info:
+            await update_property(
+                prop.id,
+                PropertyUpdateRequest(backup_contact={"name": "Neighbour", "phone": "n/a"}),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "invalid_field"
+
+        # The rejected PATCH wrote nothing — the prior canonical value survives.
+        unchanged = await get_property(prop.id, (landlord, session))
+        assert unchanged.backup_contact is not None
+        assert unchanged.backup_contact["phone"] == "+14165550188"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_backup_contact_blank_phone_left_as_is_not_rejected(session: AsyncSession) -> None:
+    """A present-but-blank ``phone`` is NOT a #260 not-nullable violation
+    (``backup_contact`` is an optional escalation field, not the emergency
+    -call target itself) — ``_backup_phone`` already treats it as "no
+    backup contact configured," a safe no-op, so it is left as-is rather
+    than rejected (see ``_canonicalize_backup_contact``'s own docstring)."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        created = await create_property(
+            PropertyCreateRequest(
+                label="Backup blank test",
+                address_line1="4 Backup St",
+                city="Toronto",
+                backup_contact={"name": "Neighbour", "phone": ""},
+            ),
+            (landlord, session),
+        )
+        assert created.backup_contact is not None
+        assert created.backup_contact["phone"] == ""
+        assert created.backup_contact["name"] == "Neighbour"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_backup_contact_explicit_null_phone_left_as_is_not_rejected(
+    session: AsyncSession,
+) -> None:
+    """Same reasoning as the blank-string case — an explicit JSON ``null``
+    for ``backup_contact.phone`` is also a safe no-op, not a #260
+    not-nullable violation."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        created = await create_property(
+            PropertyCreateRequest(
+                label="Backup null test",
+                address_line1="5 Backup St",
+                city="Toronto",
+                backup_contact={"name": "Neighbour", "phone": None},
+            ),
+            (landlord, session),
+        )
+        assert created.backup_contact is not None
+        assert created.backup_contact["phone"] is None
+        assert created.backup_contact["name"] == "Neighbour"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_backup_contact_non_string_phone_rejected_422(
+    session: AsyncSession,
+) -> None:
+    """Safety review, 2026-08-03, finding 3: a JSON NUMBER (an ordinary
+    client-side type bug, e.g. ``{"phone": 4165551234}``) used to sail
+    through untouched — ``isinstance(phone, str)`` was simply ``False``,
+    the same branch as "blank/missing" — silently storing a
+    ``backup_contact`` that LOOKS configured while the escalation chain's
+    ``_backup_phone`` returns ``None`` for it (not a ``str``) and the
+    T+10m step never fires. Now 422s BEFORE any Twilio number is
+    purchased, same as the malformed-string case."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Backup non-string phone test",
+                    address_line1="6 Backup St",
+                    city="Toronto",
+                    backup_contact={"name": "Neighbour", "phone": 4165551234},
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "invalid_field"
+
+        count = (
+            await session.execute(
+                text("SELECT COUNT(*) FROM properties WHERE landlord_id = :lid"),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert count == 0
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_update_backup_contact_non_string_phone_rejected_422(session: AsyncSession) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(
+                label="Backup non-string update test", address_line1="7 Backup St", city="Toronto"
+            ),
+            (landlord, session),
+        )
+
+        with pytest.raises(AppError) as exc_info:
+            await update_property(
+                prop.id,
+                PropertyUpdateRequest(backup_contact={"name": "Neighbour", "phone": 4165551234}),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "invalid_field"
+
+        unchanged = await get_property(prop.id, (landlord, session))
+        assert unchanged.backup_contact is None
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
 async def test_delete_blocked_by_open_case_returns_409(session: AsyncSession) -> None:
     landlord_id = await factories.insert_landlord(session)
     landlord = Landlord(id=uuid.UUID(landlord_id))

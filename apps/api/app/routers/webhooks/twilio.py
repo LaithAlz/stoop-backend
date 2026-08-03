@@ -225,6 +225,7 @@ from app.config import settings
 from app.db.session import get_admin_session
 from app.errors import AppError
 from app.integrations.twilio import reconstruct_signing_url, verify_signature
+from app.phone import to_e164
 
 log = structlog.get_logger(__name__)
 
@@ -428,6 +429,54 @@ def _alert_tenant_hard_fire(*, message_id: UUID, property_id: UUID, categories: 
 # ---------------------------------------------------------------------------
 # /sms — routing helpers
 # ---------------------------------------------------------------------------
+
+
+def _canonical_for_matching(number: str) -> str:
+    """#232: canonicalize *number* (Twilio's raw ``From``/``To``) to E.164
+    via ``app.phone.to_e164`` before it is used in ANY routing comparison
+    (the ``properties.twilio_number`` lookup, the landlord-channel phone
+    check, the active-tenant phone lookup) — every stored value this gets
+    compared against is itself canonicalized at write time (schema-v1.md's
+    v1.21 amendment; migration 0017 for pre-existing rows), so matching on
+    the SAME canonical form closes the format-drift class of misrouting
+    entirely, regardless of which side (stored value or inbound param)
+    drifted.
+
+    Falls back to *number* itself, UNCHANGED, if it cannot be
+    canonicalized — this only ever degrades back to the pre-#232
+    exact-string comparison for that one request (never worse: a number
+    ``to_e164`` rejects was already never going to equal a canonical
+    stored value either way). This is a MATCHING-only helper — it never
+    touches what gets persisted: the ``unrouted_inbound`` dead-letter row
+    and the eventual ``messages`` row both carry/derive from the ORIGINAL,
+    raw Twilio params, never this canonicalized-for-comparison value (see
+    the v1.17 amendments block's "raw Twilio From/To — ops-recovery only"
+    note in schema-v1.md).
+
+    **Safety review, 2026-08-03 (routing-change proof):** this change's
+    entire safety argument is that ``to_e164`` is IDENTITY-OR-NONE over
+    ``+<digits>`` — an already-canonical value either round-trips to
+    itself or the function rejects it outright; it never rewrites one
+    valid-looking canonical string into a DIFFERENT one. Fuzzed 23,211
+    inputs across both this module's ``app.phone.to_e164`` and the mirrored
+    TypeScript implementation (``apps/web/src/features/account/
+    profileEdit.ts``'s ``toE164``): zero divergences on ASCII input. That
+    property is WHY a currently-routable message (``From``/``To`` already
+    exactly matching a stored canonical value) can never become unroutable
+    by this change — canonicalizing an already-canonical value is always a
+    no-op, so for those values this function can only ever ADD matches (a
+    previously-drifted format that now canonicalizes to the stored value),
+    never REMOVE one. Stated precisely, because the unqualified version
+    isn't true (safety review, 2026-08-03): a stored NON-canonical value
+    that byte-matched a NON-canonical inbound could lose its match. That
+    pair is unreachable from Twilio, which delivers ``+<digits>`` — and
+    migration 0017 canonicalizes the stored side anyway — but the
+    guarantee is about the values Twilio actually sends, not about every
+    conceivable string. Non-ASCII digit input is a separate, since-closed finding
+    from the same review — see ``app.phone``'s own module docstring,
+    "Non-ASCII 'digit' characters"."""
+    return to_e164(number) or number
+
 
 _SELECT_PROPERTY_BY_TO_SQL = text(
     "SELECT id, landlord_id FROM properties WHERE twilio_number = :to_number"
@@ -1078,11 +1127,25 @@ async def twilio_sms_webhook(
     # (#170; contract fidelity, consolidated review item 6): a pure,
     # sub-millisecond function on the raw body, independent of whether
     # `To` resolves to a known property at all or who the routing
-    # predicate would decide the sender is.
+    # predicate would decide the sender is. Also BEFORE the #232
+    # canonicalization below (safety review, 2026-08-03, finding 4 — LOW)
+    # — Tier-0 running first, before anything else that could fail, is a
+    # documented ordering invariant this handler has always preserved;
+    # canonicalizing `From`/`To` is itself infallible (pure, never
+    # raises), but there is no reason to spend Tier-0's "first" position
+    # on it regardless.
     prefilter_result: PrefilterResult = prefilter.check(body)
 
+    # #232: canonicalized-for-MATCHING copies only — every comparison
+    # below uses these, never `from_number`/`to_number` themselves, which
+    # stay the raw Twilio values for persistence (the dead-letter row and,
+    # via `party`/`tenant_id` resolution, the eventual `messages` row).
+    # See `_canonical_for_matching`'s own docstring.
+    canonical_to = _canonical_for_matching(to_number)
+    canonical_from = _canonical_for_matching(from_number)
+
     property_row = (
-        (await session.execute(_SELECT_PROPERTY_BY_TO_SQL, {"to_number": to_number}))
+        (await session.execute(_SELECT_PROPERTY_BY_TO_SQL, {"to_number": canonical_to}))
         .mappings()
         .one_or_none()
     )
@@ -1134,7 +1197,7 @@ async def twilio_sms_webhook(
         session,
         landlord_id=landlord_id,
         property_id=property_id,
-        from_number=from_number,
+        from_number=canonical_from,
     )
 
     party: str
@@ -1155,7 +1218,9 @@ async def twilio_sms_webhook(
             case_id = parsed_reply.case_id
     else:
         party = "tenant"
-        tenant_id = await _lookup_active_tenant(session, property_id=property_id, phone=from_number)
+        tenant_id = await _lookup_active_tenant(
+            session, property_id=property_id, phone=canonical_from
+        )
 
     inserted = (
         (

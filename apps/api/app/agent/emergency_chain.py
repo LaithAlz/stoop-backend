@@ -535,7 +535,13 @@ def _backup_phone(backup_contact: dict[str, Any] | None) -> str | None:
     if not backup_contact:
         return None
     phone = backup_contact.get("phone")
-    return phone if isinstance(phone, str) and phone else None
+    # `.strip()`, not bare truthiness (safety review, 2026-08-03, finding 3
+    # residual): a whitespace-only value survived the old check and was
+    # handed to `create_call(to="   ")`, which Twilio rejects (21211) —
+    # `_execute_action` then swallows that into `status="failed"`, so the
+    # T+10m backup leg silently never fires. The writers treat
+    # whitespace-only as "no backup configured"; this must agree with them.
+    return phone.strip() if isinstance(phone, str) and phone.strip() else None
 
 
 # ---------------------------------------------------------------------------

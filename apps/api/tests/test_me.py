@@ -1266,6 +1266,135 @@ async def test_patch_me_phone_null_rejected_422(
 
 
 @pytest.mark.integration
+async def test_patch_me_phone_empty_string_rejected_422(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """#260: an explicit ``""`` clears the emergency-call target exactly as
+    effectively as an explicit ``null`` — must be rejected identically
+    (same 422 code)."""
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch9@example.com")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            response = await client.patch(
+                "/v1/me",
+                json={"phone": ""},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "invalid_field"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_patch_me_phone_malformed_rejected_422(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """#260/#232: a non-empty ``phone`` that ``app.phone.to_e164`` cannot
+    canonicalize is rejected (422 ``invalid_field``), never written
+    verbatim — closing the "reaches Twilio's create_call and silently
+    fails 21211" gap."""
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch10@example.com")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            response = await client.patch(
+                "/v1/me",
+                json={"phone": "n/a"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "invalid_field"
+
+        # Nothing written — landlords.phone stays NULL (never the raw junk
+        # string, and never coerced into anything).
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT phone FROM landlords WHERE auth_user_id = :uid"), {"uid": sub}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["phone"] is None
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
+async def test_patch_me_phone_normalizes_drifted_format_to_e164(
+    private_key: EllipticCurvePrivateKey,
+    jwks_payload: dict[str, Any],
+    db_session: AsyncSession,
+) -> None:
+    """A canonicalizable-but-not-yet-canonical ``phone`` is stored in its
+    canonical E.164 form, not the caller's original text (``phone`` is
+    write-only on this endpoint, so the assertion reads the DB directly)."""
+    sub = str(uuid.uuid4())
+    token = _mint_token(private_key, sub=sub, email="patch11@example.com")
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        mock.get(_JWKS_URL).mock(return_value=httpx.Response(200, json=jwks_payload))
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+            auth_mod._jwks_state.cache = None  # noqa: SLF001
+
+            response = await client.patch(
+                "/v1/me",
+                json={"phone": "(416) 555-0134"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    try:
+        assert seed.status_code == 200, seed.text
+        assert response.status_code == 200, response.text
+
+        row = (
+            (
+                await db_session.execute(
+                    text("SELECT phone FROM landlords WHERE auth_user_id = :uid"), {"uid": sub}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["phone"] == "+14165550134"
+    finally:
+        await _cleanup(db_session, sub)
+
+
+@pytest.mark.integration
 async def test_patch_me_never_provisioned_returns_403_account_deleted(
     private_key: EllipticCurvePrivateKey,
     jwks_payload: dict[str, Any],

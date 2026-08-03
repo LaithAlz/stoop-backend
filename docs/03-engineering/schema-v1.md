@@ -873,6 +873,83 @@
 >    simply the first writer of this combination. No migration needed for
 >    this part.
 
+<!-- DDL-body annotation for v1.21 lives on each phone-bearing column
+     below (`landlords.phone`, `properties.twilio_number`,
+     `properties.backup_contact`, `tenants.phone`, `vendors.phone`), per
+     the house annotate-don't-silently-edit convention. -->
+> **v1.21 amendment (2026-08-03 — #232/#260 implementation)**: every
+> phone-bearing column in this schema — `landlords.phone`, `properties.
+> twilio_number`, the `phone` key inside `properties.backup_contact`,
+> `tenants.phone`, `vendors.phone` — is now an ENFORCED E.164 invariant,
+> not just a comment. Before this amendment, "E.164" on these columns was
+> documentation only: `PATCH /v1/me` accepted `phone: ""` (clearing the
+> emergency-call target exactly as effectively as a `null`, #260) and no
+> endpoint validated shape at all, so a malformed value reached Twilio's
+> `create_call`/`send_sms` and failed silently (`app/agent/
+> emergency_chain.py`'s `_execute_action` degrades a bad-number failure to
+> `status='failed'` by design — never re-raised), and a format-drifted
+> stored value simply never matched the `/sms` webhook's exact-string
+> comparison, misrouting a message that should have reached a real
+> property/tenant (#232 — the deferred second finding this doc's own
+> v1.17 amendments block, point 5 above, named explicitly).
+> 1. **Canonicalization policy** — `app/phone.py::to_e164`, the ONE
+>    implementation every write path and the webhook's routing match now
+>    share (mirrors `apps/web/src/features/account/profileEdit.ts`'s
+>    `toE164`, #234 PR 5, rule-for-rule, so client and server never
+>    disagree about what's dialable): bare NANP 10-digit → assume `+1`;
+>    11-digit leading `1` → `+`-prefixed; already `+`-prefixed → punctuation
+>    stripped, the NANP subset gets the SAME area/exchange plausibility
+>    check as a bare number, non-NANP international is accepted on digit
+>    -count (8–15) alone; anything else (extensions, empty, unparseable
+>    junk) is REJECTED, never coerced.
+> 2. **Write-time enforcement**: `PATCH /v1/me` (`phone`), `POST/PATCH
+>    /v1/tenants`, `POST/PATCH /v1/vendors`, and `POST/PATCH
+>    /v1/properties` (`backup_contact.phone`, when present and non-blank)
+>    all canonicalize on write and 422 `invalid_field` (existing code, a
+>    new message) on anything `to_e164` can't canonicalize — see
+>    `api-contracts.md`'s v1.24 amendment for the full endpoint-by
+>    -endpoint contract. `properties.twilio_number` is Twilio-sourced
+>    (never landlord-supplied — search → purchase → configure, `app/
+>    property_provisioning.py`) and is guaranteed E.164 by Twilio's own
+>    API contract, so no additional write-time canonicalization gate was
+>    added on that specific column.
+> 3. **`""` is treated identically to an explicit `null`** for every
+>    not-nullable-by-business-rule phone field (today: `PATCH /v1/me`'s
+>    `phone`, the emergency-call target; `tenants.phone`/`vendors.phone`
+>    are also DB `NOT NULL`) — same 422 `invalid_field`, same message as
+>    the null case, closing #260's core finding. `properties.
+>    backup_contact.phone` is NOT covered by this point — it is an
+>    OPTIONAL escalation field with no not-nullable business rule, and a
+>    blank value there was already a safe no-op (`app/agent/
+>    emergency_chain.py`'s `_backup_phone` treats a blank string as "no
+>    backup contact configured").
+> 4. **Matching, not just storage**: the `/sms` webhook (`app/routers/
+>    webhooks/twilio.py`) now canonicalizes the inbound `From`/`To`
+>    (falling back to the raw value if canonicalization itself fails,
+>    which only ever degrades back to the pre-amendment exact-string
+>    behavior for that one request, never worse) BEFORE the `properties.
+>    twilio_number` lookup and the landlord-channel/active-tenant phone
+>    comparisons — format drift on either side of a comparison can no
+>    longer misroute a message. The `unrouted_inbound` dead-letter row
+>    itself is UNCHANGED by this — `from_number`/`to_number` there stay
+>    the raw, un-canonicalized Twilio values (this doc's v1.17 amendments
+>    block, point 1: "raw Twilio `From`/`To` — ops-recovery only"), since
+>    an operator reconciling a genuinely-unrouted message needs to see
+>    exactly what Twilio sent.
+> 5. **Migration 0017** canonicalizes every EXISTING value in the five
+>    locations above that `to_e164` can canonicalize, in place. A row
+>    whose stored value CANNOT be canonicalized is left completely
+>    untouched — never nulled, never dropped — a landlord's/tenant's/
+>    vendor's existing phone number is load-bearing (the emergency chain,
+>    outbound draft sends) even when malformed; nulling it would silently
+>    remove a step the current, if broken, value at least preserves the
+>    digits to eventually fix. The migration logs a per-table/per-column
+>    COUNT of rows it could not canonicalize (never the values themselves,
+>    rule #5) so an operator can find and manually adjudicate them. See
+>    that migration's own module docstring for the full rationale
+>    (including why `downgrade()` is a deliberate no-op — canonicalization
+>    has no well-defined inverse).
+
 > **v1.20 amendment (2026-08-02)** — migration 0016 implements this (#184
 > item 4; same class as the v1.3 dedupe index — an app-level existence
 > check replaced by a real Postgres constraint):
@@ -1058,6 +1135,9 @@ CREATE TABLE landlords (
   email               text NOT NULL,
   full_name           text,
   phone               text,                          -- E.164; emergency calls go here
+                                                       --  (v1.21: ENFORCED at write time,
+                                                       --  app/phone.py; migration 0017
+                                                       --  canonicalizes pre-existing rows)
   timezone            text NOT NULL DEFAULT 'America/Toronto',
   voice_profile       jsonb,                         -- {tone: text, samples: text[]}
   price_cohort        text NOT NULL DEFAULT 'early_access'
@@ -1084,11 +1164,20 @@ CREATE TABLE properties (
   lat             double precision,                  -- for weather lookup (#30)
   lon             double precision,
   twilio_number   text UNIQUE,                       -- E.164; null until provisioned
+                                                       --  (v1.21: Twilio-sourced, already
+                                                       --  E.164 by Twilio's own API contract
+                                                       --  — matched on canonical form by the
+                                                       --  /sms webhook, app/phone.py)
   twilio_sid      text,
   house_rules     text,                              -- agent context, verbatim
   quiet_hours     jsonb NOT NULL DEFAULT '{"start":"21:00","end":"08:00"}',
   heating_season  jsonb NOT NULL DEFAULT '{"start":"09-15","end":"06-01"}',
   backup_contact  jsonb,                             -- {name, phone} for escalation T+10m
+                                                       --  (v1.21: the "phone" key is E.164,
+                                                       --  ENFORCED at write time when present
+                                                       --  and non-blank — app/phone.py;
+                                                       --  migration 0017 canonicalizes
+                                                       --  pre-existing rows)
   created_at      timestamptz NOT NULL DEFAULT now(),
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
@@ -1109,7 +1198,9 @@ CREATE TABLE vendors (
   trade         text NOT NULL
                 CHECK (trade IN ('plumbing','electrical','hvac','appliance',
                                  'locksmith','pest','general','other')),
-  phone         text NOT NULL,                       -- E.164
+  phone         text NOT NULL,                       -- E.164 (v1.21: ENFORCED at write time,
+                                                       --  app/phone.py; migration 0017
+                                                       --  canonicalizes pre-existing rows)
   notes         text,                                -- "no Sundays; cash for <$100"
   working_hours jsonb,                               -- {mon:[["08:00","17:00"]],...}
   active        boolean NOT NULL DEFAULT true,
@@ -1126,6 +1217,9 @@ CREATE TABLE tenants (
   property_id         uuid NOT NULL REFERENCES properties(id) ON DELETE RESTRICT,
   name                text,
   phone               text NOT NULL,                 -- E.164; the channel key
+                                                       --  (v1.21: ENFORCED at write time,
+                                                       --  app/phone.py; migration 0017
+                                                       --  canonicalizes pre-existing rows)
   unit                text,
   vulnerable_occupant text
                       CHECK (vulnerable_occupant IN ('infant','elderly','medical_device')),

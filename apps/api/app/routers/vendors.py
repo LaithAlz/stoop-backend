@@ -18,6 +18,15 @@ Duplicate phone (senior review on PR #195, A1): ``vendors`` has
 ``UNIQUE (landlord_id, phone)`` (schema-v1.md). A create/update that
 collides is caught (``IntegrityError``) and surfaced as 409
 ``duplicate_phone`` rather than a raw 500.
+
+E.164 canonicalization (#232/#260, api-contracts.md's v1.24 amendment):
+``phone`` is canonicalized via ``app.phone.canonicalize_phone`` on both
+create and update — a value that cannot be canonicalized 422s
+``invalid_field`` rather than reaching the ``vendors.phone`` column
+(and, downstream, ``draft_sender.py``'s outbound-SMS lookup) un-dialable.
+An explicit ``phone: ""`` on update is treated identically to an explicit
+``null`` (``phone`` is ``NOT NULL`` in schema-v1.md) — same 422
+``invalid_field``.
 """
 
 from __future__ import annotations
@@ -43,7 +52,8 @@ from app.pagination import (
     decode_cursor,
     paginate_rows,
 )
-from app.validation import reject_explicit_null
+from app.phone import canonicalize_phone
+from app.validation import normalize_blank_to_null, reject_explicit_null
 
 router = APIRouter(prefix="/v1", tags=["vendors"])
 
@@ -195,6 +205,8 @@ async def create_vendor(
     landlord, session = landlord_and_session
     landlord_id = str(landlord.id)
 
+    canonical_phone = canonicalize_phone(body.phone, field="phone")
+
     try:
         result = await session.execute(
             _INSERT_SQL,
@@ -202,7 +214,7 @@ async def create_vendor(
                 "landlord_id": landlord_id,
                 "name": body.name,
                 "trade": body.trade,
-                "phone": body.phone,
+                "phone": canonical_phone,
                 "notes": body.notes,
                 "working_hours": None
                 if body.working_hours is None
@@ -233,8 +245,14 @@ async def update_vendor(
     if provided:
         # name/trade/phone/active are all NOT NULL in schema-v1.md (senior
         # review on PR #195, B3; notes/working_hours are genuinely
-        # nullable, so absent below).
+        # nullable, so absent below). #260: "" is rejected identically to
+        # an explicit null for phone.
+        normalize_blank_to_null(provided, fields=["phone"])
         reject_explicit_null(provided, not_nullable_fields=["name", "trade", "phone", "active"])
+
+        # #232/#260: a genuinely non-empty phone must canonicalize to E.164.
+        if provided.get("phone") is not None:
+            provided["phone"] = canonicalize_phone(provided["phone"], field="phone")
 
         set_clauses: list[str] = []
         params: dict[str, Any] = {"id": vid, "landlord_id": landlord_id}
