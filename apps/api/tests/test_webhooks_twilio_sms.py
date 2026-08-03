@@ -1342,6 +1342,57 @@ async def test_genuinely_unknown_to_number_still_dead_letters(db_session: AsyncS
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
+async def test_uncanonicalizable_stored_number_still_routes_on_exact_raw_match(
+    db_session: AsyncSession,
+) -> None:
+    """LOW finding (safety review, 2026-08-03): ``_canonical_for_matching``
+    falls back to the RAW value when ``to_e164`` cannot canonicalize it —
+    proves that fallback actually works, not just in theory. A short code
+    (``app.phone.to_e164`` rejects it — too few digits) is exactly the
+    shape migration 0017 would leave untouched on a pre-existing row
+    (schema-v1.md's v1.21 amendment, "UNCANONICALIZABLE ROWS"). An inbound
+    `To` that matches it BYTE-FOR-BYTE must still route normally — never
+    dead-letter — since raw-vs-raw comparison is unaffected by either side
+    failing to canonicalize."""
+    landlord_id = await _insert_landlord(db_session)
+    short_code = "12345"
+    await _insert_property(db_session, landlord_id, twilio_number=short_code)
+
+    message_sid = f"SM{uuid.uuid4().hex}"
+    params = _sms_params(
+        message_sid=message_sid, from_number=_fresh_phone(), to_number=short_code, body="hello"
+    )
+
+    try:
+        response = await _post_sms(params)
+        assert response.status_code == 200
+
+        message_row = (
+            (
+                await db_session.execute(
+                    text("SELECT landlord_id, party FROM messages WHERE twilio_sid = :sid"),
+                    {"sid": message_sid},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        assert message_row is not None, "an exact raw match on an uncanonicalizable To must route"
+        assert str(message_row["landlord_id"]) == landlord_id
+        assert message_row["party"] == "tenant"
+
+        dead_letter_count = (
+            await db_session.execute(
+                text("SELECT COUNT(*) FROM unrouted_inbound WHERE twilio_sid = :sid"),
+                {"sid": message_sid},
+            )
+        ).scalar_one()
+        assert dead_letter_count == 0
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 # ---------------------------------------------------------------------------
 # Consolidated review regressions — transaction-design fix (item 1)
 #
