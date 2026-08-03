@@ -13,6 +13,23 @@ import { SkippedCard } from "@/components/clarity/SkippedCard";
 import { AllClearState } from "@/components/clarity/AllClearState";
 import { useAuth } from "@/auth/AuthProvider";
 import { QUEUE_REFETCH_INTERVAL_MS, useQueue } from "@/api/queue";
+
+/**
+ * How long past an ambiguous edit-and-send failure a queue read must be
+ * before "the draft is still pending" is trusted enough to re-enable Send
+ * (F11 — see the effect below).
+ *
+ * Sized against the SERVER's worst case, not the poll interval. The API's
+ * per-case advisory lock retries for `_CASE_LOCK_MAX_WAIT_SECONDS = 30s`
+ * (apps/api/app/agent/graph.py) BEFORE the graph resume even begins, so an
+ * edit-and-send can legitimately commit ~30s after the request started
+ * while the client stamped its failure in the first second. One poll
+ * interval was shorter than that ceiling and left a window where a
+ * qualifying read still predated the commit. Two intervals clears it with
+ * margin; the cost is Send staying disabled a little longer under an
+ * on-screen explanation, which is the safe direction by construction.
+ */
+const UNVERIFIED_SETTLE_MS = 2 * QUEUE_REFETCH_INTERVAL_MS;
 import { ApiError, toHouseApiError } from "@/api/errors";
 import type { QueueItem } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
@@ -128,14 +145,18 @@ function AppQueuePage() {
     for (const [draftId, failedAt] of draftActions.unverifiedSendIds) {
       if (queueQuery.dataUpdatedAt <= failedAt) continue;
       const stillPending = freshIds.has(draftId);
-      if (stillPending && queueQuery.dataUpdatedAt <= failedAt + QUEUE_REFETCH_INTERVAL_MS) {
+      if (stillPending && queueQuery.dataUpdatedAt <= failedAt + UNVERIFIED_SETTLE_MS) {
         continue;
       }
       draftActions.resolveUnverifiedSend(draftId, stillPending);
     }
-    // draftActions.resolveUnverifiedSend is stable (useCallback, [onNotice]
-    // only) — unverifiedSendIds is the real dependency besides the query
-    // data itself.
+    // `draftActions.resolveUnverifiedSend` is a useCallback over
+    // [onNotice, unverifiedSendIds] — both already covered by the deps
+    // below, so listing the whole `draftActions` object would only add
+    // churn. (It was `[onNotice]` alone until F12 added the membership
+    // read; keeping this comment truthful matters, since every defect
+    // found in this file so far has been a comment asserting a guarantee
+    // the code no longer had.)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queueQuery.data, queueQuery.dataUpdatedAt, draftActions.unverifiedSendIds]);
 
