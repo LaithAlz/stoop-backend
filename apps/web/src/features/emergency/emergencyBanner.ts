@@ -35,19 +35,16 @@ export function emergencyHeadline(
  * `title`-adjacent wiring in the old app.index.tsx), which made exactly
  * that promise — flagged for copy-guardian in the PR report.
  *
- * B3 (safety review, #234 PR 2): no "tap to …" wording of any kind — the
- * live banner doesn't navigate until PR 3 lands the live cases screen, so
- * any tap promise would be a dead end on the emergency path. Property
- * label only.
- *
- * NEW-5 (round 3): `null` while `title` is null (#197's title-writing
- * half unshipped) — the fallback headline already ends in the property
- * label, and rendering it twice in a row reads broken exactly where
- * calm matters most. The banner shows the tenant's own message below
- * either way (NEW-1).
+ * PR 3 (campaign issue #234) restores navigation on the banner — it links
+ * to `/app/conversations/$id/emergency`, now a live route — so "tap to see
+ * what's happening" is honest again. Matches
+ * apps/mobile/src/features/emergency/emergencyBanner.ts's own
+ * `emergencySubtext` verbatim (already copy-reviewed there); previously
+ * (PR 2, B3 safety-review finding) this returned `null`/no "tap to …"
+ * wording at all because the live banner had nowhere to navigate yet.
  */
-export function emergencySubtext(item: Pick<QueueItem, "title" | "property_label">): string | null {
-  return item.title ? item.property_label : null;
+export function emergencySubtext(item: Pick<QueueItem, "property_label">): string {
+  return `${item.property_label} · tap to see what's happening`;
 }
 
 // ---------------------------------------------------------------------------

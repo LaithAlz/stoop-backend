@@ -3,10 +3,9 @@ import { cn } from "@/lib/utils";
 import { TimestampChip } from "./TimestampChip";
 
 interface SkippedCardProps {
-  /** B3 (safety review, #234 PR 2): optional — when absent the card is a
-   *  plain, non-navigating block. Home omits it while the conversation
-   *  routes still read mock-app.ts (a live case UUID would 404 there);
-   *  PR 3 restores the link. */
+  /** Optional — when absent the card is a plain, non-navigating block.
+   *  Home (src/routes/app.index.tsx) passes the case's own `case_id`
+   *  (campaign issue #234 PR 3 — the conversation routes are live). */
   conversationId?: string;
   tenantName: string;
   propertyLabel: string;

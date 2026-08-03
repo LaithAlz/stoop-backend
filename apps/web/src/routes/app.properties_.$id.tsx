@@ -95,28 +95,32 @@ function PropertyHub() {
               <p className="mt-2 text-[13px] text-ink-muted">No conversations yet.</p>
             </div>
           ) : (
+            // Safety review (#234 PR 3 fix round, LOW): `q.id` here is a
+            // mock queue id ("c-maria-flood"-shaped, src/lib/mock-app.ts) —
+            // this whole screen is still mock data. app.conversations.$id.tsx
+            // is wired to the LIVE `GET /v1/cases/{id}` now, so linking
+            // there with a mock id is a guaranteed `case_not_found` dead
+            // end instead of the old harmless mock-loader one. Rendered as
+            // a plain, non-navigating row until this screen gets its own
+            // live-data PR.
             <ul className="space-y-2">
               {propertyQueue.map((q) => (
-                <li key={q.id}>
-                  <Link
-                    to="/app/conversations/$id"
-                    params={{ id: q.id }}
-                    className="flex items-start gap-3 rounded-2xl border border-border bg-card p-4 hover:border-brand/30"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="font-display text-[15px] text-ink">{q.tenantFirst}</span>
-                        <SeverityBadge severity={q.severity} />
-                      </div>
-                      <p className="mt-1 line-clamp-2 text-[13px] text-ink-muted">
-                        {q.tenantMessage}
-                      </p>
-                      <p className="mt-1 font-mono text-[10px] uppercase tracking-widest text-ink-muted">
-                        {q.receivedAgo}
-                      </p>
+                <li
+                  key={q.id}
+                  className="flex items-start gap-3 rounded-2xl border border-border bg-card p-4"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-display text-[15px] text-ink">{q.tenantFirst}</span>
+                      <SeverityBadge severity={q.severity} />
                     </div>
-                    <ChevronRight className="mt-1 size-4 text-ink-muted/70" />
-                  </Link>
+                    <p className="mt-1 line-clamp-2 text-[13px] text-ink-muted">
+                      {q.tenantMessage}
+                    </p>
+                    <p className="mt-1 font-mono text-[10px] uppercase tracking-widest text-ink-muted">
+                      {q.receivedAgo}
+                    </p>
+                  </div>
                 </li>
               ))}
             </ul>

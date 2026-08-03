@@ -201,6 +201,26 @@ async function apiRequestInternal<T>(
     throw new ApiError(response.status, coerceErrorBody(parsed, response.status));
   }
 
+  // H3 (safety review, #234 PR 3 fix round): a 2xx whose body is empty or
+  // fails to parse as JSON is NOT a successful empty result — `parsed` is
+  // `null` in both cases (`safeJsonParse`'s own catch-all, and the
+  // `text.length > 0` guard above), and every typed caller in this app
+  // expects an object (`{items: [...]}`, `{id: ...}`, ...). Letting a
+  // bare `null` through as `T` used to read as "success with no data" —
+  // a blank emergency takeover, a false "no conversations yet." empty
+  // state — instead of the genuinely unexpected-response failure it is.
+  // Same shape `coerceErrorBody`'s own unparsable-body fallback already
+  // uses, applied here to a SUCCESS body instead of an error one. `204`s
+  // are unaffected (handled above, before this point, by design — an
+  // empty body IS the contract there).
+  if (parsed === null || typeof parsed !== "object") {
+    throw new ApiError(response.status, {
+      code: "unknown_error",
+      message: "The server sent back something unexpected.",
+      request_id: "req_unknown",
+    });
+  }
+
   return { data: parsed as T, dateHeader };
 }
 

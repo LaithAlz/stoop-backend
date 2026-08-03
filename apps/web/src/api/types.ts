@@ -421,12 +421,20 @@ export type TimelineEntry = TimelineMessageEntry | TimelineAuditEntry | Timeline
  * bodies). These are a best-effort read of the fields the UI actually needs
  * (name/phone/unit for the header line), flagged as a contract gap in the
  * mobile M1 report rather than presented as verbatim-confirmed.
+ *
+ * `vulnerable_occupant` (safety review, #234 PR 3 fix round, M3): present
+ * on the backend's `TenantRef` per api-contracts.md's Cases section v1.16
+ * amendment note ("Tenants & Vendors" request-body field, mirrored onto
+ * the case-detail read) — the one field that can change a 2am
+ * drive-over-vs-call-911 decision on the emergency takeover, previously
+ * dropped from this type entirely.
  */
 export interface CaseDetailTenant {
   id?: string;
   name?: string | null;
   phone?: string;
   unit?: string | null;
+  vulnerable_occupant?: VulnerableOccupant | null;
 }
 
 export interface CaseDetailVendor {
@@ -436,15 +444,30 @@ export interface CaseDetailVendor {
   phone?: string;
 }
 
-/** GET /v1/cases/{id} response. `property` reuses the full `Property` shape
- *  from the "Properties" section — the doc doesn't re-declare it here, but
- *  gives no reason to think case-detail invents a different one. */
+/**
+ * `GET /v1/cases/{id}`'s `property` field — api-contracts.md's Cases
+ * section, v1.16 amendment pins this to exactly `{id, label, address_line1,
+ * city}`, a narrower reference than the full `Property` shape from the
+ * "Properties" section (`twilio_number`/`house_rules`/`quiet_hours`/etc.
+ * are explicitly NOT included — "this endpoint has never returned them").
+ * Previously mistyped here as the full `Property` — spec-guardian catch,
+ * #234 PR 3 fix round: nothing in this app ever read a field beyond these
+ * four, so this is a pure type-accuracy fix, not a behavior change.
+ */
+export interface CasePropertyRef {
+  id: string;
+  label: string;
+  address_line1: string;
+  city: string;
+}
+
+/** GET /v1/cases/{id} response. */
 export interface CaseDetail {
   id: string;
   status: CaseStatus;
   severity: Severity | null;
   title: string | null;
-  property: Property;
+  property: CasePropertyRef;
   tenant: CaseDetailTenant;
   vendor: CaseDetailVendor | null;
   opened_at: string;
