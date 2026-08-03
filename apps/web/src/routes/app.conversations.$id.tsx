@@ -53,6 +53,17 @@ export const Route = createFileRoute("/app/conversations/$id")({
     meta: [{ title: "Conversation — Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/conversations/${params.id}` }],
   }),
+  // N2 (safety re-verify, #234 PR 3): TanStack Router REUSES the component
+  // instance across /conversations/A → /conversations/B (no key on the
+  // match unless remountDeps says so — verified in the router source). This
+  // screen now holds per-case local state (`pinnedDraft`, useDraftActions'
+  // overlay entries, `editingContext`) that must never survive a case
+  // switch: case B rendering case A's pinned draft body — or an open editor
+  // wired to A's draft id over B's timeline — is an approval-context
+  // mismatch on the "nothing sends without landlord approval" path. Not
+  // reachable through today's link graph (thread→thread always routes via
+  // the list), but that's an accident of the links, not an invariant.
+  remountDeps: ({ params }) => params.id,
   component: ConversationPage,
 });
 
@@ -140,7 +151,17 @@ function ConversationPage() {
   }, [livePendingDraft?.id, livePendingDraft?.body]);
 
   const pinnedEntry = pinnedDraft ? entryFor(draftActions.entries, pinnedDraft.id) : undefined;
-  const keepPinned = Boolean(!livePendingDraft && pinnedDraft && pinnedEntry?.status !== "idle");
+  // N1 (safety re-verify, #234 PR 3): the pin only ever needs to survive
+  // the UNDO WINDOW ("sending"). Keeping it for any non-idle status meant
+  // that after the countdown expired ("sent") the footer kept rendering
+  // the same body as a "I'd like to reply" DraftBubble with "Sent."
+  // under it — the landlord's reply shown twice, the second copy dressed
+  // as still-queued, on the screen whose whole promise is the record. A
+  // skipped draft deliberately falls back to the timeline's own "You
+  // skipped this reply — case stayed open." audit line (the honest
+  // thread-native representation; Home's muted skip CARD is a queue
+  // ruling, not a thread one).
+  const keepPinned = Boolean(!livePendingDraft && pinnedDraft && pinnedEntry?.status === "sending");
 
   const draftId = livePendingDraft?.id ?? (keepPinned ? pinnedDraft?.id : undefined);
   const draftBody = livePendingDraft?.body ?? (keepPinned ? pinnedDraft?.body : undefined);
@@ -162,11 +183,17 @@ function ConversationPage() {
   // timeline (a real outbound `message` entry replacing the drafted one,
   // per src/features/cases/timeline.ts's docstring) is the honest next
   // read — refetch instead of waiting for whatever next triggers a fetch.
+  // Watches the PINNED entry, not `draftEntry`: N1's `keepPinned` drops to
+  // false the instant the entry leaves "sending", which zeroes `draftId`
+  // and would make `draftEntry` skip straight to "idle" without this
+  // effect ever seeing "sent". Clearing the pin here also retires it for
+  // good once the send is final.
   useEffect(() => {
-    if (draftEntry.status === "sent") {
+    if (pinnedEntry?.status === "sent") {
       void queryClient.invalidateQueries({ queryKey: caseQueryKey(id) });
+      setPinnedDraft(null);
     }
-  }, [draftEntry.status, queryClient, id]);
+  }, [pinnedEntry?.status, queryClient, id]);
 
   const isClassifiedAudit = (
     entry: TimelineEntry,

@@ -17,6 +17,7 @@ import type { TimelineEntry, TimelineMessageEntry, VulnerableOccupant } from "@/
 import { firstName } from "@/lib/tenantName";
 import { formatRelativeTime } from "@/lib/relativeTime";
 import { emergencyHeadline } from "@/features/emergency/emergencyBanner";
+import { hasEmergencyTrigger } from "@/features/cases/emergencySignal";
 
 export const Route = createFileRoute("/app/conversations/$id_/emergency")({
   head: () => ({
@@ -109,6 +110,13 @@ function EmergencyPage() {
   // actually on file.
   const tenantPhone = caseDetail?.tenant.phone?.trim() || undefined;
   const vendorPhone = caseDetail?.vendor?.phone?.trim() || undefined;
+  // N3 (safety re-verify): `#`/`?` inside a stored phone ("416-555-0134
+  // #12") would start a URI fragment/query and silently truncate the
+  // href. Strip ONLY those two — not encodeURIComponent, which escapes
+  // `+` to `%2B` and some dialers mishandle that. Display keeps the raw
+  // string; only the href is sanitized.
+  const telHref = (phone: string) => `tel:${phone.replace(/[#?]/g, "")}`;
+  const smsHref = (phone: string) => `sms:${phone.replace(/[#?]/g, "")}`;
   const vulnerableLabel = caseDetail?.tenant.vulnerable_occupant
     ? VULNERABLE_LABELS[caseDetail.tenant.vulnerable_occupant]
     : null;
@@ -125,9 +133,16 @@ function EmergencyPage() {
   // backend itself doesn't perform. `null` is therefore clamped to
   // "still active" here, full stop — this screen has nothing softer to
   // fall back to display than the takeover chrome itself.
+  // Round-3 residual: the `emergency_triggered` audit row is honored here
+  // too — a case whose written severity ended up BELOW emergency despite a
+  // Tier-0 trigger means the backend's own never-de-escalate clamp failed
+  // (see src/features/cases/emergencySignal.ts); this screen must fail
+  // toward the alarm, never toward "stood down".
   const activeEmergency = caseDetail
     ? caseDetail.status !== "resolved" &&
-      (caseDetail.severity === "emergency" || caseDetail.severity === null)
+      (caseDetail.severity === "emergency" ||
+        caseDetail.severity === null ||
+        hasEmergencyTrigger(caseDetail))
     : false;
 
   return (
@@ -183,7 +198,7 @@ function EmergencyPage() {
 
               {tenantPhone ? (
                 <a
-                  href={`tel:${tenantPhone}`}
+                  href={telHref(tenantPhone)}
                   className="mt-5 flex items-center justify-between rounded-2xl bg-white/15 px-4 py-3 text-white hover:bg-white/25"
                 >
                   <span>
@@ -211,7 +226,16 @@ function EmergencyPage() {
               )}
 
               {vulnerableLabel && (
-                <p className="mt-3 text-sm font-bold text-white">{vulnerableLabel}</p>
+                // N5 (safety re-verify): the bare form-option label ("An
+                // infant") directly under the tenant line read as
+                // describing the tenant — the lead-in anchors it as
+                // who's-in-the-unit data the landlord entered.
+                <p className="mt-3 text-sm font-bold text-white">
+                  <span className="mr-2 text-[11px] font-bold uppercase tracking-widest text-white/80">
+                    In the unit
+                  </span>
+                  {vulnerableLabel}
+                </p>
               )}
             </>
           )}
@@ -253,6 +277,17 @@ function EmergencyPage() {
             </div>
           ) : (
             <>
+              {/* N6 (safety re-verify): same non-destructive refresh strip
+                  the thread and list carry — a failing background refetch
+                  on THIS screen must not show stale data silently. */}
+              {caseQuery.isError && (
+                <div
+                  role="status"
+                  className="mb-4 rounded-2xl border border-white/15 bg-white/[0.04] px-4 py-2.5 text-[13px] font-semibold text-white/80"
+                >
+                  Couldn&apos;t refresh just now — showing the last update.
+                </div>
+              )}
               {!activeEmergency && (
                 <div className="mb-6 rounded-2xl border border-white/15 bg-white/[0.04] p-4">
                   <p className="text-sm leading-relaxed text-white/90">
@@ -315,14 +350,14 @@ function EmergencyPage() {
             {tenantPhone ? (
               <>
                 <a
-                  href={`tel:${tenantPhone}`}
+                  href={telHref(tenantPhone)}
                   className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl bg-white text-lg font-bold uppercase tracking-wide text-ink hover:bg-white/95"
                 >
                   <Phone className="size-5" aria-hidden="true" />
                   Call {tenantFirst} now
                 </a>
                 <a
-                  href={`sms:${tenantPhone}`}
+                  href={smsHref(tenantPhone)}
                   className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/[0.06] text-base font-bold text-white hover:bg-white/15"
                 >
                   <MessageSquare className="size-5" aria-hidden="true" />
@@ -340,7 +375,7 @@ function EmergencyPage() {
             )}
             {caseDetail.vendor && vendorPhone && (
               <a
-                href={`tel:${vendorPhone}`}
+                href={telHref(vendorPhone)}
                 className="flex min-h-[60px] w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/[0.06] text-base font-bold text-white hover:bg-white/15"
               >
                 <Wrench className="size-5" aria-hidden="true" />

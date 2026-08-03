@@ -49,13 +49,17 @@ function ConversationsIndexPage() {
   // (`last_activity_at`) is a MUTABLE cursor per api-contracts.md's own A3
   // amendment — a case bumped by new activity between page fetches can
   // "skip ahead" and land on more than one already-fetched page. Deduping
-  // by id (last write wins) keeps the list from showing the same case
-  // twice; re-fetching page 1 is that amendment's own documented remedy
-  // for a stale cursor, not something a client needs to special-case.
+  // by id keeps the list from showing the same case twice. N4 (re-verify):
+  // FIRST write wins — page 1 is the most recently fetched snapshot of a
+  // bumped case; letting a later (staler) page overwrite its fields kept
+  // the fresh position but regressed the data. Re-fetching page 1 is the
+  // amendment's own documented remedy for a stale cursor.
   const items = useMemo(() => {
     const byId = new Map<string, CaseSummary>();
     for (const page of casesQuery.data?.pages ?? []) {
-      for (const item of page.items) byId.set(item.id, item);
+      for (const item of page.items) {
+        if (!byId.has(item.id)) byId.set(item.id, item);
+      }
     }
     return Array.from(byId.values());
   }, [casesQuery.data]);

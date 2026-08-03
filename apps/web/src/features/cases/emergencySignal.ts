@@ -20,8 +20,17 @@
  * The `emergency_triggered` audit row is written by that SAME Tier-0
  * prefilter (schema-v1.md's `audit_log.action` vocabulary) and survives
  * regardless of whether classification ever completes, so its presence in
- * the timeline is an authoritative, severity-independent signal — used
- * here as the fallback for a null severity instead of guessing either way.
+ * the timeline is an authoritative, severity-independent signal.
+ *
+ * Round-3 residual (safety re-verify): the trigger is honored
+ * UNCONDITIONALLY, not just when severity is null. The backend has no
+ * legitimate emergency→lower transition (`UPDATE … WHERE severity IS
+ * DISTINCT FROM 'emergency'` — the Tier-0 clamp), so a case carrying an
+ * `emergency_triggered` row with a lower written severity means the
+ * backend's own clamp failed (e.g. `_parse_prefilter` falling back to
+ * `hard_hit=False` on a missing/malformed `messages.prefilter`). Honoring
+ * the trigger in that state can only ever fail TOWARD the alarm — the
+ * correct direction on this surface.
  *
  * The emergency takeover (app.conversations.$id_.emergency.tsx) uses a
  * WIDER clamp for its own "still active" state (`severity === null` is
@@ -40,8 +49,5 @@ export function hasEmergencyTrigger(caseDetail: Pick<CaseDetail, "timeline">): b
 }
 
 export function isEmergencySignal(caseDetail: Pick<CaseDetail, "severity" | "timeline">): boolean {
-  return (
-    caseDetail.severity === "emergency" ||
-    (caseDetail.severity === null && hasEmergencyTrigger(caseDetail))
-  );
+  return caseDetail.severity === "emergency" || hasEmergencyTrigger(caseDetail);
 }
