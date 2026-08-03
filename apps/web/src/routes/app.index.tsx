@@ -27,6 +27,7 @@ import { useDraftActions } from "@/features/queue/useDraftActions";
 import {
   emergencyHeadline,
   emergencySubtext,
+  emergencyTenantMessage,
   hasAcknowledgeableNotification,
 } from "@/features/emergency/emergencyBanner";
 import { useAcknowledge } from "@/features/emergency/useAcknowledge";
@@ -87,6 +88,23 @@ function AppQueuePage() {
     // real dependency here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queueQuery.data, entries]);
+
+  // R3-1 (safety review round 3 follow-up, issue #252): resolve any
+  // edit-and-send left `unverifiedSendIds` by useDraftActions.ts's
+  // ambiguous-failure branch against THIS successful queue read — still
+  // listed as a card means the edit never applied (re-enable Send); gone
+  // means it did (close the editor + notice if it's still open on it).
+  useEffect(() => {
+    if (!queueQuery.data) return;
+    const freshIds = new Set(queueQuery.data.items.map((item) => item.draft_id));
+    for (const draftId of draftActions.unverifiedSendIds) {
+      draftActions.resolveUnverifiedSend(draftId, freshIds.has(draftId));
+    }
+    // draftActions.resolveUnverifiedSend is stable (useCallback, [onNotice]
+    // only) — unverifiedSendIds is the real dependency besides the query
+    // data itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queueQuery.data, draftActions.unverifiedSendIds]);
 
   const items = useMemo(() => queueQuery.data?.items ?? [], [queueQuery.data]);
   // Rule #1: the emergency line is never paywalled, throttled, or gated —
@@ -207,7 +225,7 @@ function AppQueuePage() {
                   headline={emergencyHeadline(item)}
                   subtext={emergencySubtext(item)}
                   tenantFirstName={firstName(item.tenant_name)}
-                  tenantMessage={item.tenant_message}
+                  tenantMessage={emergencyTenantMessage(item)}
                   onAcknowledge={
                     hasAcknowledgeableNotification(item)
                       ? () => acknowledge.acknowledge(item.notification_id)
@@ -307,7 +325,7 @@ function QueueRow({
       tenantName={firstName(item.tenant_name)}
       propertyLabel={propertyLabel}
       timestamp={formatRelativeTime(item.received_at)}
-      tenantMessage={item.tenant_message}
+      tenantMessage={item.tenant_message ?? ""}
       photoNote={item.has_media ? (item.media_note ?? "Sent a photo") : undefined}
       draftMessage={item.draft_body}
       why={item.why}
@@ -316,6 +334,7 @@ function QueueRow({
       totalSeconds={totalSeconds}
       staleNotice={draftActions.staleNotices[item.case_id]}
       editSubmitting={draftActions.isEditSubmitting}
+      sendUnverified={draftActions.isSendUnverified(item.draft_id)}
       actionsBusy={draftActions.isBusy(item.draft_id)}
       onApprove={() => draftActions.approve(ctx)}
       onEdit={() => onOpenEditor(item)}
