@@ -22,6 +22,19 @@ function toHouseCallbackError(): string {
   return "That sign-in link didn't work — it may have expired or already been used. Send yourself a new one below.";
 }
 
+// #248 (fast-follow to the #234 PR-1 safety review's NEW-2): with
+// `flowType: "pkce"`, a magic link opened on a DIFFERENT device than the
+// one that requested it has no `code_verifier` in that device's
+// localStorage. auth-js's own `_isPKCECallback()` check (installed
+// @supabase/auth-js, GoTrueClient.ts) then quietly treats the URL as if it
+// carried no callback at all — no exchange attempt, no error, `?code=`
+// left sitting in the address bar. Ordinary behavior (request the link on
+// a laptop, open the email on a phone), not an attack, so the copy stays
+// blame-free and just names what to do next.
+function toHouseCrossDeviceNotice(): string {
+  return "That link has to be opened on the device you asked for it from — send yourself a new one below.";
+}
+
 function parseAuthCallbackParams(): { hasError: boolean; hasPendingExchange: boolean } {
   if (typeof window === "undefined") return { hasError: false, hasPendingExchange: false };
   const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
@@ -55,13 +68,17 @@ export const Route = createFileRoute("/sign-in")({
 });
 
 function SignInPage() {
-  const { session, initializing, configured, signInWithMagicLink } = useAuth();
+  const { session, initializing, initTimedOut, configured, signInWithMagicLink } = useAuth();
   const navigate = useNavigate();
   const [email, setEmail] = useState("");
   const [sent, setSent] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [callbackError, setCallbackError] = useState<string | null>(null);
+  // #248: set once the pending PKCE/implicit exchange this page waited on
+  // (`isFinishingSignIn` below) settles with no session — i.e. the plain
+  // form is about to render silently. See `toHouseCrossDeviceNotice`.
+  const [crossDeviceNotice, setCrossDeviceNotice] = useState(false);
   // A2: starts `false` on both the server and the client's first paint
   // (there's no URL to read during SSR) and only settles in the mount
   // effect below — the same stable-then-settle shape as GreetingHeader
@@ -91,6 +108,27 @@ function SignInPage() {
       setIsFinishingSignIn(true);
     }
   }, []);
+
+  // #248: gates the cross-device notice on `initializing` having actually
+  // SETTLED, not merely on a code being present — this is what keeps a
+  // legitimate same-device exchange (still in flight, `initializing` still
+  // true) from ever flashing this message. `getSession()`
+  // (src/auth/AuthProvider.tsx) awaits the SAME `initializePromise` that
+  // GoTrue's own constructor kicked off the code exchange on, so by the
+  // time `initializing` goes false, a real exchange attempt has already
+  // fully resolved — success sets `session` in the same batched update, so
+  // the `session === null` check below can never race a success. Skips
+  // `initTimedOut`: a 10s watchdog abort (AuthProvider) means the check
+  // never came back at all, which is a network problem, not a wrong-device
+  // one — misdiagnosing it here would be worse than the prior silence.
+  useEffect(() => {
+    if (!isFinishingSignIn || initializing || initTimedOut || session) return;
+    setCrossDeviceNotice(true);
+    // Same reasoning as the `hasError` strip above: a refresh must not
+    // leave `?code=` sitting in the address bar / history, or re-attempt
+    // the exchange auth-js already silently declined to make.
+    window.history.replaceState(window.history.state, "", window.location.pathname);
+  }, [isFinishingSignIn, initializing, initTimedOut, session]);
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -174,6 +212,20 @@ function SignInPage() {
                   role="alert"
                 >
                   {callbackError}
+                </p>
+              )}
+
+              {/* #248: neutral, not destructive-red — opening a link on a
+                  different device is expected behavior, not a fault, so
+                  this stays in the same honest/no-blame register as the
+                  `!configured` box above rather than the `callbackError`
+                  alert above. */}
+              {crossDeviceNotice && (
+                <p
+                  className="mt-4 rounded-2xl border border-border bg-surface px-4 py-3 text-sm leading-relaxed text-ink-muted"
+                  role="status"
+                >
+                  {toHouseCrossDeviceNotice()}
                 </p>
               )}
 
