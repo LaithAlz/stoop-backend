@@ -39,16 +39,52 @@ export function buildMeUpdatePayload(
 
   const phone = form.phone.trim();
   if (phone.length > 0) {
-    payload.phone = phone;
+    // F3 (safety review, #234 PR 5): NORMALIZED, never the raw text.
+    // schema-v1.md documents `landlords.phone` as E.164 and the emergency
+    // chain hands it straight to Twilio's `create_call(to=...)`, which
+    // rejects anything else (21211). The placeholder this form shows is
+    // "(416) 555-0134", so the EXPECTED happy-path input was being stored
+    // un-dialable — and `_execute_action` swallows a bad-number failure by
+    // design, so the landlord's phone would simply never ring, forever,
+    // with no error anywhere.
+    payload.phone = toE164(phone);
   }
 
   return Object.keys(payload).length > 0 ? payload : null;
 }
 
-/** ≥10 digits reads as a real NANP number — same bar
- *  src/routes/app.properties_.add.tsx's area-code check and apps/mobile's
- *  own profileEdit.ts use. Blank is valid ("keep my current number"). */
+/**
+ * Best-effort E.164 for the NANP inputs this form actually sees. Anything
+ * this can't confidently normalize is rejected by `phoneLooksValid` below
+ * rather than sent — storing a string Twilio can't dial is strictly worse
+ * than refusing the edit, because the failure surfaces at 2am instead of
+ * here.
+ */
+export function toE164(phone: string): string {
+  const trimmed = phone.trim();
+  if (/^\+\d{8,15}$/.test(trimmed)) return trimmed;
+  const digits = trimmed.replace(/\D/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return `+${digits}`;
+}
+
+/**
+ * Blank is valid ("keep my current number"). Anything NON-blank must carry
+ * a dialable number.
+ *
+ * F2 (safety review, #234 PR 5): the old check counted digits only, so
+ * zero-digit text — "n/a", "same as before", "-", exactly what a hurried
+ * landlord types when the helper says "leave it blank to keep the number
+ * already on file" — passed validation AND passed the builder's
+ * `length > 0` send rule. The result was `landlords.phone = "n/a"`, a
+ * green "Saved", and an emergency chain that silently never reaches
+ * anyone. A non-empty field now has to look like a real number.
+ */
 export function phoneLooksValid(phone: string): boolean {
-  const digits = phone.replace(/\D/g, "");
-  return digits.length === 0 || digits.length >= 10;
+  const trimmed = phone.trim();
+  if (trimmed.length === 0) return true;
+  if (/^\+\d{8,15}$/.test(trimmed)) return true;
+  const digits = trimmed.replace(/\D/g, "");
+  return digits.length === 10 || (digits.length === 11 && digits.startsWith("1"));
 }

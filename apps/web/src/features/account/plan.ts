@@ -27,12 +27,24 @@ export function planDisplayName(tier: string, cohort: string): string {
  * already says what's active, and `none` is the ordinary free-tier state,
  * not a problem to flag). Returns `null` when there's nothing to say.
  */
-export function planStatusNotice(status: string): string | null {
+export function planStatusNotice(status: string, tier: string = "full"): string | null {
+  // F6 (safety review, #234 PR 5): gated on tier — a free-tier landlord
+  // carrying a stale `past_due`/`canceled` status was being shown an
+  // entitlement claim for a plan they don't have, in red, directly under
+  // "Emergency Line — free".
+  if (tier === "free") return null;
+  const planName = tier === "desk" ? "Property Managers plan" : "Full Plan";
   if (status === "past_due") {
-    return "Your last payment didn't go through. Update your payment method to keep the Full Plan active.";
+    // F6: says the emergency line is unaffected, at exactly the moment a
+    // landlord reading red text about a failed payment would doubt it
+    // (rule 1 — never paywalled). The old line also instructed "update
+    // your payment method", which has no destination anywhere in the app
+    // (billing portal isn't wired), so it's dropped rather than left as a
+    // dead instruction.
+    return `Your last payment didn't go through, so your ${planName} may lapse. Your emergency line keeps working either way.`;
   }
   if (status === "canceled") {
-    return "Your Full Plan subscription is canceled — you're on the free Emergency Line until you resubscribe.";
+    return `Your ${planName} subscription is canceled — you're on the free Emergency Line until you resubscribe.`;
   }
   return null;
 }

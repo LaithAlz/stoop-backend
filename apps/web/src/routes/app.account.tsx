@@ -169,9 +169,9 @@ function AccountPage() {
                       <Sparkles className="size-3.5" />{" "}
                       {planDisplayName(me.subscription_tier, me.price_cohort)}
                     </div>
-                    {planStatusNotice(me.subscription_status) && (
+                    {planStatusNotice(me.subscription_status, me.subscription_tier) && (
                       <p className="mt-2 text-[13px] text-destructive">
-                        {planStatusNotice(me.subscription_status)}
+                        {planStatusNotice(me.subscription_status, me.subscription_tier)}
                       </p>
                     )}
                     <div className="mt-4">
@@ -278,11 +278,13 @@ function AccountPage() {
 }
 
 /** Two-letter initials from a name, falling back to the email's first
- *  letter — never renders blank. `full_name` is a plain, unconstrained
- *  `text` column (schema-v1.md), so this can't assume two tokens. */
-function initials(fullName: string, email: string): string {
-  const trimmed = fullName.trim();
-  if (!trimmed) return email.slice(0, 1).toUpperCase() || "?";
+ *  letter — never renders blank. `full_name` is a plain, unconstrained,
+ *  NULLABLE `text` column (schema-v1.md) sourced from the auth user's
+ *  `user_metadata.full_name`, which magic-link sign-in doesn't set — so
+ *  null is the ORDINARY case on web, not an edge case (F1). */
+function initials(fullName: string | null, email: string | null): string {
+  const trimmed = (fullName ?? "").trim();
+  if (!trimmed) return (email ?? "").slice(0, 1).toUpperCase() || "?";
   const parts = trimmed.split(/\s+/);
   const first = parts[0]?.[0] ?? "";
   const last = parts.length > 1 ? (parts[parts.length - 1]?.[0] ?? "") : "";
@@ -311,23 +313,61 @@ function EditProfileDialog({
   onOpenChange: (open: boolean) => void;
   current: LandlordMe;
 }) {
+  // F4 (safety review, #234 PR 5): a dismissal while the PATCH is in
+  // flight unmounts EditProfileForm, which tears down its useMutation
+  // observer — `onSuccess`/`onError` never run, while the request itself
+  // still lands server-side. On the field that decides where emergency
+  // calls ring (and which GET /v1/me never echoes back, so the landlord
+  // can't check), that is a silent wrong-state in both directions. The
+  // dialog is held open until the write resolves.
+  const [saving, setSaving] = useState(false);
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="border-border bg-canvas">
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next && saving) return;
+        onOpenChange(next);
+      }}
+    >
+      <DialogContent
+        className="border-border bg-canvas"
+        onEscapeKeyDown={(e) => {
+          if (saving) e.preventDefault();
+        }}
+        onInteractOutside={(e) => {
+          if (saving) e.preventDefault();
+        }}
+      >
         {/* Radix's Dialog.Content only exists in the DOM while `open` is
             true (dialog.tsx has no `forceMount`) — closing this dialog
             unmounts EditProfileForm entirely, so its local state (name,
             phone, submitted, serverError) is already fresh on every open;
             no reset-via-remount `key` needed. */}
-        <EditProfileForm current={current} onClose={() => onOpenChange(false)} />
+        <EditProfileForm
+          current={current}
+          onClose={() => onOpenChange(false)}
+          onSavingChange={setSaving}
+        />
       </DialogContent>
     </Dialog>
   );
 }
 
-function EditProfileForm({ current, onClose }: { current: LandlordMe; onClose: () => void }) {
+function EditProfileForm({
+  current,
+  onClose,
+  onSavingChange,
+}: {
+  current: LandlordMe;
+  onClose: () => void;
+  onSavingChange: (saving: boolean) => void;
+}) {
   const queryClient = useQueryClient();
-  const [name, setName] = useState(current.full_name);
+  // F1: `?? ""` — a null `full_name` (the ordinary magic-link case) would
+  // otherwise make this an uncontrolled input and throw on `.trim()` in
+  // the payload builder.
+  const [name, setName] = useState(current.full_name ?? "");
   const [phone, setPhone] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
@@ -343,11 +383,20 @@ function EditProfileForm({ current, onClose }: { current: LandlordMe; onClose: (
       toast.success("Saved", { duration: 1500 });
       onClose();
     },
-    onError: (error) => {
+    onError: (error, variables) => {
       // H2-style ambiguity check (src/routes/app.properties_.$id.tsx) — a
       // status-0/5xx failure here doesn't prove the write didn't land.
       if (error instanceof ApiError && (error.status === 0 || error.status >= 500)) {
-        setServerError("That may have gone through — refresh to check before trying again.");
+        // F5 (safety review, #234 PR 5): "refresh to check" is impossible
+        // advice for a phone edit — GET /v1/me deliberately never returns
+        // `phone`, so no refresh can confirm it. PATCH is idempotent, so
+        // re-sending the same number is the safe move and the honest
+        // instruction.
+        setServerError(
+          "phone" in variables
+            ? "We couldn't confirm your number saved. Save it again — sending the same number twice is harmless."
+            : "That may have gone through — refresh to check before trying again.",
+        );
         void queryClient.invalidateQueries({ queryKey: meQueryKey });
         return;
       }
@@ -359,6 +408,7 @@ function EditProfileForm({ current, onClose }: { current: LandlordMe; onClose: (
     },
     onSettled: () => {
       submitLatch.current = false;
+      onSavingChange(false);
     },
   });
 
@@ -369,12 +419,21 @@ function EditProfileForm({ current, onClose }: { current: LandlordMe; onClose: (
     setSubmitted(true);
     setServerError(null);
     if (phoneError || mutation.isPending || submitLatch.current) return;
+    // F7 (safety review, #234 PR 5): a deliberately-blanked name produced
+    // no payload, so the dialog just closed with the old name still in the
+    // header — a silent no-op that reads as success. Say what happened
+    // instead of pretending it worked.
+    if (name.trim().length === 0 && (current.full_name ?? "").length > 0) {
+      setServerError("Your name can't be blank.");
+      return;
+    }
     const payload = buildMeUpdatePayload({ name, phone }, { full_name: current.full_name });
     if (!payload) {
       onClose();
       return;
     }
     submitLatch.current = true;
+    onSavingChange(true);
     mutation.mutate(payload);
   }
 
@@ -443,6 +502,10 @@ function EditProfileForm({ current, onClose }: { current: LandlordMe; onClose: (
         <Button
           type="button"
           variant="outline"
+          // F4: can't abandon an in-flight write to the emergency-call
+          // number — the request lands either way and the result handlers
+          // would be gone.
+          disabled={mutation.isPending}
           className="h-11 border-border text-ink"
           onClick={onClose}
         >

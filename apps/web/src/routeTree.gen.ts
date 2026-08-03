@@ -26,8 +26,6 @@ import { Route as AppConversationsIndexRouteImport } from './routes/app.conversa
 import { Route as AppPropertiesAddRouteImport } from './routes/app.properties_.add'
 import { Route as AppPropertiesIdRouteImport } from './routes/app.properties_.$id'
 import { Route as AppConversationsIdRouteImport } from './routes/app.conversations.$id'
-import { Route as AppPropertiesIdTrustRouteImport } from './routes/app.properties_.$id_.trust'
-import { Route as AppPropertiesIdSettingsRouteImport } from './routes/app.properties_.$id_.settings'
 import { Route as AppConversationsIdEmergencyRouteImport } from './routes/app.conversations.$id_.emergency'
 
 const TermsRoute = TermsRouteImport.update({
@@ -115,16 +113,6 @@ const AppConversationsIdRoute = AppConversationsIdRouteImport.update({
   path: '/conversations/$id',
   getParentRoute: () => AppRoute,
 } as any)
-const AppPropertiesIdTrustRoute = AppPropertiesIdTrustRouteImport.update({
-  id: '/properties_/$id_/trust',
-  path: '/properties/$id/trust',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppPropertiesIdSettingsRoute = AppPropertiesIdSettingsRouteImport.update({
-  id: '/properties_/$id_/settings',
-  path: '/properties/$id/settings',
-  getParentRoute: () => AppRoute,
-} as any)
 const AppConversationsIdEmergencyRoute =
   AppConversationsIdEmergencyRouteImport.update({
     id: '/conversations/$id_/emergency',
@@ -151,8 +139,6 @@ export interface FileRoutesByFullPath {
   '/app/properties/add': typeof AppPropertiesAddRoute
   '/app/conversations/': typeof AppConversationsIndexRoute
   '/app/conversations/$id/emergency': typeof AppConversationsIdEmergencyRoute
-  '/app/properties/$id/settings': typeof AppPropertiesIdSettingsRoute
-  '/app/properties/$id/trust': typeof AppPropertiesIdTrustRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -172,8 +158,6 @@ export interface FileRoutesByTo {
   '/app/properties/add': typeof AppPropertiesAddRoute
   '/app/conversations': typeof AppConversationsIndexRoute
   '/app/conversations/$id/emergency': typeof AppConversationsIdEmergencyRoute
-  '/app/properties/$id/settings': typeof AppPropertiesIdSettingsRoute
-  '/app/properties/$id/trust': typeof AppPropertiesIdTrustRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -195,8 +179,6 @@ export interface FileRoutesById {
   '/app/properties_/add': typeof AppPropertiesAddRoute
   '/app/conversations/': typeof AppConversationsIndexRoute
   '/app/conversations/$id_/emergency': typeof AppConversationsIdEmergencyRoute
-  '/app/properties_/$id_/settings': typeof AppPropertiesIdSettingsRoute
-  '/app/properties_/$id_/trust': typeof AppPropertiesIdTrustRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -219,8 +201,6 @@ export interface FileRouteTypes {
     | '/app/properties/add'
     | '/app/conversations/'
     | '/app/conversations/$id/emergency'
-    | '/app/properties/$id/settings'
-    | '/app/properties/$id/trust'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -240,8 +220,6 @@ export interface FileRouteTypes {
     | '/app/properties/add'
     | '/app/conversations'
     | '/app/conversations/$id/emergency'
-    | '/app/properties/$id/settings'
-    | '/app/properties/$id/trust'
   id:
     | '__root__'
     | '/'
@@ -262,8 +240,6 @@ export interface FileRouteTypes {
     | '/app/properties_/add'
     | '/app/conversations/'
     | '/app/conversations/$id_/emergency'
-    | '/app/properties_/$id_/settings'
-    | '/app/properties_/$id_/trust'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -400,20 +376,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppConversationsIdRouteImport
       parentRoute: typeof AppRoute
     }
-    '/app/properties_/$id_/trust': {
-      id: '/app/properties_/$id_/trust'
-      path: '/properties/$id/trust'
-      fullPath: '/app/properties/$id/trust'
-      preLoaderRoute: typeof AppPropertiesIdTrustRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/properties_/$id_/settings': {
-      id: '/app/properties_/$id_/settings'
-      path: '/properties/$id/settings'
-      fullPath: '/app/properties/$id/settings'
-      preLoaderRoute: typeof AppPropertiesIdSettingsRouteImport
-      parentRoute: typeof AppRoute
-    }
     '/app/conversations/$id_/emergency': {
       id: '/app/conversations/$id_/emergency'
       path: '/conversations/$id/emergency'
@@ -433,8 +395,6 @@ interface AppRouteChildren {
   AppPropertiesAddRoute: typeof AppPropertiesAddRoute
   AppConversationsIndexRoute: typeof AppConversationsIndexRoute
   AppConversationsIdEmergencyRoute: typeof AppConversationsIdEmergencyRoute
-  AppPropertiesIdSettingsRoute: typeof AppPropertiesIdSettingsRoute
-  AppPropertiesIdTrustRoute: typeof AppPropertiesIdTrustRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
@@ -446,8 +406,6 @@ const AppRouteChildren: AppRouteChildren = {
   AppPropertiesAddRoute: AppPropertiesAddRoute,
   AppConversationsIndexRoute: AppConversationsIndexRoute,
   AppConversationsIdEmergencyRoute: AppConversationsIdEmergencyRoute,
-  AppPropertiesIdSettingsRoute: AppPropertiesIdSettingsRoute,
-  AppPropertiesIdTrustRoute: AppPropertiesIdTrustRoute,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
