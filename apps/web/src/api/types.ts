@@ -110,7 +110,10 @@ export interface LandlordMe {
   email: string | null;
   full_name: string | null;
   timezone: string;
-  voice_profile: VoiceProfile;
+  /** Nullable, same as `full_name` above (the backend's `MeResponse`
+   *  declares `dict | None`). Nothing renders it yet — typed honestly now
+   *  so a future voice-profile editor can't repeat F1's crash. */
+  voice_profile: VoiceProfile | null;
   price_cohort: string;
   subscription_tier: string;
   subscription_status: string;

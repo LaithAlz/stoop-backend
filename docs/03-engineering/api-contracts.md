@@ -115,8 +115,30 @@
   nothing is mutated (`email`/`updated_at` untouched) before the error is
   returned. Closes #135 part 1.
 
+**v1.23 amendment (2026-08-03 — #234 PR 5):** `full_name` and
+`voice_profile` are **nullable** on this response, and `full_name` is
+null on the ordinary path, not just in theory: `landlords.full_name`
+carries no `NOT NULL` (schema-v1.md) and is populated from the auth
+user's `user_metadata.full_name`, which magic-link sign-in never sets —
+so every landlord who signed up through the web dashboard's OTP flow
+reads back `"full_name": null` until they set one. A client that assumed
+otherwise crashed its whole account screen for that (majority) case.
+`email` is likewise declared nullable by the response model, though a 200
+cannot currently carry a null one — the 403 `email_required` above
+fail-closes before any write, and `landlords.email` is `NOT NULL`.
+`phone` is **never returned** by this endpoint (internal-only, alongside
+`auth_user_id`/`stripe_customer_id`/`deleted_at`/`updated_at`); it is
+write-only via `PATCH`, so no client can read back what it just set —
+confirm-by-refetch is not available for that field.
+
 `PATCH /v1/me` — body: any of `full_name`, `phone`, `timezone`,
 `voice_profile`. Emergency notifications are not a settable preference.
+`phone` is stored as E.164 (schema-v1.md: "E.164; emergency calls go
+here") and handed to Twilio's `create_call(to=…)` verbatim — a value in
+any other shape is accepted by the API today but is undialable, and the
+escalation chain swallows that failure by design, so the landlord's phone
+simply never rings. Clients must normalize before sending; server-side
+validation is tracked in #260.
 
 **v1.9 amendment (2026-07-12 — #57 implementation):** `PATCH` never
 lazily provisions — a caller with no live `landlords` row (never
