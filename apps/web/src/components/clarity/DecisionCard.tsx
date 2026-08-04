@@ -106,23 +106,41 @@ export function DecisionCard({
 
   // #191 item 1: the Edit button (rendered by DecisionActions below)
   // unmounts the instant edit mode opens and only remounts if the
-  // landlord cancels back to "pending" — never on a successful
-  // edit-and-send, which moves straight to "sending". `editButtonRef`
-  // always points at whichever Edit button is currently mounted (or
-  // `null` if none is), so the effect below can tell reachable from not.
+  // landlord cancels back to "pending". It never remounts on a
+  // successful edit-and-send, which moves straight to "sending".
+  // `editButtonRef` always points at whichever Edit button is currently
+  // mounted, or `null` if none is, so the effect below can tell reachable
+  // from not.
   const editButtonRef = useRef<HTMLButtonElement>(null);
   const cardRef = useRef<HTMLElement>(null);
   const wasEditingRef = useRef(isEditing);
 
   useEffect(() => {
     if (wasEditingRef.current && !isEditing) {
-      // Edit mode just closed (Cancel, or a successful edit-and-send) —
-      // land focus on the Edit button if it came back, otherwise the
-      // card itself, so a keyboard user is never dropped onto <body>.
-      if (editButtonRef.current) {
-        editButtonRef.current.focus();
-      } else {
-        cardRef.current?.focus();
+      // F6 (safety review, #191 follow-up): only move focus if it was
+      // plausibly here. Either it's still literally inside the card, or
+      // it was reset to <body> because the element that had it (the
+      // editor's textarea, Cancel, or Send) was just removed as part of
+      // THIS transition. Without this guard, a background settle that
+      // has nothing to do with the landlord's own click (R3-1's
+      // `resolveUnverifiedSend`, called from a queue poll) could close a
+      // DIFFERENT card's editor while the landlord has already tabbed
+      // elsewhere, and yank their focus and the page's scroll back up to
+      // this one.
+      const active = document.activeElement;
+      if (cardRef.current?.contains(active) || active === document.body) {
+        // Edit mode just closed (Cancel, or a successful edit-and-send).
+        // Land focus on the Edit button if it came back, otherwise the
+        // card itself, so a keyboard user is never dropped onto <body>.
+        // F8: a stale ref pointing at an already-detached node would
+        // silently no-op `.focus()` and never reach the fallback below,
+        // so this checks the node is actually still in the document, not
+        // just non-null.
+        if (editButtonRef.current?.isConnected) {
+          editButtonRef.current.focus();
+        } else {
+          cardRef.current?.focus();
+        }
       }
     }
     wasEditingRef.current = isEditing;
@@ -132,6 +150,7 @@ export function DecisionCard({
     <article
       ref={cardRef}
       tabIndex={-1}
+      aria-label={`${tenantName}, ${propertyLabel}`}
       className={cn(
         "rounded-clarity-lg border border-clarity-line-strong bg-clarity-surface p-[18px] shadow-clarity-card",
         className,

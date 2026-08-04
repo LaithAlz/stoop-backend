@@ -1,3 +1,4 @@
+import { useId, useRef } from "react";
 import { cn } from "@/lib/utils";
 
 interface UndoTicketProps {
@@ -27,6 +28,28 @@ export function UndoTicket({
   const clamped = Math.max(0, secondsLeft);
   const pct = totalSeconds > 0 ? Math.max(0, Math.min(100, (clamped / totalSeconds) * 100)) : 0;
   const display = `00:${String(clamped).padStart(2, "0")}`;
+  const noticeId = useId();
+
+  // #191 F5 (safety review follow-up): `undoDisabled` used to be handed
+  // straight to the button's own `disabled` attribute. A browser
+  // automatically blurs an element the instant it's disabled, so the tap
+  // that STARTS the undo request also rips focus off the one control this
+  // whole ticket exists for, exactly when a keyboard/screen-reader user
+  // needs it to stay put. `aria-busy` below still announces "in flight"
+  // without touching focusability; this ref is what actually stops a
+  // second DELETE. It's read synchronously inside the click handler, so
+  // it also covers a same-tick double-activation the next `undoDisabled`
+  // prop update hasn't reached yet. Every path the undo mutation can
+  // resolve through (success, generic failure, `already_sent`) removes
+  // this "sending" entry (queueEntries.ts's reducer), which always
+  // unmounts THIS component, so there's no later legitimate tap on the
+  // same instance that would need `firedRef` reset.
+  const firedRef = useRef(false);
+  const handleUndo = () => {
+    if (undoDisabled || firedRef.current) return;
+    firedRef.current = true;
+    onUndo?.();
+  };
 
   return (
     <div
@@ -35,6 +58,31 @@ export function UndoTicket({
         className,
       )}
     >
+      {/* #191 F1/F2/F4 (safety review): a per-tick sr-only suffix on the
+          button's own name used to carry this. It was noisy (re-announced,
+          or not, unpredictably, every second), but at least SOMETHING told
+          a screen-reader user arriving at the button that a clock was
+          running. Replacing it with a stable "Undo" name and nothing else
+          made the control silently urgent instead. This restores that
+          context without the tick. It's `role="alert"`, not `status`,
+          because this element is INSERTED fresh every time a card starts
+          sending, and src/routes/sign-in.tsx's #248 F3 ruling already
+          established that a live region announced by insertion is
+          unreliable for `status` across assistive tech (higher stakes
+          here, since the design DEPENDS on this one firing). It's placed
+          first, above the "Sending" kicker, so it's read/announced before
+          the button in browse order, and wired to the button via
+          `aria-describedby` (the same idiom EditDraftPanel uses for its
+          blocked-Send explanation) so the text is ALSO read every time a
+          screen-reader user actually lands on Undo, not only once on
+          mount. `{totalSeconds}` is the real, server-derived window
+          (queueEntries.ts's `totalUndoSeconds`), never a hardcoded "5"
+          that could read wrong against an on-screen countdown showing
+          something else. */}
+      <p id={noticeId} role="alert" className="sr-only">
+        Undo is available for {totalSeconds} second{totalSeconds === 1 ? "" : "s"} after you
+        approve.
+      </p>
       <div className="flex items-center gap-3">
         <div className="min-w-0 flex-1">
           <span className="mb-[5px] block font-clarity-sans text-[10px] font-bold uppercase tracking-[0.1em] text-clarity-ink-dim">
@@ -50,10 +98,13 @@ export function UndoTicket({
         <div className="shrink-0 border-l border-dashed border-clarity-line-strong pl-3.5">
           <button
             type="button"
-            onClick={onUndo}
-            disabled={undoDisabled}
+            onClick={handleUndo}
             aria-busy={undoDisabled}
-            className="min-h-11 px-1.5 font-clarity-sans text-[13.5px] font-extrabold uppercase tracking-[0.03em] text-clarity-emergency underline underline-offset-[3px] disabled:opacity-60"
+            aria-describedby={noticeId}
+            className={cn(
+              "min-h-11 px-1.5 font-clarity-sans text-[13.5px] font-extrabold uppercase tracking-[0.03em] text-clarity-emergency underline underline-offset-[3px]",
+              undoDisabled && "opacity-60",
+            )}
           >
             Undo
           </button>
@@ -65,18 +116,6 @@ export function UndoTicket({
           style={{ width: `${pct}%` }}
         />
       </div>
-      {/* #191 item 2: the button's accessible name used to be "Undo the
-          message that's sending — N seconds left", recomputed (and
-          potentially re-announced) every tick. A screen-reader user needs
-          to know a reply is sending and that Undo exists, not a live
-          per-second clock — so the button keeps a stable "Undo" name, and
-          this static (non-ticking) `role="status"` text carries the rest,
-          announced once when the ticket first appears rather than every
-          second. The visible "00:05" digits stay `aria-hidden` above,
-          sighted-only, same as before. */}
-      <p role="status" className="sr-only">
-        Your reply is on its way. Undo is available for 5 seconds.
-      </p>
     </div>
   );
 }

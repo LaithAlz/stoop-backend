@@ -56,10 +56,10 @@ export function EditDraftPanel({
 
   // #191 item 1: this panel is only ever mounted while edit mode is open
   // (both call sites swap it in via a ternary rather than toggling its
-  // visibility), so "on mount" IS "on open" — no separate open/closed prop
-  // needed. Runs client-side only (useEffect never fires during SSR), so
-  // it can't fight hydration: there is nothing to focus until the browser
-  // has already committed this DOM node.
+  // visibility), so "on mount" IS "on open"; no separate open/closed prop
+  // is needed. This runs client-side only (useEffect never fires during
+  // SSR), so it can't fight hydration: there is nothing to focus until
+  // the browser has already committed this DOM node.
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);

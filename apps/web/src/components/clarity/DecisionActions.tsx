@@ -12,8 +12,8 @@ interface DecisionActionsProps {
   disabled?: boolean;
   /** #191 item 1: lets the owner (DecisionCard / the conversation thread's
    *  DraftFooter) hold a live reference to THIS Edit button so it can
-   *  return keyboard focus here once the editor it opens is closed —
-   *  the button unmounts and remounts across that round trip, so a plain
+   *  return keyboard focus here once the editor it opens is closed. The
+   *  button unmounts and remounts across that round trip, so a plain
    *  `useRef` captured once by the caller would go stale. */
   editButtonRef?: Ref<HTMLButtonElement>;
   className?: string;

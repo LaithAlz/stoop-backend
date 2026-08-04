@@ -181,23 +181,44 @@ function ConversationPage() {
   const editingContext = draftActions.editingContext;
 
   // #191 item 1: same focus-return pattern as DecisionCard's own copy of
-  // this effect (src/components/clarity/DecisionCard.tsx) — this route
-  // has no single "card" to land on, so `draftAreaRef` (the wrapper below
-  // that holds the editor/footer either way) stands in for it. The Edit
-  // button unmounts the instant `editingContext` is set and only remounts
-  // if the landlord cancels back out — never on a successful
-  // edit-and-send — so `editButtonRef.current` being null is the normal,
-  // expected "not reachable" case, not a bug.
+  // this effect (src/components/clarity/DecisionCard.tsx). This route has
+  // no single "card" to land on, so `draftAreaRef` (the wrapper below that
+  // holds the editor/footer either way) stands in for it. The Edit button
+  // unmounts the instant `editingContext` is set and only remounts if the
+  // landlord cancels back out, never on a successful edit-and-send, so
+  // `editButtonRef.current` being null is the normal, expected "not
+  // reachable" case, not a bug.
   const editButtonRef = useRef<HTMLButtonElement>(null);
   const draftAreaRef = useRef<HTMLDivElement>(null);
   const wasEditingRef = useRef(Boolean(editingContext));
   useEffect(() => {
     const isEditing = Boolean(editingContext);
     if (wasEditingRef.current && !isEditing) {
-      if (editButtonRef.current) {
-        editButtonRef.current.focus();
-      } else {
-        draftAreaRef.current?.focus();
+      // F6 (safety review, #191 follow-up): only move focus if it was
+      // plausibly here. Either it's still literally inside the draft
+      // area, or it was reset to <body> because the element that had it
+      // was just removed as part of THIS transition. Concretely: a
+      // landlord who taps Send and then immediately taps something else
+      // (the "Resolve case" button below, say) while `editAndSendDraft`
+      // is still in flight would, without this guard, get their focus
+      // and the page's scroll yanked back to this editor's remains once
+      // the request resolves, well after they'd already moved on. This
+      // also covers `resolveUnverifiedSend`'s own `setEditingContext(null)`
+      // (useDraftActions.ts): nothing in this route calls it today (a
+      // separate, already-filed gap; this screen doesn't wire the #252
+      // unverified-send guard at all), but it would hit this exact same
+      // hijack shape the moment it does.
+      const active = document.activeElement;
+      if (draftAreaRef.current?.contains(active) || active === document.body) {
+        // F8: a stale ref pointing at an already-detached node would
+        // silently no-op `.focus()` and never reach the fallback below,
+        // so this checks the node is actually still in the document, not
+        // just non-null.
+        if (editButtonRef.current?.isConnected) {
+          editButtonRef.current.focus();
+        } else {
+          draftAreaRef.current?.focus();
+        }
       }
     }
     wasEditingRef.current = isEditing;
@@ -330,7 +351,7 @@ function ConversationPage() {
 
               {rows.map((row) => renderTimelineRow(row, tenantFirst))}
 
-              <div ref={draftAreaRef} tabIndex={-1}>
+              <div ref={draftAreaRef} tabIndex={-1} aria-label={`Reply to ${tenantFirst}`}>
                 {editingContext ? (
                   <div className="mt-2">
                     <EditDraftPanel
@@ -548,7 +569,7 @@ function DraftFooter({
   why: string;
   staleNotice?: string;
   isBusy: boolean;
-  /** #191 item 1 — see ConversationPage's own `editButtonRef` comment. */
+  /** #191 item 1: see ConversationPage's own `editButtonRef` comment. */
   editButtonRef?: Ref<HTMLButtonElement>;
   onApprove: () => void;
   onEdit: () => void;

@@ -258,13 +258,20 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
     // server-confirmed transition in this hook already calls.
     onSuccess: (_data, ctx) => {
       // F8 (safety re-verify): guarded like every other post-success
-      // block in this hook (the A1 convention) — react-query routes an
+      // block in this hook (the A1 convention). react-query routes an
       // `onSuccess` throw into `onError`, which here is `handleError`,
       // i.e. a "Something didn't go through" toast after an undo that
       // actually succeeded.
+      //
+      // #191 F5 (safety review follow-up): this used to be the one
+      // outcome in this whole hook with no `onNotice` at all. Undo is the
+      // control that saves the tenant from a wrong reply going out, and
+      // it was the only success that stayed completely silent (every
+      // error path here toasts). New string, flagged for copy-guardian.
       try {
         dispatch({ type: "undone", draftId: ctx.draftId });
         onSettled();
+        onNotice("Undone. That reply won't go out.");
       } catch {
         onNotice("That went through, but the queue didn't refresh.");
       }

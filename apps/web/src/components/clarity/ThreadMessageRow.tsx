@@ -53,20 +53,25 @@ export function ThreadMessageRow({ entry, tenantFirst, className }: ThreadMessag
   const speaker = speakerLabel(entry, tenantFirst);
   const relativeTime = formatRelativeTime(entry.at);
   return (
-    // #191 item 3: the mockup puts the attribution/time line visually
-    // BELOW the bubble (docs/mockups/07-clarity-redesign.html `.thread-
-    // meta`), but DOM order before this fix matched that — bubble text
-    // first, "who sent it" second — so a screen reader read the message
-    // before saying who sent it. `role="group"` with an `aria-label`
-    // gives who-sent-it/when as the group's accessible name, announced
-    // on entry before its content, without moving anything on screen; the
-    // now-redundant meta `<p>` is hidden from the accessibility tree
-    // (still visible) so it isn't announced a second time.
-    <div
-      role="group"
-      aria-label={`${speaker} · ${relativeTime}`}
-      className={cn("mb-3.5 max-w-[83%]", isOutbound && "ml-auto", className)}
-    >
+    // #191 item 3 / F7 (safety review follow-up): the mockup puts the
+    // attribution/time line visually BELOW the bubble
+    // (docs/mockups/07-clarity-redesign.html `.thread-meta`), so DOM
+    // order matches that: bubble text first, "who sent it" second. A
+    // screen reader would then read the message before saying who sent
+    // it. An earlier version of this fix used `role="group"` with an
+    // `aria-label` to carry who-sent-it/when instead, but group names are
+    // materially less reliable in say-all and under VoiceOver than plain
+    // content, and an unattributed bubble here means a landlord could
+    // read the vendor's words as the tenant's, on the one screen whose
+    // whole promise is the record. This sr-only span is just real text,
+    // read in normal document order before the bubble it's about, with
+    // no ARIA semantics that could go uninterpreted. The now-redundant
+    // visible meta `<p>` stays hidden from the accessibility tree so it
+    // isn't read a second time.
+    <div className={cn("mb-3.5 max-w-[83%]", isOutbound && "ml-auto", className)}>
+      <span className="sr-only">
+        {speaker}, {relativeTime}
+      </span>
       <div
         className={cn(
           "rounded-clarity-lg px-[15px] py-[13px] text-[15px] leading-relaxed",
