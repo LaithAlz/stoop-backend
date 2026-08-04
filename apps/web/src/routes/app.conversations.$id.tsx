@@ -15,7 +15,7 @@ import { StaleDraftBubble } from "@/components/clarity/StaleDraftBubble";
 import { DecisionActions } from "@/components/clarity/DecisionActions";
 import { MarginNote } from "@/components/clarity/MarginNote";
 import { UndoTicket } from "@/components/clarity/UndoTicket";
-import { EditDraftPanel } from "@/components/clarity/EditDraftPanel";
+import { EditDraftPanel, UNVERIFIED_SEND_NOTICE } from "@/components/clarity/EditDraftPanel";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -39,6 +39,7 @@ import type {
 import { firstName } from "@/lib/tenantName";
 import { entryFor, secondsRemaining, totalUndoSeconds } from "@/features/queue/queueEntries";
 import { useDraftActions } from "@/features/queue/useDraftActions";
+import { useResolveUnverifiedSends } from "@/features/queue/useResolveUnverifiedSends";
 import { emergencyHeadline, emergencySubtext } from "@/features/emergency/emergencyBanner";
 import { buildTimelineRows, type TimelineRow } from "@/features/cases/timeline";
 import { isEmergencySignal } from "@/features/cases/emergencySignal";
@@ -105,6 +106,21 @@ function ConversationPage() {
     void queryClient.invalidateQueries({ queryKey: queueQueryKey });
   }, [queryClient, id]);
   const draftActions = useDraftActions({ onNotice, onSettled });
+
+  // #279: this route never wired the #252 unverified-send guard at all —
+  // zero references to `isSendUnverified`/`unverifiedSendIds` before this
+  // fix, so an ambiguous edit-and-send failure here raised the flag
+  // (useDraftActions.ts) and nothing ever resolved it, leaving Send fully
+  // enabled through the exact window it exists to close. `queueQuery` is
+  // already fetched on this route (for the tab bar's badge count below)
+  // and is a valid resolution source for ANY draft id, not just ones on
+  // this case — see useResolveUnverifiedSends.ts's own docstring.
+  useResolveUnverifiedSends({
+    data: queueQuery.data,
+    dataUpdatedAt: queueQuery.dataUpdatedAt,
+    unverifiedSendIds: draftActions.unverifiedSendIds,
+    resolveUnverifiedSend: draftActions.resolveUnverifiedSend,
+  });
 
   const caseDetail = caseQuery.data;
   const tenantFirst = firstName(caseDetail?.tenant.name);
@@ -214,10 +230,9 @@ function ConversationPage() {
       // and the page's scroll yanked back to this editor's remains once
       // the request resolves, well after they'd already moved on. This
       // also covers `resolveUnverifiedSend`'s own `setEditingContext(null)`
-      // (useDraftActions.ts): nothing in this route calls it today (a
-      // separate, already-filed gap; this screen doesn't wire the #252
-      // unverified-send guard at all), but it would hit this exact same
-      // hijack shape the moment it does.
+      // (useDraftActions.ts): as of #279 this route's `queueQuery` feeds
+      // `useResolveUnverifiedSends`, which can call it, so this hijack
+      // shape is reachable here too, not just on Home.
       const active = document.activeElement;
       if (draftAreaRef.current?.contains(active) || active === document.body) {
         // Cancel just closed the editor. Land focus on the Edit button
@@ -225,22 +240,18 @@ function ConversationPage() {
         // is never dropped onto <body>.
         // F8 (re-verify): `.isConnected` alone is not enough. `.focus()`
         // on a DISABLED button is also a silent no-op that never reaches
-        // the fallback below. #191 round 4 item 6 (safety review
-        // re-verify): the line above used to claim the reachable path
-        // was "an ambiguous edit-and-send sets `isSendUnverified`,
-        // `isBusy` stays true, the landlord taps Cancel, and Edit remounts
-        // connected but disabled, inside the #252 danger window", copied
-        // over from DecisionCard.tsx's near-identical guard, where that IS
-        // reachable. It is not reachable here: this screen never passes
-        // `sendDisabled` into `EditDraftPanel` (see `DraftFooter` below,
-        // ~line 441, which wires `isBusy={draftActions.isBusy(draftId)}`
-        // only), so `isSendUnverified` gates nothing on this route, and
-        // `EditDraftPanel`'s own Cancel button is disabled only by
-        // `submitting`, never by `isBusy`, so `isBusy` cannot be true at
-        // the moment Cancel is tappable. The guard below stays: it's
-        // still correct, harmless defensive code kept for parity with
-        // DecisionCard's identical shape, just not guarding against that
-        // particular scenario on this screen.
+        // the fallback below. #191 round 4 item 6 flagged this as
+        // unreachable on THIS screen at the time, because the route
+        // passed no `sendDisabled` into `EditDraftPanel` and `isBusy`
+        // never folded in `isSendUnverified` — #279 fixed exactly that
+        // gap, so the path IS reachable here now, the same as
+        // DecisionCard's: an ambiguous edit-and-send sets
+        // `isSendUnverified`, `DraftFooter`'s `isBusy` stays true off
+        // that alone, the landlord taps Cancel (never blocked by
+        // `isBusy`), and Edit remounts connected but disabled, inside the
+        // #252 danger window. This fallback is what recovers the
+        // keyboard user's focus onto the draft area instead of `<body>`
+        // when that happens.
         const btn = editButtonRef.current;
         if (btn?.isConnected && !btn.disabled) {
           btn.focus();
@@ -489,6 +500,11 @@ function ConversationPage() {
                       tenantName={tenantFirst}
                       initialBody={editingContext.body}
                       submitting={draftActions.isEditSubmitting}
+                      // #279: this route passed no `sendDisabled` at all,
+                      // so an ambiguous edit-and-send left Send fully
+                      // live here — the exact gap this issue closes. Same
+                      // prop Home's DecisionCard already threads through.
+                      sendDisabled={draftActions.isSendUnverified(editingContext.draftId)}
                       onCancel={() => draftActions.cancelEditor()}
                       onSend={(body) => draftActions.submitEdit(body)}
                     />
@@ -505,8 +521,26 @@ function ConversationPage() {
                       draftBody={draftBody}
                       draftEntry={draftEntry}
                       why={why}
-                      staleNotice={draftActions.staleNotices[caseDetail.id]}
-                      isBusy={draftActions.isBusy(draftId)}
+                      // F7 (#252, mirrored from Home's DecisionCard): once
+                      // the landlord cancels back out of the editor, the
+                      // action row itself needs the same explanation for
+                      // why it's still locked — the toast that raised the
+                      // guard is long gone by then.
+                      staleNotice={
+                        draftActions.staleNotices[caseDetail.id] ??
+                        (draftActions.isSendUnverified(draftId)
+                          ? UNVERIFIED_SEND_NOTICE
+                          : undefined)
+                      }
+                      // #279: OR'd with `isSendUnverified`, same as Home's
+                      // `actionsBusy` — Approve/Edit/Skip/Undo all stay
+                      // locked while this draft's last edit-and-send is
+                      // still unresolved, so a landlord can't tap Approve
+                      // and silently send the ORIGINAL, un-edited body
+                      // while its fate is unknown.
+                      isBusy={
+                        draftActions.isBusy(draftId) || draftActions.isSendUnverified(draftId)
+                      }
                       editButtonRef={editButtonRef}
                       undoButtonRef={undoButtonRef}
                       onApprove={() =>

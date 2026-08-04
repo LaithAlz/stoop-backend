@@ -165,17 +165,35 @@ export interface QueueViewRow {
 }
 
 /**
- * Merges fresh `GET /v1/queue` items with the local overlay. A skipped
- * item that has fallen out of the server's `items` (the common case — the
- * queue only lists cases still needing action) is kept visible from its
- * last-known snapshot, muted, per the founder ruling; nothing else
- * persists past its server row disappearing — EXCEPT the item currently
- * open in the edit-and-send panel (`pinnedEditingItem`, A7 below).
+ * Merges fresh `GET /v1/queue` items with the local overlay. Two entry
+ * statuses persist past their server row disappearing from `items`, from
+ * their own last-known snapshot in `queueSnapshots`: `skipped` (the
+ * founder ruling — the card stays visible, muted) and `sending` (issue
+ * #291).
+ *
+ * #291: `GET /v1/drafts/{id}/approve` moves the row to `status='approved'`
+ * server-side immediately, and `GET /v1/queue` INNER JOINs the pending
+ * draft — so an approved draft (or a successful edit-and-send, which
+ * dispatches the identical "approved" action) leaves `items` on the VERY
+ * NEXT read, well before the undo window (still running server-side) has
+ * elapsed. Without a pin here, any of Home's several refetch triggers
+ * landing mid-window (the 20s poll, the window-focus refetch, another
+ * card's skip/error `onSettled`, or `useAcknowledge`'s unconditional queue
+ * invalidation) deletes the card and its Undo control while the undo is
+ * still live and the landlord has no way to press it. `sending` is
+ * released from the pin the moment it stops being true — the countdown
+ * hitting zero (`"sent"`) or a successful undo (the entry is deleted
+ * outright) — never before; see this function's callers for exactly
+ * where each entry status's snapshot gets written.
+ *
+ * EXCEPT the item currently open in the edit-and-send panel
+ * (`pinnedEditingItem`, A7 below) — a separate single-slot pin because at
+ * most one editor is ever open at a time.
  */
 export function buildQueueView(
   items: QueueItem[],
   entries: QueueEntriesState,
-  skippedSnapshots: Record<string, QueueItem>,
+  queueSnapshots: Record<string, QueueItem>,
   pinnedEditingItem?: QueueItem | null,
 ): QueueViewRow[] {
   const seen = new Set(items.map((item) => item.draft_id));
@@ -185,8 +203,8 @@ export function buildQueueView(
   }));
 
   for (const [draftId, entry] of Object.entries(entries)) {
-    if (entry.status === "skipped" && !seen.has(draftId)) {
-      const snapshot = skippedSnapshots[draftId];
+    if ((entry.status === "skipped" || entry.status === "sending") && !seen.has(draftId)) {
+      const snapshot = queueSnapshots[draftId];
       if (snapshot) rows.push({ item: snapshot, entry });
     }
   }
@@ -216,20 +234,22 @@ export function draftStaleNotice(tenantFirstName: string): string {
 
 /**
  * M1 senior advisory (mobile, ported here verbatim): drop any snapshot
- * whose entry is no longer "skipped" — a skip that failed (its entry was
- * `cleared` by the error handler) or otherwise resolved would leave its
- * snapshot in Home's map forever, keeping a stale card resurrectable and
- * tenant text pinned in memory past its purpose. Returns the SAME object
- * when nothing needs pruning so a `setState` caller can bail without
- * re-rendering.
+ * whose entry is no longer one of the two statuses `buildQueueView` above
+ * ever pins (`skipped` or, as of #291, `sending`) — a skip or approve that
+ * failed (its entry was `cleared` by the error handler), or an undo/expiry
+ * that resolved it, would otherwise leave its snapshot in Home's map
+ * forever, keeping a stale card resurrectable and tenant text pinned in
+ * memory past its purpose. Returns the SAME object when nothing needs
+ * pruning so a `setState` caller can bail without re-rendering.
  */
-export function pruneSkippedSnapshots(
+export function pruneQueueSnapshots(
   snapshots: Record<string, QueueItem>,
   entries: QueueEntriesState,
 ): Record<string, QueueItem> {
-  const staleIds = Object.keys(snapshots).filter(
-    (draftId) => entries[draftId]?.status !== "skipped",
-  );
+  const staleIds = Object.keys(snapshots).filter((draftId) => {
+    const status = entries[draftId]?.status;
+    return status !== "skipped" && status !== "sending";
+  });
   if (staleIds.length === 0) return snapshots;
   const next = { ...snapshots };
   for (const draftId of staleIds) delete next[draftId];

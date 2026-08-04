@@ -25,6 +25,11 @@ import {
   queueEntriesReducer,
   secondsRemaining,
 } from "./queueEntries";
+import {
+  clearUnverifiedSend,
+  markUnverifiedSend,
+  useUnverifiedSendIds,
+} from "./unverifiedSendStore";
 
 export interface DraftContext {
   draftId: string;
@@ -86,25 +91,28 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   // "still pending", re-enabled Send about one frame later, and the whole
   // guard was inert. A resolution is only trustworthy against a read that
   // completed AFTER the failure, which is what the generation comparison
-  // in src/routes/app.index.tsx enforces.
-  const [unverifiedSendIds, setUnverifiedSendIds] = useState<ReadonlyMap<string, number>>(
-    () => new Map(),
-  );
+  // in src/features/queue/useResolveUnverifiedSends.ts (shared by every
+  // caller as of #279) enforces.
+  //
+  // #279: this used to be a local `useState`, invisible to any OTHER
+  // `useDraftActions` instance — and this hook is instantiated PER ROUTE
+  // (Home, the conversation thread), so a flag raised on one route was
+  // simply gone the moment that route's instance unmounted. Sourced from
+  // `unverifiedSendStore.ts` now, a module-scope store every instance
+  // reads and writes through, so a flag raised on either surface is
+  // visible, and resolvable, on both.
+  const unverifiedSendIds = useUnverifiedSendIds();
 
   const resolveUnverifiedSend = useCallback(
     (draftId: string, stillPending: boolean) => {
-      // F12 (safety re-verify round 2): read membership BEFORE the update.
-      // The early-out below lives inside the state updater, so it stops the
-      // map write but not the notice — today's only caller iterates the map
-      // so it can't misfire, but this is exported API and the planned
-      // thread wiring would call it per-draft-per-read, double-toasting.
-      const wasFlagged = unverifiedSendIds.has(draftId);
-      setUnverifiedSendIds((prev) => {
-        if (!prev.has(draftId)) return prev;
-        const next = new Map(prev);
-        next.delete(draftId);
-        return next;
-      });
+      // F12 (safety re-verify round 2): `clearUnverifiedSend` reports
+      // whether `draftId` WAS flagged, atomically with the removal —
+      // today's callers (one shared resolution effect per mounted route,
+      // as of #279) each iterate their own snapshot of the map, so two
+      // mounted routes could in principle both observe the same flagged
+      // id and both call this; the atomic check-and-clear is what keeps
+      // only the first from firing the notice below.
+      const wasFlagged = clearUnverifiedSend(draftId);
       if (!wasFlagged) return;
       // Draft still pending → the ambiguous edit-and-send never applied;
       // clearing the flag above already re-enables Send, nothing else to
@@ -131,7 +139,11 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       // invoked more than once, which would have double-toasted.
       setEditingContext((current) => (current?.draftId === draftId ? null : current));
     },
-    [onNotice, unverifiedSendIds],
+    // #279: `unverifiedSendIds` is no longer read inside this callback's
+    // body — `clearUnverifiedSend` reads the shared store directly — so
+    // it's correctly gone from these deps rather than kept for a
+    // resemblance to the old shape.
+    [onNotice],
   );
 
   const markBusy = useCallback((draftId: string) => {
@@ -390,8 +402,11 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
         // TanStack's `dataUpdatedAt` (same clock, same units) — the screen
         // refuses to resolve against any read that didn't complete AFTER
         // this moment. No plumbing needed for the query's generation.
+        // #279: written to the shared module-scope store (not local
+        // state) so this flag is visible to whichever route — this one or
+        // the other — ends up resolving it.
         const failedAt = Date.now();
-        setUnverifiedSendIds((prev) => new Map(prev).set(ctx.draftId, failedAt));
+        markUnverifiedSend(ctx.draftId, failedAt);
         onNotice("That may have gone through. Give it a moment to update before sending again.");
         onSettled();
         return;
