@@ -21,6 +21,12 @@ const waitlistSchema = z.object({
   website: z.string().max(0).optional().default(""), // honeypot — must stay empty
 });
 
+// Raw shape the client sends (see CaptureForm.onSubmit below). The real
+// validation is `waitlistSchema.safeParse` inside the handler below — this
+// is only a type-level pass-through so `createServerFn` knows the request
+// body's shape without changing the runtime (no throwing on bad input).
+type WaitlistRequestBody = { email: string; isPm: boolean; website: string };
+
 type D1Like = {
   prepare(q: string): {
     bind(...v: unknown[]): { run(): Promise<unknown> };
@@ -42,8 +48,9 @@ async function getWaitlistDb(): Promise<D1Like | null> {
   }
 }
 
-const joinWaitlist = createServerFn({ method: "POST" }).handler(
-  async (ctx): Promise<{ ok: boolean; reason?: string; skipped?: boolean }> => {
+const joinWaitlist = createServerFn({ method: "POST" })
+  .inputValidator((data: WaitlistRequestBody) => data)
+  .handler(async (ctx): Promise<{ ok: boolean; reason?: string; skipped?: boolean }> => {
     const parsed = waitlistSchema.safeParse(ctx.data);
     if (!parsed.success) return { ok: false, reason: "invalid" };
     // Honeypot: pretend success to the bot (identical UI), but flag it as
@@ -61,8 +68,7 @@ const joinWaitlist = createServerFn({ method: "POST" }).handler(
       .bind(email.toLowerCase(), isPm ? 1 : 0, WAITLIST_SOURCE)
       .run();
     return { ok: true };
-  },
-);
+  });
 
 export const Route = createFileRoute("/early-access")({
   head: () => ({
