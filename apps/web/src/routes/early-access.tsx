@@ -49,7 +49,18 @@ async function getWaitlistDb(): Promise<D1Like | null> {
 }
 
 const joinWaitlist = createServerFn({ method: "POST" })
-  .inputValidator((data: WaitlistRequestBody) => data)
+  // Typed `unknown`, not `WaitlistRequestBody` (safety review, #267). At
+  // runtime `ctx.data` is whatever seroval deserialized from an
+  // unauthenticated POST: a string, an array, a Date, null. Declaring it as
+  // the request body would be a type that lies, and the `safeParse` below
+  // is the only thing between that lie and the D1 `.bind()` call. With
+  // `unknown` the parse is structurally impossible to skip: a future edit
+  // reading `ctx.data.email` directly stops compiling instead of shipping
+  // unvalidated. Deliberately an identity function rather than the zod
+  // schema, because passing the schema makes the framework THROW on invalid
+  // input and replaces the graceful `{ ok: false, reason: "invalid" }` this
+  // public form returns today.
+  .inputValidator((data: unknown) => data)
   .handler(async (ctx): Promise<{ ok: boolean; reason?: string; skipped?: boolean }> => {
     const parsed = waitlistSchema.safeParse(ctx.data);
     if (!parsed.success) return { ok: false, reason: "invalid" };

@@ -78,9 +78,13 @@ jobs:
     # protection counts a skipped required check as PASSING. Zero tests
     # would run and the PR would go green. Failing open on the gate is
     # the silence direction, so an unhealthy gate now runs the job
-    # (safety review, #267 finding B).
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.backend == 'true') }}
+    # (safety review, #267 finding B). `!cancelled()` rather than
+    # `always()`: both keep the failed-gate row running, but `always()`
+    # also fires on a CANCELLED run, so every superseded push would
+    # still spin up all three jobs including Postgres.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.backend == 'true') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/api
@@ -143,9 +147,13 @@ jobs:
     # protection counts a skipped required check as PASSING. Zero tests
     # would run and the PR would go green. Failing open on the gate is
     # the silence direction, so an unhealthy gate now runs the job
-    # (safety review, #267 finding B).
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.mobile == 'true') }}
+    # (safety review, #267 finding B). `!cancelled()` rather than
+    # `always()`: both keep the failed-gate row running, but `always()`
+    # also fires on a CANCELLED run, so every superseded push would
+    # still spin up all three jobs including Postgres.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.mobile == 'true') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/mobile
@@ -185,9 +193,13 @@ jobs:
     # protection counts a skipped required check as PASSING. Zero tests
     # would run and the PR would go green. Failing open on the gate is
     # the silence direction, so an unhealthy gate now runs the job
-    # (safety review, #267 finding B).
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
+    # (safety review, #267 finding B). `!cancelled()` rather than
+    # `always()`: both keep the failed-gate row running, but `always()`
+    # also fires on a CANCELLED run, so every superseded push would
+    # still spin up all three jobs including Postgres.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/web
