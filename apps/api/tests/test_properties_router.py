@@ -32,6 +32,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncGenerator, Iterator
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -530,54 +531,170 @@ async def test_update_backup_contact_phone_normalizes_and_rejects(session: Async
         await _cleanup(session, landlord_id)
 
 
+# #290: a non-null `backup_contact` object with no usable `phone` used to
+# be silently stored (the property then rendered as *having* a backup
+# contact while the escalation chain's backup legs silently did nothing).
+# These four shapes are the ones the issue found accepted with 200 against
+# the real router.
+_NO_PHONE_SHAPES: list[dict[str, Any]] = [
+    {},
+    {"name": "Ghost"},
+    {"phone": "   "},
+    {"name": "G", "phone": ""},
+]
+
+
 @pytest.mark.integration
-async def test_backup_contact_blank_phone_left_as_is_not_rejected(session: AsyncSession) -> None:
-    """A present-but-blank ``phone`` is NOT a #260 not-nullable violation
-    (``backup_contact`` is an optional escalation field, not the emergency
-    -call target itself) — ``_backup_phone`` already treats it as "no
-    backup contact configured," a safe no-op, so it is left as-is rather
-    than rejected (see ``_canonicalize_backup_contact``'s own docstring)."""
+@pytest.mark.parametrize("backup_contact", _NO_PHONE_SHAPES)
+async def test_create_property_backup_contact_no_phone_rejected_422(
+    session: AsyncSession, backup_contact: dict[str, Any]
+) -> None:
+    """#290: each of the four shapes the issue found silently accepted now
+    422s with the new, distinct ``backup_contact_no_phone`` code, BEFORE
+    any Twilio number is purchased (module docstring, "Pre-Twilio-call
+    money guards"), same placement as the existing malformed-phone guard."""
     landlord_id = await factories.insert_landlord(session)
     landlord = Landlord(id=uuid.UUID(landlord_id))
     try:
-        created = await create_property(
-            PropertyCreateRequest(
-                label="Backup blank test",
-                address_line1="4 Backup St",
-                city="Toronto",
-                backup_contact={"name": "Neighbour", "phone": ""},
-            ),
-            (landlord, session),
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="No-phone test",
+                    address_line1="4 Backup St",
+                    city="Toronto",
+                    backup_contact=backup_contact,
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "backup_contact_no_phone"
+        # Static message, never the submitted shape (never-break rule #5).
+        assert (
+            exc_info.value.message
+            == "backup_contact must include a usable phone number, or be sent as null to clear it."
         )
-        assert created.backup_contact is not None
-        assert created.backup_contact["phone"] == ""
-        assert created.backup_contact["name"] == "Neighbour"
+
+        count = (
+            await session.execute(
+                text("SELECT COUNT(*) FROM properties WHERE landlord_id = :lid"),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert count == 0
     finally:
         await _cleanup(session, landlord_id)
 
 
 @pytest.mark.integration
-async def test_backup_contact_explicit_null_phone_left_as_is_not_rejected(
-    session: AsyncSession,
+@pytest.mark.parametrize("backup_contact", _NO_PHONE_SHAPES)
+async def test_update_backup_contact_no_phone_rejected_422(
+    session: AsyncSession, backup_contact: dict[str, Any]
 ) -> None:
-    """Same reasoning as the blank-string case — an explicit JSON ``null``
-    for ``backup_contact.phone`` is also a safe no-op, not a #260
-    not-nullable violation."""
+    """Same four shapes, through ``PATCH``, a rejected update leaves the
+    property's existing (empty) ``backup_contact`` untouched, no write."""
     landlord_id = await factories.insert_landlord(session)
     landlord = Landlord(id=uuid.UUID(landlord_id))
     try:
-        created = await create_property(
+        prop = await create_property(
             PropertyCreateRequest(
-                label="Backup null test",
-                address_line1="5 Backup St",
-                city="Toronto",
-                backup_contact={"name": "Neighbour", "phone": None},
+                label="No-phone update test", address_line1="5 Backup St", city="Toronto"
             ),
             (landlord, session),
         )
-        assert created.backup_contact is not None
-        assert created.backup_contact["phone"] is None
-        assert created.backup_contact["name"] == "Neighbour"
+        assert prop.backup_contact is None
+
+        with pytest.raises(AppError) as exc_info:
+            await update_property(
+                prop.id,
+                PropertyUpdateRequest(backup_contact=backup_contact),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "backup_contact_no_phone"
+
+        unchanged = await get_property(prop.id, (landlord, session))
+        assert unchanged.backup_contact is None
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_backup_contact_nested_null_phone_rejected_422(
+    session: AsyncSession,
+) -> None:
+    """Not one of the issue's four enumerated shapes, but the same bug
+    class: a non-null ``backup_contact`` object with an explicit nested
+    ``"phone": null`` is "no usable phone" too, previously left as-is
+    (pre-#290 behavior), now rejected the same as a missing/blank key.
+    Distinct from clearing the WHOLE field via a top-level
+    ``backup_contact: null`` (#268), which is unaffected by this issue,
+    see ``test_update_backup_contact_explicit_null_clears_it``."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        with pytest.raises(AppError) as exc_info:
+            await create_property(
+                PropertyCreateRequest(
+                    label="Nested-null phone test",
+                    address_line1="6 Backup St",
+                    city="Toronto",
+                    backup_contact={"name": "Neighbour", "phone": None},
+                ),
+                (landlord, session),
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.code == "backup_contact_no_phone"
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_create_property_backup_contact_valid_writes_audit_log_with_no_pii(
+    session: AsyncSession,
+) -> None:
+    """#290 AC: a valid ``{name, phone}`` still writes, unchanged, and the
+    ``audit_log`` row for that successful write is unchanged too, still
+    carrying no name or phone (never-break rule #5)."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(
+                label="Valid backup contact test", address_line1="7 Backup St", city="Toronto"
+            ),
+            (landlord, session),
+        )
+
+        updated = await update_property(
+            prop.id,
+            PropertyUpdateRequest(backup_contact={"name": "Neighbour", "phone": "416-555-0199"}),
+            (landlord, session),
+        )
+        assert updated.backup_contact is not None
+        assert updated.backup_contact["phone"] == "+14165550199"
+        assert updated.backup_contact["name"] == "Neighbour"
+
+        audit_row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT payload FROM audit_log WHERE landlord_id = :lid "
+                        "AND action = 'settings_changed'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"] == {
+            "resource": "property",
+            "property_id": str(prop.id),
+            "field": "backup_contact",
+        }
+        assert "phone" not in json.dumps(audit_row["payload"])
+        assert "Neighbour" not in json.dumps(audit_row["payload"])
+        assert "0199" not in json.dumps(audit_row["payload"])
     finally:
         await _cleanup(session, landlord_id)
 

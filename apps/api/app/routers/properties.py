@@ -356,47 +356,56 @@ def _is_duplicate_property_unique_violation(exc: IntegrityError) -> bool:
 def _canonicalize_backup_contact(
     backup_contact: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """#232/#260: ``backup_contact`` (schema-v1.md: ``{name, phone}`` for
-    the escalation chain's T+10m step and its T+20m+ repeat cycles,
+    """#232/#260/#290: ``backup_contact`` (schema-v1.md: ``{name, phone}``
+    for the escalation chain's T+10m step and its T+20m+ repeat cycles,
     ``app/agent/emergency_chain.py``'s ``_backup_phone``) is a free-form
     ``jsonb`` blob with no DB-level shape enforcement — only its ``phone``
     key is a phone number, so only that key is validated here, in place,
-    leaving everything else (including a missing ``phone`` key entirely)
-    untouched.
+    leaving everything else untouched.
 
-    A present-but-BLANK ``phone`` (``""``/whitespace-only) — or an
-    explicit JSON ``null`` — is left as-is rather than rejected:
-    ``_backup_phone`` already treats either as "no backup contact
-    configured" (falsy/non-``str`` check), the same safe no-op as a
-    missing key — there is no not-nullable business rule for this
-    OPTIONAL escalation field the way there is for ``landlords.phone``, so
-    #260's null-equivalence treatment does not apply here.
+    An explicit top-level ``backup_contact: null`` (the whole field) is a
+    real, confirmed clear (#268) and is returned as ``None`` unchanged,
+    that is NOT this function's concern.
+
+    **#290: "configured" and "actually reachable" must be the same
+    state.** A NON-null ``backup_contact`` object with no usable ``phone``
+    (the key absent, an explicit ``null``, or a blank/whitespace-only
+    string) used to be silently stored as-is (the #260-era reasoning:
+    ``_backup_phone`` already treats all three as "no backup contact
+    configured," so writing them looked like a safe no-op). It wasn't: the
+    property then renders as *having* a backup contact while the T+10m
+    step and every T+20m+ repeat's backup legs silently do nothing, no
+    dialog, no landlord-visible removal, no audit signal that the
+    capability is gone, exactly the silent-failure class this codebase
+    keeps finding, sitting on the emergency escalation chain. Now
+    REJECTED: 422 ``backup_contact_no_phone``, a code distinct from
+    ``invalid_field`` below, so a client can tell "you sent a contact with
+    no number at all" from "this number is not dialable."
 
     A present, NON-blank ``str`` that cannot be canonicalized (a typo, a
-    dropped digit) IS rejected — that is exactly the "reaches Twilio and
-    silently fails" failure mode #260 exists to close, and staying silent
-    about it here would leave a landlord believing their backup contact
-    will be reached when it never will.
+    dropped digit) is rejected as ``invalid_field`` (unchanged from
+    #260), that is exactly the "reaches Twilio and silently fails"
+    failure mode #260 exists to close.
 
-    **Safety review, 2026-08-03, finding 3 — SHOULD-FIX:** a present ``phone`` that is neither a
-    (blank-or-non-blank) ``str`` NOR ``null`` — e.g. ``{"phone":
-    4165551234}``, a JSON NUMBER, an ordinary client-side type bug — used
-    to sail through untouched (``isinstance(phone, str)`` was simply
-    ``False``, same branch as "blank/missing"). That silently stores a
-    ``backup_contact`` that LOOKS configured (present, non-null) while
-    ``_backup_phone`` returns ``None`` for it (not a ``str``) — the T+10m
-    escalation step and every T+20m+ repeat's backup legs never fire, with
-    nothing landlord-visible saying so.
-    Now REJECTED (422 ``invalid_field``), distinctly from the safe-no-op
-    blank/null case.
+    A present ``phone`` that is neither a ``str`` nor ``null``, e.g.
+    ``{"phone": 4165551234}``, a JSON NUMBER, an ordinary client-side type
+    bug (safety review, 2026-08-03, finding 3), is also ``invalid_field``,
+    unchanged by #290: it is a malformed phone, not an absent one.
+
+    Never echoes the submitted value in either error (never-break rule
+    #5), both messages are static, naming only the field, matching
+    ``app/phone.py::canonicalize_phone``'s own discipline.
     """
     if backup_contact is None:
         return None
-    if "phone" not in backup_contact:
-        return backup_contact
-    phone = backup_contact["phone"]
+    phone = backup_contact.get("phone")
     if phone is None:
-        return backup_contact
+        raise AppError(
+            status_code=422,
+            code="backup_contact_no_phone",
+            message="backup_contact must include a usable phone number, "
+            "or be sent as null to clear it.",
+        )
     if not isinstance(phone, str):
         raise AppError(
             status_code=422,
@@ -404,7 +413,12 @@ def _canonicalize_backup_contact(
             message="backup_contact.phone must be a valid, dialable phone number.",
         )
     if not phone.strip():
-        return backup_contact
+        raise AppError(
+            status_code=422,
+            code="backup_contact_no_phone",
+            message="backup_contact must include a usable phone number, "
+            "or be sent as null to clear it.",
+        )
     canonical = canonicalize_phone(phone, field="backup_contact.phone")
     return {**backup_contact, "phone": canonical}
 

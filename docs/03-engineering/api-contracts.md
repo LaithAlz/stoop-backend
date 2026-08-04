@@ -467,6 +467,55 @@ schema-v1.md needs no change: `properties.backup_contact` is already
 declared `jsonb` with no `NOT NULL` (verified against the live column,
 not just the doc text).
 
+**v1.27 amendment (2026-08-04, #290 implementation):** a `backup_contact`
+that is a non-null object with no usable `phone` is now REJECTED, `422`
+with a new, distinct code, `backup_contact_no_phone`, separate from the
+existing `invalid_field` (used when a `phone` is present but fails
+canonicalization) and from the v1.25 amendment above's explicit-`null`
+clear (unchanged; a real, confirmed clear, not this issue). "No usable
+phone" means any of: the `phone` key absent entirely, present but `null`,
+or present as a `str` that is empty or whitespace-only after
+`.strip()`, exactly the shapes `app/agent/emergency_chain.py`'s
+`_backup_phone` already treats as "no backup contact configured," now
+rejected at write time instead of silently stored. A present, non-`str`
+`phone` (e.g. a JSON number) keeps its EXISTING `invalid_field` 422 from
+the v1.24 amendment above, unchanged by this amendment.
+
+**Why:** before this amendment, `{}`, `{"name": "Ghost"}`,
+`{"phone": "   "}`, and `{"name": "G", "phone": ""}` all wrote with `200`
+and stored verbatim, the property then rendered as *having* a backup
+contact while the escalation chain's T+10m step and every T+20m+ repeat's
+backup legs silently did nothing, with no dialog, no landlord-visible
+removal, and no audit signal that the capability was gone. "Configured"
+and "actually reachable" are now the same state: a `backup_contact` that
+reads as present is guaranteed to carry a phone `_backup_phone` can
+actually dial.
+
+**Error message never echoes the submitted value** (never-break rule #5)
+a fixed, static message naming only the field, matching
+`app/phone.py::canonicalize_phone`'s existing discipline.
+
+**Out of scope, deliberately:** rows already stored in one of the
+rejected shapes before this amendment. The web dashboard's
+`backupContactPhoneLooksInvalid` already warns when a stored contact's
+phone doesn't look dialable (#268); widening that detector to also catch
+a missing/blank `phone` is tracked separately (#299), not part of this
+amendment. No migration, no backfill, no `DELETE`/`UPDATE` of existing
+rows.
+
+**Verified before shipping this amendment**: no current writer of
+`backup_contact` sends one of the four now-rejected shapes, the mobile
+onboarding step (`apps/mobile/src/app/onboarding/backup.tsx`) only calls
+`PATCH` when both name and phone are non-blank and the phone normalizes
+client-side first, or not at all (skip); the web dashboard's settings
+form (`apps/web/src/features/properties/settings.ts`'s
+`buildPropertySettingsPayload`) only ever sends a full `{name, phone}`
+pair, an explicit confirmed `null`, or omits the field; `POST
+/v1/properties` (create) is never called with `backup_contact` by either
+client. The web marketing/demo onboarding route
+(`apps/web/src/routes/onboarding.tsx`) collects a backup contact into
+local component state only and never calls the real API at all.
+
 ## Tenants & Vendors
 
 `GET/POST /v1/properties/{id}/tenants` · `PATCH/DELETE /v1/tenants/{id}`
