@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { PhoneFrame } from "@/components/stoop/PhoneFrame";
@@ -350,15 +350,121 @@ function QueueRow({
   onOpenEditor: (item: QueueItem) => void;
 }) {
   const { item, entry } = row;
+  const tenantFirst = firstName(item.tenant_name);
+  // Live `unit` is a bare label ("2", "4", "A"), composed with the
+  // property label the same way the mock's `unitLabel`/`propertyLabel`
+  // pair was, no new copy invented.
+  const propertyLabel = item.unit
+    ? `Unit ${item.unit}, ${item.property_label}`
+    : item.property_label;
+
+  // #191 F3/F6 (safety review follow-up): DecisionCard's own focus-return
+  // effect only ever sees `editingContext` changing (Cancel), so it can
+  // handle the Edit round trip on its own. It cannot see these three,
+  // none of which touch `editingContext`: Approve moves this row's entry
+  // to "sending" (the Undo ticket takes the actions row's place), Skip
+  // replaces the WHOLE card with `SkippedCard` (a full unmount, so
+  // nothing inside the old DecisionCard could react even if it tried),
+  // and a successful Undo moves the entry back from "sending" to idle
+  // (the actions row reappears, unmounting the Undo button out from
+  // under a focused landlord). `rowRef` wraps whichever of the two
+  // branches below ever renders here, so it survives all three swaps as
+  // a stable landing spot.
+  const rowRef = useRef<HTMLDivElement>(null);
+  const undoButtonRef = useRef<HTMLButtonElement>(null);
+  const prevEntryStatusRef = useRef(entry.status);
+  // #191 round 4 item 4 (safety review re-verify): by the time the
+  // transition effect below runs, a removed Undo button has already reset
+  // `document.activeElement` to `<body>` (verified by hand: a focused
+  // descendant removed from inside a `tabIndex={-1}` container resets
+  // focus to `<body>`, never to the container), the exact same value a
+  // session that never focused anything at all also sits at. Reading
+  // `document.activeElement` only AFTER the removal can't tell those two
+  // apart. This ref is refreshed on every render while still "sending"
+  // (the countdown's own per-second tick keeps it fresh well within the
+  // five-second window), so the transition effect can ask "was Undo
+  // genuinely focused as of the last render before it went away" instead.
+  const undoHadFocusRef = useRef(false);
+  useEffect(() => {
+    const prevStatus = prevEntryStatusRef.current;
+    prevEntryStatusRef.current = entry.status;
+    if (prevStatus === entry.status) return;
+    // #191 round 4 item 4 (safety review re-verify): `sending -> sent` is
+    // the 5-second countdown simply running out, a timer, never a
+    // landlord action by itself. Only stay exempt when Undo did NOT
+    // plausibly hold focus right up to the moment it was removed (a
+    // landlord who has already moved their attention elsewhere on the
+    // page); otherwise fall through to the same recovery every other
+    // transition here gets, so a keyboard user whose focus was
+    // legitimately on Undo isn't silently dumped onto `<body>` with
+    // nothing to land on and no announcement.
+    if (prevStatus === "sending" && entry.status === "sent" && !undoHadFocusRef.current) return;
+    // F6: only steal focus if it was plausibly inside this row, either
+    // still literally there, or reset to <body> because the control that
+    // had it was just removed as part of this very transition. A
+    // background change to a DIFFERENT row, or this row settling after
+    // the landlord has already tabbed elsewhere, leaves focus on some
+    // other, still-mounted element, which this correctly leaves alone.
+    const active = document.activeElement;
+    if (!(rowRef.current?.contains(active) || active === document.body)) return;
+    if (entry.status === "sending") {
+      // F2/F4: Approve or a successful edit-and-send. Focus the Undo
+      // button itself, not just the row, so its accessible name and its
+      // `aria-describedby` text (UndoTicket.tsx) are read together at the
+      // instant they matter. F8: `.isConnected` alone isn't enough,
+      // `.focus()` on a DISABLED button is also a silent no-op, though in
+      // practice this button never mounts disabled.
+      const btn = undoButtonRef.current;
+      if (btn?.isConnected && !btn.disabled) {
+        btn.focus();
+        return;
+      }
+    }
+    // `preventScroll` (round 5 re-verify): this landing is reached on
+    // transitions the landlord did NOT initiate, including the one that
+    // fires five seconds after an approve. Recovering focus is right;
+    // yanking the viewport back to a card they scrolled away from is
+    // not. The announcement still happens, the scroll position does not
+    // move.
+    rowRef.current?.focus({ preventScroll: true });
+  }, [entry.status]);
+  // #191 round 4 item 4 (safety review re-verify): refreshed every
+  // render, not only on a status change, so it reflects the freshest real
+  // focus state right up to the render before "sending" flips to "sent"
+  // (see `undoHadFocusRef`'s own comment above).
+  useEffect(() => {
+    if (entry.status === "sending") {
+      undoHadFocusRef.current = document.activeElement === undoButtonRef.current;
+    }
+  });
 
   if (entry.status === "skipped") {
     return (
-      <SkippedCard
-        conversationId={item.case_id}
-        tenantName={firstName(item.tenant_name)}
-        propertyLabel={item.property_label}
-        timestamp={formatRelativeTime(item.received_at)}
-      />
+      // #191 round 4 item 5 (safety review re-verify): this wrapper's own
+      // content is exactly one `<Link>` (SkippedCard.tsx, when it's given
+      // a `conversationId`, which Home always does): `role="group"` is
+      // "a set of objects", and one link is not a set. Round 5
+      // (re-verify) put both back: this div is where `rowRef.current
+      // ?.focus()` lands after a Skip, and round 4 left that landing
+      // computing `role=generic name=""` in Chrome's AX tree, where
+      // round 3 had a real name. "One link is not a set" is a purist
+      // reading of `group`, and it cost a real announcement on a
+      // programmatic focus landing. A named `group` is the cheaper
+      // trade, and it keeps `aria-label` on a role that supports it
+      // (which is what F10 was actually about).
+      <div
+        ref={rowRef}
+        tabIndex={-1}
+        role="group"
+        aria-label={`${tenantFirst}, ${item.property_label}`}
+      >
+        <SkippedCard
+          conversationId={item.case_id}
+          tenantName={tenantFirst}
+          propertyLabel={item.property_label}
+          timestamp={formatRelativeTime(item.received_at)}
+        />
+      </div>
     );
   }
 
@@ -374,49 +480,71 @@ function QueueRow({
   const secondsLeft = entry.status === "sending" ? secondsRemaining(entry.undoExpiresAtClient) : 0;
   const totalSeconds = entry.status === "sending" ? totalUndoSeconds(entry) : 5;
   const ctx = { draftId: item.draft_id, caseId: item.case_id, tenantName: item.tenant_name };
-  // Live `unit` is a bare label ("2", "4", "A") — composed with the
-  // property label the same way the mock's `unitLabel`/`propertyLabel`
-  // pair was, no new copy invented.
-  const propertyLabel = item.unit
-    ? `Unit ${item.unit}, ${item.property_label}`
-    : item.property_label;
 
   return (
-    <DecisionCard
-      severity={item.severity}
-      conversationId={item.case_id}
-      tenantName={firstName(item.tenant_name)}
-      propertyLabel={propertyLabel}
-      timestamp={formatRelativeTime(item.received_at)}
-      tenantMessage={item.tenant_message ?? ""}
-      photoNote={item.has_media ? (item.media_note ?? "Sent a photo") : undefined}
-      draftMessage={item.draft_body}
-      why={item.why}
-      status={cardStatus}
-      secondsLeft={secondsLeft}
-      totalSeconds={totalSeconds}
-      // F7 (safety re-verify round 2, #252): with the guard actually
-      // holding, Cancel is the only live control in the editor — so it
-      // becomes the path of least resistance, and behind it the card
-      // used to return to a full action row with Approve enabled and no
-      // marking at all. One tap there sends the ORIGINAL, un-edited body:
-      // exactly the wording the landlord opened the editor to fix. The
-      // card now carries the same explanation and the same block.
-      staleNotice={
-        draftActions.staleNotices[item.case_id] ??
-        (draftActions.isSendUnverified(item.draft_id) ? UNVERIFIED_SEND_NOTICE : undefined)
-      }
-      editSubmitting={draftActions.isEditSubmitting}
-      sendUnverified={draftActions.isSendUnverified(item.draft_id)}
-      actionsBusy={
-        draftActions.isBusy(item.draft_id) || draftActions.isSendUnverified(item.draft_id)
-      }
-      onApprove={() => draftActions.approve(ctx)}
-      onEdit={() => onOpenEditor(item)}
-      onSkip={() => onSkip(item)}
-      onUndo={() => draftActions.undo(ctx)}
-      onCancelEdit={() => draftActions.cancelEditor()}
-      onSubmitEdit={(body) => draftActions.submitEdit(body)}
-    />
+    // #191 round 4 item 5 (safety review re-verify): `aria-label` used to
+    // be set here AND on `DecisionCard`'s own `<article>` inside it, the
+    // identical string, so browsing this card announced the same name
+    // twice, and round 4 dropped it here to fix that. Round 5
+    // (re-verify) put it back, because the fix cost more than the
+    // duplicate did: Chrome's AX tree confirmed this div then computed
+    // `name=""`, and it is exactly where `rowRef.current?.focus()` lands
+    // on `sending -> sent`, on undo success, and on `already_sent`. Item
+    // 4 buys that focus landing precisely so the landlord is not dumped
+    // somewhere unannounced.
+    //
+    // The duplicate is now DELIBERATE, and the reasoning is the trade,
+    // not an oversight. Both this wrapper and DecisionCard's `<article>`
+    // are programmatic focus landings (the article is where an
+    // edit-cancel recovers to), and the article does not always re-read
+    // its containing group's name, because focus moving WITHIN a group
+    // does not re-announce it. Naming only one leaves the other landing
+    // silent. A repeated name while browsing is verbosity; a silent
+    // focus landing is a lost announcement on the approve loop's only
+    // escape hatch. Verbosity is the safer failure of the two.
+    // `role="group"` stays: unlike the skipped branch above, this
+    // wrapper's one child is an `<article>` holding a genuine set of
+    // controls (Edit, Skip, Approve, or the Undo ticket), not a lone
+    // link.
+    <div ref={rowRef} tabIndex={-1} role="group" aria-label={`${tenantFirst}, ${propertyLabel}`}>
+      <DecisionCard
+        severity={item.severity}
+        conversationId={item.case_id}
+        tenantName={tenantFirst}
+        propertyLabel={propertyLabel}
+        timestamp={formatRelativeTime(item.received_at)}
+        tenantMessage={item.tenant_message ?? ""}
+        photoNote={item.has_media ? (item.media_note ?? "Sent a photo") : undefined}
+        draftMessage={item.draft_body}
+        why={item.why}
+        status={cardStatus}
+        secondsLeft={secondsLeft}
+        totalSeconds={totalSeconds}
+        // F7 (safety re-verify round 2, #252): with the guard actually
+        // holding, Cancel is the only live control in the editor, so it
+        // becomes the path of least resistance, and behind it the card
+        // used to return to a full action row with Approve enabled and no
+        // marking at all. One tap there sends the ORIGINAL, un-edited
+        // body: exactly the wording the landlord opened the editor to
+        // fix. The card now carries the same explanation and the same
+        // block.
+        staleNotice={
+          draftActions.staleNotices[item.case_id] ??
+          (draftActions.isSendUnverified(item.draft_id) ? UNVERIFIED_SEND_NOTICE : undefined)
+        }
+        editSubmitting={draftActions.isEditSubmitting}
+        sendUnverified={draftActions.isSendUnverified(item.draft_id)}
+        actionsBusy={
+          draftActions.isBusy(item.draft_id) || draftActions.isSendUnverified(item.draft_id)
+        }
+        onApprove={() => draftActions.approve(ctx)}
+        onEdit={() => onOpenEditor(item)}
+        onSkip={() => onSkip(item)}
+        onUndo={() => draftActions.undo(ctx)}
+        onCancelEdit={() => draftActions.cancelEditor()}
+        onSubmitEdit={(body) => draftActions.submitEdit(body)}
+        undoButtonRef={undoButtonRef}
+      />
+    </div>
   );
 }

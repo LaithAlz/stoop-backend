@@ -1,3 +1,4 @@
+import { useEffect, useRef, type Ref } from "react";
 import { Link } from "@tanstack/react-router";
 import { ChevronRight, Image as ImageIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -63,6 +64,10 @@ interface DecisionCardProps {
   onUndo?: () => void;
   onCancelEdit?: () => void;
   onSubmitEdit?: (body: string) => void;
+  /** #191 F2/F4 (safety review follow-up): forwarded straight through to
+   *  `UndoTicket`'s own Undo button so the row above can focus it the
+   *  moment this card starts sending. See that prop's own comment. */
+  undoButtonRef?: Ref<HTMLButtonElement>;
   className?: string;
 }
 
@@ -96,6 +101,7 @@ export function DecisionCard({
   onUndo,
   onCancelEdit,
   onSubmitEdit,
+  undoButtonRef,
   className,
 }: DecisionCardProps) {
   const isSending = status === "sending";
@@ -103,8 +109,66 @@ export function DecisionCard({
   const isEditing = status === "editing";
   const isPending = status === "pending";
 
+  // #191 item 1: the Edit button (rendered by DecisionActions below)
+  // unmounts the instant edit mode opens and only remounts if the
+  // landlord cancels back to "pending". It never remounts on a
+  // successful edit-and-send, which moves straight to "sending".
+  // `editButtonRef` always points at whichever Edit button is currently
+  // mounted, or `null` if none is, so the effect below can tell reachable
+  // from not.
+  const editButtonRef = useRef<HTMLButtonElement>(null);
+  const cardRef = useRef<HTMLElement>(null);
+  const wasEditingRef = useRef(isEditing);
+
+  useEffect(() => {
+    // #191 F2/F4 (safety review re-verify): this used to fire on ANY
+    // isEditing true -> false edge, including a successful edit-and-send
+    // (which moves straight to "sending", never back to "pending"). That
+    // raced the row-level effect below the queue that now focuses the
+    // Undo button on that same transition: this one (a child, so it
+    // commits its effects first) would focus the card, and the row's
+    // effect would immediately re-focus the Undo button, firing focus
+    // twice in one commit for a single user action. Scoping this to
+    // `isPending` narrows it to the ONE case it's actually for: Cancel,
+    // which is the only close path that lands back on "pending".
+    if (wasEditingRef.current && !isEditing && isPending) {
+      // F6 (safety review, #191 follow-up): only move focus if it was
+      // plausibly here. Either it's still literally inside the card, or
+      // it was reset to <body> because the element that had it (the
+      // editor's textarea or Cancel) was just removed as part of THIS
+      // transition. Without this guard, a background settle that has
+      // nothing to do with the landlord's own click (R3-1's
+      // `resolveUnverifiedSend`, called from a queue poll) could close a
+      // DIFFERENT card's editor while the landlord has already tabbed
+      // elsewhere, and yank their focus and the page's scroll back up to
+      // this one.
+      const active = document.activeElement;
+      if (cardRef.current?.contains(active) || active === document.body) {
+        // Cancel just closed the editor. Land focus on the Edit button
+        // if it came back, otherwise the card itself, so a keyboard user
+        // is never dropped onto <body>.
+        // F8 (re-verify): `.isConnected` alone isn't enough. `.focus()`
+        // on a DISABLED button is also a silent no-op that never reaches
+        // the fallback below, and Edit can come back disabled: an
+        // ambiguous edit-and-send sets `sendUnverified`, `actionsBusy`
+        // stays true, the landlord taps Cancel, and Edit remounts
+        // connected but disabled, inside the #252 danger window.
+        const btn = editButtonRef.current;
+        if (btn?.isConnected && !btn.disabled) {
+          btn.focus();
+        } else {
+          cardRef.current?.focus();
+        }
+      }
+    }
+    wasEditingRef.current = isEditing;
+  }, [isEditing, isPending]);
+
   return (
     <article
+      ref={cardRef}
+      tabIndex={-1}
+      aria-label={`${tenantName}, ${propertyLabel}`}
       className={cn(
         "rounded-clarity-lg border border-clarity-line-strong bg-clarity-surface p-[18px] shadow-clarity-card",
         className,
@@ -116,7 +180,7 @@ export function DecisionCard({
           <Link
             to="/app/conversations/$id"
             params={{ id: conversationId }}
-            className="inline-flex min-h-8 items-center gap-1 py-1 font-clarity-sans text-xs font-bold text-clarity-ink-dim hover:text-clarity-brand"
+            className="inline-flex min-h-11 items-center gap-1 py-1 font-clarity-sans text-xs font-bold text-clarity-ink-dim hover:text-clarity-brand"
           >
             Full view
             <ChevronRight className="size-3" aria-hidden="true" />
@@ -174,6 +238,7 @@ export function DecisionCard({
           totalSeconds={totalSeconds}
           onUndo={onUndo}
           undoDisabled={actionsBusy}
+          undoButtonRef={undoButtonRef}
         />
       )}
       {isSent && (
@@ -191,6 +256,7 @@ export function DecisionCard({
             onSkip={onSkip}
             onApprove={onApprove}
             disabled={actionsBusy}
+            editButtonRef={editButtonRef}
           />
         </>
       )}

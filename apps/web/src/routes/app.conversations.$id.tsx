@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Ref } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Check, ChevronLeft, Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -180,6 +180,161 @@ function ConversationPage() {
   // whatever the landlord had just typed still in it.
   const editingContext = draftActions.editingContext;
 
+  // #191 item 1: same focus-return pattern as DecisionCard's own copy of
+  // this effect (src/components/clarity/DecisionCard.tsx). This route has
+  // no single "card" to land on, so `draftAreaRef` (the wrapper below that
+  // holds the editor/footer either way) stands in for it. The Edit button
+  // unmounts the instant `editingContext` is set and only remounts if the
+  // landlord cancels back out, never on a successful edit-and-send, so
+  // `editButtonRef.current` being null is the normal, expected "not
+  // reachable" case, not a bug.
+  const editButtonRef = useRef<HTMLButtonElement>(null);
+  const draftAreaRef = useRef<HTMLDivElement>(null);
+  const wasEditingRef = useRef(Boolean(editingContext));
+  useEffect(() => {
+    const isEditing = Boolean(editingContext);
+    // #191 F2/F4 (safety review re-verify): this used to fire on ANY
+    // isEditing true -> false edge, including a successful edit-and-send,
+    // which moves `draftEntry.status` straight to "sending" rather than
+    // back to idle. That would race the row-level effect below (added
+    // for F3), which now focuses the Undo button on that same
+    // transition: without this check both would move focus in one
+    // commit for a single user action. Checking `draftEntry.status` at
+    // close time narrows this effect to the one case it is actually for:
+    // Cancel, or the `draft_not_found` close, neither of which lands on
+    // "sending".
+    if (wasEditingRef.current && !isEditing && draftEntry.status !== "sending") {
+      // F6 (safety review, #191 follow-up): only move focus if it was
+      // plausibly here. Either it's still literally inside the draft
+      // area, or it was reset to <body> because the element that had it
+      // was just removed as part of THIS transition. Concretely: a
+      // landlord who taps Send and then immediately taps something else
+      // (the "Resolve case" button below, say) while `editAndSendDraft`
+      // is still in flight would, without this guard, get their focus
+      // and the page's scroll yanked back to this editor's remains once
+      // the request resolves, well after they'd already moved on. This
+      // also covers `resolveUnverifiedSend`'s own `setEditingContext(null)`
+      // (useDraftActions.ts): nothing in this route calls it today (a
+      // separate, already-filed gap; this screen doesn't wire the #252
+      // unverified-send guard at all), but it would hit this exact same
+      // hijack shape the moment it does.
+      const active = document.activeElement;
+      if (draftAreaRef.current?.contains(active) || active === document.body) {
+        // Cancel just closed the editor. Land focus on the Edit button
+        // if it came back, otherwise the draft area, so a keyboard user
+        // is never dropped onto <body>.
+        // F8 (re-verify): `.isConnected` alone is not enough. `.focus()`
+        // on a DISABLED button is also a silent no-op that never reaches
+        // the fallback below. #191 round 4 item 6 (safety review
+        // re-verify): the line above used to claim the reachable path
+        // was "an ambiguous edit-and-send sets `isSendUnverified`,
+        // `isBusy` stays true, the landlord taps Cancel, and Edit remounts
+        // connected but disabled, inside the #252 danger window", copied
+        // over from DecisionCard.tsx's near-identical guard, where that IS
+        // reachable. It is not reachable here: this screen never passes
+        // `sendDisabled` into `EditDraftPanel` (see `DraftFooter` below,
+        // ~line 441, which wires `isBusy={draftActions.isBusy(draftId)}`
+        // only), so `isSendUnverified` gates nothing on this route, and
+        // `EditDraftPanel`'s own Cancel button is disabled only by
+        // `submitting`, never by `isBusy`, so `isBusy` cannot be true at
+        // the moment Cancel is tappable. The guard below stays: it's
+        // still correct, harmless defensive code kept for parity with
+        // DecisionCard's identical shape, just not guarding against that
+        // particular scenario on this screen.
+        const btn = editButtonRef.current;
+        if (btn?.isConnected && !btn.disabled) {
+          btn.focus();
+        } else {
+          draftAreaRef.current?.focus();
+        }
+      }
+    }
+    wasEditingRef.current = isEditing;
+  }, [editingContext, draftEntry.status]);
+
+  // #191 F3 (safety review re-verify): the identical three transitions
+  // exist here as in Home's QueueRow (src/routes/app.index.tsx): Approve
+  // moves `draftEntry.status` to "sending" (the Undo ticket takes
+  // DecisionActions' place), Skip replaces the whole footer with the
+  // thread's own "No reply sent" line (DraftFooter's `isSkipped`
+  // branch), and a successful Undo moves it back from "sending" to idle
+  // (the actions row reappears). Issue #191 filed this item under "From
+  // PR #190 (conversation thread)", and the first pass at this fix only
+  // ever touched Home's QueueRow. This mirrors it here, on the surface
+  // the item was actually about.
+  const undoButtonRef = useRef<HTMLButtonElement>(null);
+  const prevDraftStatusRef = useRef(draftEntry.status);
+  // #191 round 4 item 4 (safety review re-verify): by the time the
+  // transition effect below runs, a removed Undo button has already reset
+  // `document.activeElement` to `<body>` (verified by hand: a focused
+  // descendant removed from inside a `tabIndex={-1}` container resets
+  // focus to `<body>`, never to the container), the exact same value a
+  // session that never focused anything at all also sits at. Reading
+  // `document.activeElement` only AFTER the removal can't tell those two
+  // apart. This ref is refreshed on every render while still "sending"
+  // (the countdown's own per-second tick keeps it fresh well within the
+  // five-second window), so the transition effect can ask "was Undo
+  // genuinely focused as of the last render before it went away" instead.
+  const undoHadFocusRef = useRef(false);
+  useEffect(() => {
+    const prevStatus = prevDraftStatusRef.current;
+    prevDraftStatusRef.current = draftEntry.status;
+    if (prevStatus === draftEntry.status) return;
+    // #191 round 4 item 1 (safety review re-verify): `sent -> idle` is the
+    // pinned draft's own cleanup settling once the server refetch this
+    // screen kicks off on "sent" (the effect a little below that clears
+    // `pinnedDraft`) catches up, never a landlord action, and there's
+    // nothing to land on by then anyway: the draft area's idle content is
+    // a static disclaimer, not a control. Exempt outright, the same as
+    // the timer-driven transition right below.
+    if (prevStatus === "sent") return;
+    // #191 round 4 item 4 (safety review re-verify): `sending -> sent` is
+    // the five-second countdown simply running out, a timer, never a
+    // landlord action by itself. Only stay exempt when Undo did NOT
+    // plausibly hold focus right up to the moment it was removed (a
+    // landlord who has already moved their attention elsewhere on the
+    // page); otherwise fall through to the same recovery every other
+    // transition here gets, so a keyboard user whose focus was
+    // legitimately on Undo isn't silently dumped onto `<body>` with
+    // nothing to land on and no announcement.
+    if (prevStatus === "sending" && draftEntry.status === "sent" && !undoHadFocusRef.current) {
+      return;
+    }
+    // F6: only steal focus if it was plausibly inside the draft area,
+    // either still literally there, or reset to <body> because the
+    // control that had it was just removed as part of this transition.
+    const active = document.activeElement;
+    if (!(draftAreaRef.current?.contains(active) || active === document.body)) return;
+    if (draftEntry.status === "sending") {
+      // F2/F4: Approve or a successful edit-and-send. Focus the Undo
+      // button itself, not just the draft area, so its accessible name
+      // and its `aria-describedby` text (UndoTicket.tsx) are read
+      // together at the instant they matter.
+      const btn = undoButtonRef.current;
+      if (btn?.isConnected && !btn.disabled) {
+        btn.focus();
+        return;
+      }
+    }
+    // `preventScroll` (round 5 re-verify): same reasoning as QueueRow's.
+    // This landing is reached on transitions the landlord did not
+    // initiate, and on a long thread `focus()` would scroll them to the
+    // bottom, away from whatever they had scrolled up to read. On an
+    // emergency case that scroll can also push the EmergencyBanner off a
+    // phone-sized viewport with no user action at all. Recover the
+    // focus, leave the viewport alone.
+    draftAreaRef.current?.focus({ preventScroll: true });
+  }, [draftEntry.status]);
+  // #191 round 4 item 4 (safety review re-verify): refreshed every
+  // render, not only on a status change, so it reflects the freshest real
+  // focus state right up to the render before "sending" flips to "sent"
+  // (see `undoHadFocusRef`'s own comment above).
+  useEffect(() => {
+    if (draftEntry.status === "sending") {
+      undoHadFocusRef.current = document.activeElement === undoButtonRef.current;
+    }
+  });
+
   // Once the local approve overlay settles on "sent", the server's own
   // timeline (a real outbound `message` entry replacing the drafted one,
   // per src/features/cases/timeline.ts's docstring) is the honest next
@@ -307,69 +462,93 @@ function ConversationPage() {
 
               {rows.map((row) => renderTimelineRow(row, tenantFirst))}
 
-              {editingContext ? (
-                <div className="mt-2">
-                  <EditDraftPanel
-                    tenantName={tenantFirst}
-                    initialBody={editingContext.body}
-                    submitting={draftActions.isEditSubmitting}
-                    onCancel={() => draftActions.cancelEditor()}
-                    onSend={(body) => draftActions.submitEdit(body)}
-                  />
-                  {draftActions.staleNotices[caseDetail.id] && (
-                    <p className="mt-2.5 text-right font-clarity-sans text-[13px] font-semibold text-clarity-brand">
-                      {draftActions.staleNotices[caseDetail.id]}
-                    </p>
-                  )}
-                </div>
-              ) : draftId && draftBody !== undefined ? (
-                <div className="mt-2">
-                  <DraftFooter
-                    tenantFirst={tenantFirst}
-                    draftBody={draftBody}
-                    draftEntry={draftEntry}
-                    why={why}
-                    staleNotice={draftActions.staleNotices[caseDetail.id]}
-                    isBusy={draftActions.isBusy(draftId)}
-                    onApprove={() =>
-                      draftActions.approve({
-                        draftId,
-                        caseId: caseDetail.id,
-                        tenantName: caseDetail.tenant.name ?? "",
-                      })
-                    }
-                    onEdit={() =>
-                      draftActions.openEditor(
-                        {
+              <div
+                ref={draftAreaRef}
+                tabIndex={-1}
+                role="group"
+                // #191 round 4 item 5 (safety review re-verify): this
+                // wrapper covers three branches (editing, the pending
+                // draft's own footer, and, once the case is resolved or
+                // draftless, a bare disclaimer paragraph with nothing to
+                // reply to). Naming it "Reply to {tenantFirst}"
+                // unconditionally put a screen-reader user landing on a
+                // resolved case inside a group named "Reply to Maria"
+                // that in fact holds only "nothing here can be edited or
+                // removed once it's sent". Only name it when there is
+                // actually something to reply with; the plain disclaimer
+                // branch stays unlabeled (its own text is read directly).
+                aria-label={
+                  editingContext || (draftId && draftBody !== undefined)
+                    ? `Reply to ${tenantFirst}`
+                    : undefined
+                }
+              >
+                {editingContext ? (
+                  <div className="mt-2">
+                    <EditDraftPanel
+                      tenantName={tenantFirst}
+                      initialBody={editingContext.body}
+                      submitting={draftActions.isEditSubmitting}
+                      onCancel={() => draftActions.cancelEditor()}
+                      onSend={(body) => draftActions.submitEdit(body)}
+                    />
+                    {draftActions.staleNotices[caseDetail.id] && (
+                      <p className="mt-2.5 text-right font-clarity-sans text-[13px] font-semibold text-clarity-brand">
+                        {draftActions.staleNotices[caseDetail.id]}
+                      </p>
+                    )}
+                  </div>
+                ) : draftId && draftBody !== undefined ? (
+                  <div className="mt-2">
+                    <DraftFooter
+                      tenantFirst={tenantFirst}
+                      draftBody={draftBody}
+                      draftEntry={draftEntry}
+                      why={why}
+                      staleNotice={draftActions.staleNotices[caseDetail.id]}
+                      isBusy={draftActions.isBusy(draftId)}
+                      editButtonRef={editButtonRef}
+                      undoButtonRef={undoButtonRef}
+                      onApprove={() =>
+                        draftActions.approve({
                           draftId,
                           caseId: caseDetail.id,
                           tenantName: caseDetail.tenant.name ?? "",
-                        },
-                        draftBody,
-                      )
-                    }
-                    onSkip={() =>
-                      draftActions.skip({
-                        draftId,
-                        caseId: caseDetail.id,
-                        tenantName: caseDetail.tenant.name ?? "",
-                      })
-                    }
-                    onUndo={() =>
-                      draftActions.undo({
-                        draftId,
-                        caseId: caseDetail.id,
-                        tenantName: caseDetail.tenant.name ?? "",
-                      })
-                    }
-                  />
-                </div>
-              ) : (
-                <p className="mt-4 font-clarity-sans text-xs leading-relaxed text-clarity-ink-dim">
-                  Nothing here can be edited or removed once it&rsquo;s sent — that&rsquo;s what
-                  makes it useful if you ever need the record.
-                </p>
-              )}
+                        })
+                      }
+                      onEdit={() =>
+                        draftActions.openEditor(
+                          {
+                            draftId,
+                            caseId: caseDetail.id,
+                            tenantName: caseDetail.tenant.name ?? "",
+                          },
+                          draftBody,
+                        )
+                      }
+                      onSkip={() =>
+                        draftActions.skip({
+                          draftId,
+                          caseId: caseDetail.id,
+                          tenantName: caseDetail.tenant.name ?? "",
+                        })
+                      }
+                      onUndo={() =>
+                        draftActions.undo({
+                          draftId,
+                          caseId: caseDetail.id,
+                          tenantName: caseDetail.tenant.name ?? "",
+                        })
+                      }
+                    />
+                  </div>
+                ) : (
+                  <p className="mt-4 font-clarity-sans text-xs leading-relaxed text-clarity-ink-dim">
+                    Nothing here can be edited or removed once it&rsquo;s sent — that&rsquo;s what
+                    makes it useful if you ever need the record.
+                  </p>
+                )}
+              </div>
 
               {caseIsOpen && (
                 <div className="mt-6 flex flex-col items-start gap-1">
@@ -510,6 +689,8 @@ function DraftFooter({
   why,
   staleNotice,
   isBusy,
+  editButtonRef,
+  undoButtonRef,
   onApprove,
   onEdit,
   onSkip,
@@ -521,6 +702,10 @@ function DraftFooter({
   why: string;
   staleNotice?: string;
   isBusy: boolean;
+  /** #191 item 1: see ConversationPage's own `editButtonRef` comment. */
+  editButtonRef?: Ref<HTMLButtonElement>;
+  /** #191 F2/F4: see ConversationPage's own `undoButtonRef` comment. */
+  undoButtonRef?: Ref<HTMLButtonElement>;
   onApprove: () => void;
   onEdit: () => void;
   onSkip: () => void;
@@ -559,6 +744,7 @@ function DraftFooter({
           totalSeconds={totalSeconds}
           onUndo={onUndo}
           undoDisabled={isBusy}
+          undoButtonRef={undoButtonRef}
         />
       ) : isSent ? (
         <p className="mt-3.5 text-right font-clarity-sans text-[13px] font-semibold text-clarity-whenever">
@@ -572,6 +758,7 @@ function DraftFooter({
             onSkip={onSkip}
             onApprove={onApprove}
             disabled={isBusy}
+            editButtonRef={editButtonRef}
           />
         </>
       )}
