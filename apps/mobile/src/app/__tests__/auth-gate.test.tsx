@@ -65,24 +65,38 @@ describe("root layout auth gate (rendered)", () => {
     mockAuthState.session = null;
   });
 
-  it("lands a signed-out user on the sign-in screen", async () => {
-    renderRouter("src/app", { initialUrl: "/" });
+  // renderRouter mounts the *entire* file-based router tree (the heaviest
+  // render in this suite) — comfortably under 2s in isolation (see #267),
+  // but the default 5000ms Jest test timeout is too tight once every suite
+  // in the repo is running in parallel and competing for CPU (observed up
+  // to ~15s under full-suite contention locally). Bump these two only,
+  // generously — the timing itself is asserted nowhere.
+  it(
+    "lands a signed-out user on the sign-in screen",
+    async () => {
+      renderRouter("src/app", { initialUrl: "/" });
 
-    // The Stack.Protected guard should redirect / (tabs) -> /sign-in.
-    expect(await screen.findByTestId("sign-in-submit")).toBeOnTheScreen();
-    expect(screen.getByText("Welcome back.")).toBeOnTheScreen();
-  });
+      // The Stack.Protected guard should redirect / (tabs) -> /sign-in.
+      expect(await screen.findByTestId("sign-in-submit")).toBeOnTheScreen();
+      expect(screen.getByText("Welcome back.")).toBeOnTheScreen();
+    },
+    30000,
+  );
 
-  it("lands a signed-in user in the tab shell", async () => {
-    mockAuthState.session = { user: { email: "landlord@example.com" } };
+  it(
+    "lands a signed-in user in the tab shell",
+    async () => {
+      mockAuthState.session = { user: { email: "landlord@example.com" } };
 
-    renderRouter("src/app", { initialUrl: "/" });
+      renderRouter("src/app", { initialUrl: "/" });
 
-    // The tab bar's own labels only render inside (tabs) — unlike Home's
-    // content (M1: a real, data-dependent queue fetch), these are static
-    // regardless of network/query state, so they're a stable "we're inside
-    // (tabs), not sign-in" signal for this test.
-    expect(await screen.findByText("Conversations")).toBeOnTheScreen();
-    expect(screen.queryByTestId("sign-in-submit")).toBeNull();
-  });
+      // The tab bar's own labels only render inside (tabs) — unlike Home's
+      // content (M1: a real, data-dependent queue fetch), these are static
+      // regardless of network/query state, so they're a stable "we're inside
+      // (tabs), not sign-in" signal for this test.
+      expect(await screen.findByText("Conversations")).toBeOnTheScreen();
+      expect(screen.queryByTestId("sign-in-submit")).toBeNull();
+    },
+    30000,
+  );
 });
