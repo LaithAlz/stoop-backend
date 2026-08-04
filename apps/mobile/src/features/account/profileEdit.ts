@@ -16,8 +16,19 @@
  * `phone` is write-only on this contract (GET /v1/me never returns it), so
  * the form can't prefill it — the screen says "leave blank to keep your
  * current number" and this builder enforces exactly that.
+ *
+ * `toE164`/`phoneLooksValid` (the safety-reviewed NANP normalizer, five
+ * rounds — F2/F3/N1/R1/R3/R4, ported from apps/web/src/lib/phone.ts) now
+ * live at src/lib/phone.ts (issue #269) — this file's own digit-count-only
+ * `phoneLooksValid` sent the raw, un-normalized string to `landlords.phone`
+ * (the number the emergency chain calls first), exactly the F2/R1 bug the
+ * web side already closed. src/app/onboarding/backup.tsx and
+ * src/features/tenants/TenantFormModal.tsx reuse the same module instead of
+ * each defining their own copy.
  */
 import type { UpdateMeInput } from "@/api/types";
+import { toE164 } from "@/lib/phone";
+export { phoneLooksValid } from "@/lib/phone";
 
 export interface ProfileEditForm {
   /** The name field's current text. */
@@ -39,15 +50,14 @@ export function buildMeUpdatePayload(
 
   const phone = form.phone.trim();
   if (phone.length > 0) {
-    payload.phone = phone;
+    // #269: NORMALIZED, never the raw text — schema-v1.md documents
+    // `landlords.phone` as E.164 and the emergency chain hands it straight
+    // to Twilio's `create_call(to=...)`, which rejects anything else. An
+    // unnormalizable number is never sent — the screen blocks this earlier
+    // via `phoneLooksValid`, but the builder must be safe on its own too.
+    const e164 = toE164(phone);
+    if (e164) payload.phone = e164;
   }
 
   return Object.keys(payload).length > 0 ? payload : null;
-}
-
-/** ≥10 digits reads as a real NANP number — same bar the web onboarding
- *  uses. Blank is valid ("keep my current number"). */
-export function phoneLooksValid(phone: string): boolean {
-  const digits = phone.replace(/\D/g, "");
-  return digits.length === 0 || digits.length >= 10;
 }
