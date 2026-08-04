@@ -567,6 +567,7 @@ async def test_draft_response_success_inserts_pending_draft_and_audit(
         assert audit_rows[0]["action"] == "drafted"
         payload = audit_rows[0]["payload"]
         assert payload["guard_failed"] is False
+        assert payload["length_over_budget"] is False
         assert payload["model"] == "claude-sonnet-5"
         assert payload["tokens_in"] == 150
         assert payload["tokens_out"] == 40
@@ -1794,6 +1795,25 @@ async def test_draft_response_length_violation_persists_kept_not_truncated(
             .one()
         )
         assert draft_row["body"] == long_body_2
+
+        # #178 follow-up: length_over_budget must land in the persisted
+        # 'drafted' audit_log payload too, not just the returned state --
+        # the module docstring frames it as a landlord-review signal
+        # alongside guard_failed, and it was previously omitted here.
+        audit_row = (
+            (
+                await db_session.execute(
+                    text(
+                        "SELECT payload FROM audit_log WHERE case_id = :cid AND action = 'drafted'"
+                    ),
+                    {"cid": case_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"]["length_over_budget"] is True
+        assert audit_row["payload"]["guard_failed"] is False
     finally:
         await _cleanup(db_session, landlord_id)
 

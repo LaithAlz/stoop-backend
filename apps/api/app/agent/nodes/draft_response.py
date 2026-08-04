@@ -270,8 +270,13 @@ reported model id (``None`` if every attempt failed at the transport level
 with no response at all). All four (``model``, ``tokens_in``,
 ``tokens_out``, ``cost_cents``) are added to the existing ``'drafted'``
 ``audit_log`` payload alongside ``draft_id``, ``refusal_templates_used``,
-and ``guard_failed`` — never a message body. ``message_id`` is ALSO
-included (#34 safety review): ``app/agent/graph_entry.py`` uses a
+``guard_failed``, and ``length_over_budget`` (#178 follow-up — the value
+was already computed above and returned in ``draft_response``'s own state
+update, but had been left out of the persisted audit row; it is the SAME
+landlord-review signal as ``guard_failed``, just for the "still too long"
+dimension instead of the "unsafe as generated" one, per point 4 above) —
+never a message body. ``message_id`` is ALSO included (#34 safety review):
+``app/agent/graph_entry.py`` uses a
 ``'drafted'``-or-``'degraded_mode'`` audit row carrying THIS message's id
 as the completion marker that decides whether a redelivered/retried graph
 invocation should re-run the pipeline — see that module's own docstring.
@@ -1358,6 +1363,7 @@ async def draft_response(state: AgentState) -> dict[str, Any]:
                                 flag.value for flag in draft_result.refusal_templates_used
                             ],
                             "guard_failed": guard_failed,
+                            "length_over_budget": length_over_budget,
                             "model": last_model,
                             "tokens_in": total_tokens_in,
                             "tokens_out": total_tokens_out,

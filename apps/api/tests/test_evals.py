@@ -182,6 +182,32 @@ class TestLoader:
             assert scenario.prefilter_must_fire is False, scenario.id
             assert scenario.category == "routine"
 
+    async def test_tier0_only_scenario_never_calls_the_model(self) -> None:
+        """#178 follow-up: pins the "negative scenarios make zero paid
+        calls" guarantee with a ``tool_caller`` stub that RAISES if invoked
+        at all -- proves ``run_scenario`` returns for every ``tier0_only``
+        scenario without ever reaching step (b)/(c) (the
+        ``classify_severity`` samples / the draft call), see
+        ``run_scenario``'s own docstring points (a)/(b)/(c) and its
+        ``if scenario.tier0_only: return result`` early-out. Dry-run only
+        by construction (the stub never touches the network either way,
+        but ``dry_run=True`` also confirms no pacing/backoff wrapper ever
+        gets a chance to call it)."""
+
+        async def _raising_tool_caller(**kwargs: Any) -> anthropic_mod.ToolCallResult:
+            del kwargs
+            raise AssertionError(
+                "tier0_only scenario made a model call -- it must return before "
+                "ever reaching classify_severity/draft_response"
+            )
+
+        assert NEGATIVE_SCENARIOS  # sanity: the loop below isn't vacuous
+        for scenario in NEGATIVE_SCENARIOS:
+            result = await run_scenario(scenario, tool_caller=_raising_tool_caller, dry_run=True)
+            assert result.classification_samples == []
+            assert result.draft_check is None
+            assert result.infra_error is None
+
     def test_f1_f2_category_is_refusal_but_severity_is_routine(self) -> None:
         f1 = _by_id("f1-rent-ltb")
         f2 = _by_id("f2-access-code")
@@ -629,13 +655,33 @@ class TestScoreResults:
     def _failing_result(self, scenario_id: str, category: str) -> ScenarioResult:
         from app.agent.schemas import PrefilterResult
 
+        # A synthetic classification failure (rather than the removed
+        # `top_level_failures` field, #178 follow-up -- see
+        # evals/scoring.py's `ScenarioResult` -- there is no longer a
+        # top-level failure bucket, only prefilter/classification/draft)
+        # is enough to make `passed` False without asserting anything
+        # about prefilter/draft.
         return ScenarioResult(
             scenario_id=scenario_id,
             category=category,
             prefilter_result=PrefilterResult(hard_hit=False),
             prefilter_expected=None,
             prefilter_ok=None,
-            top_level_failures=["synthetic failure"],
+            classification_samples=[
+                ClassificationSample(
+                    sample_index=0,
+                    severity=Severity.ROUTINE,
+                    rules_fired=[],
+                    modifier=None,
+                    refusal_flags=[],
+                    reasoning=[],
+                    tokens_in=1,
+                    tokens_out=1,
+                    cost_cents=0.0,
+                    latency_s=0.0,
+                    failures=["synthetic failure"],
+                )
+            ],
         )
 
     def test_all_pass_no_release_block(self) -> None:
@@ -682,6 +728,62 @@ class TestScoreResults:
         assert verdict.release_blocked is True
         assert "n1" in verdict.hard_failed_scenario_ids
 
+    def test_prefilter_failure_dominates_a_later_infra_error(self) -> None:
+        """#178 follow-up: a confirmed Tier-0 miss (``prefilter_ok is
+        False``) combined with a LATER infra error (classification/draft
+        never got a verdict) must still be a HARD failure, not merely
+        "errored" (inconclusive, re-run) -- the prefilter check is a pure
+        function that ran to completion independently of the later
+        Anthropic call that failed. See ``ScenarioResult.is_hard_failure``'s
+        docstring for the full reasoning, including why the ORIGINAL #177
+        ordering (``errored`` checked first) was wrong."""
+        from app.agent.schemas import PrefilterResult
+
+        result = ScenarioResult(
+            scenario_id="e1",
+            category="emergency",
+            prefilter_result=PrefilterResult(hard_hit=False),
+            prefilter_expected=True,
+            prefilter_ok=False,
+            infra_error="rate-limit/overload backoff exhausted after 6 attempts",
+        )
+        assert result.errored is True
+        assert result.passed is False
+        assert result.is_hard_failure is True
+
+        verdict = score_results([result])
+        assert verdict.release_blocked is True
+        assert "e1" in verdict.hard_failed_scenario_ids
+        # Deliberately ALSO still in errored_scenario_ids -- the two are no
+        # longer mutually exclusive in this one case (see
+        # GateVerdict.errored_scenario_ids's docstring); it is not counted
+        # as soft-failed either way.
+        assert "e1" in verdict.errored_scenario_ids
+        assert "e1" not in verdict.soft_failed_scenario_ids
+
+    def test_infra_error_alone_without_a_prefilter_miss_stays_errored_not_hard(self) -> None:
+        """The dominance rule is narrow -- an infra error with NO confirmed
+        prefilter miss (``prefilter_ok`` is ``True``/``None``) is still
+        "inconclusive, re-run", never promoted to hard-fail just because
+        the category happens to be E-class/F-class."""
+        from app.agent.schemas import PrefilterResult
+
+        result = ScenarioResult(
+            scenario_id="e1",
+            category="emergency",
+            prefilter_result=PrefilterResult(hard_hit=True, categories=["water"]),
+            prefilter_expected=True,
+            prefilter_ok=True,
+            infra_error="timeout",
+        )
+        assert result.is_hard_failure is False
+
+        verdict = score_results([result])
+        assert "e1" in verdict.errored_scenario_ids
+        assert "e1" not in verdict.hard_failed_scenario_ids
+        assert "e1" not in verdict.soft_failed_scenario_ids
+        assert verdict.release_blocked is True  # still blocked -- "inconclusive" also blocks
+
 
 # ---------------------------------------------------------------------------
 # Dry-run, end-to-end (the machinery test the task requires in the default
@@ -722,11 +824,7 @@ class TestDryRunHappyPath:
         scenario file, with zero network calls. It is a self-consistency
         check on the MACHINERY, not a claim about the real model."""
         result = await run_scenario(scenario, tool_caller=make_dry_run_tool_caller(scenario))
-        assert result.passed, (
-            result.top_level_failures,
-            result.classification_samples,
-            result.draft_check,
-        )
+        assert result.passed, (result.classification_samples, result.draft_check)
 
     def test_all_scenarios_report_summary(self) -> None:
         import asyncio
@@ -886,6 +984,13 @@ class TestReportingAndSnapshot:
         assert "prefilter" in payload
         assert "classification_samples" in payload
         assert len(payload["classification_samples"]) == 3
+        # #178 follow-up: `reasoning` must be in the reported payload, not
+        # just on the ClassificationSample dataclass -- the evidence text a
+        # rule-anchor failure needs is otherwise invisible in last-run.json.
+        for sample_payload, sample in zip(
+            payload["classification_samples"], result.classification_samples, strict=True
+        ):
+            assert sample_payload["reasoning"] == sample.reasoning
 
     def test_write_snapshot_creates_valid_json(self, tmp_path: Any) -> None:
         import asyncio
@@ -1609,4 +1714,3 @@ async def test_eval_scenario(scenario: Scenario) -> None:
     ]
     draft_failures = result.draft_check.failures if result.draft_check else None
     assert result.draft_ok is not False, draft_failures
-    assert not result.top_level_failures
