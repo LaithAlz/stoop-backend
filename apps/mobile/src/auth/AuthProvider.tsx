@@ -113,7 +113,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // Bounded + best-effort (deviceRegistration.ts's own docstring) —
         // this can never throw or hang sign-out.
         await unregisterCurrentDeviceBestEffort();
-        await supabase.auth.signOut();
+        // B3 (#263, ported from apps/web/src/auth/AuthProvider.tsx):
+        // `scope: "local"` — supabase-js defaults `signOut()` to
+        // `scope: "global"`, which revokes the session server-side across
+        // EVERY device signed into this account. A landlord tapping "Sign
+        // out" on their phone must not silently sign them out of the
+        // Stoop web dashboard too, and — the sharper version of this on
+        // mobile — must never kill the session on a DIFFERENT phone/tablet
+        // that's still the one receiving emergency push.
+        await supabase.auth.signOut({ scope: "local" });
       },
     }),
     [session, initializing],

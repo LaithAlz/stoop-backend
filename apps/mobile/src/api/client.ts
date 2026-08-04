@@ -142,13 +142,59 @@ async function apiRequestInternal<T>(
 
   if (!response.ok) {
     if (response.status === 401) {
-      // The server rejected a token we believed was live (expired/revoked
-      // between local checks) — sign out so the root layout's auth gate
-      // (src/app/_layout.tsx, resolveAuthRoute) swaps back to sign-in
-      // instead of every screen quietly re-401ing forever.
-      void supabase.auth.signOut();
+      // B3 (#263, ported from apps/web/src/api/client.ts): a bare 401 is
+      // NOT proof the session is actually dead — a transient backend
+      // hiccup (e.g. a JWKS rotation blip on the API side) can 401 a
+      // token that's still genuinely live. This is materially worse on
+      // mobile than on web (#263 safety-review comment): mobile is the
+      // ONE device that receives emergency push, and the forced-401 path
+      // below deliberately skips the server-side device unregister (it
+      // has no live token to authenticate the DELETE with), so an
+      // unconditional sign-out here used to wipe the local session while
+      // pushes kept arriving at a device now showing a sign-in wall, with
+      // the deep link landing on the auth gate instead of the case.
+      //
+      // Check the LOCAL session before reacting: only sign out when it's
+      // genuinely absent or past its own `expires_at` (the server and the
+      // local client disagreeing on a still-valid token is not grounds to
+      // destroy it); otherwise let the `ApiError` below surface normally
+      // and leave the session alone so the caller can retry.
+      const { data } = await supabase.auth.getSession();
+      const localSession = data.session;
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const sessionLooksDead =
+        !localSession ||
+        (typeof localSession.expires_at === "number" && localSession.expires_at <= nowSeconds);
+      if (sessionLooksDead) {
+        // `scope: "local"` — this device's session only (matches
+        // src/auth/AuthProvider.tsx's explicit sign-out). A transient API
+        // 401 (or a session that's actually expired here) must never
+        // reach out and kill the landlord's OTHER signed-in devices —
+        // the only device left to receive an emergency push must not be
+        // one of the ones taken down by this device's own 401.
+        void supabase.auth.signOut({ scope: "local" });
+      }
     }
     throw new ApiError(response.status, coerceErrorBody(parsed, response.status));
+  }
+
+  // H3 (#263, ported from apps/web/src/api/client.ts): a 2xx whose body is
+  // empty or fails to parse as JSON is NOT a successful empty result —
+  // `parsed` is `null` in both cases (`safeJsonParse`'s own catch-all, and
+  // the `text.length > 0` guard above), and every typed caller in this app
+  // expects an object (`{items: [...]}`, `{id: ...}`, ...). Letting a bare
+  // `null` through as `T` used to read as "success with no data" — a false
+  // "no conversations yet." empty state, or `result.data.undo_until`
+  // throwing a raw TypeError instead of the house `unknown_error` — rather
+  // than the genuinely unexpected-response failure it is. This check sits
+  // BELOW the 204 early-return above (by design — an empty body IS the
+  // contract there).
+  if (parsed === null || typeof parsed !== "object") {
+    throw new ApiError(response.status, {
+      code: "unknown_error",
+      message: "The server sent back something unexpected.",
+      request_id: "req_unknown",
+    });
   }
 
   return { data: parsed as T, dateHeader };
