@@ -427,10 +427,10 @@ function SettingsForm({
               (copy-guardian FAIL on the first version, commit 9ec310b). */}
           <p className="mt-1 text-[13px] leading-relaxed text-ink-muted">
             The second number I call during a real emergency, in case yours is ever wrong, off, or
-            you just don&rsquo;t pick up. I call you first, every time — if there&rsquo;s no answer,
+            you just don&rsquo;t pick up. I call you first, every time. If there&rsquo;s no answer,
             I call this number about ten minutes later. They&rsquo;ll also get a text saying what
             happened at {current.label}, that you haven&rsquo;t answered, and your tenant&rsquo;s
-            name — asking them to call your tenant or tap a link to say they&rsquo;ve got it. I keep
+            name, asking them to call your tenant or tap a link to say they&rsquo;ve got it. I keep
             alternating between you and them every fifteen minutes until one of you does. Optional,
             but strongly recommended.
           </p>

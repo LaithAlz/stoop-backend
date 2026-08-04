@@ -544,8 +544,8 @@ function ConversationPage() {
                   </div>
                 ) : (
                   <p className="mt-4 font-clarity-sans text-xs leading-relaxed text-clarity-ink-dim">
-                    Nothing here can be edited or removed once it&rsquo;s sent. That&rsquo;s
-                    what makes it useful if you ever need the record.
+                    Nothing here can be edited or removed once it&rsquo;s sent. That&rsquo;s what
+                    makes it useful if you ever need the record.
                   </p>
                 )}
               </div>

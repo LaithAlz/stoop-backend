@@ -63,6 +63,6 @@ export const TRUST_SECTION_TITLE = "Automatic sending";
 
 export const TRUST_SECTION_BODY =
   "For routine repairs only, Stoop can earn the right to send a reply here " +
-  "without waiting — after a streak of replies you approved unchanged. " +
+  "without waiting, after a streak of replies you approved unchanged. " +
   "Emergencies and anything urgent always come to you. Turning it off is " +
   "always one tap, right here.";
