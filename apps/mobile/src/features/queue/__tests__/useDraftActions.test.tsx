@@ -181,9 +181,19 @@ describe("useDraftActions — undo 409 already_sent (M1 advisory)", () => {
     // the old math (server timestamp compared to the device's OWN, 10
     // minutes fast, clock) it would be roughly 9 minutes in the past,
     // i.e. instant expiry, not ~60s out.
-    const delta = entry.undoExpiresAtClient - before;
+    // `approvedAtClient` is the device clock at receipt, so it must sit in
+    // the window this test actually spans. Bounds by construction, never
+    // flaky, and it stops the delta assertion below from passing on two
+    // fields that are wrong together.
+    expect(entry.approvedAtClient).toBeGreaterThanOrEqual(before);
+    expect(entry.approvedAtClient).toBeLessThanOrEqual(Date.now());
+    // R4: measured against `approvedAtClient`, the exact receipt timestamp
+    // the anchoring math itself uses, not against a `before` sampled earlier
+    // in the test. That removes the dispatch latency from the window
+    // entirely, so a loaded CI box stalling between the two cannot flake it.
+    const delta = entry.undoExpiresAtClient - entry.approvedAtClient;
     expect(delta).toBeGreaterThan(30_000);
-    expect(delta).toBeLessThanOrEqual(62_000);
+    expect(delta).toBeLessThanOrEqual(61_000);
   });
 });
 

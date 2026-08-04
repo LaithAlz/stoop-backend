@@ -27,10 +27,22 @@ export interface ApiRequestOptions {
   signal?: AbortSignal;
 }
 
+/** R3 (safety review): the same defensive read as the 401 liveness gate
+ *  below, one function up and on EVERY request rather than only on 401s.
+ *  `getSession()` touches the keychain, and a read/decrypt rejection there
+ *  used to reject `apiRequest` with a raw `Error` before `fetch` was even
+ *  attempted, breaking this module's own contract (everything it throws is
+ *  an `ApiError`) and bypassing `ApiError` typing in every caller's error
+ *  handling. Failing to an anonymous request is the right direction: the
+ *  request 401s into the liveness branch, which is now itself safe. */
 async function authHeader(): Promise<Record<string, string>> {
-  const { data } = await supabase.auth.getSession();
-  const token = data.session?.access_token;
-  return token ? { Authorization: `Bearer ${token}` } : {};
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
+  }
 }
 
 /** A malformed/non-JSON error body still has to produce a usable ApiError

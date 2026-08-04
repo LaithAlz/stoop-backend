@@ -268,6 +268,32 @@ describe("apiRequest", () => {
     expect(mockSignOut).not.toHaveBeenCalled();
   });
 
+  it("R3 (safety review): a getSession() that rejects on the REQUEST path still produces a typed ApiError, not a raw Error", async () => {
+    // R3 is B3-2 one function up. authHeader() reads the keychain on EVERY
+    // request, not only on 401s, and an unwrapped rejection there escaped
+    // before fetch was ever attempted: callers got a raw Error, breaking
+    // this module's contract that everything it throws is an ApiError.
+    // Every getSession() call rejects here, including authHeader's own.
+    mockGetSession.mockRejectedValue(new Error("keychain read failed"));
+    (globalThis.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(401, {
+        error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" },
+      }),
+    );
+
+    const error = await apiRequest("/v1/me").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe("unauthorized");
+    // The request went out anonymously rather than not going out at all.
+    expect(globalThis.fetch as jest.Mock).toHaveBeenCalled();
+    const headers = ((globalThis.fetch as jest.Mock).mock.calls[0][1] as RequestInit)
+      .headers as Record<string, string>;
+    expect(headers.Authorization).toBeUndefined();
+    // And the unreadable keychain is still not treated as a dead session.
+    expect(mockSignOut).not.toHaveBeenCalled();
+  });
+
   it("B3-4 (safety review): a signOut() that itself rejects never surfaces as an unhandled rejection", async () => {
     mockGetSession.mockResolvedValue({ data: { session: null } });
     mockSignOut.mockRejectedValue(new Error("storage write failed"));
