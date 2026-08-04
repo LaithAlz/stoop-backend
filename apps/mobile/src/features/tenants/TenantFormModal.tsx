@@ -26,8 +26,21 @@
  * unchanged, un-normalizable stored phone skips the blocking `phoneError`
  * (by design, above), but that used to leave the field with zero signal:
  * the neutral "The number they'll text from." helper kept rendering over a
- * number Twilio can never dial and the `/sms` webhook can never match
- * (schema-v1.md v1.21 point 4, `unrouted_inbound`). `phoneUnchangedUnreachable`
+ * number Twilio can never dial and `_lookup_active_tenant` can never match.
+ *
+ * The re-verify corrected what the stake actually is, and the copy now
+ * says it. This is NOT the `unrouted_inbound` path: that dead-letters an
+ * unrecognized `To` (schema-v1.md v1.21 point 4), and this tenant's text
+ * still routes, because `To` finds the property. What happens instead is
+ * that `_lookup_active_tenant` returns None and the `messages` row is
+ * written with `tenant_id = NULL`, so the landlord DOES hear something,
+ * just unattributed. The real harm runs the other way:
+ * `emergency_chain.py` resolves the tenant's number through
+ * `messages.tenant_id -> tenants.phone`, so both tenant legs come back
+ * `skipped / no_tenant_phone`. This tenant gets no reply and no emergency
+ * safety SMS at 2am, and the `vulnerable_occupant` the landlord opened
+ * this modal to set can never attach to their message either, which is
+ * the irony at the middle of #292. `phoneUnchangedUnreachable`
  * below renders a non-blocking warning in that exact case, mirroring
  * apps/web/src/features/properties/settings.ts's
  * `backupContactPhoneLooksInvalid` pattern (a persistent notice for a
@@ -240,8 +253,8 @@ function TenantFormContent({ propertyId, tenant, onClose }: Omit<TenantFormModal
               // a submit attempt, since the landlord may never touch this
               // field on this visit.
               <Text style={styles.fieldWarning} testID="tenant-phone-warning">
-                I can&rsquo;t text this number as it&rsquo;s saved. Update it so this tenant&rsquo;s
-                messages reach you.
+                I can&rsquo;t text this number as it&rsquo;s saved, so this tenant won&rsquo;t get
+                my replies or emergency safety steps. Update it.
               </Text>
             ) : (
               <Text style={styles.helper}>The number they&rsquo;ll text from.</Text>
