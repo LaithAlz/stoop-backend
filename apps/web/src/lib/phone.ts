@@ -12,37 +12,64 @@
  */
 
 /**
- * CJK ideographic numerals (simple and financial/"trusted" forms across
- * Chinese/Japanese/Korean — e.g. 一二三四五六七八九十百千万億, plus their
- * CJK Compatibility Ideograph and Extension-B variants). Python's
- * `str.isnumeric()` (apps/api/app/phone.py's `_contains_non_ascii_digit`,
- * the server-side authority this file must not diverge from — #232/#260,
- * #273) treats these as numeric because Unicode gives them a
- * Numeric_Type=Numeric property, but their General_Category is `Lo`
- * (Letter, other), NOT one of the Number categories (`Nd`/`Nl`/`No`) — so
- * a JS `\p{N}` Unicode-property-escape test alone MISSES them; JS regex
- * has no Numeric_Type escape to fall back on. This literal list closes
- * that gap. It was generated (and diff-verified against Python's
- * `ch.isnumeric() and not ch.isascii()` across every codepoint
- * 0..0x10FFFF, zero misses) rather than hand-picked — see #273's PR
- * description for the generation script.
+ * Non-ASCII characters that are UNAMBIGUOUSLY not digits, and so may
+ * appear in a pasted phone string and be stripped as punctuation: letters
+ * (`\p{L}` — "Célular:", "携帯", "моб."), spaces (`\p{Zs}` — NBSP and
+ * narrow-NBSP, the copy-off-a-webpage case), format controls (`\p{Cf}` —
+ * LRM/RLM from an RTL paste, word joiners, BOM), punctuation (`\p{P}` —
+ * en/em dashes from Word autocorrect, non-breaking hyphen, smart quotes)
+ * and symbols (`\p{S}`).
+ *
+ * F1 (safety re-verify, #273): this is an ALLOWLIST, and the guard below
+ * rejects any non-ASCII code point NOT in it. The first cut was the
+ * inverse — a denylist of "characters that might be digits" — which fails
+ * OPEN against a moving standard: the web client sends `toE164`'s OUTPUT,
+ * not the landlord's raw input, so the server never sees the offending
+ * character on a web write and this guard is the ONLY line of defense.
+ * Any digit codepoint newer than the landlord's own browser's Unicode
+ * table would fall out of `\p{Nd}` and be silently stripped exactly as
+ * before #273 (measured: a browser at Unicode 14 reintroduces the bug for
+ * the Kawi and Nag Mundari digit blocks). Failing closed also retires the
+ * hand-maintained list of 81 CJK ideographic numerals that `\p{N}` misses
+ * — those are General_Category `Lo`, so no Number-property escape catches
+ * them, and JS exposes no Numeric_Type escape.
+ *
+ * Verified against Python's `str.isnumeric() and not isascii()` (the
+ * server-side authority, apps/api/app/phone.py) across every codepoint
+ * 0..0x10FFFF: zero misses, and zero new rejections across a corpus of
+ * realistic pastes.
+ *
+ * The CJK numerals below are carved BACK OUT of `\p{L}`, not retired:
+ * they are General_Category `Lo` (Letter), so an allowlist that trusts
+ * `\p{L}` wholesale would hand `一`/`〇` straight back through — measured,
+ * not assumed. Everything else the old denylist enumerated is now covered
+ * by the fail-closed default, so this list no longer has to track new
+ * digit blocks; it only has to track CJK numerals, which is a closed set.
  */
-const NON_ASCII_NUMERIC_RE =
-  /[\p{Nd}\p{Nl}\p{No}\u{3405}\u{3483}\u{382A}\u{3B4D}\u{4E00}\u{4E03}\u{4E07}\u{4E09}\u{4E5D}\u{4E8C}\u{4E94}\u{4E96}\u{4EBF}\u{4EC0}\u{4EDF}\u{4EE8}\u{4F0D}\u{4F70}\u{5104}\u{5146}\u{5169}\u{516B}\u{516D}\u{5341}\u{5343}\u{5344}\u{5345}\u{534C}\u{53C1}\u{53C2}\u{53C3}\u{53C4}\u{56DB}\u{58F1}\u{58F9}\u{5E7A}\u{5EFE}\u{5EFF}\u{5F0C}\u{5F0D}\u{5F0E}\u{5F10}\u{62FE}\u{634C}\u{67D2}\u{6F06}\u{7396}\u{767E}\u{8086}\u{842C}\u{8CAE}\u{8CB3}\u{8D30}\u{9621}\u{9646}\u{964C}\u{9678}\u{96F6}\u{F96B}\u{F973}\u{F978}\u{F9B2}\u{F9D1}\u{F9D3}\u{F9FD}\u{20001}\u{20064}\u{200E2}\u{20121}\u{2092A}\u{20983}\u{2098C}\u{2099C}\u{20AEA}\u{20AFD}\u{20B19}\u{22390}\u{22998}\u{23B1B}\u{2626D}\u{2F890}]/u;
+const NON_ASCII_ALLOWED_RE = /[\p{L}\p{Zs}\p{Cf}\p{P}\p{S}]/u;
+
+/** CJK ideographic numerals — `Lo`, so exempted from the `\p{L}` allowlist
+ *  above. Diff-verified against Python's `isnumeric()` across every
+ *  codepoint. */
+const CJK_NUMERALS_RE =
+  /[\u{3405}\u{3483}\u{382A}\u{3B4D}\u{4E00}\u{4E03}\u{4E07}\u{4E09}\u{4E5D}\u{4E8C}\u{4E94}\u{4E96}\u{4EBF}\u{4EC0}\u{4EDF}\u{4EE8}\u{4F0D}\u{4F70}\u{5104}\u{5146}\u{5169}\u{516B}\u{516D}\u{5341}\u{5343}\u{5344}\u{5345}\u{534C}\u{53C1}\u{53C2}\u{53C3}\u{53C4}\u{56DB}\u{58F1}\u{58F9}\u{5E7A}\u{5EFE}\u{5EFF}\u{5F0C}\u{5F0D}\u{5F0E}\u{5F10}\u{62FE}\u{634C}\u{67D2}\u{6F06}\u{7396}\u{767E}\u{8086}\u{842C}\u{8CAE}\u{8CB3}\u{8D30}\u{9621}\u{9646}\u{964C}\u{9678}\u{96F6}\u{F96B}\u{F973}\u{F978}\u{F9B2}\u{F9D1}\u{F9D3}\u{F9FD}\u{20001}\u{20064}\u{200E2}\u{20121}\u{2092A}\u{20983}\u{2098C}\u{2099C}\u{20AEA}\u{20AFD}\u{20B19}\u{22390}\u{22998}\u{23B1B}\u{2626D}\u{2F890}]/u;
 
 /**
- * `true` iff *value* contains a character that is numeric (by the test
- * above — a JS-reachable equivalent of Python's `str.isnumeric()`) but is
- * not plain ASCII `0`-`9`.
+ * `true` iff *value* contains a non-ASCII character that isn't clearly
+ * punctuation-or-letter — i.e. anything that might be a digit, including
+ * codepoints this engine's Unicode tables don't know yet.
  *
  * Iterates by Unicode code point (`for...of` on a string), not UTF-16 code
- * unit, so a supplementary-plane character (e.g. the Extension-B ideograph
- * U+20001, above) is tested whole rather than as two broken surrogate
- * halves.
+ * unit, so a supplementary-plane character is tested whole rather than as
+ * two broken surrogate halves. (The regex deliberately carries no `g`
+ * flag: a global regex keeps `lastIndex` across `.test()` calls and would
+ * alternate results on repeated input.)
  */
 function containsNonAsciiDigit(value: string): boolean {
   for (const ch of value) {
-    if (ch.codePointAt(0)! > 0x7f && NON_ASCII_NUMERIC_RE.test(ch)) return true;
+    if (ch.codePointAt(0)! <= 0x7f) continue;
+    if (CJK_NUMERALS_RE.test(ch)) return true;
+    if (!NON_ASCII_ALLOWED_RE.test(ch)) return true;
   }
   return false;
 }
