@@ -208,6 +208,17 @@ migration project of its own, not a config flip. ``app/config.py``'s
 ``APP_DATABASE_URL`` set (#22 safety review item 3), so this step cannot be
 silently skipped in production.
 
+OPERATOR NOTE (#174 follow-up safety review): a successful ``downgrade()``
+``DROP ROLE``s this same role, destroying the password
+``APP_DATABASE_URL`` authenticates with once the step above has been run
+in production. Separately, the unconditional ``ALTER ROLE app_role
+NOLOGIN`` in ``upgrade()`` (see below) strips ``LOGIN`` from a live
+production ``app_role`` on any re-run of this migration. Both fail loudly
+(request-path 500s), and webhook ingestion uses ``get_admin_session``, not
+``app_role``, so the emergency line survives either one. But neither is a
+benign no-op against a live production database: it is a "dashboard down
+at 2am" event a downgrade or re-run should not cause by accident.
+
 DOWNGRADE
 ---------
 Reverses upgrade() in dependency-safe order: drop all 13 policies, then
@@ -216,6 +227,19 @@ Reverses upgrade() in dependency-safe order: drop all 13 policies, then
 ``REVOKE ALL ON ALL TABLES/SEQUENCES IN SCHEMA public`` plus
 ``USAGE ON SCHEMA public`` — and finally drop the role itself, but ONLY if
 ``pg_shdepend`` shows no remaining cluster-wide dependents.
+
+That last ``REVOKE USAGE ON SCHEMA public FROM app_role`` does NOT, by
+itself, remove ``app_role``'s ability to reach schema ``public``: on a
+stock PG15 database, schema ``public`` retains its default
+``=U/pg_database_owner`` grant to ``PUBLIC``, so every role, ``app_role``
+included, still holds ``USAGE`` on it regardless of this explicit
+``REVOKE``. Harmless here (``app_role`` holds no table/sequence privileges
+left to exploit that ``USAGE`` with, given the two ``REVOKE`` statements
+above it), but this ``REVOKE`` only reverses ``upgrade()``'s own explicit
+``GRANT``, for symmetry; it does not close schema access on its own. Keep
+the corresponding ``GRANT USAGE ON SCHEMA public TO app_role`` in
+``upgrade()`` regardless: it is redundant on stock PG15 but not
+necessarily on Supabase, where schema-level default grants may differ.
 
 Table order within each of those first two blocks (#174, fixed after a
 flaky ``DeadlockDetectedError`` in ``tests/test_migrations.py::
@@ -227,21 +251,50 @@ still matters and is unchanged; it does not mean the 13 tables within a
 phase need to be touched in reverse-of-creation order, and reversing them
 was an unforced, deadlock-prone choice.
 
-That ``pg_shdepend`` guard reuses the exact pattern an earlier revision of
-migration 0004 used for its (since-removed) ``landlord_sync_role`` — see
+That ``pg_shdepend`` guard reuses the pattern an earlier revision of
+migration 0004 used for its (since-removed) ``landlord_sync_role``: see
 that revision's git history for the original writeup. Reason it matters:
 roles are CLUSTER-GLOBAL (not per-database). If a sibling database in the
 same Postgres cluster also has this migration applied, that other
 database's grants still reference ``app_role`` after THIS database's own
-``REVOKE`` above finishes, and an unconditional ``DROP ROLE`` would fail
+``REVOKE`` above finishes, and an unconditional ``DROP ROLE`` could fail
 ("role ... cannot be dropped because some objects depend on it"), rolling
 back this entire downgrade. ``pg_shdepend`` records every shared
-(cluster-wide) dependency on a role across ALL databases, so checking it —
-not just this database's local state — after our own ``REVOKE`` is the
-only reliable "is anything else still using this role" test. When the
-guard trips, the harmless NOLOGIN, now-privilege-free role is left in
-place rather than the downgrade failing outright — leaving a no-login,
-no-privilege role behind is a no-op from a security standpoint.
+(cluster-wide) dependency on a role across ALL databases, so checking it,
+not just this database's local state, after our own ``REVOKE`` is the
+right "is anything else still using this role" test.
+
+That guard's SELECT-then-DROP is NOT atomic, though, and the window is not
+narrow (#174 follow-up safety review, item 3; reproduced live against a
+throwaway Postgres 15 container). ``DropRole()`` takes the role's lock
+BEFORE it (unconditionally, inside Postgres core) re-checks shared
+dependencies against a dirty snapshot, so the sequence that breaks it is:
+a sibling database's session ``GRANT``s something referencing
+``app_role``, uncommitted; our guard's own ``SELECT`` (ordinary MVCC)
+never sees that uncommitted row, so it proceeds into ``DROP ROLE``;
+Postgres's own internal check inside ``DROP ROLE`` DOES see it
+(dirty-snapshot scan) and blocks (``XactLockTableWait``) until the
+sibling's transaction resolves; if it commits, ``DROP ROLE`` fails with
+exactly the error text above. Before this fix that failure was an
+uncaught PL/pgSQL exception, aborting the ENTIRE downgrade rather than
+just this guard. ``DROP ROLE`` now runs inside its own
+``BEGIN``/``EXCEPTION`` block catching ``dependent_objects_still_exist``,
+so a lost race degrades to the same, already-documented "leave the
+harmless, NOLOGIN, now-privilege-free role behind" outcome a guard that
+saw the dependency up front would have produced, never to an aborted
+downgrade. Leaving a no-login, no-privilege role behind remains a no-op
+from a security standpoint.
+
+The guard also now filters on ``refclassid = 'pg_authid'::regclass``, not
+just ``refobjid = 'app_role'::regrole``: ``pg_shdepend.refobjid`` also
+carries database and tablespace OIDs for other dependency kinds, so a bare
+``refobjid`` match risked a false-positive numeric-OID collision against
+some unrelated shared object. Fail-safe direction (a false positive only
+costs one extra "leave the role behind" cycle), so this was a precision
+fix, not a new safety hole; ``tests/test_migrations_0005.py``'s own
+``pg_shdepend`` helper already filtered on ``refclassid``, so the
+migration's own guard is now at least as strict as the test that exercises
+it.
 
 The step-4 anon/authenticated REVOKEs (both the direct one and the
 ``ALTER DEFAULT PRIVILEGES`` one) are deliberately NOT reversed here: we
@@ -270,7 +323,19 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     """Create app_role + grants, then enable RLS (no FORCE — see module
     docstring) with one policy per table (13 tables — every schema-v1.md
-    table except alembic_version)."""
+    table except alembic_version).
+
+    FIRST statement, before anything else: a per-database,
+    transaction-scoped advisory lock that serializes this function against
+    downgrade() below (#174 item 1). See downgrade()'s own docstring for
+    the full rationale."""
+
+    # ── serialize upgrade()/downgrade() of THIS migration against each
+    # other, per-database (#174 item 1, see downgrade()'s own docstring
+    # for the deadlock-cycle rationale this closes). Advisory locks are
+    # NOT cluster-global (they are keyed per-database), so this never
+    # contends with a sibling lane's own database. ──────────────────────
+    op.execute("SELECT pg_advisory_xact_lock(hashtext('stoop_migration_0005'))")
 
     # ── app_role: NOLOGIN, idempotent via catalog lookup (never pg_has_role) ──
     op.execute(
@@ -528,29 +593,104 @@ def downgrade() -> None:
     module docstring). The anon/authenticated REVOKEs from upgrade() are
     deliberately NOT reversed here (see module docstring "DOWNGRADE").
 
-    Table order in BOTH blocks below deliberately MATCHES upgrade()'s order
-    (properties, vendors, tenants, cases, messages, drafts, trust_metrics,
-    audit_log, notifications, push_tokens, landlords, message_cases,
-    message_status_events) rather than reversing it (#174). Each
-    ``DROP POLICY``/``DISABLE ROW LEVEL SECURITY`` statement takes an
+    FIRST statement (#174 item 1): the same per-database, transaction-
+    scoped ``pg_advisory_xact_lock(hashtext('stoop_migration_0005'))``
+    upgrade() takes as ITS first statement. This fully serializes any
+    upgrade() of this migration against any downgrade() of this migration
+    run concurrently against the SAME database: whichever gets there
+    first runs to completion (commit or rollback) before the other can
+    take a single lock of its own. That closes BOTH lock-ordering deadlock
+    cycles this migration can produce against itself:
+
+      - upgrade-first interleaving: upgrade()'s role AccessShare (GRANT,
+        ~line 357) -> properties AccessExclusive (~line 397), against
+        downgrade()'s properties AccessExclusive (the first DROP POLICY
+        below) -> role AccessExclusive (DROP ROLE, further below). The
+        table-order match described next happens to remove this cycle's
+        relation-vs-relation half too, but the advisory lock removes the
+        whole cycle outright, role lock included, independent of either
+        function's table order.
+      - downgrade-first interleaving: the same two lock pairs, acquired in
+        the other order. The original #174 safety review measured this
+        deadlocking 1/1 under BOTH the old and the new table order (5
+        trials each), before the advisory lock existed. Independently
+        reproduced here against the current (already-reordered) code, 5/5
+        trials, verbatim ``deadlock detected`` each time (``AccessExclusiveLock
+        on object ... of class 1260``, i.e. ``pg_authid``/``app_role``, vs.
+        ``AccessExclusiveLock on relation ...``, i.e. ``properties``). The
+        table reorder above never touched this half of the problem: it is
+        role-vs-relation, not relation-vs-relation, and involves only ONE
+        of the 13 tables regardless of what order the other 12 are touched
+        in. The advisory lock does close it: 0/5 trials deadlocked with it
+        in place, reproduced the same way.
+
+    Table order in BOTH blocks below still deliberately MATCHES upgrade()'s
+    order (properties, vendors, tenants, cases, messages, drafts,
+    trust_metrics, audit_log, notifications, push_tokens, landlords,
+    message_cases, message_status_events) rather than reversing it (#174).
+    Each ``DROP POLICY``/``DISABLE ROW LEVEL SECURITY`` statement takes an
     ACCESS EXCLUSIVE lock on its table; an EARLIER revision of this
     downgrade walked the 13 tables in the exact REVERSE of upgrade()'s
-    order, which is the textbook setup for a lock-ordering deadlock
-    (Postgres docs, "Explicit Locking": concurrent transactions that lock
-    the same objects in different orders can deadlock) the moment any
-    OTHER session ever acquires locks across two-or-more of these same
-    tables in upgrade()'s order while this downgrade is running — e.g. a
-    concurrent upgrade of this same migration (multi-worktree/lane-DB
-    topology, #193) or, more plausibly in this app's own read/write shape,
-    a query that touches several RLS tables in creation order (a JOIN or a
-    multi-table cleanup). Matching the order removes that specific,
-    self-inflicted deadlock class; it does not (and cannot, from inside a
-    single migration file) prevent contention with an arbitrary unrelated
-    transaction touching an overlapping but differently-ordered subset of
-    tables — full isolation (a dedicated database/lane per concurrent
-    migration run) is the only complete fix for that, and is already this
-    repo's convention for concurrent local/CI runs.
+    order, which is the textbook setup for a relation-vs-relation
+    lock-ordering deadlock (Postgres docs, "Explicit Locking") against a
+    concurrent upgrade() of this same migration run against the same
+    database. The advisory lock above makes that self-vs-self scenario
+    moot (the two paths can no longer even be mid-flight at the same
+    time), but the reorder is kept regardless: it is correct, state-
+    neutral (proved by catalog snapshots across round trips in both
+    orders), and costs nothing.
+
+    Two claims from an earlier revision of this docstring did not hold up
+    and are corrected here rather than repeated (#174 follow-up safety
+    review, item 2):
+
+      - "a concurrent upgrade of this same migration (multi-worktree/
+        lane-DB topology, #193)" is not a scenario the table reorder ever
+        addressed. Relation locks are database-scoped
+        (``pg_locks.database`` is non-null for ``locktype='relation'``),
+        and the lane-DB topology gives every lane its own database, so two
+        lanes never contend on a relation lock at all; the reorder was a
+        no-op for that topology either way. The only object lanes share is
+        the cluster-global ``app_role`` role itself (see the
+        ``pg_shdepend`` guard below), not any of these tables.
+      - "a query that touches several RLS tables in creation order (a JOIN
+        or a multi-table cleanup)" was unverified and, on inspection,
+        unsupported: nothing in ``apps/api/app/`` orders table access by
+        migration creation order, and a JOIN's lock acquisition order is
+        planner-determined, not source-text order.
+
+    The scenario this migration's own history DOES demonstrate (container
+    logs, #174; and the two interleavings measured above) is simpler: this
+    migration's own upgrade() and downgrade() paths, run concurrently
+    against the same database, fighting each other. That is exactly what
+    the advisory lock above closes, directly, rather than via lock-order
+    matching alone.
+
+    SAFETY OF THE INTERMEDIATE WINDOW (#174 item 4): between the first
+    ``DROP POLICY`` below and the last ``DISABLE ROW LEVEL SECURITY``, a
+    table already touched is RLS-enabled-but-policy-free (deny-all, not
+    allow-all) or, after its own ``DISABLE`` statement, unprotected
+    entirely. That no concurrent session can observe a policy-free
+    ``properties``, ``vendors``, ``tenants``, ``cases``, or ``messages``
+    row (addresses, tenant identities, message bodies) rests ENTIRELY on
+    this whole downgrade running as a single transaction: ``migrations/
+    env.py`` wraps the full migration chain in one transaction and Alembic
+    logs "Will assume transactional DDL", so no other session's snapshot
+    can observe an in-progress DDL change here today. If these statements
+    are ever run statement-by-statement instead (a psql paste during an
+    incident, a switch to ``transaction_per_migration``, a backend without
+    transactional DDL), the table order below INVERTS which tables are
+    exposed longest, for the worse: ``properties``, ``vendors``,
+    ``tenants``, ``cases``, ``messages`` now go policy-free FIRST and stay
+    exposed LONGEST, where the old (reversed) order stripped delivery
+    receipts and join rows first and kept ``properties`` protected until
+    the last statement. Recording the trade here so nobody later optimizes
+    the transaction boundary away without seeing what it was buying.
     """
+
+    # ── serialize against a concurrent upgrade() of this same migration,
+    # per-database (#174 item 1, see docstring above) ─────────────────────
+    op.execute("SELECT pg_advisory_xact_lock(hashtext('stoop_migration_0005'))")
 
     # ── drop policies (same table order as upgrade() — see docstring above) ─
     op.execute("DROP POLICY IF EXISTS properties_isolation ON properties")
@@ -601,9 +741,26 @@ def downgrade() -> None:
             REVOKE USAGE ON SCHEMA public FROM app_role;
             IF NOT EXISTS (
               SELECT 1 FROM pg_shdepend
-              WHERE refobjid = 'app_role'::regrole
+              WHERE refclassid = 'pg_authid'::regclass
+                AND refobjid = 'app_role'::regrole
             ) THEN
-              DROP ROLE app_role;
+              -- TOCTOU (#174 item 3): this snapshot read and the DROP
+              -- below are not atomic. DROP ROLE re-checks shared
+              -- dependencies itself, against a dirty snapshot, after it
+              -- has already taken the role's lock: a sibling database's
+              -- session can GRANT something referencing app_role,
+              -- uncommitted, right after our SELECT above returned zero
+              -- rows. DROP ROLE then blocks on that session and, if it
+              -- commits, fails with "cannot be dropped because some
+              -- objects depend on it". A lost race must degrade to the
+              -- same "leave the harmless role behind" outcome this guard
+              -- already documents, never abort the whole downgrade.
+              BEGIN
+                DROP ROLE app_role;
+              EXCEPTION WHEN dependent_objects_still_exist THEN
+                RAISE NOTICE
+                  'app_role retained: a sibling database took a dependency mid-downgrade';
+              END;
             END IF;
           END IF;
         END $$;

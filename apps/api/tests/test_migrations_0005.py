@@ -871,3 +871,169 @@ async def test_reupgrade_restores_0005_state(db: AsyncEngine) -> None:
             )
         )
         assert rls_result.scalar_one() == expected_table_count
+
+
+# ---------------------------------------------------------------------------
+# 7. #174 item 3 -- the pg_shdepend guard's TOCTOU: a peer database's
+# uncommitted GRANT, still invisible when our own snapshot check runs, must
+# never abort the whole downgrade once DROP ROLE's own (dirty-snapshot)
+# internal check catches it later. MUST run last (like section 6 above): it
+# mutates schema state (drops the 13 policies, disables RLS, revokes and
+# restores app_role's grants) for the remainder of the session, and restores
+# full 0005-head state itself in a ``finally`` block rather than relying on
+# a test that runs after it.
+# ---------------------------------------------------------------------------
+
+_PEER_DUMMY_TABLE = "_stoop_0005_toctou_peer_dummy"
+
+
+def _extract_role_drop_guard_sql() -> str:
+    """Pull the exact ``DO $$ ... $$;`` block that revokes app_role's
+    grants and (guarded) drops the role, verbatim from the migration
+    source -- never hand-duplicated here, so this test can never pass
+    against a guard it isn't actually exercising (#174 item 3)."""
+    content = _MIGRATION_PATH.read_text()
+    matches = re.findall(r'op\.execute\(\s*"""(.*?)"""\s*\)', content, re.S)
+    guard_sql = matches[-1].strip()
+    assert "DROP ROLE app_role" in guard_sql
+    assert "dependent_objects_still_exist" in guard_sql, (
+        "the extracted guard block no longer catches dependent_objects_still_exist -- "
+        "either the #174 item 3 fix regressed, or this extraction picked up the wrong "
+        "op.execute(...) block and needs updating"
+    )
+    return guard_sql
+
+
+def _peer_db_url() -> str:
+    """Same cluster, different database ('postgres', which every real
+    Postgres install carries) -- stands in for a sibling lane database
+    (#193 topology) without needing a second throwaway container."""
+    return re.sub(r"/[^/]+$", "/postgres", _get_db_url())
+
+
+@pytest.mark.integration
+async def test_downgrade_role_guard_survives_cross_database_toctou_race(
+    db: AsyncEngine,
+) -> None:
+    """Reproduces the exact race a #174 follow-up safety review found live:
+    a peer database's session GRANTs something referencing ``app_role``,
+    uncommitted, after this database's own guard SELECT already returned
+    zero rows; Postgres's own internal check inside DROP ROLE (a dirty
+    snapshot) DOES see it, blocks until the peer's transaction resolves,
+    and -- before the #174 item 3 fix -- failed and aborted the whole
+    downgrade the instant the peer committed. The fixed guard must instead
+    complete cleanly with app_role retained.
+    """
+    peer_engine = create_async_engine(_peer_db_url(), echo=False)
+    try:
+        async with peer_engine.connect() as probe:
+            await probe.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001
+        await peer_engine.dispose()
+        pytest.skip(f"peer database 'postgres' unreachable in this cluster: {exc}")
+
+    guard_sql = _extract_role_drop_guard_sql()
+
+    try:
+        # ── set up the exact pre-guard state downgrade() itself reaches:
+        # all 13 policies gone, RLS disabled everywhere (table order does
+        # not matter here -- no concurrent contention during setup) ───────
+        async with db.connect() as setup_conn:
+            trans = await setup_conn.begin()
+            for table in _ALL_RLS_TABLES:
+                await setup_conn.execute(
+                    text(f"DROP POLICY IF EXISTS {table}_isolation ON {table}")
+                )
+                await setup_conn.execute(text(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"))
+            await trans.commit()
+
+        async with db.connect() as verify_conn:
+            local_dependents = (
+                await verify_conn.execute(
+                    text(
+                        "SELECT count(*) FROM pg_shdepend sd "
+                        "JOIN pg_database d ON d.oid = sd.dbid "
+                        "WHERE sd.refclassid = 'pg_authid'::regclass "
+                        "AND sd.refobjid = 'app_role'::regrole "
+                        "AND d.datname = current_database()"
+                    )
+                )
+            ).scalar_one()
+            # Grants (not yet revoked -- that's inside guard_sql itself)
+            # still count as local dependents at this point; only the 13
+            # policy-type dependents are gone. Just confirms setup landed.
+            assert local_dependents > 0, "setup should still show pre-revoke grant dependents"
+
+        peer_ready = asyncio.Event()
+
+        async def _peer() -> None:
+            async with peer_engine.connect() as connection:
+                trans = await connection.begin()
+                try:
+                    await connection.execute(
+                        text(f"CREATE TABLE IF NOT EXISTS {_PEER_DUMMY_TABLE} (id int)")
+                    )
+                    await connection.execute(
+                        text(f"GRANT SELECT ON {_PEER_DUMMY_TABLE} TO app_role")
+                    )
+                    # Uncommitted from here -- signal the guard to run
+                    # while this GRANT is still invisible to it.
+                    peer_ready.set()
+                    await asyncio.sleep(1.0)
+                    await trans.commit()
+                except Exception:
+                    await trans.rollback()
+                    raise
+
+        async def _guard() -> None:
+            await peer_ready.wait()
+            async with db.connect() as connection:
+                trans = await connection.begin()
+                await connection.execute(text(guard_sql))
+                await trans.commit()
+
+        # Both coroutines run genuinely concurrently; _guard() only starts
+        # once _peer()'s GRANT has been issued (uncommitted), matching the
+        # exact ordering the live reproduction used.
+        await asyncio.gather(_guard(), _peer())
+
+        async with db.connect() as final_conn:
+            role_row = (
+                await final_conn.execute(
+                    text("SELECT rolname FROM pg_roles WHERE rolname = 'app_role'")
+                )
+            ).one_or_none()
+            assert role_row is not None, (
+                "app_role must be RETAINED (never dropped, never an aborted "
+                "downgrade) when a peer database wins this race -- see #174 item 3"
+            )
+
+        async with peer_engine.connect() as peer_verify:
+            peer_dependents = (
+                await peer_verify.execute(
+                    text(
+                        "SELECT count(*) FROM pg_shdepend sd "
+                        "JOIN pg_database d ON d.oid = sd.dbid "
+                        "WHERE sd.refclassid = 'pg_authid'::regclass "
+                        "AND sd.refobjid = 'app_role'::regrole "
+                        "AND d.datname = current_database()"
+                    )
+                )
+            ).scalar_one()
+            assert peer_dependents > 0, (
+                "the peer's GRANT must have actually committed (a real dependency), "
+                "otherwise this test proves nothing about the race"
+            )
+    finally:
+        async with peer_engine.connect() as cleanup_conn:
+            trans = await cleanup_conn.begin()
+            await cleanup_conn.execute(text(f"DROP TABLE IF EXISTS {_PEER_DUMMY_TABLE}"))
+            await trans.commit()
+        await peer_engine.dispose()
+
+        # Full reset -- restores 0005-head state regardless of pass/fail,
+        # rather than leaving the session's shared database in the
+        # policy-free, RLS-disabled state this test's setup put it in.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: _alembic("downgrade", "base"))
+        await loop.run_in_executor(None, lambda: _alembic("upgrade", "head"))
