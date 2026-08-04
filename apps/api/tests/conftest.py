@@ -77,6 +77,40 @@ for _key, _value in _PLACEHOLDER_ENV.items():
 # (see the debugging playbook) is the real fix, not a bigger assertion.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Another dirty-DB mechanism (#281), distinct from the sender_tick one
+# above: migration 0009's downgrade() intentionally FAILS CLOSED (raises,
+# rolls back, stays at revision 0009) if a `tenant_ack`/`degraded_retry`
+# row still exists in `notifications` -- see that migration's own module
+# docstring, "ROUND-TRIP" section, for the full hazard analysis. A full
+# test-suite run killed mid-flight (Ctrl-C, OOM, a crashed worker) can
+# leave exactly such a row behind. From then on, EVERY `_migrate_once`
+# -style session fixture that does `downgrade base` -> `upgrade head`
+# (~19 modules: every `test_migrations_000N.py`, plus
+# `test_rls_isolation.py`, `test_rls_isolation_matrix.py`,
+# `test_checkpointer.py`, `test_require_landlord.py`) genuinely fails,
+# deterministically, against that same lane database -- a cascade of
+# ~200 confusing setup errors with nothing pointing at the actual cause.
+#
+# Those ~19 fixtures now share their downgrade-base/upgrade-head sequence
+# via `tests/migration_harness.py::migrate_from_base_to_head()` (imported,
+# not duplicated -- see that module's docstring for why this one piece was
+# extracted while each file's own `_get_db_url`/`_alembic` stay local).
+# That shared function catches exactly this failure shape and re-raises
+# `migration_harness.LaneDatabaseNeedsRecreateError` naming the cause and
+# the remedy (recreate the lane database), chained onto the original
+# `RuntimeError` so the raw alembic/Postgres output is still visible.
+# It does NOT catch any other alembic failure, and does NOT touch
+# migration 0011's structurally-identical `number_release` guard on the
+# same constraint (a separate, un-fixed instance of the same mechanism --
+# see `migration_harness.py` for that note).
+#
+# If you hit the RAW cascade instead of the friendly message (e.g. from a
+# migration test module that predates this fix, or a fixture that calls
+# alembic directly rather than through the harness), the fix is the same
+# either way: recreate the lane database, don't chase it as a code defect.
+# ---------------------------------------------------------------------------
+
 
 @pytest.fixture(autouse=True)
 def _reset_jwks_auth_state() -> Iterator[None]:

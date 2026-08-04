@@ -38,6 +38,8 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from tests import migration_harness
+
 # ---------------------------------------------------------------------------
 # Helpers — duplicated (not imported) from tests/test_migrations_0006.py, to
 # keep this module self-contained (established convention in this repo).
@@ -69,9 +71,15 @@ def _alembic(*args: str) -> None:
 
 @pytest.fixture(scope="session", autouse=False)
 def _migrate_once() -> None:  # type: ignore[misc]
-    """Apply migrations exactly once per test session (ends at head/0007)."""
-    _alembic("downgrade", "base")
-    _alembic("upgrade", "head")
+    """Apply migrations exactly once per test session (ends at head/0007).
+
+    Delegates to ``tests.migration_harness.migrate_from_base_to_head`` —
+    see that module's docstring for why (issue #281: migration 0009's
+    fail-closed downgrade guard turning into a confusing ~200-error
+    cascade when a lane database has a leftover tenant_ack/degraded_retry
+    row from an interrupted prior run).
+    """
+    migration_harness.migrate_from_base_to_head(_alembic)
     yield
     # Leave schema in place; CI drops the DB container after the run.
 

@@ -75,6 +75,7 @@ import app.db.session as db_session_mod
 from app.deps import Landlord, require_landlord
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthUser
+from tests import migration_harness
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -108,9 +109,15 @@ def _alembic(*args: str) -> None:
 
 @pytest.fixture(scope="session", autouse=False)
 def _migrate_once() -> None:  # type: ignore[misc]
-    """Apply migrations exactly once per test session (ends at head/0005)."""
-    _alembic("downgrade", "base")
-    _alembic("upgrade", "head")
+    """Apply migrations exactly once per test session (ends at head/0005).
+
+    Delegates to ``tests.migration_harness.migrate_from_base_to_head`` —
+    see that module's docstring for why (issue #281: migration 0009's
+    fail-closed downgrade guard turning into a confusing ~200-error
+    cascade when a lane database has a leftover tenant_ack/degraded_retry
+    row from an interrupted prior run).
+    """
+    migration_harness.migrate_from_base_to_head(_alembic)
     yield
     # Leave schema in place; CI drops the DB container after the run.
 
