@@ -89,18 +89,34 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
 
   const approveMutation = useMutation({
     mutationFn: (ctx: DraftContext) => approveDraft(ctx.draftId),
+    // A1 (#263, ported from apps/web/src/features/queue/useDraftActions.ts):
+    // guarded so a throw in this block (the only realistic thrower is an
+    // empty/unparsable 2xx body reaching `result.data.undo_until` — H3
+    // above makes that throw earlier, in the client, but this stays
+    // defensive) can't be routed into `onError` by react-query, which
+    // wraps mutationFn + onSuccess + onSettled in ONE try/catch and calls
+    // onError for a throw from ANY of them. Without this guard, our own
+    // bookkeeping breaking here would present as a REJECTED approve — the
+    // request already succeeded server-side, so `handleError`'s "cleared"
+    // dispatch would wrongly revert the card to an approvable-looking
+    // state on a reply that's already sending.
     onSuccess: (result, ctx) => {
-      const approvedAtClient = Date.now();
-      dispatch({
-        type: "approved",
-        draftId: ctx.draftId,
-        undoExpiresAtClient: computeUndoExpiresAt(
-          result.data.undo_until,
-          result.dateHeader,
+      try {
+        const approvedAtClient = Date.now();
+        dispatch({
+          type: "approved",
+          draftId: ctx.draftId,
+          undoExpiresAtClient: computeUndoExpiresAt(
+            result.data.undo_until,
+            result.dateHeader,
+            approvedAtClient,
+          ),
           approvedAtClient,
-        ),
-        approvedAtClient,
-      });
+        });
+      } catch {
+        onNotice("That went through, but the on-screen countdown didn't update.");
+        onSettled();
+      }
     },
     onError: handleError,
   });
@@ -132,19 +148,28 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
 
   const editMutation = useMutation({
     mutationFn: (ctx: DraftContext & { body: string }) => editAndSendDraft(ctx.draftId, ctx.body),
+    // A1, same reasoning as approve's onSuccess above — the edit-and-send
+    // request already succeeded server-side, so a throw in this block must
+    // never be presented as a rejected send.
     onSuccess: (result, ctx) => {
-      const approvedAtClient = Date.now();
-      dispatch({
-        type: "approved",
-        draftId: ctx.draftId,
-        undoExpiresAtClient: computeUndoExpiresAt(
-          result.data.undo_until,
-          result.dateHeader,
+      try {
+        const approvedAtClient = Date.now();
+        dispatch({
+          type: "approved",
+          draftId: ctx.draftId,
+          undoExpiresAtClient: computeUndoExpiresAt(
+            result.data.undo_until,
+            result.dateHeader,
+            approvedAtClient,
+          ),
           approvedAtClient,
-        ),
-        approvedAtClient,
-      });
-      setEditingContext(null);
+        });
+        setEditingContext(null);
+      } catch {
+        onNotice("That went through, but the on-screen countdown didn't update.");
+        onSettled();
+        setEditingContext(null);
+      }
     },
     onError: (error, ctx) => {
       handleError(error, ctx);

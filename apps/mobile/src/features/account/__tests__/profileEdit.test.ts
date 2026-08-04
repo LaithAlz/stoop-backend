@@ -7,10 +7,10 @@
 import { buildMeUpdatePayload, phoneLooksValid } from "../profileEdit";
 
 describe("buildMeUpdatePayload", () => {
-  it("sends both fields when both changed", () => {
+  it("sends both fields when both changed, phone normalized to E.164", () => {
     expect(
       buildMeUpdatePayload({ name: "Sarah Chen", phone: "(416) 555-0134" }, { full_name: null }),
-    ).toEqual({ full_name: "Sarah Chen", phone: "(416) 555-0134" });
+    ).toEqual({ full_name: "Sarah Chen", phone: "+14165550134" });
   });
 
   it("omits an unchanged name — a phone-only edit never re-writes the name", () => {
@@ -19,7 +19,12 @@ describe("buildMeUpdatePayload", () => {
         { name: "Sarah Chen", phone: "(416) 555-0134" },
         { full_name: "Sarah Chen" },
       ),
-    ).toEqual({ phone: "(416) 555-0134" });
+    ).toEqual({ phone: "+14165550134" });
+  });
+
+  it("#269: never sends an un-normalizable phone, raw or otherwise", () => {
+    const payload = buildMeUpdatePayload({ name: "", phone: "n/a" }, { full_name: null });
+    expect(payload).toBeNull();
   });
 
   it("a blank phone means 'keep the number on file' — omitted, NEVER null", () => {

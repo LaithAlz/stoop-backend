@@ -46,7 +46,13 @@ export default function AboutYouStep() {
       ),
   });
 
-  const phoneError = phoneLooksValid(phone) ? null : "Use a 10-digit phone number.";
+  // #269: the message now matches what src/lib/phone.ts's `phoneLooksValid`
+  // actually checks (10 digits, 11 starting with 1, or a + and country
+  // code) — the old "Use a 10-digit phone number." line was already
+  // inaccurate for the +country escape hatch this form has always accepted.
+  const phoneError = phoneLooksValid(phone)
+    ? null
+    : "Use 10 digits, 11 starting with 1, or + and your country code.";
 
   function handleContinue() {
     setSubmitted(true);
