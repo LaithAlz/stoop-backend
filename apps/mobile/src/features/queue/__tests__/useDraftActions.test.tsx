@@ -148,11 +148,20 @@ describe("useDraftActions — undo 409 already_sent (M1 advisory)", () => {
    */
   it("anchors the stored expiry to the response's Date header, not the device clock", async () => {
     const serverNow = new Date(Date.now() - 600_000); // device runs 10 min fast
+    // CI-reviewer finding: the fixture window MUST differ from
+    // UNDO_WINDOW_FALLBACK_MS (queueEntries.ts, 5_000). At 5_000 the
+    // no-anchor fallback value (receivedAtClient + 5_000) lands inside the
+    // same assertion range as the correctly-anchored value, so the two
+    // mutants this test exists to catch (dateHeader -> null; reverting to
+    // Date.parse(result.data.undo_until)) both leave the suite green. 60s
+    // is the server's real contract window and is far enough from the
+    // fallback that only the correctly-anchored math can satisfy the
+    // delta assertion below.
     mockApprove.mockResolvedValue({
       data: {
         status: "approved",
-        scheduled_send_at: new Date(serverNow.getTime() + 5_000).toISOString(),
-        undo_until: new Date(serverNow.getTime() + 5_000).toISOString(),
+        scheduled_send_at: new Date(serverNow.getTime() + 60_000).toISOString(),
+        undo_until: new Date(serverNow.getTime() + 60_000).toISOString(),
       },
       dateHeader: serverNow.toUTCString(),
     });
@@ -168,10 +177,13 @@ describe("useDraftActions — undo 409 already_sent (M1 advisory)", () => {
 
     const entry = result.current.entries["draft-1"];
     if (entry?.status !== "sending") throw new Error("expected a sending entry");
-    // Anchored: expiry lands ~5s from RECEIPT on the device clock. Under
-    // the old math it would be 10 minutes in the past → instant expiry.
-    expect(entry.undoExpiresAtClient).toBeGreaterThanOrEqual(before);
-    expect(entry.undoExpiresAtClient).toBeLessThanOrEqual(Date.now() + 6_000);
+    // Anchored: expiry lands ~60s from RECEIPT on the device clock. Under
+    // the old math (server timestamp compared to the device's OWN, 10
+    // minutes fast, clock) it would be roughly 9 minutes in the past,
+    // i.e. instant expiry, not ~60s out.
+    const delta = entry.undoExpiresAtClient - before;
+    expect(delta).toBeGreaterThan(30_000);
+    expect(delta).toBeLessThanOrEqual(62_000);
   });
 });
 
