@@ -18,8 +18,18 @@ import { queryClient } from "@/api/queryClient";
 import { resetOnboardingOffer } from "@/features/onboarding/gate";
 import {
   clearRegisteredDeviceId,
+  reconcileStaleDeviceRegistration,
   unregisterCurrentDeviceBestEffort,
 } from "@/features/push/deviceRegistration";
+
+/** B3-5 (#284): `ok: false` means `supabase.auth.signOut()` came back with
+ *  an error and, per auth-js's own `_signOut` (GoTrueClient.ts), the LOCAL
+ *  session was never actually cleared - see `signOut` below for exactly
+ *  why. The Me tab uses this to tell the landlord honestly rather than the
+ *  fire-and-forget it used to be. */
+interface SignOutResult {
+  ok: boolean;
+}
 
 interface AuthContextValue {
   session: Session | null;
@@ -27,7 +37,7 @@ interface AuthContextValue {
    *  window before we know whether to show sign-in or the tabs. */
   initializing: boolean;
   signIn: (email: string, password: string) => Promise<{ error: string | null }>;
-  signOut: () => Promise<void>;
+  signOut: () => Promise<SignOutResult>;
 }
 
 // Customer-facing copy rule (CLAUDE.md rule 8 / copy-guardian, M0 review):
@@ -103,15 +113,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       initializing,
       signIn: async (email, password) => {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (!error) {
+          // B3-8 (#284): fire-and-forget, never awaited or allowed to
+          // affect this sign-in's own result. See
+          // deviceRegistration.ts's `reconcileStaleDeviceRegistration`
+          // docstring for what this cleans up and why it's called here -
+          // the first moment after a sign-in this device has both a live
+          // token again and (if the landlord left one behind on a forced
+          // or offline sign-out) a stale server-side device registration
+          // still worth clearing out.
+          void reconcileStaleDeviceRegistration();
+        }
         return { error: error ? toHouseAuthError(error) : null };
       },
-      signOut: async () => {
+      signOut: async (): Promise<SignOutResult> => {
         // M3: unregister this device BEFORE invalidating the session — the
         // DELETE needs a still-live bearer token (src/api/client.ts reads
         // it fresh from the current supabase session on every call), which
         // is gone the instant supabase.auth.signOut() below completes.
         // Bounded + best-effort (deviceRegistration.ts's own docstring) —
-        // this can never throw or hang sign-out.
+        // this can never throw or hang sign-out. B3-8: when this can't
+        // complete (e.g. offline), the id it would have unregistered is
+        // durably persisted there and retried on the next successful
+        // sign-in instead of lost.
         await unregisterCurrentDeviceBestEffort();
         // B3 (#263, ported from apps/web/src/auth/AuthProvider.tsx):
         // `scope: "local"` - supabase-js defaults `signOut()` to
@@ -125,7 +149,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // push - CLAUDE.md rule 1, apps/api/app/push_outbox.py - so a
         // sign-out on one device never affects whether the emergency
         // chain can still reach the landlord.)
-        await supabase.auth.signOut({ scope: "local" });
+        //
+        // B3-5 (#284): auth-js's own `_signOut` (GoTrueClient.ts) calls
+        // the `/logout` endpoint FIRST and, when that call fails with
+        // anything other than a 404/401/403/session-missing (the cases it
+        // already treats as "nothing left to log out of"), returns that
+        // error WITHOUT ever calling its local `_removeSession()` - a
+        // retryable fetch error (no connection - the concrete "signing out
+        // on the subway" case this finding names) takes that exact branch.
+        // So a non-null `error` here is not a maybe: this device's local
+        // session, and the working bearer token src/api/client.ts reads
+        // fresh from `getSession()` on every request, are BOTH still
+        // fully live.
+        //
+        // Deliberately NOT force-clearing the local session ourselves on
+        // that path. "Sign out" is a security action - the wrong failure
+        // direction is claiming success on a device that's still fully
+        // signed in - but the only way to force a clear here would be
+        // reaching past this SDK's public API into its private storage
+        // internals (there is no supported "local-only, no network"
+        // signOut), which would (a) leave supabase-js's own in-memory
+        // session cache untouched anyway, so `getSession()` and every
+        // subsequent `apiRequest` bearer token would still work exactly as
+        // before behind a UI now falsely showing signed-out, and (b)
+        // duplicate exactly the kind of undocumented-internals coupling
+        // that produced B3-3's finding above. An honest failure the Me tab
+        // can surface (see `SignOutResult`) is the safer and the more
+        // maintainable choice; the landlord can retry once back online.
+        const { error } = await supabase.auth.signOut({ scope: "local" });
+        return { ok: !error };
       },
     }),
     [session, initializing],

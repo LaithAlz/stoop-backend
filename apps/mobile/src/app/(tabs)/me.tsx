@@ -42,6 +42,14 @@ import {
   PUSH_SECTION_TITLE,
 } from "@/features/push/pushCopy";
 
+// B3-5 (#284): shown only when `signOut()` comes back `{ ok: false }` -
+// see AuthProvider.tsx's `signOut` docstring for exactly when that is (a
+// `/logout` call that failed to reach Stoop, most commonly offline). Same
+// house-voice shape as the network_error message src/api/client.ts already
+// uses elsewhere in this app, reused rather than inventing new copy for the
+// same underlying situation.
+const SIGN_OUT_FAILED_NOTICE = "Couldn't reach Stoop. Check your connection and try again.";
+
 export default function MeScreen() {
   const { session, signOut } = useAuth();
   const meQuery = useMe();
@@ -91,6 +99,19 @@ export default function MeScreen() {
       { text: "Cancel", style: "cancel" },
       { text: copy.confirmLabel, style: "destructive", onPress: () => revokeMutation.mutate() },
     ]);
+  }
+
+  // B3-5 (#284): `signOut()` used to be fire-and-forget here, so an
+  // offline "Sign out" (auth-js's `_signOut` skips clearing the local
+  // session when its own `/logout` call fails - see AuthProvider.tsx's
+  // `signOut` docstring) left the landlord still signed in with no signal
+  // that anything went wrong. Silent on success (matches every other
+  // action on this screen); only speaks up on the honest failure.
+  async function handleSignOut() {
+    const result = await signOut();
+    if (!result.ok) {
+      Alert.alert("Stoop", SIGN_OUT_FAILED_NOTICE);
+    }
   }
 
   return (
@@ -182,7 +203,12 @@ export default function MeScreen() {
           </View>
         ) : null}
 
-        <Button label="Sign out" variant="ghost" onPress={() => void signOut()} testID="sign-out" />
+        <Button
+          label="Sign out"
+          variant="ghost"
+          onPress={() => void handleSignOut()}
+          testID="sign-out"
+        />
       </ScrollView>
 
       <ProfileEditModal

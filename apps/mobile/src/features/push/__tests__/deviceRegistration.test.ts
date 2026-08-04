@@ -4,7 +4,9 @@
  * network, no real native module). Covers the brief's explicit list:
  * registration-on-sign-in, the token→POST payload shape, the
  * permission-denied path, the founder-gated (no EAS projectId) no-op, and
- * unregister-on-sign-out.
+ * unregister-on-sign-out. Also covers #284's B3-8: the durable SecureStore
+ * marker that survives a forced/offline sign-out, and its one-shot
+ * reconcile-on-next-sign-in cleanup.
  */
 import { Platform } from "react-native";
 import Constants from "expo-constants";
@@ -13,6 +15,7 @@ import {
   clearRegisteredDeviceId,
   getPushPermissionState,
   getRegisteredDeviceId,
+  reconcileStaleDeviceRegistration,
   registerForPushNotificationsAsync,
   requestPushPermission,
   unregisterCurrentDeviceBestEffort,
@@ -29,6 +32,16 @@ jest.mock("expo-notifications", () => ({
   getExpoPushTokenAsync: (options: unknown) => mockGetExpoPushToken(options),
   setNotificationChannelAsync: (id: string, config: unknown) => mockSetChannel(id, config),
   AndroidImportance: { DEFAULT: 5 },
+}));
+
+const mockSecureGetItem = jest.fn();
+const mockSecureSetItem = jest.fn();
+const mockSecureDeleteItem = jest.fn();
+
+jest.mock("expo-secure-store", () => ({
+  getItemAsync: (key: string) => mockSecureGetItem(key),
+  setItemAsync: (key: string, value: string) => mockSecureSetItem(key, value),
+  deleteItemAsync: (key: string) => mockSecureDeleteItem(key),
 }));
 
 // Inline factory (no external ref — avoids the babel-jest-hoist TDZ where a
@@ -76,6 +89,9 @@ beforeEach(() => {
     created_at: "2026-07-21T00:00:00Z",
   });
   mockUnregisterDevice.mockResolvedValue({ status: "deleted" });
+  mockSecureGetItem.mockResolvedValue(null);
+  mockSecureSetItem.mockResolvedValue(undefined);
+  mockSecureDeleteItem.mockResolvedValue(undefined);
 });
 
 afterAll(() => setPlatform("ios"));
@@ -211,5 +227,78 @@ describe("unregisterCurrentDeviceBestEffort — the sign-out path", () => {
 
     await expect(unregisterCurrentDeviceBestEffort()).resolves.toBeUndefined();
     expect(getRegisteredDeviceId()).toBeNull();
+  });
+
+  // B3-8 (#284): the durable marker, separate from the in-memory
+  // `registeredDeviceId` above.
+  it("clears the durable SecureStore marker too, on a confirmed successful DELETE", async () => {
+    await registerForPushNotificationsAsync();
+    expect(mockSecureSetItem).toHaveBeenCalledWith(expect.any(String), "dev-1");
+
+    await unregisterCurrentDeviceBestEffort();
+
+    expect(mockSecureDeleteItem).toHaveBeenCalledWith(expect.any(String));
+  });
+
+  it("leaves the durable SecureStore marker in place when the DELETE fails — B3-8's reconcile step is what's supposed to catch this", async () => {
+    await registerForPushNotificationsAsync();
+    mockUnregisterDevice.mockRejectedValue(new Error("network"));
+
+    await unregisterCurrentDeviceBestEffort();
+
+    expect(mockSecureDeleteItem).not.toHaveBeenCalled();
+  });
+});
+
+describe("B3-8 (#284): registerForPushNotificationsAsync persists a durable marker", () => {
+  it("writes the returned device id to SecureStore alongside the in-memory id", async () => {
+    const id = await registerForPushNotificationsAsync();
+
+    expect(id).toBe("dev-1");
+    expect(mockSecureSetItem).toHaveBeenCalledWith(expect.any(String), "dev-1");
+  });
+
+  it("still returns the device id even when the SecureStore write itself fails (never turns a successful POST into a failed registration)", async () => {
+    mockSecureSetItem.mockRejectedValue(new Error("keychain write failed"));
+
+    await expect(registerForPushNotificationsAsync()).resolves.toBe("dev-1");
+    expect(getRegisteredDeviceId()).toBe("dev-1");
+  });
+});
+
+describe("reconcileStaleDeviceRegistration — B3-8's reconcile-on-next-sign-in cleanup", () => {
+  it("does nothing when there is no persisted marker", async () => {
+    mockSecureGetItem.mockResolvedValue(null);
+
+    await reconcileStaleDeviceRegistration();
+
+    expect(mockUnregisterDevice).not.toHaveBeenCalled();
+    expect(mockSecureDeleteItem).not.toHaveBeenCalled();
+  });
+
+  it("DELETEs the persisted stale device id and clears the marker on success", async () => {
+    mockSecureGetItem.mockResolvedValue("dev-stale-from-a-forced-signout");
+
+    await reconcileStaleDeviceRegistration();
+
+    expect(mockUnregisterDevice).toHaveBeenCalledWith("dev-stale-from-a-forced-signout");
+    expect(mockSecureDeleteItem).toHaveBeenCalledWith(expect.any(String));
+  });
+
+  it("still clears the marker even when the DELETE fails — one best-effort attempt, not a retry queue (the accepted residual gap)", async () => {
+    mockSecureGetItem.mockResolvedValue("dev-stale-from-a-forced-signout");
+    mockUnregisterDevice.mockRejectedValue(new Error("network"));
+
+    await expect(reconcileStaleDeviceRegistration()).resolves.toBeUndefined();
+
+    expect(mockUnregisterDevice).toHaveBeenCalledWith("dev-stale-from-a-forced-signout");
+    expect(mockSecureDeleteItem).toHaveBeenCalledWith(expect.any(String));
+  });
+
+  it("never throws when SecureStore itself can't be read (unreadable keychain isn't actionable)", async () => {
+    mockSecureGetItem.mockRejectedValue(new Error("keychain read failed"));
+
+    await expect(reconcileStaleDeviceRegistration()).resolves.toBeUndefined();
+    expect(mockUnregisterDevice).not.toHaveBeenCalled();
   });
 });

@@ -245,6 +245,51 @@ describe("apiRequest", () => {
     });
   });
 
+  describe("B3-3 (#284): the liveness check's own getSession() is raced against ~2s, not left to auth-js's 30s retry backoff", () => {
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it("does NOT sign out when getSession() itself never resolves, and surfaces at the ~2s race window rather than after 30s", async () => {
+      jest.useFakeTimers({ doNotFake: ["nextTick", "queueMicrotask"] });
+      mockGetSession
+        // authHeader()'s own read, on the way OUT (unrelated to this
+        // finding) - resolves normally.
+        .mockResolvedValueOnce({ data: { session: null } })
+        // The 401 liveness check's getSession() - stands in for auth-js's
+        // `_refreshAccessToken` hanging on a flaky network. Never settles.
+        .mockReturnValueOnce(new Promise(() => {}));
+      (globalThis.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(401, {
+          error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" },
+        }),
+      );
+
+      const pending = apiRequest("/v1/me").catch((e: unknown) => e);
+      // Advancing by exactly the race window (not 30s) is the proof: if the
+      // implementation still awaited the real getSession() unraced, this
+      // promise would still be pending after this and the `await` below
+      // would hang past Jest's own test timeout.
+      await jest.advanceTimersByTimeAsync(2000);
+      const error = await pending;
+
+      expect(error).toBeInstanceOf(ApiError);
+      expect(mockSignOut).not.toHaveBeenCalled();
+    });
+
+    it("still signs out normally when getSession() resolves well within the race window", async () => {
+      mockGetSession.mockResolvedValue({ data: { session: null } });
+      (globalThis.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(401, {
+          error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" },
+        }),
+      );
+
+      await expect(apiRequest("/v1/me")).rejects.toBeInstanceOf(ApiError);
+      expect(mockSignOut).toHaveBeenCalledWith({ scope: "local" });
+    });
+  });
+
   it("B3-2 (safety review): a getSession() that REJECTS (unreadable keychain) still surfaces a typed ApiError, and never signs out", async () => {
     // First call is authHeader()'s own (pre-existing, unrelated to B3) read
     // to build the Authorization header -- that one succeeds normally.
