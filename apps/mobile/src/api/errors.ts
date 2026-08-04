@@ -84,7 +84,7 @@ export function toHouseApiError(error: ApiError): string {
     // do the one thing guaranteed not to work. Mapped now, ahead of the
     // first writer that can actually reach it.
     case "backup_contact_no_phone":
-      return "A backup contact needs a phone number. Add one, or remove the backup contact instead.";
+      return "A backup contact needs a phone number. Add one.";
     // --- Tenants ---
     case "tenant_not_found":
       return "That tenant isn't on file anymore.";
