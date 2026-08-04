@@ -53,7 +53,7 @@ import {
 
 export const Route = createFileRoute("/app/properties_/$id")({
   head: ({ params }) => ({
-    meta: [{ title: "Property — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Property. Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/properties/${params.id}` }],
   }),
   component: PropertyHub,
@@ -132,7 +132,7 @@ function PropertyHub() {
       error.status >= 500 ||
       (error.code === "unknown_error" && error.status >= 200 && error.status < 300));
   const AMBIGUOUS_NOTICE =
-    "That may have gone through — give it a moment to update before trying again.";
+    "That may have gone through. Give it a moment to update before trying again.";
 
   const revokeMutation = useMutation({
     mutationFn: () => revokeTrust(id, "property"),
@@ -264,7 +264,7 @@ function PropertyHub() {
                 role="status"
                 className="mx-4 mt-4 rounded-2xl border border-border bg-surface px-4 py-2.5 text-[13px] font-medium text-ink-muted"
               >
-                Couldn&apos;t refresh just now — showing the last update.
+                Couldn&apos;t refresh just now. Showing the last update.
               </div>
             )}
 
@@ -332,7 +332,7 @@ function PropertyHub() {
                       dialable. */}
                   {backupContactPhoneLooksInvalid(property.backup_contact) && (
                     <p className="mt-0.5 text-[12px] font-medium text-urgent">
-                      Their number doesn&rsquo;t look valid — I may not be able to reach them in an
+                      Their number doesn&rsquo;t look valid. I may not be able to reach them in an
                       emergency.
                     </p>
                   )}
@@ -359,7 +359,7 @@ function PropertyHub() {
                   role="status"
                   className="mb-2 rounded-2xl border border-border bg-surface px-4 py-2.5 text-[13px] font-medium text-ink-muted"
                 >
-                  Couldn&apos;t refresh just now — showing the last update.
+                  Couldn&apos;t refresh just now. Showing the last update.
                 </div>
               )}
               <div className="overflow-hidden rounded-2xl border border-border bg-card">
@@ -397,7 +397,7 @@ function PropertyHub() {
                                 would let an empty string render a blank
                                 name line. */}
                             {firstName(tenant.name)}
-                            {tenant.unit ? ` — Unit ${tenant.unit}` : ""}
+                            {tenant.unit ? `, Unit ${tenant.unit}` : ""}
                           </p>
                           <p className="mt-0.5 font-mono text-[12px] text-ink-muted">
                             {tenant.phone}

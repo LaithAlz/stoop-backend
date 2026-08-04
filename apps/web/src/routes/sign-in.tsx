@@ -19,7 +19,7 @@ import { useAuth } from "@/auth/AuthProvider";
 // branching — "expired" and "already used" are the same story to a
 // landlord either way.
 function toHouseCallbackError(): string {
-  return "That sign-in link didn't work — it may have expired or already been used. Send yourself a new one below.";
+  return "That sign-in link didn't work. It may have expired or already been used. Send yourself a new one below.";
 }
 
 // #248 (fast-follow to the #234 PR-1 safety review's NEW-2): with
@@ -41,7 +41,7 @@ function toHouseCallbackError(): string {
 // landlord back to the laptop to hit the same wall. So: hedge the cause,
 // keep the remedy, which is correct on every one of those paths.
 function toHouseCrossDeviceNotice(): string {
-  return "We couldn't finish that sign-in here. Links have to be opened on the same device you asked for them from — send yourself a new one below.";
+  return "We couldn't finish that sign-in here. Links have to be opened on the same device you asked for them from. Send yourself a new one below.";
 }
 
 // F2 (safety review, #248): the 10s watchdog path. Distinct from the
@@ -53,7 +53,7 @@ function toHouseCrossDeviceNotice(): string {
 // deliberately does NOT strip `?code=` on this path, so the reload can
 // still complete the sign-in.
 function toHouseInitTimeoutNotice(): string {
-  return "We couldn't finish signing you in just now — check your connection and reload this page.";
+  return "We couldn't finish signing you in just now. Check your connection and reload this page.";
 }
 
 // F-runtime (safety review, #248): survives a remount. The notice is
@@ -98,13 +98,13 @@ function parseAuthCallbackParams(): { hasError: boolean; hasPendingExchange: boo
 export const Route = createFileRoute("/sign-in")({
   head: () => ({
     meta: [
-      { title: "Sign in — Stoop." },
+      { title: "Sign in. Stoop." },
       {
         name: "description",
         content:
-          "Sign in to Stoop. Tenant maintenance, sorted and drafted — handles the 2am text so you don't have to.",
+          "Sign in to Stoop. Tenant maintenance, sorted and drafted. Handles the 2am text so you don't have to.",
       },
-      { property: "og:title", content: "Sign in — Stoop." },
+      { property: "og:title", content: "Sign in. Stoop." },
       {
         property: "og:description",
         content: "Sign in to your Stoop. account.",
@@ -230,7 +230,7 @@ function SignInPage() {
                 className="size-6 animate-spin text-brand motion-reduce:animate-none"
                 aria-hidden="true"
               />
-              <p className="text-sm text-ink-muted">You're signed in — taking you to Stoop…</p>
+              <p className="text-sm text-ink-muted">You're signed in. Taking you to Stoop…</p>
             </div>
           ) : isFinishingSignIn && initializing ? (
             // A2: the round trip after clicking the email link — Supabase
@@ -346,7 +346,7 @@ function SignInPage() {
                 </Button>
               </div>
               <p className="mt-2 text-center text-xs text-ink-muted">
-                Apple and Google sign-in are coming soon — use email for now.
+                Apple and Google sign-in are coming soon. Use email for now.
               </p>
 
               <div className="my-6 flex items-center gap-3 text-xs font-bold uppercase tracking-widest text-ink-muted">

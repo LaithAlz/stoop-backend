@@ -13,7 +13,7 @@ import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/conversations/")({
   head: () => ({
-    meta: [{ title: "Conversations — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Conversations. Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: ConversationsIndexPage,
 });
@@ -140,7 +140,7 @@ function ConversationsIndexPage() {
                   role="status"
                   className="mb-3.5 rounded-clarity-md border border-clarity-line-strong bg-clarity-panel px-4 py-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
                 >
-                  Couldn&apos;t refresh just now — showing the last update.
+                  Couldn&apos;t refresh just now. Showing the last update.
                 </div>
               )}
 
@@ -201,7 +201,7 @@ function EmptyConversations({ filtered }: { filtered: boolean }) {
       <p className="mx-auto max-w-[30ch] font-clarity-sans text-sm leading-relaxed text-clarity-ink-dim">
         {filtered
           ? "No conversations match this filter right now."
-          : "Every text between your tenants and Stoop will be saved here, with dates and times — nothing edited, nothing lost."}
+          : "Every text between your tenants and Stoop will be saved here, with dates and times: nothing edited, nothing lost."}
       </p>
     </div>
   );

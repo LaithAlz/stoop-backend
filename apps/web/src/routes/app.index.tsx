@@ -52,7 +52,7 @@ import { useAcknowledge } from "@/features/emergency/useAcknowledge";
 
 export const Route = createFileRoute("/app/")({
   head: () => ({
-    meta: [{ title: "Home — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Home. Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: AppQueuePage,
 });
@@ -307,12 +307,12 @@ function AppQueuePage() {
                   role="status"
                   className="mb-3.5 rounded-clarity-md border border-clarity-line-strong bg-clarity-panel px-4 py-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
                 >
-                  Couldn&apos;t refresh just now — showing the last update.
+                  Couldn&apos;t refresh just now. Showing the last update.
                 </div>
               )}
 
               {showAllClear ? (
-                <AllClearState message="I'm watching your messages — go enjoy your day. I'll text you if anything needs you." />
+                <AllClearState message="I'm watching your messages. Go enjoy your day. I'll text you if anything needs you." />
               ) : (
                 rows.length > 0 && (
                   <div className="space-y-3.5">

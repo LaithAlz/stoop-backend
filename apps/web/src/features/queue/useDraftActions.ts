@@ -121,7 +121,7 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       // window where a tenant is actively texting. State only what this
       // read supports and point at the record.
       onNotice(
-        "This draft isn't waiting to send anymore — open the conversation to see what happened.",
+        "This draft isn't waiting to send anymore. Open the conversation to see what happened.",
       );
       // F4: the notice above is unconditional and OUTSIDE the state
       // updater. Previously it fired inside `setEditingContext`, so it was
@@ -392,7 +392,7 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
         // this moment. No plumbing needed for the query's generation.
         const failedAt = Date.now();
         setUnverifiedSendIds((prev) => new Map(prev).set(ctx.draftId, failedAt));
-        onNotice("That may have gone through — give it a moment to update before sending again.");
+        onNotice("That may have gone through. Give it a moment to update before sending again.");
         onSettled();
         return;
       }

@@ -18,9 +18,9 @@ export function buildDisclosureMessage(
   const who = landlordFirstName.trim() || "your landlord";
   const property = propertyLabel.trim() || "the property";
   return (
-    `Hi, it's ${who}. I've set up a new number for anything about ${property} — ` +
+    `Hi, it's ${who}. I've set up a new number for anything about ${property}, ` +
     `repairs, questions, anything: ${formatStoopNumber(stoopNumber)}. Software helps me read ` +
-    `and reply faster — I still see and approve everything, and a real emergency ` +
+    `and reply faster. I still see and approve everything, and a real emergency ` +
     `reaches me immediately, day or night. Texting works exactly like texting me.`
   );
 }

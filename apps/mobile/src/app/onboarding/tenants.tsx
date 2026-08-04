@@ -37,7 +37,7 @@ export default function TenantsStep() {
       <WizardChrome
         stepNumber={3}
         title="First, your property."
-        subtitle="Tenants attach to a property — add yours first."
+        subtitle="Tenants attach to a property. Add yours first."
         onBack={() => router.back()}
         onNext={() => router.push("/onboarding/property")}
         nextLabel="Add my property"
@@ -81,7 +81,7 @@ export default function TenantsStep() {
             <View style={styles.tenantText}>
               <Text style={styles.tenantName}>
                 {firstName(tenant.name)}
-                {tenant.unit ? ` — Unit ${tenant.unit}` : ""}
+                {tenant.unit ? `, Unit ${tenant.unit}` : ""}
               </Text>
               <Text style={styles.tenantPhoneNote}>Tap to edit</Text>
             </View>

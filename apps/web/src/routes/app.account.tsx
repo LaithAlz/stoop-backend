@@ -37,7 +37,7 @@ import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/account")({
   head: () => ({
-    meta: [{ title: "Account — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Account. Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: AccountPage,
 });
@@ -139,7 +139,7 @@ function AccountPage() {
                     role="status"
                     className="mb-3 rounded-2xl border border-border bg-surface px-4 py-2.5 text-[13px] font-medium text-ink-muted"
                   >
-                    Couldn&apos;t refresh just now — showing the last update.
+                    Couldn&apos;t refresh just now. Showing the last update.
                   </div>
                 )}
 
@@ -225,7 +225,7 @@ function AccountPage() {
             </button>
           </Card>
           <p className="mt-3 px-1 text-center font-mono text-[10px] uppercase tracking-widest text-ink-muted">
-            Stoop. v1.0.0 — Made in the GTA
+            Stoop. v1.0.0 (Made in the GTA)
           </p>
         </Section>
       </div>
@@ -413,8 +413,8 @@ function EditProfileForm({
         // instruction.
         setServerError(
           "phone" in variables
-            ? "We couldn't confirm your number saved. Save it again — sending the same number twice is harmless."
-            : "That may have gone through — refresh to check before trying again.",
+            ? "We couldn't confirm your number saved. Save it again: sending the same number twice is harmless."
+            : "That may have gone through. Refresh to check before trying again.",
         );
         void queryClient.invalidateQueries({ queryKey: meQueryKey });
         return;

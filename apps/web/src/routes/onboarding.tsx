@@ -101,12 +101,12 @@ import {
 export const Route = createFileRoute("/onboarding")({
   head: () => ({
     meta: [
-      { title: "Get set up — Stoop." },
+      { title: "Get set up. Stoop." },
       { name: "robots", content: "noindex" },
       {
         name: "description",
         content:
-          "Set up your first property on Stoop. Five short steps, about five minutes — the Emergency Line is free, forever.",
+          "Set up your first property on Stoop. Five short steps, about five minutes. The Emergency Line is free, forever.",
       },
     ],
   }),
@@ -550,7 +550,7 @@ function WelcomeStep({ onNext }: { onNext: () => void }) {
         <div className="mt-7 flex items-start gap-2.5 rounded-clarity-lg border border-clarity-line-strong bg-clarity-surface p-4">
           <ShieldCheck className="mt-0.5 size-4 shrink-0 text-clarity-brand" aria-hidden="true" />
           <p className="font-clarity-sans text-[13px] leading-relaxed text-clarity-ink-dim">
-            The Emergency Line is free, forever — every message read, real emergencies ring your
+            The Emergency Line is free, forever: every message read, real emergencies ring your
             phone. Setting up your voice below is part of the Full Plan:{" "}
             <span className="font-bold text-clarity-ink">$5/month early-access rate</span>, locked
             in for as long as you stay.
@@ -967,7 +967,7 @@ function VoiceStep({
                   id={`voice-sample-${i}`}
                   value={sample}
                   onChange={(e) => onUpdateSample(i, e.target.value)}
-                  placeholder={`e.g. "Hey Sam, thanks for flagging — I'll get Tony out there Thursday morning."`}
+                  placeholder={`e.g. "Hey Sam, thanks for flagging. I'll get Tony out there Thursday morning."`}
                   aria-invalid={showVoiceError || undefined}
                   aria-describedby={showVoiceError ? "voice-samples-err" : undefined}
                   className="min-h-20 w-full rounded-clarity-md border-[1.5px] border-clarity-line-strong bg-clarity-panel px-3.5 py-3 font-clarity-sans text-sm leading-relaxed text-clarity-ink placeholder:text-clarity-ink-dim/60"
@@ -1124,7 +1124,7 @@ function VoiceStep({
 
           <Field
             label="Heating season"
-            helper="When you're required to provide heat — helps me flag a no-heat report correctly."
+            helper="When you're required to provide heat. Helps me flag a no-heat report correctly."
           >
             <div className="flex items-center gap-3">
               <div className="flex-1">
@@ -1191,7 +1191,7 @@ function BackupStep({
     <WizardChrome
       stepNumber={5}
       title="Who do we call if you don't pick up?"
-      subtitle="Strongly encouraged, not required — a partner, super, or trusted neighbor."
+      subtitle="Strongly encouraged, not required: a partner, super, or trusted neighbor."
       onBack={onBack}
       onNext={onNext}
       skip={onNext}
@@ -1226,7 +1226,7 @@ function BackupStep({
           </span>
         </div>
         <p className="mt-3 font-clarity-sans text-[13px] leading-relaxed text-clarity-ink-dim">
-          When a tenant sends something like this, I call your phone right away — free, no matter
+          When a tenant sends something like this, I call your phone right away. Free, no matter
           your plan. If you don't answer, I call again, then call {backupName} ten minutes later.
           Nobody has to wait alone.
         </p>

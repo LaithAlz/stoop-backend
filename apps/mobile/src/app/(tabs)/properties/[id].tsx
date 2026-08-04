@@ -195,7 +195,7 @@ export default function PropertyDetailScreen() {
                     <View style={styles.tenantText}>
                       <Text style={styles.tenantName}>
                         {firstName(tenant.name)}
-                        {tenant.unit ? ` — Unit ${tenant.unit}` : ""}
+                        {tenant.unit ? `, Unit ${tenant.unit}` : ""}
                       </Text>
                       {vulnerable ? (
                         <Text style={styles.tenantVulnerable}>{vulnerable}</Text>

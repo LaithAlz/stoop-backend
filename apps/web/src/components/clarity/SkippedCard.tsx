@@ -31,9 +31,9 @@ export function SkippedCard({
     <>
       <span className="min-w-0 flex-1 font-clarity-sans text-[13.5px] leading-snug text-clarity-ink-dim">
         <b className="block font-bold text-clarity-ink">
-          {tenantName} — {propertyLabel}
+          {tenantName}, {propertyLabel}
         </b>
-        No reply sent — case still open
+        No reply sent. Case still open
       </span>
       <TimestampChip className="shrink-0 border-clarity-line-strong bg-transparent text-clarity-ink-dim">
         {timestamp}

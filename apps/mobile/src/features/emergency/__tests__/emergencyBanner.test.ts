@@ -30,7 +30,7 @@ describe("emergencyHeadline", () => {
       tenant_name: "Maria Gonzalez",
       property_label: "41 Palmerston",
     });
-    expect(headline).toBe("Maria needs you now — 41 Palmerston");
+    expect(headline).toBe("Maria needs you now at 41 Palmerston");
     expect(headline.toLowerCase()).not.toMatch(/flood|fire|gas|smoke|leak|break/);
   });
 });

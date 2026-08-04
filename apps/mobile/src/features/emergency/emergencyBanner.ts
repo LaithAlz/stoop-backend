@@ -20,7 +20,7 @@ export function emergencyHeadline(
   item: Pick<QueueItem, "title" | "tenant_name" | "property_label">,
 ): string {
   if (item.title) return item.title;
-  return `${firstName(item.tenant_name)} needs you now — ${item.property_label}`;
+  return `${firstName(item.tenant_name)} needs you now at ${item.property_label}`;
 }
 
 /** Deliberately doesn't promise a phone call: the queue contract carries no

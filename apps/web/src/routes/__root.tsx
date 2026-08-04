@@ -94,7 +94,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       meta: [
         { charSet: "utf-8" },
         { name: "viewport", content: "width=device-width, initial-scale=1" },
-        { title: "Stoop. — Tenant maintenance, handled for small landlords" },
+        { title: "Stoop. Tenant maintenance, handled for small landlords" },
         {
           name: "description",
           content:
@@ -102,12 +102,12 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
         },
         {
           property: "og:title",
-          content: "Stoop. — Tenant maintenance, handled for small landlords",
+          content: "Stoop. Tenant maintenance, handled for small landlords",
         },
         {
           property: "og:description",
           content:
-            "Reads, sorts, and drafts replies for tenant maintenance over SMS — you approve before it sends.",
+            "Reads, sorts, and drafts replies for tenant maintenance over SMS. You approve before it sends.",
         },
         { property: "og:type", content: "website" },
         // TODO(domain): og:image must be an absolute URL for scrapers to

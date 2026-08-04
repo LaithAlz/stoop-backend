@@ -30,7 +30,7 @@ const LABELS: Partial<Record<AuditAction, string>> = {
   case_resolved: "Case marked resolved.",
   approved: "You approved this reply.",
   edited: "You edited this reply before sending.",
-  rejected: "You skipped this reply — case stayed open.",
+  rejected: "You skipped this reply. Case stayed open.",
   sent: "Sent.",
   send_cancelled: "Sending was cancelled.",
   auto_sent: "Stoop sent this one automatically for a routine reply here.",

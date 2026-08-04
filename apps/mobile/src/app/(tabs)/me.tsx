@@ -164,7 +164,7 @@ export default function MeScreen() {
             <Text style={styles.label}>Automatic sending</Text>
             <Text style={styles.cardBody}>
               At properties where Stoop has earned it, routine replies can go out without waiting.
-              One tap here turns that off everywhere — every reply comes back to you.
+              One tap here turns that off everywhere. Every reply comes back to you.
             </Text>
             <View style={styles.cardAction}>
               <Button

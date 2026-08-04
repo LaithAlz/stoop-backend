@@ -90,7 +90,7 @@ describe("useDraftActions — undo 409 already_sent (M1 advisory)", () => {
 
     // The house line — never the raw server message — and a refetch nudge.
     expect(onNotice).toHaveBeenCalledWith(
-      "That reply already went out — there's nothing left to undo.",
+      "That reply already went out. There's nothing left to undo.",
     );
     expect(onSettled).toHaveBeenCalled();
   });

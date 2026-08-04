@@ -28,7 +28,7 @@ import { cn } from "@/lib/utils";
 export const Route = createFileRoute("/design-system")({
   head: () => ({
     meta: [
-      { title: "Stoop. — Design system" },
+      { title: "Stoop. Design system" },
       {
         name: "description",
         content: "The Heritage Utility design system for Stoop.",
@@ -106,9 +106,9 @@ function DesignSystemPage() {
         {/* Wordmark */}
         <Section
           id="wordmark"
-          eyebrow="01 — Identity"
+          eyebrow="01: Identity"
           title="The wordmark"
-          description="The mark is Stoop. — the period is part of the mark and always rendered in emergency red as a small operator signal."
+          description="The mark is Stoop. The period is part of the mark and always rendered in emergency red as a small operator signal."
         >
           <div className="grid items-end gap-10 rounded-3xl border border-border bg-card p-10 md:grid-cols-4">
             <div className="space-y-2">
@@ -133,7 +133,7 @@ function DesignSystemPage() {
         {/* Typography */}
         <Section
           id="typography"
-          eyebrow="02 — Typography"
+          eyebrow="02: Typography"
           title="Fraunces & Plus Jakarta Sans"
           description="An editorial serif paired with a humanist sans. No Inter, no Roboto, no system defaults for display."
         >
@@ -214,9 +214,9 @@ function DesignSystemPage() {
         {/* Color */}
         <Section
           id="color"
-          eyebrow="03 — Color"
+          eyebrow="03: Color"
           title="Light mode is the system"
-          description="Dark tokens are reserved exclusively for the emergency screen — the one place the app inverts."
+          description="Dark tokens are reserved exclusively for the emergency screen: the one place the app inverts."
         >
           <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-6">
             <Swatch name="Canvas" value="#FDFCFB" varName="--canvas" />
@@ -231,8 +231,8 @@ function DesignSystemPage() {
         {/* Severity */}
         <Section
           id="severity"
-          eyebrow="04 — Severity"
-          title="Color, icon, and label — always together"
+          eyebrow="04: Severity"
+          title="Color, icon, and label: always together"
           description="Severity is never conveyed by color alone. Each level carries a Lucide icon and an explicit text label."
         >
           <div className="grid gap-4 md:grid-cols-3">
@@ -250,7 +250,7 @@ function DesignSystemPage() {
         {/* Buttons */}
         <Section
           id="buttons"
-          eyebrow="05 — Buttons"
+          eyebrow="05: Buttons"
           title="Action variants"
           description="Primary actions are 56px on mobile. Press states, focus rings, loading and disabled are all on."
         >
@@ -287,7 +287,7 @@ function DesignSystemPage() {
         {/* Forms */}
         <Section
           id="forms"
-          eyebrow="06 — Forms"
+          eyebrow="06: Forms"
           title="Form elements with real labels"
           description="Every field uses a real <label>. Placeholders never carry meaning."
         >
@@ -405,7 +405,7 @@ function DesignSystemPage() {
         {/* Cards */}
         <Section
           id="cards"
-          eyebrow="07 — Cards"
+          eyebrow="07: Cards"
           title="Card variants"
           description="From quiet metric tiles to severity-tinted draft cards."
         >
@@ -419,7 +419,7 @@ function DesignSystemPage() {
             <Card className="border-emergency/30 bg-emergency-soft p-6">
               <SeverityBadge severity="emergency" />
               <p className="mt-3 font-display text-2xl font-bold text-emergency">Water leak</p>
-              <p className="text-sm text-ink">Unit 3B — Ceiling, master bath</p>
+              <p className="text-sm text-ink">Unit 3B: Ceiling, master bath</p>
             </Card>
 
             <Card className="border-dashed border-brand/40 bg-brand-muted/40 p-6">
@@ -468,7 +468,7 @@ function DesignSystemPage() {
         {/* Message bubbles */}
         <Section
           id="bubbles"
-          eyebrow="08 — Conversation"
+          eyebrow="08: Conversation"
           title="Message bubbles"
           description="Tenant inbound, agent outbound, draft pending, and photo bubbles. The AI assistant tag is always visible whenever the agent speaks."
         >
@@ -495,7 +495,7 @@ function DesignSystemPage() {
               />
               <MessageBubble
                 variant="draft"
-                text="Pickup is delayed one day this week — it'll be Tuesday morning. Please have bins out by 7am."
+                text="Pickup is delayed one day this week. It'll be Tuesday morning. Please have bins out by 7am."
                 timestamp="9:02 AM"
               />
               <div className="flex gap-3">
@@ -511,7 +511,7 @@ function DesignSystemPage() {
         {/* Autonomy pills */}
         <Section
           id="autonomy"
-          eyebrow="09 — Autonomy"
+          eyebrow="09: Autonomy"
           title="The trust ladder"
           description="Landlords graduate Stoop. from shadow mode toward full autonomy as they approve more drafts unedited."
         >
@@ -540,7 +540,7 @@ function DesignSystemPage() {
         {/* Approval card */}
         <Section
           id="approval"
-          eyebrow="10 — Approval queue"
+          eyebrow="10: Approval queue"
           title="The card that runs the app"
           description="Tenant message, AI-drafted reply with the always-visible AI assistant tag, severity, and 56px primary action."
         >
@@ -551,7 +551,7 @@ function DesignSystemPage() {
               receivedAgo="4m ago"
               severity="urgent"
               tenantMessage="The kitchen sink is overflowing. I've turned the valve under the sink but water is still coming up from the drain."
-              draftReply="I'm so sorry — I've reached our on-call plumber and they'll be there within 90 minutes. Please clear the area under the sink and place towels around the base. I'll text once they're 10 minutes out."
+              draftReply="I'm so sorry. I've reached our on-call plumber and they'll be there within 90 minutes. Please clear the area under the sink and place towels around the base. I'll text once they're 10 minutes out."
             />
           </div>
         </Section>
@@ -559,7 +559,7 @@ function DesignSystemPage() {
         {/* Navigation */}
         <Section
           id="nav"
-          eyebrow="11 — Navigation"
+          eyebrow="11: Navigation"
           title="Marketing nav & in-app tab bar"
           description="No hamburgers, no icon-only nav. Every tab carries a text label."
         >
@@ -584,7 +584,7 @@ function DesignSystemPage() {
         {/* Icons */}
         <Section
           id="icons"
-          eyebrow="12 — Iconography"
+          eyebrow="12: Iconography"
           title="Lucide, paired with labels"
           description="No emojis as structural UI. Icons sit next to a text label everywhere except back arrows and close X."
         >

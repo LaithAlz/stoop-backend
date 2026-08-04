@@ -13,11 +13,11 @@ export function planDisplayName(tier: string, cohort: string): string {
     // Price-lock phrasing per the PR #142 audit remediation: never
     // "locked for life" — "locked in for as long as you stay" is the
     // house claim (mirrors src/routes/plans.tsx and apps/mobile's own copy).
-    return "Full Plan — $5/month early access, locked in for as long as you stay";
+    return "Full Plan: $5/month early access, locked in for as long as you stay";
   }
-  if (tier === "full") return "Full Plan — $10/month";
-  if (tier === "desk") return "Property Managers — $1.50/door/month";
-  return "Emergency Line — free";
+  if (tier === "full") return "Full Plan: $10/month";
+  if (tier === "desk") return "Property Managers: $1.50/door/month";
+  return "Emergency Line: free";
 }
 
 /**
@@ -44,7 +44,7 @@ export function planStatusNotice(status: string, tier: string = "full"): string 
     return `Your last payment didn't go through, so your ${planName} may lapse. Your emergency line keeps working either way.`;
   }
   if (status === "canceled") {
-    return `Your ${planName} subscription is canceled — you're on the free Emergency Line until you resubscribe.`;
+    return `Your ${planName} subscription is canceled. You're on the free Emergency Line until you resubscribe.`;
   }
   return null;
 }

@@ -36,7 +36,7 @@ export const toneOptions: ToneOption[] = [
   {
     value: "warm",
     label: "Warm",
-    example: "Hi Elena — sorry about that, I'll get someone out today.",
+    example: "Hi Elena. Sorry about that, I'll get someone out today.",
   },
   { value: "direct", label: "Direct", example: "Got it. Plumber's booked for 1 PM Thursday." },
   {
@@ -197,9 +197,9 @@ export function buildDisclosureMessage(
   const who = landlordFirstName.trim() || "your landlord";
   const property = propertyNickname.trim() || "the property";
   return (
-    `Hi, it's ${who}. I've set up a new number for anything about ${property} — ` +
+    `Hi, it's ${who}. I've set up a new number for anything about ${property}, ` +
     `repairs, questions, anything: ${MOCK_PROVISIONED_NUMBER}. Software helps me read ` +
-    `and reply faster — I still see and approve everything, and a real emergency ` +
+    `and reply faster. I still see and approve everything, and a real emergency ` +
     `reaches me immediately, day or night. Texting works exactly like texting me.`
   );
 }
@@ -211,5 +211,5 @@ export function buildDisclosureMessage(
 export const testTextInbound = "test";
 export function buildTestTextReply(propertyNickname: string): string {
   const property = propertyNickname.trim() || "your property";
-  return `Got it — I'm live for ${property}. I'll draft your first reply the moment a tenant texts in.`;
+  return `Got it. I'm live for ${property}. I'll draft your first reply the moment a tenant texts in.`;
 }

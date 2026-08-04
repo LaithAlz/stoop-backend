@@ -5,13 +5,13 @@ import { SiteFooter } from "@/components/stoop/SiteFooter";
 export const Route = createFileRoute("/terms")({
   head: () => ({
     meta: [
-      { title: "Terms of Service — Stoop." },
+      { title: "Terms of Service. Stoop." },
       {
         name: "description",
         content:
-          "Terms for using Stoop. — a tenant-maintenance tool for small landlords. We handle comms, not legal advice.",
+          "Terms for using Stoop. It's a tenant-maintenance tool for small landlords. We handle comms, not legal advice.",
       },
-      { property: "og:title", content: "Terms of Service — Stoop." },
+      { property: "og:title", content: "Terms of Service. Stoop." },
       {
         property: "og:description",
         content: "Terms of service for Stoop.",
@@ -40,7 +40,7 @@ function TermsPage() {
         <Section title="What Stoop is">
           <p>
             Stoop is a tool that receives SMS from your tenants, drafts replies, and routes urgent
-            messages to you. It runs alongside you — not instead of you. You always retain the right
+            messages to you. It runs alongside you, not instead of you. You always retain the right
             to take over a conversation.
           </p>
         </Section>
@@ -70,7 +70,7 @@ function TermsPage() {
           </p>
           <p>
             You're responsible for compliance with Ontario's RTA and the CRTC's SMS rules in your
-            jurisdiction. We provide a tool — you provide the legal basis.
+            jurisdiction. We provide a tool. You provide the legal basis.
           </p>
         </Section>
 

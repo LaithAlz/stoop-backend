@@ -230,6 +230,6 @@ describe("pruneSkippedSnapshots — M1 senior advisory (snapshots die with their
 
 describe("draftStaleNotice", () => {
   it("names the tenant in the honest one-line note (conversation-model.md's own example wording)", () => {
-    expect(draftStaleNotice("Maria")).toBe("Maria replied — this draft just updated.");
+    expect(draftStaleNotice("Maria")).toBe("Maria replied. This draft just updated.");
   });
 });

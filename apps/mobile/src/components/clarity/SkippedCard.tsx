@@ -26,9 +26,9 @@ export function SkippedCard({ tenantName, propertyLabel, timestamp, onPress }: S
     >
       <View style={styles.textBlock}>
         <Text style={styles.title}>
-          {firstName(tenantName)} — {propertyLabel}
+          {firstName(tenantName)}, {propertyLabel}
         </Text>
-        <Text style={styles.subtitle}>No reply sent — case still open</Text>
+        <Text style={styles.subtitle}>No reply sent. Case still open</Text>
       </View>
       <TimestampChip>{formatRelativeTime(timestamp)}</TimestampChip>
     </Pressable>

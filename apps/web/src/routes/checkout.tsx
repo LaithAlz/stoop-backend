@@ -15,7 +15,7 @@ const planLabel: Record<"full" | "early_access", string> = {
 export const Route = createFileRoute("/checkout")({
   validateSearch: (s) => searchSchema.parse(s),
   head: () => ({
-    meta: [{ title: "Checkout — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Checkout. Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: CheckoutPage,
 });
@@ -28,7 +28,7 @@ function CheckoutPage() {
       <main className="mx-auto max-w-2xl px-6 py-24 text-center">
         <p className="text-xs font-bold uppercase tracking-[0.2em] text-brand">Checkout</p>
         <h1 className="mt-3 font-display text-4xl font-bold tracking-tight">
-          Stripe checkout — coming soon
+          Stripe checkout: coming soon
         </h1>
         <p className="mt-4 text-ink-muted">
           You picked the <span className="font-semibold text-ink">{planLabel[plan]}</span>. Hosted

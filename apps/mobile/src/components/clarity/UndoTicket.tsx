@@ -32,7 +32,7 @@ export function UndoTicket({ secondsLeft, totalSeconds, onUndo }: UndoTicketProp
         <View style={styles.divider} />
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`Undo — ${clamped} seconds left`}
+          accessibilityLabel={`Undo (${clamped} seconds left)`}
           onPress={onUndo}
           style={styles.undoButton}
           hitSlop={8}

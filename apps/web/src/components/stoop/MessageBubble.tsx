@@ -65,7 +65,7 @@ export function MessageBubble({ variant, text, timestamp, author, className }: M
           AI assistant
         </span>
         <span className="text-[10px] font-medium text-ink-muted">
-          {isDraft ? "Draft — awaiting approval" : "Sent"}
+          {isDraft ? "Draft: awaiting approval" : "Sent"}
           {timestamp && ` • ${timestamp}`}
         </span>
       </div>

@@ -51,7 +51,7 @@ import {
 
 export const Route = createFileRoute("/app/conversations/$id")({
   head: ({ params }) => ({
-    meta: [{ title: "Conversation — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Conversation. Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/conversations/${params.id}` }],
   }),
   // N2 (safety re-verify, #234 PR 3): TanStack Router REUSES the component
@@ -443,7 +443,7 @@ function ConversationPage() {
                   role="status"
                   className="mb-3.5 rounded-clarity-md border border-clarity-line-strong bg-clarity-panel px-4 py-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
                 >
-                  Couldn&apos;t refresh just now — showing the last update.
+                  Couldn&apos;t refresh just now. Showing the last update.
                 </div>
               )}
 
@@ -544,7 +544,7 @@ function ConversationPage() {
                   </div>
                 ) : (
                   <p className="mt-4 font-clarity-sans text-xs leading-relaxed text-clarity-ink-dim">
-                    Nothing here can be edited or removed once it&rsquo;s sent — that&rsquo;s what
+                    Nothing here can be edited or removed once it&rsquo;s sent. That&rsquo;s what
                     makes it useful if you ever need the record.
                   </p>
                 )}
@@ -664,7 +664,7 @@ function ThreadHeader({
       </div>
       <h1 className="mt-2 font-clarity-serif text-[19px] font-semibold leading-[1.3] tracking-tight text-clarity-ink">
         {caseDetail
-          ? `${tenantFirst}${caseDetail.tenant.unit ? ` — Unit ${caseDetail.tenant.unit}` : ""}`
+          ? `${tenantFirst}${caseDetail.tenant.unit ? `, Unit ${caseDetail.tenant.unit}` : ""}`
           : "Conversation"}
       </h1>
       <p className="mt-0.5 font-clarity-sans text-[12.5px] text-clarity-ink-dim">
@@ -721,7 +721,7 @@ function DraftFooter({
   if (isSkipped) {
     return (
       <p className="rounded-clarity-lg border border-dashed border-clarity-line-strong bg-clarity-bg px-[18px] py-3.5 text-center font-clarity-sans text-[13px] text-clarity-ink-dim">
-        No reply sent — case still open
+        No reply sent. Case still open
       </p>
     );
   }
