@@ -108,7 +108,11 @@
   mode). `properties.backup_contact.phone` is the one exception: it is an
   OPTIONAL escalation field with no not-nullable rule, so a blank value is
   left as-is (already a safe no-op downstream), while a present, malformed
-  one is still rejected. The `/webhooks/twilio/sms` route (see "Webhooks"
+  one is still rejected. **[Superseded by the v1.27 amendment (#290): a
+  blank or missing `phone` on a non-null `backup_contact` is now REJECTED
+  with `backup_contact_no_phone`. The "safe no-op downstream" reasoning is
+  exactly what the bug was, because it made "configured" and "actually
+  reachable" different states.]** The `/webhooks/twilio/sms` route (see "Webhooks"
   below) canonicalizes inbound `From`/`To` the same way before matching —
   see that section's own note. Closes #260; schema-v1.md's v1.21 amendment
   is the matching schema-doc update, and migration 0017 backfills
@@ -392,6 +396,8 @@ purchase before being rejected. A present-but-BLANK `phone` is left as-is
 (not rejected) — `backup_contact` is an optional escalation field with no
 not-nullable business rule, and the escalation chain already treats a
 blank value as "no backup contact configured," a safe no-op.
+**[Superseded by the v1.27 amendment (#290): that shape is now a 422
+`backup_contact_no_phone`.]**
 
 **v1.25 amendment (2026-08-04 — #268 implementation):** `PATCH
 /v1/properties/{id}` with an explicit `"backup_contact": null` **clears
@@ -491,17 +497,23 @@ and "actually reachable" are now the same state: a `backup_contact` that
 reads as present is guaranteed to carry a phone `_backup_phone` can
 actually dial.
 
-**Error message never echoes the submitted value** (never-break rule #5)
+**Error message never echoes the submitted value** (never-break rule #5):
 a fixed, static message naming only the field, matching
 `app/phone.py::canonicalize_phone`'s existing discipline.
 
 **Out of scope, deliberately:** rows already stored in one of the
-rejected shapes before this amendment. The web dashboard's
-`backupContactPhoneLooksInvalid` already warns when a stored contact's
-phone doesn't look dialable (#268); widening that detector to also catch
-a missing/blank `phone` is tracked separately (#299), not part of this
-amendment. No migration, no backfill, no `DELETE`/`UPDATE` of existing
-rows.
+rejected shapes before this amendment. No migration, no backfill, no
+`DELETE`/`UPDATE` of existing rows.
+
+Those rows are already surfaced: the web dashboard's
+`backupContactPhoneLooksInvalid` (#268) returns `true` for **all four**
+of the rejected shapes today, verified by running it, because
+`toE164(contact.phone ?? "")` is null for a missing, null, blank or
+whitespace-only value. No widening is needed. (An earlier draft of this
+amendment claimed otherwise and cited #299; that was wrong on both
+counts. #299 is an unrelated class: `+<cc>0...` trunk-zero rows
+canonicalized by migration 0017 before the #277 fix, which the detector
+genuinely does miss because `toE164` returns a 13-digit value unchanged.)
 
 **Verified before shipping this amendment**: no current writer of
 `backup_contact` sends one of the four now-rejected shapes, the mobile

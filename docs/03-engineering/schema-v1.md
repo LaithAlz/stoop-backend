@@ -873,6 +873,48 @@
 >    simply the first writer of this combination. No migration needed for
 >    this part.
 
+<!-- DDL-body annotation for v1.23 lives on `properties.backup_contact`
+     below, per the house annotate-don't-silently-edit convention. -->
+> **v1.23 amendment (2026-08-04, #290 implementation)**: no migration
+> required, a `properties.backup_contact` doc-annotation correction plus a
+> router-level (application) validation change; the column itself stays
+> `jsonb`, nullable, no CHECK. Closes the gap #268's own review surfaced but
+> didn't fix: `_canonicalize_backup_contact`
+> (`app/routers/properties.py`) previously left a non-null `backup_contact`
+> object with a missing/`null`/blank-string `phone` key completely
+> untouched (the v1.21 amendment's "ENFORCED at write time when present and
+> non-blank" already named this carve-out explicitly), `{}`,
+> `{"name": "Ghost"}`, `{"phone": "   "}`, and `{"name": "G", "phone": ""}`
+> all wrote with `200` and stored verbatim, so the property rendered as
+> *having* a backup contact while `app/agent/emergency_chain.py`'s
+> `_backup_phone` returned `None` for every one of them, the T+10m
+> escalation step and every T+20m+ repeat's backup legs silently did
+> nothing, with no dialog, no landlord-visible removal, and no audit
+> signal that the capability was gone.
+> 1. A non-null `backup_contact` object with no usable `phone` (key
+>    absent, `null`, or a `str` that is empty/whitespace-only after
+>    `.strip()`) is now REJECTED, `422` with a new code,
+>    `backup_contact_no_phone`, distinct from the existing `invalid_field`
+>    (a present, non-blank `phone` that fails E.164 canonicalization) and
+>    from an explicit column-level `null`, which still clears the field
+>    exactly as #268 built it (that is a deliberate, confirmed clear, not
+>    this issue's concern). See `api-contracts.md`'s v1.27 amendment for
+>    the full endpoint-level contract.
+> 2. **Not retroactive.** Rows already stored in one of the
+>    now-rejected shapes before this amendment are untouched, no
+>    migration, no backfill, no `UPDATE`/`DELETE`. They remain readable and
+>    keep behaving exactly as before (the escalation chain's `_backup_phone`
+>    already treats them as "no backup contact configured," a safe no-op,
+>    this amendment only closes the WRITE path that could create more of
+>    them). The web dashboard's `backupContactPhoneLooksInvalid` warning
+>    (#268) already surfaces all four of these shapes, verified by
+>    running it: `toE164(contact.phone ?? "")` is null for a missing,
+>    null, blank or whitespace-only value, so no widening is needed. (An
+>    earlier draft said otherwise and cited #299. That was wrong on both
+>    counts: #299 is the unrelated `+<cc>0...` trunk-zero class, which
+>    the detector genuinely does miss because `toE164` returns those
+>    13-digit values unchanged.)
+
 > **v1.22 amendment (2026-08-04 — #277/#276 implementation, adversarial
 > safety review):** two corrections to `app/phone.py::to_e164`'s
 > canonicalization policy (v1.21 amendment below), plus one doc
@@ -930,44 +972,6 @@
 >    test runner yet, #294, so its copy is verified by direct comparison
 >    against the other two instead).
 
-<!-- DDL-body annotation for v1.23 lives on `properties.backup_contact`
-     below, per the house annotate-don't-silently-edit convention. -->
-> **v1.23 amendment (2026-08-04, #290 implementation)**: no migration
-> required, a `properties.backup_contact` doc-annotation correction plus a
-> router-level (application) validation change; the column itself stays
-> `jsonb`, nullable, no CHECK. Closes the gap #268's own review surfaced but
-> didn't fix: `_canonicalize_backup_contact`
-> (`app/routers/properties.py`) previously left a non-null `backup_contact`
-> object with a missing/`null`/blank-string `phone` key completely
-> untouched (the v1.21 amendment's "ENFORCED at write time when present and
-> non-blank" already named this carve-out explicitly), `{}`,
-> `{"name": "Ghost"}`, `{"phone": "   "}`, and `{"name": "G", "phone": ""}`
-> all wrote with `200` and stored verbatim, so the property rendered as
-> *having* a backup contact while `app/agent/emergency_chain.py`'s
-> `_backup_phone` returned `None` for every one of them, the T+10m
-> escalation step and every T+20m+ repeat's backup legs silently did
-> nothing, with no dialog, no landlord-visible removal, and no audit
-> signal that the capability was gone.
-> 1. A non-null `backup_contact` object with no usable `phone` (key
->    absent, `null`, or a `str` that is empty/whitespace-only after
->    `.strip()`) is now REJECTED, `422` with a new code,
->    `backup_contact_no_phone`, distinct from the existing `invalid_field`
->    (a present, non-blank `phone` that fails E.164 canonicalization) and
->    from an explicit column-level `null`, which still clears the field
->    exactly as #268 built it (that is a deliberate, confirmed clear, not
->    this issue's concern). See `api-contracts.md`'s v1.27 amendment for
->    the full endpoint-level contract.
-> 2. **Not retroactive.** Rows already stored in one of the
->    now-rejected shapes before this amendment are untouched, no
->    migration, no backfill, no `UPDATE`/`DELETE`. They remain readable and
->    keep behaving exactly as before (the escalation chain's `_backup_phone`
->    already treats them as "no backup contact configured," a safe no-op,
->    this amendment only closes the WRITE path that could create more of
->    them). The web dashboard's `backupContactPhoneLooksInvalid` warning
->    (#268) already surfaces a stored contact with a non-dialable `phone`;
->    widening it to also catch a missing/blank one is tracked separately
->    (#299).
-
 <!-- DDL-body annotation for v1.21 lives on each phone-bearing column
      below (`landlords.phone`, `properties.twilio_number`,
      `properties.backup_contact`, `tenants.phone`, `vendors.phone`), per
@@ -1017,7 +1021,12 @@
 >    OPTIONAL escalation field with no not-nullable business rule, and a
 >    blank value there was already a safe no-op (`app/agent/
 >    emergency_chain.py`'s `_backup_phone` treats a blank string as "no
->    backup contact configured").
+>    backup contact configured"). **[Superseded by the v1.23 amendment
+>    (#290): a blank or missing `phone` on a non-null `backup_contact` is
+>    now rejected with `backup_contact_no_phone`. The "safe no-op"
+>    reasoning is what the bug was: the property read as HAVING a backup
+>    contact while the T+10m step and every T+20m+ repeat's backup legs
+>    did nothing.]**
 > 4. **Matching, not just storage**: the `/sms` webhook (`app/routers/
 >    webhooks/twilio.py`) now canonicalizes the inbound `From`/`To`
 >    (falling back to the raw value if canonicalization itself fails,
