@@ -1,10 +1,10 @@
 /**
- * EXPO_PUBLIC_API_URL scheme validation (issue #292) — mirrors
+ * EXPO_PUBLIC_API_URL scheme validation (issue #292), mirroring
  * apps/api/app/config.py's `_require_non_local_dashboard_origins_in_
  * production` test coverage (#255) on this side of the fence.
  *
  * `__DEV__` is a real, writable RN/Jest global (`true` by default under
- * jest-expo) — set and restored around each test rather than mocked, so
+ * jest-expo): set and restored around each test rather than mocked, so
  * `env.apiUrl`'s own `isProductionBuild()` check is exercised for real,
  * not stubbed out.
  */
@@ -22,7 +22,7 @@ afterEach(() => {
   setDev(ORIGINAL_DEV ?? true);
 });
 
-describe("env.apiUrl — production build", () => {
+describe("env.apiUrl, production build", () => {
   it("rejects a plaintext http:// origin", () => {
     setDev(false);
     process.env.EXPO_PUBLIC_API_URL = "http://api.stoop.example";
@@ -47,7 +47,7 @@ describe("env.apiUrl — production build", () => {
     expect(() => env.apiUrl).toThrow(/https/i);
   });
 
-  it("never echoes the full configured value in the thrown message (rule 5 — can carry credentials)", () => {
+  it("never echoes the full configured value in the thrown message (rule 5: it can carry credentials)", () => {
     setDev(false);
     process.env.EXPO_PUBLIC_API_URL = "http://secret-token@api.stoop.example";
     expect(() => env.apiUrl).toThrow(/https/i);
@@ -61,7 +61,7 @@ describe("env.apiUrl — production build", () => {
   });
 });
 
-describe("env.apiUrl — dev build", () => {
+describe("env.apiUrl, dev build", () => {
   it("keeps working on http://localhost", () => {
     setDev(true);
     process.env.EXPO_PUBLIC_API_URL = "http://localhost:8000";

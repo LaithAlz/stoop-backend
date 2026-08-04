@@ -124,6 +124,188 @@ describe("TenantFormModal, #292: a legacy un-normalizable phone stays editable",
   }, 30000);
 });
 
+// Adversarial safety review, 2026-08-04, item 1 (FIX 1, HIGH): the exact
+// legacy row most likely to survive migration 0017 untouched (schema-v1.md
+// v1.21 point 5) is one with surrounding whitespace on top of the
+// unnormalizable text (a CSV import, a paste from a spreadsheet, a
+// trailing newline). Before the fix this whole suite passed against
+// LEGACY_TENANT's exact phone but failed for every one of these.
+describe("TenantFormModal, item 1: a legacy phone with surrounding whitespace stays editable", () => {
+  it("a trailing space on the stored phone does not block an unrelated edit", async () => {
+    const tenantWithTrailingSpace: Tenant = { ...LEGACY_TENANT, phone: "call the office " };
+    mockUpdateTenant.mockResolvedValue({
+      ...tenantWithTrailingSpace,
+      vulnerable_occupant: "infant",
+    });
+    const onClose = jest.fn();
+    render(
+      <TenantFormModal
+        visible
+        propertyId="prop-1"
+        tenant={tenantWithTrailingSpace}
+        onClose={onClose}
+      />,
+      { wrapper: makeWrapper() },
+    );
+
+    fireEvent.press(screen.getByText("An infant"));
+    fireEvent.press(screen.getByTestId("tenant-save"));
+
+    expect(screen.queryByText(PHONE_FORMAT_ERROR)).toBeNull();
+    await waitFor(() => expect(mockUpdateTenant).toHaveBeenCalledTimes(1));
+    const [, body] = mockUpdateTenant.mock.calls[0];
+    expect(body).not.toHaveProperty("phone");
+    expect(body).toEqual({ vulnerable_occupant: "infant" });
+  }, 30000);
+
+  it("a leading space on the stored phone does not block an unrelated edit", async () => {
+    const tenantWithLeadingSpace: Tenant = { ...LEGACY_TENANT, phone: " call the office" };
+    mockUpdateTenant.mockResolvedValue({
+      ...tenantWithLeadingSpace,
+      vulnerable_occupant: "elderly",
+    });
+    const onClose = jest.fn();
+    render(
+      <TenantFormModal
+        visible
+        propertyId="prop-1"
+        tenant={tenantWithLeadingSpace}
+        onClose={onClose}
+      />,
+      { wrapper: makeWrapper() },
+    );
+
+    fireEvent.press(screen.getByText("An elderly person"));
+    fireEvent.press(screen.getByTestId("tenant-save"));
+
+    expect(screen.queryByText(PHONE_FORMAT_ERROR)).toBeNull();
+    await waitFor(() => expect(mockUpdateTenant).toHaveBeenCalledTimes(1));
+    const [, body] = mockUpdateTenant.mock.calls[0];
+    expect(body).not.toHaveProperty("phone");
+  }, 30000);
+
+  it("a trailing newline on the stored phone does not block an unrelated edit", async () => {
+    const tenantWithTrailingNewline: Tenant = {
+      ...LEGACY_TENANT,
+      phone: "416-555-0134 x22\n",
+    };
+    mockUpdateTenant.mockResolvedValue({
+      ...tenantWithTrailingNewline,
+      vulnerable_occupant: "medical_device",
+    });
+    const onClose = jest.fn();
+    render(
+      <TenantFormModal
+        visible
+        propertyId="prop-1"
+        tenant={tenantWithTrailingNewline}
+        onClose={onClose}
+      />,
+      { wrapper: makeWrapper() },
+    );
+
+    fireEvent.press(screen.getByText("On powered medical equipment"));
+    fireEvent.press(screen.getByTestId("tenant-save"));
+
+    expect(screen.queryByText(PHONE_FORMAT_ERROR)).toBeNull();
+    await waitFor(() => expect(mockUpdateTenant).toHaveBeenCalledTimes(1));
+    const [, body] = mockUpdateTenant.mock.calls[0];
+    expect(body).not.toHaveProperty("phone");
+  }, 30000);
+});
+
+// Item 3 (FIX 3, MEDIUM): the one field-level signal for a tenant whose
+// stored, unchanged phone is un-normalizable, non-blocking on purpose.
+describe("TenantFormModal, item 3: unreachable-number warning", () => {
+  it("shows a non-blocking warning as soon as the modal opens, before any submit attempt", () => {
+    const onClose = jest.fn();
+    render(
+      <TenantFormModal visible propertyId="prop-1" tenant={LEGACY_TENANT} onClose={onClose} />,
+      { wrapper: makeWrapper() },
+    );
+
+    expect(screen.getByTestId("tenant-phone-warning")).toBeTruthy();
+    // Never the blocking format error, and never the neutral helper.
+    expect(screen.queryByText(PHONE_FORMAT_ERROR)).toBeNull();
+  }, 30000);
+
+  it("does not block Save while the warning is showing", async () => {
+    mockUpdateTenant.mockResolvedValue({ ...LEGACY_TENANT, vulnerable_occupant: "infant" });
+    const onClose = jest.fn();
+    render(
+      <TenantFormModal visible propertyId="prop-1" tenant={LEGACY_TENANT} onClose={onClose} />,
+      { wrapper: makeWrapper() },
+    );
+
+    expect(screen.getByTestId("tenant-phone-warning")).toBeTruthy();
+    fireEvent.press(screen.getByText("An infant"));
+    fireEvent.press(screen.getByTestId("tenant-save"));
+
+    await waitFor(() => expect(mockUpdateTenant).toHaveBeenCalledTimes(1));
+  }, 30000);
+
+  it("clears once the landlord actually edits the phone field", () => {
+    const onClose = jest.fn();
+    render(
+      <TenantFormModal visible propertyId="prop-1" tenant={LEGACY_TENANT} onClose={onClose} />,
+      { wrapper: makeWrapper() },
+    );
+
+    expect(screen.getByTestId("tenant-phone-warning")).toBeTruthy();
+    fireEvent.changeText(screen.getByTestId("tenant-phone"), "(416) 555-0199");
+
+    expect(screen.queryByTestId("tenant-phone-warning")).toBeNull();
+  }, 30000);
+
+  it("never shows for a tenant with a normalized, dialable phone", () => {
+    const onClose = jest.fn();
+    const normalTenant: Tenant = { ...LEGACY_TENANT, phone: "+14165550134" };
+    render(
+      <TenantFormModal visible propertyId="prop-1" tenant={normalTenant} onClose={onClose} />,
+      { wrapper: makeWrapper() },
+    );
+
+    expect(screen.queryByTestId("tenant-phone-warning")).toBeNull();
+  }, 30000);
+});
+
+// Item 4 (FIX 4, MEDIUM): a pre-#260 blank stored phone must not read as
+// "unchanged": the required-field error has to keep showing until the
+// landlord actually fixes it, exactly as it would for a brand-new tenant.
+describe("TenantFormModal, item 4: a blank stored phone still requires a fix", () => {
+  it("blocks Save with the required-field error, unchanged", () => {
+    const blankPhoneTenant: Tenant = { ...LEGACY_TENANT, phone: "" };
+    const onClose = jest.fn();
+    render(
+      <TenantFormModal visible propertyId="prop-1" tenant={blankPhoneTenant} onClose={onClose} />,
+      { wrapper: makeWrapper() },
+    );
+
+    fireEvent.press(screen.getByText("An infant"));
+    fireEvent.press(screen.getByTestId("tenant-save"));
+
+    expect(screen.getByText("Add a phone number.")).toBeTruthy();
+    expect(mockUpdateTenant).not.toHaveBeenCalled();
+  }, 30000);
+
+  it("saves once the landlord supplies a real phone", async () => {
+    const blankPhoneTenant: Tenant = { ...LEGACY_TENANT, phone: "" };
+    mockUpdateTenant.mockResolvedValue({ ...blankPhoneTenant, phone: "+14165550134" });
+    const onClose = jest.fn();
+    render(
+      <TenantFormModal visible propertyId="prop-1" tenant={blankPhoneTenant} onClose={onClose} />,
+      { wrapper: makeWrapper() },
+    );
+
+    fireEvent.changeText(screen.getByTestId("tenant-phone"), "(416) 555-0134");
+    fireEvent.press(screen.getByTestId("tenant-save"));
+
+    await waitFor(() => expect(mockUpdateTenant).toHaveBeenCalledTimes(1));
+    const [, body] = mockUpdateTenant.mock.calls[0];
+    expect(body).toEqual({ phone: "+14165550134" });
+  }, 30000);
+});
+
 describe("TenantFormModal, create mode is unaffected", () => {
   it("still requires and sends a validated phone for a brand-new tenant", async () => {
     mockCreateTenant.mockResolvedValue({ ...LEGACY_TENANT, id: "tenant-2" });

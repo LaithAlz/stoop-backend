@@ -15,6 +15,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { AuthProvider, useAuth } from "@/auth/AuthProvider";
 import { resolveAuthRoute } from "@/auth/resolveAuthRoute";
 import { queryClient } from "@/api/queryClient";
+import { env } from "@/lib/env";
 import { colors } from "@/theme/tokens";
 
 // Keep the native splash screen up until we know whether there's a session,
@@ -22,6 +23,21 @@ import { colors } from "@/theme/tokens";
 SplashScreen.preventAutoHideAsync().catch(() => {
   // Already hidden, or unsupported on this platform (e.g. web) — fine to ignore.
 });
+
+// Adversarial safety review, 2026-08-04, item 2 (FIX 2, HIGH): touch
+// `env.apiUrl` once, right here at module load, so a plaintext
+// EXPO_PUBLIC_API_URL in a production build throws at boot, as
+// src/lib/env.ts's own docstring claims. Before this, nothing accessed the
+// getter until the first real API call, deep inside src/api/client.ts's
+// fetch try/catch, where the thrown Error was mapped to the same generic
+// network_error every dropped connection gets and never reached a log or
+// the landlord: the diagnosis direction was silent even though the traffic
+// direction (fetch never attempted) was already safe. Never touch
+// env.supabaseUrl/supabaseAnonKey here: those throw on a MISSING value even
+// in dev (a fresh checkout with no .env yet), which is an expected,
+// already-documented setup step, not a misconfiguration to fail loud on at
+// import time.
+void env.apiUrl;
 
 export default function RootLayout() {
   return (
