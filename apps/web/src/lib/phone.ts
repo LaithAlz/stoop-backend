@@ -12,6 +12,69 @@
  */
 
 /**
+ * Non-ASCII characters that are UNAMBIGUOUSLY not digits, and so may
+ * appear in a pasted phone string and be stripped as punctuation: letters
+ * (`\p{L}` — "Célular:", "携帯", "моб."), spaces (`\p{Zs}` — NBSP and
+ * narrow-NBSP, the copy-off-a-webpage case), format controls (`\p{Cf}` —
+ * LRM/RLM from an RTL paste, word joiners, BOM), punctuation (`\p{P}` —
+ * en/em dashes from Word autocorrect, non-breaking hyphen, smart quotes)
+ * and symbols (`\p{S}`).
+ *
+ * F1 (safety re-verify, #273): this is an ALLOWLIST, and the guard below
+ * rejects any non-ASCII code point NOT in it. The first cut was the
+ * inverse — a denylist of "characters that might be digits" — which fails
+ * OPEN against a moving standard: the web client sends `toE164`'s OUTPUT,
+ * not the landlord's raw input, so the server never sees the offending
+ * character on a web write and this guard is the ONLY line of defense.
+ * Any digit codepoint newer than the landlord's own browser's Unicode
+ * table would fall out of `\p{Nd}` and be silently stripped exactly as
+ * before #273 (measured: a browser at Unicode 14 reintroduces the bug for
+ * the Kawi and Nag Mundari digit blocks). Failing closed also retires the
+ * hand-maintained list of 81 CJK ideographic numerals that `\p{N}` misses
+ * — those are General_Category `Lo`, so no Number-property escape catches
+ * them, and JS exposes no Numeric_Type escape.
+ *
+ * Verified against Python's `str.isnumeric() and not isascii()` (the
+ * server-side authority, apps/api/app/phone.py) across every codepoint
+ * 0..0x10FFFF: zero misses, and zero new rejections across a corpus of
+ * realistic pastes.
+ *
+ * The CJK numerals below are carved BACK OUT of `\p{L}`, not retired:
+ * they are General_Category `Lo` (Letter), so an allowlist that trusts
+ * `\p{L}` wholesale would hand `一`/`〇` straight back through — measured,
+ * not assumed. Everything else the old denylist enumerated is now covered
+ * by the fail-closed default, so this list no longer has to track new
+ * digit blocks; it only has to track CJK numerals, which is a closed set.
+ */
+const NON_ASCII_ALLOWED_RE = /[\p{L}\p{Zs}\p{Cf}\p{P}\p{S}]/u;
+
+/** CJK ideographic numerals — `Lo`, so exempted from the `\p{L}` allowlist
+ *  above. Diff-verified against Python's `isnumeric()` across every
+ *  codepoint. */
+const CJK_NUMERALS_RE =
+  /[\u{3405}\u{3483}\u{382A}\u{3B4D}\u{4E00}\u{4E03}\u{4E07}\u{4E09}\u{4E5D}\u{4E8C}\u{4E94}\u{4E96}\u{4EBF}\u{4EC0}\u{4EDF}\u{4EE8}\u{4F0D}\u{4F70}\u{5104}\u{5146}\u{5169}\u{516B}\u{516D}\u{5341}\u{5343}\u{5344}\u{5345}\u{534C}\u{53C1}\u{53C2}\u{53C3}\u{53C4}\u{56DB}\u{58F1}\u{58F9}\u{5E7A}\u{5EFE}\u{5EFF}\u{5F0C}\u{5F0D}\u{5F0E}\u{5F10}\u{62FE}\u{634C}\u{67D2}\u{6F06}\u{7396}\u{767E}\u{8086}\u{842C}\u{8CAE}\u{8CB3}\u{8D30}\u{9621}\u{9646}\u{964C}\u{9678}\u{96F6}\u{F96B}\u{F973}\u{F978}\u{F9B2}\u{F9D1}\u{F9D3}\u{F9FD}\u{20001}\u{20064}\u{200E2}\u{20121}\u{2092A}\u{20983}\u{2098C}\u{2099C}\u{20AEA}\u{20AFD}\u{20B19}\u{22390}\u{22998}\u{23B1B}\u{2626D}\u{2F890}]/u;
+
+/**
+ * `true` iff *value* contains a non-ASCII character that isn't clearly
+ * punctuation-or-letter — i.e. anything that might be a digit, including
+ * codepoints this engine's Unicode tables don't know yet.
+ *
+ * Iterates by Unicode code point (`for...of` on a string), not UTF-16 code
+ * unit, so a supplementary-plane character is tested whole rather than as
+ * two broken surrogate halves. (The regex deliberately carries no `g`
+ * flag: a global regex keeps `lastIndex` across `.test()` calls and would
+ * alternate results on repeated input.)
+ */
+function containsNonAsciiDigit(value: string): boolean {
+  for (const ch of value) {
+    if (ch.codePointAt(0)! <= 0x7f) continue;
+    if (CJK_NUMERALS_RE.test(ch)) return true;
+    if (!NON_ASCII_ALLOWED_RE.test(ch)) return true;
+  }
+  return false;
+}
+
+/**
  * Best-effort E.164 for the NANP inputs these forms actually see. Anything
  * this can't confidently normalize is rejected by `phoneLooksValid` below
  * rather than sent — storing a string Twilio can't dial is strictly worse
@@ -20,6 +83,22 @@
  */
 export function toE164(phone: string): string | null {
   const trimmed = phone.trim();
+  // #273 (safety review, 2026-08-03 finding 1, client-side half — BLOCKING):
+  // must run before ANY other processing, including the digit-strip below.
+  // `.replace(/\D/g, "")` without the `u` flag is ASCII-only, so a
+  // non-ASCII "digit" (Arabic-Indic "١", CJK "一"/"〇", fullwidth "４", …)
+  // used to be treated as punctuation and silently STRIPPED rather than
+  // rejected — shifting the remaining digits into a DIFFERENT, still-
+  // plausible-looking number instead of failing loudly:
+  // toE164("+١4165551234") used to return "+4165551234", a number that is
+  // NOT the one the landlord typed, silently stored on `landlords.phone`
+  // or `backup_contact.phone` — the field the emergency escalation chain
+  // dials (apps/api/app/agent/emergency_chain.py). Reject outright
+  // instead, mirroring apps/api/app/phone.py's `_contains_non_ascii_digit`
+  // exactly (verified above) so the client never accepts what the server
+  // would 422 on, and never silently rewrites what the server would
+  // accept.
+  if (containsNonAsciiDigit(trimmed)) return null;
   // R3 (safety re-verify): the +country test runs on the PUNCTUATION-
   // STRIPPED string, so "+44 20 7946 0958" is accepted the same as
   // "+442079460958" — a landlord with an international mobile shouldn't
