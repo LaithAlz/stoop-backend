@@ -240,7 +240,7 @@ describe("unregisterCurrentDeviceBestEffort — the sign-out path", () => {
     expect(mockSecureDeleteItem).toHaveBeenCalledWith(expect.any(String));
   });
 
-  it("leaves the durable SecureStore marker in place when the DELETE fails — B3-8's reconcile step is what's supposed to catch this", async () => {
+  it("leaves the durable SecureStore marker in place when the DELETE fails, B3-8's reconcile step is what's supposed to catch this", async () => {
     await registerForPushNotificationsAsync();
     mockUnregisterDevice.mockRejectedValue(new Error("network"));
 
@@ -266,7 +266,7 @@ describe("B3-8 (#284): registerForPushNotificationsAsync persists a durable mark
   });
 });
 
-describe("reconcileStaleDeviceRegistration — B3-8's reconcile-on-next-sign-in cleanup", () => {
+describe("reconcileStaleDeviceRegistration, B3-8's reconcile-on-next-sign-in cleanup", () => {
   it("does nothing when there is no persisted marker", async () => {
     mockSecureGetItem.mockResolvedValue(null);
 
@@ -285,7 +285,7 @@ describe("reconcileStaleDeviceRegistration — B3-8's reconcile-on-next-sign-in 
     expect(mockSecureDeleteItem).toHaveBeenCalledWith(expect.any(String));
   });
 
-  it("still clears the marker even when the DELETE fails — one best-effort attempt, not a retry queue (the accepted residual gap)", async () => {
+  it("still clears the marker even when the DELETE fails, one best-effort attempt, not a retry queue (the accepted residual gap)", async () => {
     mockSecureGetItem.mockResolvedValue("dev-stale-from-a-forced-signout");
     mockUnregisterDevice.mockRejectedValue(new Error("network"));
 

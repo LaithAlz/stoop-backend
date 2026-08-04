@@ -8,7 +8,7 @@
  * other action on this screen.
  *
  * `@/auth/AuthProvider`, `@/api/me`, `@/api/properties`, `@/api/trust`, and
- * `@/features/push/usePushPermission` are all mocked — real, unmocked
+ * `@/features/push/usePushPermission` are all mocked, real, unmocked
  * versions of the `@/api/*` modules construct the actual Supabase client at
  * import time (src/lib/supabase.ts) and throw without a configured .env,
  * same reason src/features/tenants/__tests__/TenantFormModal.test.tsx mocks
@@ -80,7 +80,7 @@ beforeEach(() => {
   jest.spyOn(Alert, "alert").mockImplementation(() => undefined);
 });
 
-describe("Me tab — Sign out feedback (#284 B3-5)", () => {
+describe("Me tab, Sign out feedback (#284 B3-5)", () => {
   it("shows no alert on a successful sign-out", async () => {
     mockSignOut.mockResolvedValue({ ok: true });
     const { getByTestId } = render(<MeScreen />, { wrapper });

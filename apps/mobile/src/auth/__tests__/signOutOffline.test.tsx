@@ -2,7 +2,7 @@
  * #284 B3-5 + B3-8: `AuthProvider.signOut`'s honest result when auth-js's
  * own `/logout` call fails (offline, most concretely), and
  * `AuthProvider.signIn`'s reconcile-on-next-sign-in wiring. `@/lib/supabase`
- * and `@/features/push/deviceRegistration` are both mocked — zero network,
+ * and `@/features/push/deviceRegistration` are both mocked, zero network,
  * no real SecureStore/keychain touch (mirrors src/auth/__tests__/
  * signOutClearsCache.test.tsx's own fence).
  */
@@ -74,7 +74,7 @@ beforeEach(() => {
   mockReconcileStaleDeviceRegistration.mockResolvedValue(undefined);
 });
 
-describe("signOut — B3-5 (#284): an offline /logout must not be reported as success", () => {
+describe("signOut, B3-5 (#284): an offline /logout must not be reported as success", () => {
   it("resolves { ok: true } and fires SIGNED_OUT when supabase.auth.signOut succeeds", async () => {
     mockSupabaseSignOut.mockResolvedValue({ error: null });
     renderHarness();
@@ -87,7 +87,7 @@ describe("signOut — B3-5 (#284): an offline /logout must not be reported as su
 
   it("resolves { ok: false } when supabase.auth.signOut returns a retryable/offline error, and never claims SIGNED_OUT happened", async () => {
     // Standing in for auth-js's own `_signOut` (GoTrueClient.ts) returning
-    // early on a network failure from /logout — the exact "subway" case
+    // early on a network failure from /logout, the exact "subway" case
     // this finding names. The mock never calls onAuthStateChange's captured
     // callback here, matching auth-js's real behavior on this branch: no
     // `_removeSession()`, no SIGNED_OUT event.
@@ -97,7 +97,7 @@ describe("signOut — B3-5 (#284): an offline /logout must not be reported as su
     const result = await captured.ctx!.signOut();
 
     expect(result).toEqual({ ok: false });
-    // The session was never actually torn down — this is the "not left
+    // The session was never actually torn down, this is the "not left
     // believing something false" half of the fix: the context still
     // reports the same (here: already-null in this harness, but the
     // point is nothing SET it to null via a fabricated SIGNED_OUT) state
@@ -116,7 +116,7 @@ describe("signOut — B3-5 (#284): an offline /logout must not be reported as su
   });
 });
 
-describe("signIn — B3-8 (#284): reconciles a stale device registration on success", () => {
+describe("signIn, B3-8 (#284): reconciles a stale device registration on success", () => {
   it("calls reconcileStaleDeviceRegistration after a successful sign-in", async () => {
     mockSignInWithPassword.mockResolvedValue({ error: null });
     renderHarness();

@@ -379,7 +379,9 @@ describe("apiRequest", () => {
     it("resolves undefined (never throws) on a genuine 204", async () => {
       (globalThis.fetch as jest.Mock).mockResolvedValue(rawResponse(204, ""));
 
-      await expect(apiRequest("/v1/drafts/draft-1/reject", { method: "DELETE" })).resolves.toBeUndefined();
+      await expect(
+        apiRequest("/v1/drafts/draft-1/reject", { method: "DELETE" }),
+      ).resolves.toBeUndefined();
     });
 
     it("throws unknown_error on a 200 with a totally empty body", async () => {
