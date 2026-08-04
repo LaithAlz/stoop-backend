@@ -95,8 +95,8 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   // caller as of #279) enforces.
   //
   // #279: this used to be a local `useState`, invisible to any OTHER
-  // `useDraftActions` instance — and this hook is instantiated PER ROUTE
-  // (Home, the conversation thread), so a flag raised on one route was
+  // `useDraftActions` instance (this hook is instantiated PER ROUTE:
+  // Home, the conversation thread), so a flag raised on one route was
   // simply gone the moment that route's instance unmounted. Sourced from
   // `unverifiedSendStore.ts` now, a module-scope store every instance
   // reads and writes through, so a flag raised on either surface is
@@ -106,8 +106,8 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   const resolveUnverifiedSend = useCallback(
     (draftId: string, stillPending: boolean) => {
       // F12 (safety re-verify round 2): `clearUnverifiedSend` reports
-      // whether `draftId` WAS flagged, atomically with the removal —
-      // today's callers (one shared resolution effect per mounted route,
+      // whether `draftId` WAS flagged, atomically with the removal.
+      // Today's callers (one shared resolution effect per mounted route,
       // as of #279) each iterate their own snapshot of the map, so two
       // mounted routes could in principle both observe the same flagged
       // id and both call this; the atomic check-and-clear is what keeps
@@ -140,7 +140,7 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       setEditingContext((current) => (current?.draftId === draftId ? null : current));
     },
     // #279: `unverifiedSendIds` is no longer read inside this callback's
-    // body — `clearUnverifiedSend` reads the shared store directly — so
+    // body (`clearUnverifiedSend` reads the shared store directly), so
     // it's correctly gone from these deps rather than kept for a
     // resemblance to the old shape.
     [onNotice],
@@ -403,8 +403,8 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
         // refuses to resolve against any read that didn't complete AFTER
         // this moment. No plumbing needed for the query's generation.
         // #279: written to the shared module-scope store (not local
-        // state) so this flag is visible to whichever route — this one or
-        // the other — ends up resolving it.
+        // state) so this flag is visible to whichever route, this one or
+        // the other, ends up resolving it.
         const failedAt = Date.now();
         markUnverifiedSend(ctx.draftId, failedAt);
         onNotice("That may have gone through. Give it a moment to update before sending again.");

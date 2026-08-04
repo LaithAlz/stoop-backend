@@ -66,7 +66,7 @@ function AppQueuePage() {
   // Last-known QueueItem per draft id for the two entry statuses
   // buildQueueView pins past their server row disappearing from a fresh
   // `items` read: `skipped` (the founder ruling) and, as of #291,
-  // `sending` (the undo window must survive a refetch — see
+  // `sending` (the undo window must survive a refetch, see
   // buildQueueView's own docstring). Written at `handleSkip`/`handleApprove`
   // /`handleSubmitEdit` below, right before the local overlay entry moves
   // to the status that needs it pinned.
@@ -99,8 +99,8 @@ function AppQueuePage() {
   }, [queueQuery.data, entries]);
 
   // #279: the resolution rule itself now lives in
-  // useResolveUnverifiedSends.ts, shared with the conversation thread —
-  // see that file's docstring for the full F1/F11 reasoning this used to
+  // useResolveUnverifiedSends.ts, shared with the conversation thread.
+  // See that file's docstring for the full F1/F11 reasoning this used to
   // carry inline.
   useResolveUnverifiedSends({
     data: queueQuery.data,
@@ -162,7 +162,7 @@ function AppQueuePage() {
 
   // #291: captured BEFORE `draftActions.approve` so the snapshot exists
   // the instant the mutation's `onSuccess` flips this draft's local entry
-  // to "sending" — buildQueueView needs it on that very first render in
+  // to "sending": buildQueueView needs it on that very first render in
   // case a concurrent refetch has already dropped the row from `items`.
   function handleApprove(item: QueueItem) {
     setQueueSnapshots((prev) => ({
@@ -184,7 +184,7 @@ function AppQueuePage() {
     );
   }
 
-  // #291: same reasoning as `handleApprove` above — a successful
+  // #291: same reasoning as `handleApprove` above: a successful
   // edit-and-send dispatches the identical "approved" action (it's one
   // mutation outcome shape, per useDraftActions.ts), so it needs the same
   // pin. `editingSnapshot` is the queue item the editor opened with;

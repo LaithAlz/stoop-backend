@@ -168,12 +168,12 @@ export interface QueueViewRow {
  * Merges fresh `GET /v1/queue` items with the local overlay. Two entry
  * statuses persist past their server row disappearing from `items`, from
  * their own last-known snapshot in `queueSnapshots`: `skipped` (the
- * founder ruling — the card stays visible, muted) and `sending` (issue
+ * founder ruling, the card stays visible, muted) and `sending` (issue
  * #291).
  *
  * #291: `GET /v1/drafts/{id}/approve` moves the row to `status='approved'`
  * server-side immediately, and `GET /v1/queue` INNER JOINs the pending
- * draft — so an approved draft (or a successful edit-and-send, which
+ * draft, so an approved draft (or a successful edit-and-send, which
  * dispatches the identical "approved" action) leaves `items` on the VERY
  * NEXT read, well before the undo window (still running server-side) has
  * elapsed. Without a pin here, any of Home's several refetch triggers
@@ -181,13 +181,13 @@ export interface QueueViewRow {
  * card's skip/error `onSettled`, or `useAcknowledge`'s unconditional queue
  * invalidation) deletes the card and its Undo control while the undo is
  * still live and the landlord has no way to press it. `sending` is
- * released from the pin the moment it stops being true — the countdown
+ * released from the pin the moment it stops being true: the countdown
  * hitting zero (`"sent"`) or a successful undo (the entry is deleted
- * outright) — never before; see this function's callers for exactly
+ * outright), never before. See this function's callers for exactly
  * where each entry status's snapshot gets written.
  *
  * EXCEPT the item currently open in the edit-and-send panel
- * (`pinnedEditingItem`, A7 below) — a separate single-slot pin because at
+ * (`pinnedEditingItem`, A7 below), a separate single-slot pin because at
  * most one editor is ever open at a time.
  */
 export function buildQueueView(
@@ -235,7 +235,7 @@ export function draftStaleNotice(tenantFirstName: string): string {
 /**
  * M1 senior advisory (mobile, ported here verbatim): drop any snapshot
  * whose entry is no longer one of the two statuses `buildQueueView` above
- * ever pins (`skipped` or, as of #291, `sending`) — a skip or approve that
+ * ever pins (`skipped` or, as of #291, `sending`). A skip or approve that
  * failed (its entry was `cleared` by the error handler), or an undo/expiry
  * that resolved it, would otherwise leave its snapshot in Home's map
  * forever, keeping a stale card resurrectable and tenant text pinned in

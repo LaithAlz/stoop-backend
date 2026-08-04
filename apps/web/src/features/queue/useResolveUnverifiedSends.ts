@@ -1,7 +1,7 @@
 /**
  * The #252 unverified-send resolution rule, shared by every caller as of
  * issue #279. Previously lived inline in src/routes/app.index.tsx (Home)
- * only — the conversation thread (src/routes/app.conversations.$id.tsx)
+ * only: the conversation thread (src/routes/app.conversations.$id.tsx)
  * never wired it at all, so an ambiguous edit-and-send failure there
  * raised the flag (useDraftActions.ts) and nothing ever resolved it, and
  * Send stayed enabled through the exact window the flag exists to close.
@@ -11,12 +11,12 @@
  * with a `pending` draft, unscoped to any one conversation, so it is a
  * valid "is this draft still pending" read for a flag raised on EITHER
  * surface. The conversation thread already fetches it today (for the tab
- * bar's queue-count badge — src/routes/app.conversations.$id.tsx), so
+ * bar's queue-count badge, src/routes/app.conversations.$id.tsx), so
  * reusing it here needs no second query.
  *
  * Extracted into one hook, not copied twice, because this rule already
  * took two safety rounds to get right and both earlier, wrong attempts
- * SHIPPED and were inert — see the two comment blocks (F1, F11) below.
+ * SHIPPED and were inert (see the two comment blocks, F1 and F11, below).
  * A second hand-copied version on the thread route would have been a
  * third chance to drift.
  */
@@ -42,15 +42,15 @@ import type { QueueResponse } from "@/api/types";
 export const UNVERIFIED_SETTLE_MS = 2 * QUEUE_REFETCH_INTERVAL_MS;
 
 export interface UseResolveUnverifiedSendsOptions {
-  /** The queue read both routes already fetch — Home as its primary data
+  /** The queue read both routes already fetch: Home as its primary data
    *  source, the thread for its tab-bar badge count. */
   data: QueueResponse | undefined;
-  /** TanStack Query's own `dataUpdatedAt` for that same read — the CLIENT
+  /** TanStack Query's own `dataUpdatedAt` for that same read, the CLIENT
    *  clock moment this particular payload was received, directly
    *  comparable to `markUnverifiedSend`'s `failedAt` stamp (same clock,
    *  same units; see unverifiedSendStore.ts). */
   dataUpdatedAt: number;
-  /** `useDraftActions().unverifiedSendIds` — sourced from the shared
+  /** `useDraftActions().unverifiedSendIds`, sourced from the shared
    *  module-scope store as of #279, so this is the SAME map regardless of
    *  which route's `useDraftActions` instance is asking. */
   unverifiedSendIds: ReadonlyMap<string, number>;
@@ -60,15 +60,15 @@ export interface UseResolveUnverifiedSendsOptions {
 
 export interface DueUnverifiedResolution {
   draftId: string;
-  /** Whether the draft was still present in the fresh read — `true`
-   *  means the edit-and-send never applied (re-enable Send); `false`
-   *  means it's gone (the notice + editor-close branch). */
+  /** Whether the draft was still present in the fresh read: `true` means
+   *  the edit-and-send never applied (re-enable Send); `false` means it's
+   *  gone (the notice + editor-close branch). */
   stillPending: boolean;
 }
 
 /**
  * R3-1 (safety review round 3 follow-up, issue #252): the resolution rule
- * itself, pure and React-free — like queueEntries.ts's own reducer, kept
+ * itself, pure and React-free, like queueEntries.ts's own reducer, kept
  * this way specifically so it's directly exercisable without a DOM (web
  * has no test runner yet, #294). `useResolveUnverifiedSends` below is a
  * thin `useEffect` wrapper that calls this and fires
@@ -76,27 +76,27 @@ export interface DueUnverifiedResolution {
  * file duplicates the rule.
  *
  * Resolves any flagged `unverifiedSendIds` against a queue read that
- * completed AFTER the failure that raised them — still listed as a card
+ * completed AFTER the failure that raised them: still listed as a card
  * means the edit never applied (re-enable Send); gone means it did.
  *
  * F1 (safety re-verify, #252): resolve ONLY against a read that completed
  * after the failure. Without the `dataUpdatedAt` comparison this fired on
- * the very next commit — when the query's `data` is still the last
+ * the very next commit, when the query's `data` is still the last
  * successful payload from BEFORE the send, which of course still lists
- * the draft — so it resolved "still pending", re-enabled Send about one
+ * the draft, so it resolved "still pending", re-enabled Send about one
  * frame later, and the guard did nothing at all. `isFetching` alone isn't
  * sufficient; the generation is.
  *
  * F11 (safety re-verify round 2, #252): the two directions need DIFFERENT
  * evidence, because the server request outlives the client's error.
  * `POST /v1/drafts/{id}/edit-and-send` synchronously resumes the
- * LangGraph thread under a per-case lock — hundreds of ms to seconds —
- * and the ambiguous triggers (edge 504, client timeout, dropped
- * connection) all leave the origin still working. So a read completing
- * 200ms after the failure can honestly report the draft still `pending`
- * while the origin commits a second later. Resolving "still pending" on
- * that read re-enables Send permanently, and the retype-and-resend lands
- * on the idempotent 200 that discards the new body.
+ * LangGraph thread under a per-case lock (hundreds of ms to seconds), and
+ * the ambiguous triggers (edge 504, client timeout, dropped connection)
+ * all leave the origin still working. So a read completing 200ms after
+ * the failure can honestly report the draft still `pending` while the
+ * origin commits a second later. Resolving "still pending" on that read
+ * re-enables Send permanently, and the retype-and-resend lands on the
+ * idempotent 200 that discards the new body.
  *   gone          -> definitive on the FIRST post-failure read (the
  *                    editor closes either way; a resend can only 409 or
  *                    hit the idempotent 200).
