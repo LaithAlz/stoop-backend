@@ -373,21 +373,32 @@ function QueueRow({
   const rowRef = useRef<HTMLDivElement>(null);
   const undoButtonRef = useRef<HTMLButtonElement>(null);
   const prevEntryStatusRef = useRef(entry.status);
+  // #191 round 4 item 4 (safety review re-verify): by the time the
+  // transition effect below runs, a removed Undo button has already reset
+  // `document.activeElement` to `<body>` (verified by hand: a focused
+  // descendant removed from inside a `tabIndex={-1}` container resets
+  // focus to `<body>`, never to the container), the exact same value a
+  // session that never focused anything at all also sits at. Reading
+  // `document.activeElement` only AFTER the removal can't tell those two
+  // apart. This ref is refreshed on every render while still "sending"
+  // (the countdown's own per-second tick keeps it fresh well within the
+  // five-second window), so the transition effect can ask "was Undo
+  // genuinely focused as of the last render before it went away" instead.
+  const undoHadFocusRef = useRef(false);
   useEffect(() => {
     const prevStatus = prevEntryStatusRef.current;
     prevEntryStatusRef.current = entry.status;
     if (prevStatus === entry.status) return;
-    // #191 F2/F4/re-verify "two smaller ones" (safety review follow-up):
-    // `sending -> sent` is the 5-second countdown simply running out, a
-    // timer, never a landlord action. Focus can legitimately be anywhere
-    // by then (this is exactly the gap the guard below exists for on the
-    // OTHER transitions, but on a timer there's no click to have put
-    // focus here in the first place on a mouse-only Safari session,
-    // where clicking a button doesn't focus it, `activeElement` sits at
-    // `<body>` the whole time, which would otherwise satisfy the guard
-    // and scroll the page back to this row five seconds after every
-    // approve). Exempted outright rather than guarded.
-    if (prevStatus === "sending" && entry.status === "sent") return;
+    // #191 round 4 item 4 (safety review re-verify): `sending -> sent` is
+    // the 5-second countdown simply running out, a timer, never a
+    // landlord action by itself. Only stay exempt when Undo did NOT
+    // plausibly hold focus right up to the moment it was removed (a
+    // landlord who has already moved their attention elsewhere on the
+    // page); otherwise fall through to the same recovery every other
+    // transition here gets, so a keyboard user whose focus was
+    // legitimately on Undo isn't silently dumped onto `<body>` with
+    // nothing to land on and no announcement.
+    if (prevStatus === "sending" && entry.status === "sent" && !undoHadFocusRef.current) return;
     // F6: only steal focus if it was plausibly inside this row, either
     // still literally there, or reset to <body> because the control that
     // had it was just removed as part of this very transition. A
@@ -411,10 +422,29 @@ function QueueRow({
     }
     rowRef.current?.focus();
   }, [entry.status]);
+  // #191 round 4 item 4 (safety review re-verify): refreshed every
+  // render, not only on a status change, so it reflects the freshest real
+  // focus state right up to the render before "sending" flips to "sent"
+  // (see `undoHadFocusRef`'s own comment above).
+  useEffect(() => {
+    if (entry.status === "sending") {
+      undoHadFocusRef.current = document.activeElement === undoButtonRef.current;
+    }
+  });
 
   if (entry.status === "skipped") {
     return (
-      <div ref={rowRef} tabIndex={-1} role="group" aria-label={`${tenantFirst}, ${propertyLabel}`}>
+      // #191 round 4 item 5 (safety review re-verify): this wrapper's own
+      // content is exactly one `<Link>` (SkippedCard.tsx, when it's given
+      // a `conversationId`, which Home always does): `role="group"` is
+      // "a set of objects", and one link is not a set. Dropped here. No
+      // `aria-label` either: it would be an F10 regression (a roleless
+      // div doesn't support `aria-label` per WebKit/axe-core), and it
+      // isn't needed anyway, since the Link's own accessible name is
+      // already the tenant, property, "No reply sent", and timestamp text
+      // it wraps. `rowRef` still needs this div for the focus-recovery
+      // fallback above; it just carries no ARIA semantics of its own now.
+      <div ref={rowRef} tabIndex={-1}>
         <SkippedCard
           conversationId={item.case_id}
           tenantName={tenantFirst}
@@ -439,7 +469,15 @@ function QueueRow({
   const ctx = { draftId: item.draft_id, caseId: item.case_id, tenantName: item.tenant_name };
 
   return (
-    <div ref={rowRef} tabIndex={-1} role="group" aria-label={`${tenantFirst}, ${propertyLabel}`}>
+    // #191 round 4 item 5 (safety review re-verify): `aria-label` used to
+    // be set here AND on `DecisionCard`'s own `<article>` inside it, the
+    // identical string, so browsing this card announced the same name
+    // twice. Dropped here, kept on the article, which was already a
+    // valid, labelled host for it. `role="group"` stays: unlike the
+    // skipped branch above, this wrapper's one child is an `<article>`
+    // holding a genuine set of controls (Edit, Skip, Approve, or the Undo
+    // ticket), not a lone link.
+    <div ref={rowRef} tabIndex={-1} role="group">
       <DecisionCard
         severity={item.severity}
         conversationId={item.case_id}

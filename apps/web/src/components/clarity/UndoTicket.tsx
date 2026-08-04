@@ -66,28 +66,28 @@ export function UndoTicket({
         className,
       )}
     >
-      {/* #191 F2/F4 (safety review follow-up): an earlier version of this
-          fix made this a `role="alert"` live region, on the theory that a
-          screen-reader user needs to be told a clock is running. The
-          reviewer's re-verify found the live region wasn't actually doing
-          that: nothing here focused the Undo button itself, so on Home
-          focus landed two tab stops above it (the row wrapper) and on the
-          thread it stayed at `<body>`, meaning the description only ever
-          fired if the landlord happened to tab in during the five-second
-          window, with the live region racing that same focus move. The
-          owner now focuses THIS button directly on the `-> sending`
-          transition (see QueueRow / ConversationPage), so the browser's
-          normal "read the accessible name plus its description on focus"
-          behavior delivers one clean announcement, "Undo, button, Undo is
-          available for N seconds after you approve", at the instant it
-          matters, on the control it describes. No live role here on
-          purpose: pairing a live announcement with a focus move on the
-          SAME element makes them race and can cancel each other.
-          `{totalSeconds}` is the real, server-derived window
+      {/* #191 round 4 item 3 (safety review re-verify): `role="status"`
+          restored here, on THIS paragraph, a sibling of the Undo button,
+          not on the button itself. Round 3 dropped the live role reasoning
+          that pairing a live announcement with a FOCUS MOVE on the SAME
+          element makes them race: true, but that reasoning doesn't reach
+          a live region on a different node. This element is freshly
+          mounted the instant a draft starts sending (UndoTicket only ever
+          exists while `status === "sending"`), so the announcement fires
+          once, right then, independent of whether focus ever reaches the
+          button at all. That independence is the point: `markBusy`
+          disables Approve on click, so focus sits at `<body>` for the
+          whole in-flight request, and a landlord who presses Tab in that
+          window ends up on some other control by the time this ticket
+          renders, past the point the owner's own focus-move effect
+          (QueueRow / ConversationPage) can catch it. This region still
+          announces. `{totalSeconds}` is the real, server-derived window
           (queueEntries.ts's `totalUndoSeconds`), never a hardcoded "5"
           that could read wrong against an on-screen countdown showing
-          something else. */}
-      <p id={noticeId} className="sr-only">
+          something else. Also still wired as `aria-describedby` below, so
+          a screen-reader user who tabs to Undo later in the window hears
+          the same window length again, read together with its name. */}
+      <p id={noticeId} role="status" className="sr-only">
         Undo is available for {totalSeconds} second{totalSeconds === 1 ? "" : "s"} after you
         approve.
       </p>
@@ -116,6 +116,26 @@ export function UndoTicket({
             )}
           >
             Undo
+            {/* #191 round 4 item 2 (safety review re-verify): this text
+                used to live INSIDE the button, part of its accessible
+                NAME, before round 3 moved it out to `aria-describedby`
+                only, leaving the name a bare "Undo". A description is the
+                first thing users turn off for verbosity, is dropped in
+                several browse-mode and rotor contexts, and isn't part of
+                the name at all: announced on focus, in the rotor, in a
+                say-all pass, and never suppressible by verbosity settings,
+                the way a name is. Restored here, alongside
+                `aria-describedby` above (kept, for the window length, read
+                again if a screen-reader user tabs to Undo later in the
+                countdown). `{clamped}` (not `{totalSeconds}`) so a
+                screen-reader user who tabs in mid-countdown hears how long
+                is ACTUALLY left, matching the visible "00:0X" digits
+                above, which stay `aria-hidden` (this span is the only
+                accessible-tree carrier of that number now). */}
+            <span className="sr-only">
+              {" "}
+              the message that&rsquo;s sending, {clamped} second{clamped === 1 ? "" : "s"} left
+            </span>
           </button>
         </div>
       </div>

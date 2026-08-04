@@ -225,10 +225,22 @@ function ConversationPage() {
         // is never dropped onto <body>.
         // F8 (re-verify): `.isConnected` alone is not enough. `.focus()`
         // on a DISABLED button is also a silent no-op that never reaches
-        // the fallback below, and Edit can come back disabled: an
-        // ambiguous edit-and-send sets `isSendUnverified`, `isBusy` stays
-        // true, the landlord taps Cancel, and Edit remounts connected but
-        // disabled, inside the #252 danger window.
+        // the fallback below. #191 round 4 item 6 (safety review
+        // re-verify): the line above used to claim the reachable path
+        // was "an ambiguous edit-and-send sets `isSendUnverified`,
+        // `isBusy` stays true, the landlord taps Cancel, and Edit remounts
+        // connected but disabled, inside the #252 danger window", copied
+        // over from DecisionCard.tsx's near-identical guard, where that IS
+        // reachable. It is not reachable here: this screen never passes
+        // `sendDisabled` into `EditDraftPanel` (see `DraftFooter` below,
+        // ~line 441, which wires `isBusy={draftActions.isBusy(draftId)}`
+        // only), so `isSendUnverified` gates nothing on this route, and
+        // `EditDraftPanel`'s own Cancel button is disabled only by
+        // `submitting`, never by `isBusy`, so `isBusy` cannot be true at
+        // the moment Cancel is tappable. The guard below stays: it's
+        // still correct, harmless defensive code kept for parity with
+        // DecisionCard's identical shape, just not guarding against that
+        // particular scenario on this screen.
         const btn = editButtonRef.current;
         if (btn?.isConnected && !btn.disabled) {
           btn.focus();
@@ -252,17 +264,42 @@ function ConversationPage() {
   // the item was actually about.
   const undoButtonRef = useRef<HTMLButtonElement>(null);
   const prevDraftStatusRef = useRef(draftEntry.status);
+  // #191 round 4 item 4 (safety review re-verify): by the time the
+  // transition effect below runs, a removed Undo button has already reset
+  // `document.activeElement` to `<body>` (verified by hand: a focused
+  // descendant removed from inside a `tabIndex={-1}` container resets
+  // focus to `<body>`, never to the container), the exact same value a
+  // session that never focused anything at all also sits at. Reading
+  // `document.activeElement` only AFTER the removal can't tell those two
+  // apart. This ref is refreshed on every render while still "sending"
+  // (the countdown's own per-second tick keeps it fresh well within the
+  // five-second window), so the transition effect can ask "was Undo
+  // genuinely focused as of the last render before it went away" instead.
+  const undoHadFocusRef = useRef(false);
   useEffect(() => {
     const prevStatus = prevDraftStatusRef.current;
     prevDraftStatusRef.current = draftEntry.status;
     if (prevStatus === draftEntry.status) return;
-    // The `sending -> sent` transition is the five-second countdown
-    // simply running out, a timer, never a landlord action. See
-    // QueueRow's identical exemption for the full reasoning (Safari does
-    // not focus a button on click, so `activeElement` sits at <body> for
-    // whole mouse-only sessions, which would otherwise satisfy the guard
-    // below and scroll the page back here five seconds after approving).
-    if (prevStatus === "sending" && draftEntry.status === "sent") return;
+    // #191 round 4 item 1 (safety review re-verify): `sent -> idle` is the
+    // pinned draft's own cleanup settling once the server refetch this
+    // screen kicks off on "sent" (the effect a little below that clears
+    // `pinnedDraft`) catches up, never a landlord action, and there's
+    // nothing to land on by then anyway: the draft area's idle content is
+    // a static disclaimer, not a control. Exempt outright, the same as
+    // the timer-driven transition right below.
+    if (prevStatus === "sent") return;
+    // #191 round 4 item 4 (safety review re-verify): `sending -> sent` is
+    // the five-second countdown simply running out, a timer, never a
+    // landlord action by itself. Only stay exempt when Undo did NOT
+    // plausibly hold focus right up to the moment it was removed (a
+    // landlord who has already moved their attention elsewhere on the
+    // page); otherwise fall through to the same recovery every other
+    // transition here gets, so a keyboard user whose focus was
+    // legitimately on Undo isn't silently dumped onto `<body>` with
+    // nothing to land on and no announcement.
+    if (prevStatus === "sending" && draftEntry.status === "sent" && !undoHadFocusRef.current) {
+      return;
+    }
     // F6: only steal focus if it was plausibly inside the draft area,
     // either still literally there, or reset to <body> because the
     // control that had it was just removed as part of this transition.
@@ -281,6 +318,15 @@ function ConversationPage() {
     }
     draftAreaRef.current?.focus();
   }, [draftEntry.status]);
+  // #191 round 4 item 4 (safety review re-verify): refreshed every
+  // render, not only on a status change, so it reflects the freshest real
+  // focus state right up to the render before "sending" flips to "sent"
+  // (see `undoHadFocusRef`'s own comment above).
+  useEffect(() => {
+    if (draftEntry.status === "sending") {
+      undoHadFocusRef.current = document.activeElement === undoButtonRef.current;
+    }
+  });
 
   // Once the local approve overlay settles on "sent", the server's own
   // timeline (a real outbound `message` entry replacing the drafted one,
@@ -413,7 +459,22 @@ function ConversationPage() {
                 ref={draftAreaRef}
                 tabIndex={-1}
                 role="group"
-                aria-label={`Reply to ${tenantFirst}`}
+                // #191 round 4 item 5 (safety review re-verify): this
+                // wrapper covers three branches (editing, the pending
+                // draft's own footer, and, once the case is resolved or
+                // draftless, a bare disclaimer paragraph with nothing to
+                // reply to). Naming it "Reply to {tenantFirst}"
+                // unconditionally put a screen-reader user landing on a
+                // resolved case inside a group named "Reply to Maria"
+                // that in fact holds only "nothing here can be edited or
+                // removed once it's sent". Only name it when there is
+                // actually something to reply with; the plain disclaimer
+                // branch stays unlabeled (its own text is read directly).
+                aria-label={
+                  editingContext || (draftId && draftBody !== undefined)
+                    ? `Reply to ${tenantFirst}`
+                    : undefined
+                }
               >
                 {editingContext ? (
                   <div className="mt-2">
