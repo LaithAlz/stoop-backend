@@ -126,7 +126,7 @@ _INSERT_NEEDS_EYES_SQL = text(
 def _migrate_once() -> None:  # type: ignore[misc]
     """Apply migrations exactly once per test session (ends at head/0009).
 
-    Delegates to ``tests.migration_harness.migrate_from_base_to_head`` —
+    Delegates to ``tests.migration_harness.migrate_from_base_to_head``,
     see that module's docstring for why (issue #281: migration 0009's OWN
     fail-closed downgrade guard, defined further down in THIS module,
     turning into a confusing ~200-error cascade when a lane database has
@@ -134,9 +134,9 @@ def _migrate_once() -> None:  # type: ignore[misc]
     run). This is unrelated to ``test_downgrade_fails_closed_when_tenant_
     ack_row_exists`` below, which deliberately trips the same guard via a
     direct ``_alembic()`` call (not through this fixture) and asserts on
-    the raw ``RuntimeError`` — that assertion is untouched by this change.
+    the raw ``RuntimeError``, that assertion is untouched by this change.
     """
-    migration_harness.migrate_from_base_to_head(_alembic)
+    migration_harness.migrate_from_base_to_head(_alembic, _get_db_url())
     yield
     # Leave schema in place; CI drops the DB container after the run.
 

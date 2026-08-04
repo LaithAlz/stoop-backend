@@ -153,13 +153,13 @@ def _set_landlord_guc_sql() -> object:
 def _migrate_once() -> None:  # type: ignore[misc]
     """Apply migrations exactly once per test session (ends at head/0005).
 
-    Delegates to ``tests.migration_harness.migrate_from_base_to_head`` —
+    Delegates to ``tests.migration_harness.migrate_from_base_to_head``,
     see that module's docstring for why (issue #281: migration 0009's
     fail-closed downgrade guard turning into a confusing ~200-error
     cascade when a lane database has a leftover tenant_ack/degraded_retry
     row from an interrupted prior run).
     """
-    migration_harness.migrate_from_base_to_head(_alembic)
+    migration_harness.migrate_from_base_to_head(_alembic, _get_db_url())
     yield
     # Leave schema in place; CI drops the DB container after the run.
 

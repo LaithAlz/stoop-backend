@@ -93,18 +93,18 @@ def _migrate_once() -> None:  # type: ignore[misc]
     head further without affecting this file's own assertions, none of
     which hardcode "0011" as a synonym for "head" anymore).
 
-    Delegates to ``tests.migration_harness.migrate_from_base_to_head`` —
-    see that module's docstring for why (issue #281: migration 0009's
+    Delegates to ``tests.migration_harness.migrate_from_base_to_head``,
+    see that module's docstring for why (issue #281: a migration's
     fail-closed downgrade guard turning into a confusing ~200-error
-    cascade when a lane database has a leftover tenant_ack/degraded_retry
-    row from an interrupted prior run). NOTE: this migration's OWN
-    downgrade (0011 -> 0010) has the structurally identical hazard for
-    its 'number_release' type on the same notifications_type_check
-    constraint — NOT covered by that shared catch (see the module
-    docstring in ``tests/migration_harness.py``); a stray number_release
-    row still produces the raw cascade here.
+    cascade when a lane database has leftover rows from an interrupted
+    prior run). This migration's OWN downgrade (0011 -> 0010) has the
+    structurally identical hazard for its 'number_release' type on the
+    same notifications_type_check constraint that migration 0009's guard
+    uses, listed alongside 0009's in
+    ``migration_harness.NOTIFICATIONS_TYPE_CHECK_GUARDS`` so a stray
+    number_release row is covered too, not just tenant_ack/degraded_retry.
     """
-    migration_harness.migrate_from_base_to_head(_alembic)
+    migration_harness.migrate_from_base_to_head(_alembic, _get_db_url())
     yield
 
 
