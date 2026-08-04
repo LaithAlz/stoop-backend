@@ -73,6 +73,29 @@ describe("apiRequest", () => {
     globalThis.fetch = jest.fn();
   });
 
+  it("F7 (re-verify): apiRequest hands the caller's AbortSignal to fetch", async () => {
+    // #284's reconcile DELETE aborts on its own timeout so an abandoned
+    // request cannot land later and kill a registration that was recreated
+    // in the meantime. That only works if the signal survives the whole
+    // chain: unregisterDevice -> apiRequest -> fetch. The re-verify found
+    // that deleting `signal: options?.signal` from devices.ts left all 25
+    // device tests green.
+    //
+    // This test covers the apiRequest -> fetch half ONLY. It does NOT
+    // catch that devices.ts mutation, verified by running it against the
+    // mutation and watching it pass. The half that does catch it lives in
+    // src/api/__tests__/devices.test.ts, and the two together pin the
+    // whole chain. Worth stating out loud, because a test named after a
+    // finding it does not actually cover is worse than no test at all.
+    (globalThis.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { ok: true }));
+    const controller = new AbortController();
+
+    await apiRequest("/v1/devices/device-1", { method: "DELETE", signal: controller.signal });
+
+    const init = (globalThis.fetch as jest.Mock).mock.calls[0][1] as RequestInit;
+    expect(init.signal).toBe(controller.signal);
+  });
+
   it("resolves the parsed JSON body on success", async () => {
     (globalThis.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { items: [], counts: {} }));
 

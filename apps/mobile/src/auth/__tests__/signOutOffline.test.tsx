@@ -117,12 +117,13 @@ describe("signOut, B3-5 (#284): an offline /logout must not be reported as succe
 });
 
 describe("signOut, FIX 1 (#284 adversarial review): a signOut() that itself rejects must not escape", () => {
-  it("resolves { ok: false }, never rejects, when supabase.auth.signOut() itself REJECTS (e.g. a keychain read/decrypt failure)", async () => {
+  it("resolves { ok: false }, never rejects, when signOut() REJECTS and the session is STILL LIVE", async () => {
     // Mirrors src/api/client.test.ts's B3-4 test for the same underlying
     // auth-js gap (an unguarded SecureStore read/write inside `signOut()`
     // rejecting rather than resolving `{ error }`), on this file's explicit
     // sign-out path instead of the 401 liveness gate's fire-and-forget one.
     mockSupabaseSignOut.mockRejectedValue(new Error("keychain read failed"));
+    mockGetSession.mockResolvedValue({ data: { session: { access_token: "still-live" } } });
     renderHarness();
 
     const result = await captured.ctx!.signOut();
@@ -131,6 +132,42 @@ describe("signOut, FIX 1 (#284 adversarial review): a signOut() that itself reje
     // The best-effort device unregister still ran first, same as every
     // other signOut() outcome.
     expect(mockUnregisterCurrentDeviceBestEffort).toHaveBeenCalledTimes(1);
+  });
+
+  it("F1 (re-verify): resolves { ok: true } when signOut() rejects AFTER the session was already torn down", async () => {
+    // The reject is not the answer, the session is. auth-js awaits
+    // `_removeSession()` and THEN a second unguarded keychain write, and
+    // `_notifyAllSubscribers` rethrows a subscriber's throw after the
+    // event has already been delivered. So a sign-out that genuinely
+    // worked can still reject on the way out.
+    //
+    // Before this, that landlord was navigated to the sign-in wall AND
+    // told to check their connection. Reporting a failure for a sign-out
+    // that succeeded trains people to ignore the message, which matters
+    // because the true case (still signed in on a borrowed device) is
+    // the one that has to land.
+    mockSupabaseSignOut.mockRejectedValue(new Error("code-verifier write failed"));
+    mockGetSession.mockResolvedValue({ data: { session: null } });
+    renderHarness();
+
+    const result = await captured.ctx!.signOut();
+
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("F1 (re-verify): resolves { ok: false } when the reject-path getSession() ALSO throws", async () => {
+    // An unreadable keychain leaves us no better informed than the throw
+    // did, so report the failure. That is the honest answer and the safe
+    // direction: it over-warns, it never claims a sign-out worked when
+    // nothing is known.
+    mockSupabaseSignOut.mockRejectedValue(new Error("keychain read failed"));
+    renderHarness();
+    // Rejected only AFTER mount, so this pins the catch path's own read
+    // rather than the provider's startup read (which has its own
+    // handling, and is not what this test is about).
+    mockGetSession.mockRejectedValueOnce(new Error("keychain unreadable"));
+
+    await expect(captured.ctx!.signOut()).resolves.toEqual({ ok: false });
   });
 });
 

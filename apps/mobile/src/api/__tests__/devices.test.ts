@@ -49,4 +49,26 @@ describe("unregisterDevice (DELETE /v1/devices/{id}, v1.18)", () => {
     await unregisterDevice("dev-1");
     expect(mockApiRequest).toHaveBeenCalledWith("/v1/devices/dev-1", { method: "DELETE" });
   });
+
+  it("F7 (re-verify): forwards the caller's AbortSignal, so a timeout can actually abandon the request", () => {
+    // #284's reconcile aborts its DELETE on a timeout so an abandoned
+    // request cannot land later and delete a registration that was
+    // recreated in the meantime (the backend upsert is ON CONFLICT
+    // (token) DO UPDATE, which PRESERVES the row id, so a late DELETE
+    // matches the new row). That only works if the signal survives
+    // unregisterDevice, and nothing pinned it: deleting
+    // `signal: options?.signal` left all 25 device tests green.
+    //
+    // The test above cannot catch it. `unregisterDevice("dev-1")` passes
+    // `signal: undefined`, and `toHaveBeenCalledWith` uses recursive
+    // equality that ignores undefined properties, so `{method}` and
+    // `{method, signal: undefined}` compare equal either way. Passing a
+    // REAL signal is what makes the assertion bite.
+    const controller = new AbortController();
+    void unregisterDevice("dev-1", { signal: controller.signal });
+    expect(mockApiRequest).toHaveBeenCalledWith("/v1/devices/dev-1", {
+      method: "DELETE",
+      signal: controller.signal,
+    });
+  });
 });

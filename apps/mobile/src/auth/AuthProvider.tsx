@@ -221,7 +221,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           const { error } = await supabase.auth.signOut({ scope: "local" });
           return { ok: !error };
         } catch {
-          return { ok: false };
+          // F1 (re-verify): a throw here does NOT mean the sign-out
+          // failed. auth-js awaits `_removeSession()` and THEN
+          // `removeItemAsync(storage, storageKey + "-code-verifier")`, a
+          // second unguarded keychain write on the same corrupt keychain,
+          // AFTER `_removeSession` has already fired SIGNED_OUT. And
+          // `_notifyAllSubscribers` collects subscriber throws and
+          // rethrows the first one after delivering the event to
+          // everyone, so a throw out of our own handler rejects
+          // `_removeSession` post hoc.
+          //
+          // So a bare `{ ok: false }` here told a landlord whose sign-out
+          // genuinely worked to go check their connection, while the app
+          // navigated them to the sign-in wall. Ask the session itself
+          // instead of inferring from the throw. Wrapped, because the
+          // read is the very thing that may be broken, and an unreadable
+          // keychain leaves us no better informed than before: report the
+          // failure, which is the honest answer and the safe direction.
+          try {
+            const { data } = await supabase.auth.getSession();
+            return { ok: !data.session };
+          } catch {
+            return { ok: false };
+          }
         }
       },
     }),

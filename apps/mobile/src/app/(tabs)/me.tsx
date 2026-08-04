@@ -42,9 +42,13 @@ import {
   PUSH_SECTION_TITLE,
 } from "@/features/push/pushCopy";
 
-// B3-5 (#284): shown only when `signOut()` comes back `{ ok: false }` -
-// see AuthProvider.tsx's `signOut` docstring for exactly when that is (a
-// `/logout` call that failed to reach Stoop, most commonly offline). Same
+// B3-5 (#284): shown when `signOut()` comes back `{ ok: false }`, which
+// after the F1 re-verify means one thing: the session is still live. It
+// covers a `/logout` that could not reach Stoop (most commonly offline)
+// AND a keychain read that threw, because AuthProvider now asks the
+// session itself rather than inferring from the error. It does NOT fire
+// for a sign-out that worked and threw on the way out, which an earlier
+// version of this comment (and of that code) got wrong. Same
 // house-voice shape as the network_error message src/api/client.ts already
 // uses elsewhere in this app, reused rather than inventing new copy for the
 // same underlying situation.
