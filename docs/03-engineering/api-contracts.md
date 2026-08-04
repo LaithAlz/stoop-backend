@@ -114,8 +114,8 @@
   is the matching schema-doc update, and migration 0017 backfills
   pre-existing rows.
 - **v1.26 amendment (2026-08-04 — #277/#276 implementation, adversarial
-  safety review; v1.25 is reserved by issue #268's `backup_contact`
-  -clearing amendment):** two behavior corrections to the v1.24
+  safety review; v1.25 is issue #268's `backup_contact`-clearing
+  amendment, already merged):** two behavior corrections to the v1.24
   canonicalization policy above, plus one doc correction — no new
   endpoint, no migration.
   1. `app/phone.py::to_e164`'s parenthesized-trunk-zero drop (`"+44
