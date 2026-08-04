@@ -104,4 +104,18 @@ describe("Me tab, Sign out feedback (#284 B3-5)", () => {
       ),
     );
   }, 30000);
+
+  it("FIX 1 (#284 adversarial review): still tells the landlord sign-out didn't go through when signOut() itself REJECTS, rather than letting it escape unhandled through onPress", async () => {
+    mockSignOut.mockRejectedValue(new Error("keychain read failed"));
+    const { getByTestId } = render(<MeScreen />, { wrapper });
+
+    fireEvent.press(getByTestId("sign-out"));
+
+    await waitFor(() =>
+      expect(Alert.alert).toHaveBeenCalledWith(
+        "Stoop",
+        "Couldn't reach Stoop. Check your connection and try again.",
+      ),
+    );
+  }, 30000);
 });

@@ -116,6 +116,24 @@ describe("signOut, B3-5 (#284): an offline /logout must not be reported as succe
   });
 });
 
+describe("signOut, FIX 1 (#284 adversarial review): a signOut() that itself rejects must not escape", () => {
+  it("resolves { ok: false }, never rejects, when supabase.auth.signOut() itself REJECTS (e.g. a keychain read/decrypt failure)", async () => {
+    // Mirrors src/api/client.test.ts's B3-4 test for the same underlying
+    // auth-js gap (an unguarded SecureStore read/write inside `signOut()`
+    // rejecting rather than resolving `{ error }`), on this file's explicit
+    // sign-out path instead of the 401 liveness gate's fire-and-forget one.
+    mockSupabaseSignOut.mockRejectedValue(new Error("keychain read failed"));
+    renderHarness();
+
+    const result = await captured.ctx!.signOut();
+
+    expect(result).toEqual({ ok: false });
+    // The best-effort device unregister still ran first, same as every
+    // other signOut() outcome.
+    expect(mockUnregisterCurrentDeviceBestEffort).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("signIn, B3-8 (#284): reconciles a stale device registration on success", () => {
   it("calls reconcileStaleDeviceRegistration after a successful sign-in", async () => {
     mockSignInWithPassword.mockResolvedValue({ error: null });

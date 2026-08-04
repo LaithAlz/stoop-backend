@@ -107,9 +107,25 @@ export default function MeScreen() {
   // `signOut` docstring) left the landlord still signed in with no signal
   // that anything went wrong. Silent on success (matches every other
   // action on this screen); only speaks up on the honest failure.
+  //
+  // FIX 1 (#284 adversarial review): `try`/`catch` here is defense in
+  // depth, not the primary fix - AuthProvider.signOut already wraps
+  // supabase.auth.signOut()'s own reject path (an unguarded SecureStore
+  // read/write in auth-js) and resolves `{ ok: false }` instead of
+  // throwing. But this button's `onPress={() => void handleSignOut()}`
+  // discards whatever this function returns, so if `signOut()` were ever to
+  // throw anyway - a future auth-js change, a bug in the wrapper above -
+  // this is the last place standing between that and the exact "tap Sign
+  // out, see nothing happen, still fully signed in" failure this finding
+  // exists to close. Same house-voice notice as the honest `{ ok: false }`
+  // case, since from the landlord's side they're the same failure.
   async function handleSignOut() {
-    const result = await signOut();
-    if (!result.ok) {
+    try {
+      const result = await signOut();
+      if (!result.ok) {
+        Alert.alert("Stoop", SIGN_OUT_FAILED_NOTICE);
+      }
+    } catch {
       Alert.alert("Stoop", SIGN_OUT_FAILED_NOTICE);
     }
   }

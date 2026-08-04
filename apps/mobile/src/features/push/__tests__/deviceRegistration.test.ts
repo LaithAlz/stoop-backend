@@ -281,7 +281,10 @@ describe("reconcileStaleDeviceRegistration, B3-8's reconcile-on-next-sign-in cle
 
     await reconcileStaleDeviceRegistration();
 
-    expect(mockUnregisterDevice).toHaveBeenCalledWith("dev-stale-from-a-forced-signout");
+    expect(mockUnregisterDevice).toHaveBeenCalledWith(
+      "dev-stale-from-a-forced-signout",
+      expect.objectContaining({ signal: expect.anything() }),
+    );
     expect(mockSecureDeleteItem).toHaveBeenCalledWith(expect.any(String));
   });
 
@@ -291,7 +294,10 @@ describe("reconcileStaleDeviceRegistration, B3-8's reconcile-on-next-sign-in cle
 
     await expect(reconcileStaleDeviceRegistration()).resolves.toBeUndefined();
 
-    expect(mockUnregisterDevice).toHaveBeenCalledWith("dev-stale-from-a-forced-signout");
+    expect(mockUnregisterDevice).toHaveBeenCalledWith(
+      "dev-stale-from-a-forced-signout",
+      expect.objectContaining({ signal: expect.anything() }),
+    );
     expect(mockSecureDeleteItem).toHaveBeenCalledWith(expect.any(String));
   });
 
@@ -300,5 +306,69 @@ describe("reconcileStaleDeviceRegistration, B3-8's reconcile-on-next-sign-in cle
 
     await expect(reconcileStaleDeviceRegistration()).resolves.toBeUndefined();
     expect(mockUnregisterDevice).not.toHaveBeenCalled();
+  });
+});
+
+describe("reconcileStaleDeviceRegistration, #284 adversarial review finding 2: the DELETE it fires cannot outlive a concurrent registration", () => {
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it("ABORTS the in-flight DELETE at the timeout deadline, rather than merely walking away from it client-side", async () => {
+    jest.useFakeTimers({ doNotFake: ["nextTick", "queueMicrotask"] });
+    mockSecureGetItem.mockResolvedValue("dev-stale-from-a-forced-signout");
+    let capturedSignal: AbortSignal | undefined;
+    let settleDelete: (() => void) | undefined;
+    mockUnregisterDevice.mockImplementation(
+      (_id: string, options?: { signal?: AbortSignal }) =>
+        new Promise((resolve) => {
+          capturedSignal = options?.signal;
+          settleDelete = () => resolve({ status: "deleted" });
+        }),
+    );
+
+    const pending = reconcileStaleDeviceRegistration();
+    // RECONCILE_TIMEOUT_MS - the deadline this DELETE is raced against.
+    await jest.advanceTimersByTimeAsync(3000);
+
+    // The proof this fix exists for: the request itself is aborted, not
+    // just abandoned. Before this fix there was no AbortController at all,
+    // so a real fetch behind this mock would still be in flight here and
+    // could still land on the server after a concurrent registration under
+    // the SAME id (the backend upsert preserves it) had already gone live.
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal?.aborted).toBe(true);
+
+    // Let the now-aborted request settle late (standing in for a slow
+    // connection) so this test doesn't leave a dangling promise behind.
+    settleDelete?.();
+    await pending;
+  });
+
+  it("bails without DELETing when this install's current live registration already claims the marker's exact id (upsert preserves id on the same token)", async () => {
+    await registerForPushNotificationsAsync();
+    expect(getRegisteredDeviceId()).toBe("dev-1");
+    mockSecureGetItem.mockResolvedValue("dev-1");
+
+    await reconcileStaleDeviceRegistration();
+
+    expect(mockUnregisterDevice).not.toHaveBeenCalled();
+    // The marker already correctly points at the live registration - bail
+    // leaves it alone rather than wiping it.
+    expect(mockSecureDeleteItem).not.toHaveBeenCalled();
+  });
+
+  it("does NOT clobber a fresher marker a concurrent successful registration wrote while the DELETE was in flight", async () => {
+    // reconcile's own initial read of the marker it will act on...
+    mockSecureGetItem.mockResolvedValueOnce("dev-stale-from-a-forced-signout");
+    mockUnregisterDevice.mockResolvedValue({ status: "deleted" });
+    // ...but by the time this call re-reads the key to decide whether to
+    // clear it, a concurrent registration has already overwritten it with
+    // a DIFFERENT, fresher id.
+    mockSecureGetItem.mockResolvedValueOnce("dev-fresh-from-a-concurrent-registration");
+
+    await reconcileStaleDeviceRegistration();
+
+    expect(mockSecureDeleteItem).not.toHaveBeenCalled();
   });
 });

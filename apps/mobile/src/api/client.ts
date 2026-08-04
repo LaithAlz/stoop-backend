@@ -83,12 +83,18 @@ function safeJsonParse(text: string): unknown {
 /** B3-3 (#284, follow-up to #263): the 401 liveness gate's own
  *  `getSession()` call below can itself go slow - if the access token sits
  *  inside auth-js's ~90s expiry margin, `getSession()` kicks off
- *  `_refreshAccessToken`, which retries a NETWORK call with backoff bounded
- *  by a 30s tick. On a flaky connection a 401 that used to throw instantly
- *  now held this branch (and the caller's spinner) open for up to that long
- *  before the `ApiError` below ever threw - only partly absorbed by the
- *  60s refresh-failure cooldown. Racing the read against ~2s bounds that.
- *  ON TIMEOUT this must NOT sign out: a slow read is not evidence the
+ *  `_refreshAccessToken`, which retries a NETWORK call with its BACKOFF
+ *  bounded by a 30s tick. That 30s bounds only the gap BETWEEN retry
+ *  attempts, not any single attempt: each underlying `fetch` inside the
+ *  retry loop carries no `AbortSignal` of its own, so one hanging POST can
+ *  hold this open past 30s - on iOS, up to ~60s, `NSURLSession`'s own
+ *  default request timeout (adversarial review, finding 7 - strengthens
+ *  this fix, since the real old worst case was longer than the 30s figure
+ *  alone suggests). On a flaky connection a 401 that used to throw
+ *  instantly now held this branch (and the caller's spinner) open for up to
+ *  that long before the `ApiError` below ever threw - only partly absorbed
+ *  by the 60s refresh-failure cooldown. Racing the read against ~2s bounds
+ *  that. ON TIMEOUT this must NOT sign out: a slow read is not evidence the
  *  session is dead, same "fail toward not dead" direction B3-2's catch
  *  below already established for this exact call - a timeout is just a
  *  different way for it to not complete cleanly, not a different verdict. */
@@ -280,7 +286,12 @@ async function apiRequestInternal<T>(
         // could not actually complete.
         sessionLooksDead = false;
       } finally {
-        if (livenessTimer) clearTimeout(livenessTimer);
+        // `!== undefined`, not bare truthiness (#284 adversarial review,
+        // finding 6): RN/Hermes' `setTimeout` returns a numeric id (unlike
+        // Node's truthy `Timeout` object), and id `0` would be falsy. Not
+        // reachable in practice (Hermes' ids start at 1), but this is the
+        // strictly correct check, not a "trust the runtime" one.
+        if (livenessTimer !== undefined) clearTimeout(livenessTimer);
       }
       if (sessionLooksDead) {
         // `scope: "local"` - this device's session only (matches

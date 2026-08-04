@@ -22,11 +22,15 @@ import {
   unregisterCurrentDeviceBestEffort,
 } from "@/features/push/deviceRegistration";
 
-/** B3-5 (#284): `ok: false` means `supabase.auth.signOut()` came back with
- *  an error and, per auth-js's own `_signOut` (GoTrueClient.ts), the LOCAL
- *  session was never actually cleared - see `signOut` below for exactly
- *  why. The Me tab uses this to tell the landlord honestly rather than the
- *  fire-and-forget it used to be. */
+/** B3-5 (#284): `ok: false` means `supabase.auth.signOut()` did not
+ *  complete cleanly - either it resolved with a non-null `error`, or (FIX 1,
+ *  adversarial review follow-up) it REJECTED outright, which auth-js's own
+ *  unguarded SecureStore reads/writes make possible - see `signOut` below
+ *  for both. In the common case (the actual `/logout` network call failed)
+ *  the LOCAL session is still fully live, per auth-js's own `_signOut`
+ *  (GoTrueClient.ts) - see `signOut` below for exactly why, and for the one
+ *  narrower branch where that is NOT true. The Me tab uses this to tell the
+ *  landlord honestly rather than the fire-and-forget it used to be. */
 interface SignOutResult {
   ok: boolean;
 }
@@ -157,27 +161,68 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // error WITHOUT ever calling its local `_removeSession()` - a
         // retryable fetch error (no connection - the concrete "signing out
         // on the subway" case this finding names) takes that exact branch.
-        // So a non-null `error` here is not a maybe: this device's local
-        // session, and the working bearer token src/api/client.ts reads
-        // fresh from `getSession()` on every request, are BOTH still
+        // In THAT branch a non-null `error` is not a maybe: this device's
+        // local session, and the working bearer token src/api/client.ts
+        // reads fresh from `getSession()` on every request, are BOTH still
         // fully live.
         //
+        // Adversarial review (#284 follow-up), finding 3: that is only ONE
+        // of the two branches that can hand `_signOut` a non-null `error`,
+        // and the paragraph above overstated it as universal. `_signOut`
+        // ALSO surfaces a `sessionError` straight from `__loadSession`
+        // (GoTrueClient.ts) when a background token refresh failed
+        // non-retryably - and if the access token had genuinely expired by
+        // then, `_callRefreshToken` has ALREADY called `_removeSession()`
+        // before `_signOut` ever reaches the `/logout` network step above.
+        // On THAT branch `SIGNED_OUT` has already fired - the PII fence in
+        // this file's `onAuthStateChange` handler already ran, the session
+        // is already gone - by the time this call resolves with a non-null
+        // `error`. The `{ ok: false }` this returns on that branch is a
+        // false negative (the landlord IS signed out, just not because of
+        // this specific tap), not a false positive, so it is left as-is
+        // rather than adding a second network round trip here just to
+        // distinguish the two - the unsafe direction (claiming success on a
+        // device that's still live) is still avoided either way.
+        //
+        // FIX 1 (adversarial review): `signOut()` doesn't only resolve with
+        // `{ error }`, it can REJECT. `__loadSession`'s own SecureStore read
+        // (`getItemAsync`, GoTrueClient.ts) has no catch around it - only a
+        // `finally` - and `_removeSession`'s own `removeItemAsync`
+        // (auth-js's helpers.ts) is a bare unguarded `await` too. A
+        // keychain read/decrypt failure (an iCloud restore, a corrupt
+        // keychain - the same case src/api/client.ts's B3-2 liveness gate
+        // already guards) can take either path. Unguarded, that rejection
+        // would propagate past this function, past the Me tab's
+        // `handleSignOut`, and be silently dropped by its
+        // `onPress={() => void handleSignOut()}` - the landlord taps Sign
+        // out, sees nothing happen, and the session (plus any cached tenant
+        // data still in the QueryClient, since the PII fence only runs on
+        // SIGNED_OUT) stays fully live on a device they may be about to
+        // hand to someone else. Same failure direction as B3-5, from a
+        // different unguarded call underneath the same public API - so it
+        // gets the same honest `{ ok: false }` rather than an unhandled
+        // rejection.
+        //
         // Deliberately NOT force-clearing the local session ourselves on
-        // that path. "Sign out" is a security action - the wrong failure
-        // direction is claiming success on a device that's still fully
-        // signed in - but the only way to force a clear here would be
-        // reaching past this SDK's public API into its private storage
-        // internals (there is no supported "local-only, no network"
-        // signOut), which would (a) leave supabase-js's own in-memory
-        // session cache untouched anyway, so `getSession()` and every
-        // subsequent `apiRequest` bearer token would still work exactly as
-        // before behind a UI now falsely showing signed-out, and (b)
-        // duplicate exactly the kind of undocumented-internals coupling
+        // the "still live" paths above. "Sign out" is a security action -
+        // the wrong failure direction is claiming success on a device
+        // that's still fully signed in - but the only way to force a clear
+        // here would be reaching past this SDK's public API into its
+        // private storage internals (there is no supported "local-only, no
+        // network" signOut), which would (a) leave supabase-js's own
+        // in-memory session cache untouched anyway, so `getSession()` and
+        // every subsequent `apiRequest` bearer token would still work
+        // exactly as before behind a UI now falsely showing signed-out, and
+        // (b) duplicate exactly the kind of undocumented-internals coupling
         // that produced B3-3's finding above. An honest failure the Me tab
         // can surface (see `SignOutResult`) is the safer and the more
         // maintainable choice; the landlord can retry once back online.
-        const { error } = await supabase.auth.signOut({ scope: "local" });
-        return { ok: !error };
+        try {
+          const { error } = await supabase.auth.signOut({ scope: "local" });
+          return { ok: !error };
+        } catch {
+          return { ok: false };
+        }
       },
     }),
     [session, initializing],

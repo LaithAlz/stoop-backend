@@ -96,6 +96,28 @@ async function clearPendingUnregister(): Promise<void> {
   }
 }
 
+/** Compare-and-clear (#284 adversarial review, finding 2): only removes the
+ *  marker if it STILL holds `id`, the value the caller acted on. Plain
+ *  `clearPendingUnregister` above is safe only when nothing else could have
+ *  written this key in the meantime - `reconcileStaleDeviceRegistration`
+ *  below doesn't have that guarantee: a concurrent, successful
+ *  `registerForPushNotificationsAsync` call can persist a FRESHER id into
+ *  this same key while reconcile's own DELETE is still in flight. An
+ *  unconditional clear afterwards would wipe that fresher marker instead of
+ *  the stale one this call actually acted on, leaving the new live
+ *  registration with no durable trail of its own. Best-effort, same
+ *  unreadable-keychain posture as every SecureStore touch here. */
+async function clearPendingUnregisterIfMatches(id: string): Promise<void> {
+  try {
+    const current = await SecureStore.getItemAsync(PENDING_UNREGISTER_KEY);
+    if (current === id) {
+      await SecureStore.deleteItemAsync(PENDING_UNREGISTER_KEY);
+    }
+  } catch {
+    // See clearPendingUnregister's docstring above.
+  }
+}
+
 function currentPlatform(): DevicePlatform | null {
   // Expo push tokens have no 'web' concept (schema-v1.md's push_tokens.
   // platform CHECK note) -- Platform.OS on web/other resolves to `null`
@@ -263,7 +285,12 @@ export async function unregisterCurrentDeviceBestEffort(): Promise<void> {
     // Clear the deadline timer whichever side of the race won — so a
     // fast DELETE never leaves a pending 3s timer that would later reject
     // an orphan promise (and, in tests, leak an open handle).
-    if (timer) clearTimeout(timer);
+    // `!== undefined`, not bare truthiness (#284 adversarial review,
+    // finding 6): RN/Hermes' `setTimeout` returns a numeric id, and id `0`
+    // would be falsy. Not reachable in practice (Hermes' ids start at 1),
+    // but this is the strictly correct check, not a "trust the runtime"
+    // one.
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -288,6 +315,27 @@ const RECONCILE_TIMEOUT_MS = 3000;
  * an admin already deleted it, or a DIFFERENT landlord's `DELETE` from a
  * shared device 403s) is swallowed the same as every other outcome here;
  * there is nothing actionable left to do with any of them.
+ *
+ * #284 adversarial review, finding 2: this DELETE targets a device row by
+ * id, and the backend's upsert (`POST /v1/devices`, `ON CONFLICT (token)
+ * DO UPDATE ... ` - api-contracts.md's Devices section) preserves that same
+ * id when the SAME token re-registers. `signIn` fires this fire-and-forget
+ * right as the tab shell mounts `usePushRegistration`
+ * (registerForPushNotificationsAsync below) - a few hundred ms later, a
+ * POST for the SAME token this marker's id belongs to can land, and get
+ * back that exact id. Two guards against this DELETE undoing that
+ * registration instead of the actually-stale one it was meant for:
+ *
+ *  1. Bail entirely when this install's CURRENT in-memory registration
+ *     already claims this id - nothing stale left to clean up.
+ *  2. Otherwise, race the DELETE against an `AbortController`-backed
+ *     deadline (not a bare `Promise.race`, which only stops THIS function
+ *     from waiting - the underlying request keeps running and can still
+ *     land on the server after the deadline, undoing a registration that
+ *     went live in the meantime) and, on the way out, only clear the
+ *     durable marker if it still holds the id this call acted on - a
+ *     concurrent successful registration can have written a fresher one
+ *     into the same key while this was in flight.
  */
 export async function reconcileStaleDeviceRegistration(): Promise<void> {
   let id: string | null;
@@ -299,21 +347,42 @@ export async function reconcileStaleDeviceRegistration(): Promise<void> {
     return;
   }
   if (!id) return;
+
+  // Guard 1 (see docstring): a live registration under this EXACT id
+  // already exists - deleting it would tear down something that's live
+  // right now, not the stale registration this marker was written for.
+  // The marker is already correct for that live registration
+  // (`persistPendingUnregister` wrote the same id), so bail without
+  // touching it either.
+  if (getRegisteredDeviceId() === id) return;
+
+  // Guard 2 (see docstring): abort the request itself at the deadline, not
+  // just this function's wait for it.
+  const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      unregisterDevice(id),
+      // `.catch(() => {})`: once raced away, nothing else is left holding a
+      // handler on this promise - an eventual rejection (the abort below,
+      // or a genuine late network failure) must not surface as an
+      // unhandled rejection, same posture as src/api/client.ts's B3-4 on
+      // its own raced-away `signOut()` call. This is purely a "don't let a
+      // stray rejection escape" guard: since success and failure are
+      // already treated identically below, swallowing it here changes
+      // nothing about which branch this function takes.
+      unregisterDevice(id, { signal: controller.signal }).catch(() => {}),
       new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("stale device unregister timed out")),
-          RECONCILE_TIMEOUT_MS,
-        );
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("stale device unregister timed out"));
+        }, RECONCILE_TIMEOUT_MS);
       }),
     ]);
   } catch {
     // Best-effort, single attempt -- see docstring above.
   } finally {
-    if (timer) clearTimeout(timer);
-    await clearPendingUnregister();
+    if (timer !== undefined) clearTimeout(timer);
+    // Compare-and-clear, not a bare clear (see docstring / finding 2).
+    await clearPendingUnregisterIfMatches(id);
   }
 }
