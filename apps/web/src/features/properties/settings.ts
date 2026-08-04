@@ -64,7 +64,7 @@
  * call this again with `confirmedClear: true` once the landlord agrees.
  */
 import type { BackupContact, Property, QuietHours, UpdatePropertyInput } from "@/api/types";
-import { toE164 } from "@/lib/phone";
+import { phoneErrorMessage, toE164 } from "@/lib/phone";
 
 export interface PropertySettingsForm {
   houseRules: string;
@@ -100,7 +100,9 @@ function sameQuietHours(current: QuietHours | null, candidate: QuietHours): bool
  * field alone is not — `BackupContact` has no optional half, and the
  * builder below can't send a name with no dialable phone or a phone with
  * no name. Mirrors src/features/account/profileEdit.ts's `phoneLooksValid`
- * shape for the phone half.
+ * shape for the phone half. The phone message itself comes from
+ * `phoneErrorMessage` (issue #276) so a non-ASCII-digit input gets its own
+ * line here too, not just on the account screen.
  */
 export function backupContactError(form: PropertySettingsForm): string | null {
   const name = form.backupName.trim();
@@ -108,9 +110,7 @@ export function backupContactError(form: PropertySettingsForm): string | null {
   if (name.length === 0 && phone.length === 0) return null;
   if (phone.length === 0) return "Add their phone number too, or clear the name.";
   if (name.length === 0) return "Add their name too, or clear the phone number.";
-  return toE164(phone) === null
-    ? "Use 10 digits, 11 starting with 1, or + and your country code."
-    : null;
+  return phoneErrorMessage(phone);
 }
 
 /** Same "both or neither" shape as `backupContactError` — `QuietHours`

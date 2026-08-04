@@ -113,6 +113,40 @@
   see that section's own note. Closes #260; schema-v1.md's v1.21 amendment
   is the matching schema-doc update, and migration 0017 backfills
   pre-existing rows.
+- **v1.26 amendment (2026-08-04 — #277/#276 implementation, adversarial
+  safety review; v1.25 is issue #268's `backup_contact`-clearing
+  amendment, already merged):** two behavior corrections to the v1.24
+  canonicalization policy above, plus one doc correction — no new
+  endpoint, no migration.
+  1. `app/phone.py::to_e164`'s parenthesized-trunk-zero drop (`"+44
+     (0)20 7946 0958"` -> `"+4420 7946 0958"`) is now gated on an
+     explicit ALLOWLIST of country codes (`44, 49, 33, 31, 32, 41, 43,
+     45, 46, 47, 48, 351, 353, 61, 64, 27, 91, 81, 86, 7, 20, 30, 36, 40,
+     420, 421`) whose numbering plan drops the trunk zero
+     internationally. Italy (39), San Marino (378), Vatican City (379),
+     and Cote d'Ivoire (225) retain it — the previous, ungated rule
+     turned `"+39 (0)6 6982 1234"`, a correct dialable number, into
+     `"+39669821234"`, an undialable one, silently accepted (it still
+     passed the 8-15 digit length check) on the field the emergency
+     escalation chain dials. An unlisted country code now leaves that
+     function a no-op (plain punctuation-stripping, the pre-#277
+     status quo), never a guess. See schema-v1.md's v1.22 amendment for
+     the full allowlist-vs-skip-list rationale.
+  2. The separator class between the country code and the parenthesized
+     `(0)` gained six characters it was silently missing (U+2010 HYPHEN,
+     U+2015, U+2212, U+FF0D, and a bare line feed/carriage return) and
+     now also treats six invisible zero-width/bidi format characters
+     (U+00AD, U+200B, U+2060, U+FEFF, U+200E, U+200F) as separators, a
+     deliberate choice — see schema-v1.md's v1.22 amendment.
+  3. **Doc correction:** the v1.24 amendment above (and schema-v1.md's
+     matching v1.21 amendment) named `apps/web/src/features/account/
+     profileEdit.ts`'s `toE164` as the single client-side mirror — true
+     when v1.24 was written, stale since #273 moved that logic to
+     `apps/web/src/lib/phone.ts` and #269 added a second, independent
+     mirror at `apps/mobile/src/lib/phone.ts` for the mobile app that
+     neither doc had ever mentioned. The authority is, and has been
+     since #232/#260, `apps/api/app/phone.py::to_e164`; both TS files
+     are reviewed mirrors of it.
 - IDs are uuids as strings. Timestamps ISO-8601 UTC (`2026-06-11T14:02:00Z`).
 - **Pagination**: `?limit=` (default 25, max 100) + `?cursor=`; responses
   carry `"next_cursor": string|null`. Lists are newest-first.

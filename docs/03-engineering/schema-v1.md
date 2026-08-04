@@ -873,6 +873,63 @@
 >    simply the first writer of this combination. No migration needed for
 >    this part.
 
+> **v1.22 amendment (2026-08-04 — #277/#276 implementation, adversarial
+> safety review):** two corrections to `app/phone.py::to_e164`'s
+> canonicalization policy (v1.21 amendment below), plus one doc
+> correction. No migration — behavior-only, on the same columns v1.21
+> already covers.
+> 1. **Parenthesized trunk-zero drop, gated on an explicit country-code
+>    allowlist.** `"+44 (0)20 7946 0958"` (a UK number written with its
+>    trunk prefix parenthesized — the single most common written form)
+>    used to normalize to a 13-digit non-number Twilio rejects (21211).
+>    `to_e164` now drops that leading `(0)` when it appears directly after
+>    the country code, but ONLY when the country code is on an explicit
+>    allowlist (`44, 49, 33, 31, 32, 41, 43, 45, 46, 47, 48, 351, 353, 61,
+>    64, 27, 91, 81, 86, 7, 20, 30, 36, 40, 420, 421` — countries whose
+>    numbering plan drops the trunk zero internationally). This is an
+>    ALLOWLIST, not a skip list: Italy (39), San Marino (378), Vatican
+>    City (379), and Cote d'Ivoire (225, post-2021 numbering plan) all
+>    *retain* their trunk zero when dialed from abroad
+>    (libphonenumber carries a dedicated `italian_leading_zero` field for
+>    exactly this) — an earlier, ungated version of this rule turned
+>    `"+39 (0)6 6982 1234"`, a correct dialable Rome number, into
+>    `"+39669821234"`, an undialable one, on the exact field the
+>    escalation chain dials. A skip list of the countries that DON'T drop
+>    it would fail OPEN (the next unconsidered country gets mangled next);
+>    the allowlist fails CLOSED (an unlisted country code keeps the
+>    pre-#277 status quo — punctuation-stripped only, no digit dropped —
+>    never a new bug). Adding a country to the allowlist is a deliberate
+>    act: check that country's own numbering plan first.
+> 2. **Separator class widened.** The set of characters treated as a
+>    separator between the country code and the parenthesized `(0)`
+>    (previously missing U+2010 HYPHEN — the character literally named
+>    HYPHEN, distinct from U+2011 NON-BREAKING HYPHEN which was already
+>    covered — plus U+2015 HORIZONTAL BAR, U+2212 MINUS SIGN, U+FF0D
+>    FULLWIDTH HYPHEN-MINUS, and a bare line feed/carriage return) now
+>    includes all of those. A miss in this class doesn't error — it just
+>    leaves the OLD, undialable-but-length-plausible value in place, so
+>    the hole was silent. Zero-width/bidi format characters (U+00AD SOFT
+>    HYPHEN, U+200B ZWSP, U+2060 WORD JOINER, U+FEFF BOM, U+200E LRM,
+>    U+200F RLM) are also now treated as separators — a deliberate choice,
+>    since they're invisible on screen and a landlord pasting one (an RTL
+>    paste picking up a stray LRM, for instance) has no way to see or
+>    remove it.
+> 3. **Doc correction, no behavior change:** the v1.21 amendment below (and
+>    `api-contracts.md`'s matching v1.24 amendment) named
+>    `apps/web/src/features/account/profileEdit.ts`'s `toE164` as the
+>    single client-side mirror — true when v1.21 was written, stale since
+>    issue #273 moved that logic to `apps/web/src/lib/phone.ts`
+>    (`profileEdit.ts` now just re-exports it) and issue #269 added a
+>    second, independent mirror at `apps/mobile/src/lib/phone.ts` for the
+>    mobile app, never previously mentioned in either doc. The single
+>    source of truth is, and has been since #232/#260,
+>    `apps/api/app/phone.py::to_e164`; both TS files are reviewed,
+>    byte-identical-where-it-matters mirrors of it, verified by a
+>    three-way agreement test suite (`apps/api/tests/test_phone.py`,
+>    `apps/mobile/src/lib/__tests__/phone.test.ts` — `apps/web` has no
+>    test runner yet, #294, so its copy is verified by direct comparison
+>    against the other two instead).
+
 <!-- DDL-body annotation for v1.21 lives on each phone-bearing column
      below (`landlords.phone`, `properties.twilio_number`,
      `properties.backup_contact`, `tenants.phone`, `vendors.phone`), per

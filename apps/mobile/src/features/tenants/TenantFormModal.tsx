@@ -37,7 +37,7 @@ import { Button } from "@/components/Button";
 import { TextField } from "@/components/TextField";
 import { ChipGroup, type ChipOption } from "@/components/clarity/ChipGroup";
 import { MarginNote } from "@/components/clarity/MarginNote";
-import { toE164 } from "@/lib/phone";
+import { phoneErrorMessage, toE164 } from "@/lib/phone";
 import { colors, spacing, type } from "@/theme/tokens";
 
 /** Display labels for schema-v1's `vulnerable_occupant` values (null =
@@ -86,13 +86,12 @@ function TenantFormContent({ propertyId, tenant, onClose }: Omit<TenantFormModal
   // #269: same digit-count-only bug as the onboarding backup step, fixed
   // the same way — `tenants.phone` is what the routing match and the
   // draft/reply flow key off (schema-v1.md), so an un-normalized value
-  // stored here is silently un-matchable, not just un-dialable.
+  // stored here is silently un-matchable, not just un-dialable. #276: the
+  // message itself comes from `phoneErrorMessage`, which names a
+  // non-ASCII-digit input specifically instead of restating the "10
+  // digits" count rule.
   const phoneError =
-    trimmedPhone.length === 0
-      ? "Add a phone number."
-      : toE164(trimmedPhone) === null
-        ? "Use 10 digits, 11 starting with 1, or + and your country code."
-        : null;
+    trimmedPhone.length === 0 ? "Add a phone number." : phoneErrorMessage(trimmedPhone);
 
   const mutation = useMutation({
     mutationFn: (input: CreateTenantInput) =>

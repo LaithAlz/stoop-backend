@@ -32,7 +32,7 @@ import { ApiError, toHouseApiError } from "@/api/errors";
 import type { LandlordMe, UpdateMeInput } from "@/api/types";
 import { useAuth } from "@/auth/AuthProvider";
 import { planDisplayName, planStatusNotice } from "@/features/account/plan";
-import { buildMeUpdatePayload, phoneLooksValid } from "@/features/account/profileEdit";
+import { buildMeUpdatePayload, phoneErrorMessage } from "@/features/account/profileEdit";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/account")({
@@ -431,16 +431,14 @@ function EditProfileForm({
     },
   });
 
-  // Copy-guardian (#234 PR 5, round 2): the message has to describe what
-  // `phoneLooksValid` actually accepts — the F2/F3 fixes widened it past
-  // plain 10 digits, and an error narrower than the rule tells a landlord
-  // their valid number is wrong.
-  const phoneError = phoneLooksValid(phone)
-    ? null
-    : // R3: the rule also accepts a +country number, so the message says
-      // so — a landlord with an international mobile was being told their
-      // valid number was wrong.
-      "Use 10 digits, 11 starting with 1, or + and your country code.";
+  // Copy-guardian (#234 PR 5, round 2; #276): the message has to describe
+  // what's actually wrong. `phoneErrorMessage` (src/lib/phone.ts) picks a
+  // specific line for a non-ASCII-digit input (an Arabic/Persian/
+  // Devanagari keyboard, e.g. — whose screen already shows ten digits, so
+  // the old generic "use 10 digits" line left no path forward) and falls
+  // back to the same generic line as before for every other rejection
+  // reason.
+  const phoneError = phoneErrorMessage(phone);
 
   function handleSave(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();

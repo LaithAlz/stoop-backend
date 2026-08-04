@@ -18,7 +18,7 @@ import { SeverityPlaque } from "@/components/clarity/SeverityPlaque";
 import { TextField } from "@/components/TextField";
 import { WizardChrome } from "@/features/onboarding/WizardChrome";
 import { useOnboarding } from "@/features/onboarding/OnboardingContext";
-import { toE164 } from "@/lib/phone";
+import { phoneErrorMessage, toE164 } from "@/lib/phone";
 import { colors, radius, spacing, type } from "@/theme/tokens";
 
 export default function BackupStep() {
@@ -54,13 +54,13 @@ export default function BackupStep() {
   // verbatim) replaced with the shared, safety-reviewed normalizer —
   // src/lib/phone.ts's `toE164` — so this screen agrees with the server
   // about what's dialable (apps/api/app/phone.py) instead of trusting a
-  // weaker local check.
+  // weaker local check. #276: the message itself comes from
+  // `phoneErrorMessage`, which names a non-ASCII-digit input specifically
+  // instead of restating the "10 digits" count rule.
   const phoneError = engaged
     ? trimmedPhone.length === 0
       ? "Add their phone number too, or clear the name."
-      : toE164(trimmedPhone) === null
-        ? "Use 10 digits, 11 starting with 1, or + and your country code."
-        : null
+      : phoneErrorMessage(trimmedPhone)
     : null;
   const nameError = engaged && !name.trim() ? "Add their name." : null;
 

@@ -9,7 +9,7 @@
  * table codepoint still rejects" and "realistic paste still accepts"
  * cases below are that shape's own test matrix, ported.
  */
-import { phoneLooksValid, toE164 } from "../phone";
+import { phoneErrorMessage, phoneLooksValid, toE164, validatePhone } from "../phone";
 
 describe("toE164 — accepts", () => {
   it.each([
@@ -23,8 +23,104 @@ describe("toE164 — accepts", () => {
     ["+1 (416) 555-1234", "+14165551234"],
     ["+44 20 7946 0958", "+442079460958"],
     ["+442079460958", "+442079460958"],
+    // #277: the single most common WRITTEN form of a UK number — a
+    // parenthesized trunk zero directly after the country code — is
+    // dropped, not carried through into a 13-digit non-number Twilio
+    // rejects (21211).
+    ["+44 (0)20 7946 0958", "+442079460958"],
+    ["+44(0)2079460958", "+442079460958"],
+    ["+44-(0)20-7946-0958", "+442079460958"],
+    ["+44  (0)  20 7946 0958", "+442079460958"],
   ])("normalizes %s to %s", (raw, expected) => {
     expect(toE164(raw)).toBe(expected);
+  });
+});
+
+describe("toE164 — #277: parenthesized trunk zero", () => {
+  it("drops a leading trunk 0 parenthesized directly after the country code", () => {
+    expect(toE164("+44 (0)20 7946 0958")).toBe("+442079460958");
+  });
+
+  it("leaves an area code's parentheses alone — not a trunk marker", () => {
+    // Those parentheses hold "416" (an area code), not a literal "0" —
+    // the rule only fires on the literal parenthesized "0".
+    expect(toE164("+1 (416) 555 0100")).toBe("+14165550100");
+  });
+
+  // The mirror of apps/api/tests/test_phone.py's
+  // test_to_e164_trunk_zero_rule_sees_unicode_separators. JavaScript's `\s`
+  // is Unicode-aware even WITHOUT the `u` flag and Python's under
+  // `re.ASCII` is not, so writing the separator class as `[\s-]` made the
+  // client drop the trunk zero here and the server keep it. A UK number
+  // pasted off a web page that wrote it with `&nbsp;` is the realistic
+  // input, not a contrived one. Both suites must agree on every case.
+  it.each([
+    ["nbsp", "\u00a0"],
+    ["thin space", "\u2009"],
+    ["narrow nbsp", "\u202f"],
+    ["ideographic space", "\u3000"],
+    ["en dash", "\u2013"],
+    ["non-breaking hyphen", "\u2011"],
+    // Adversarial safety review, 2026-08-04, item 2 — the class had a
+    // hole: it enumerated U+2011/U+2012/U+2013/U+2014 but skipped the
+    // character literally named HYPHEN, plus the other look-alike dashes
+    // and a bare line break.
+    ["hyphen (the one literally named HYPHEN)", "\u2010"],
+    ["horizontal bar", "\u2015"],
+    ["minus sign", "\u2212"],
+    ["fullwidth hyphen-minus (a CJK IME's hyphen)", "\uff0d"],
+    ["line feed (a line-wrapped email-signature paste)", "\n"],
+    ["carriage return", "\r"],
+    // Zero-width / bidi format characters — invisible on screen, so a
+    // landlord has no way to see or remove one. DELIBERATE DECISION:
+    // permitted as separators (see the constant's own comment).
+    ["soft hyphen", "\u00ad"],
+    ["zero-width space", "\u200b"],
+    ["word joiner", "\u2060"],
+    ["BOM / zero-width no-break space", "\ufeff"],
+    ["left-to-right mark (an RTL paste)", "\u200e"],
+    ["right-to-left mark", "\u200f"],
+  ])("the trunk-zero rule sees a %s separator, same as the server", (_label, sep) => {
+    expect(toE164(`+44${sep}(0)20 7946 0958`)).toBe("+442079460958");
+  });
+
+  it("leaves a genuine, un-parenthesized leading 0 alone (option 1 only)", () => {
+    // Out of scope for this fix — still passes straight through to the
+    // international branch's own digit-count check, exactly as before.
+    expect(toE164("+44 020 7946 0958")).toBe("+4402079460958");
+  });
+
+  it("never fires outside the '+'-prefixed branch", () => {
+    expect(toE164("(0)4165551234")).toBeNull();
+  });
+
+  describe("country-code allowlist (adversarial safety review, 2026-08-04, BLOCKING)", () => {
+    it("the UK (on the allowlist) still has its trunk zero dropped", () => {
+      expect(toE164("+44 (0)20 7946 0958")).toBe("+442079460958");
+    });
+
+    it("Italy (NOT on the allowlist) is left alone — libphonenumber's italian_leading_zero case", () => {
+      // Italy RETAINS the leading zero when dialed from abroad. The
+      // ungated rule turned this correct, dialable Rome number into
+      // "+39669821234" — undialable, on the field the escalation chain
+      // dials.
+      expect(toE164("+39 (0)6 6982 1234")).toBe("+390669821234");
+    });
+
+    it("San Marino (NOT on the allowlist) is left alone", () => {
+      expect(toE164("+378 (0)549 882345")).toBe("+3780549882345");
+    });
+
+    // Named in the allowlist comment and in both docs, but asserted
+    // nowhere until now (re-verify finding 1), which is how a country
+    // quietly gets added later by someone reading only the tests.
+    it("Vatican City (NOT on the allowlist) is left alone", () => {
+      expect(toE164("+379 (0)6 698 12345")).toBe("+3790669812345");
+    });
+
+    it("Cote d'Ivoire (NOT on the allowlist, post-2021 numbering plan) is left alone", () => {
+      expect(toE164("+225 (0)1 23 45 67 89")).toBe("+2250123456789");
+    });
   });
 });
 
@@ -136,5 +232,42 @@ describe("phoneLooksValid", () => {
     expect(phoneLooksValid("n/a")).toBe(false);
     expect(phoneLooksValid("416-555-0134 x22")).toBe(false);
     expect(phoneLooksValid("+١4165551234")).toBe(false);
+  });
+});
+
+describe("validatePhone / phoneErrorMessage — issue #276", () => {
+  it("blank is valid, with no value to write", () => {
+    expect(validatePhone("")).toEqual({ ok: true, value: null });
+    expect(validatePhone("   ")).toEqual({ ok: true, value: null });
+    expect(phoneErrorMessage("")).toBeNull();
+  });
+
+  it("a dialable number is ok, carrying the normalized value", () => {
+    expect(validatePhone("(416) 555-1234")).toEqual({ ok: true, value: "+14165551234" });
+    expect(phoneErrorMessage("(416) 555-1234")).toBeNull();
+  });
+
+  it("a non-ASCII digit gets its own reason and its own message — not the generic line", () => {
+    expect(validatePhone("+١4165551234")).toEqual({ ok: false, reason: "non_ascii_digit" });
+    const message = phoneErrorMessage("+١4165551234");
+    expect(message).not.toBeNull();
+    expect(message).not.toBe("Use 10 digits, 11 starting with 1, or + and your country code.");
+    // Copy revised (adversarial safety review, 2026-08-04): spells the
+    // digits out one at a time rather than "0 to 9", which reads as a
+    // repeat of the digit-COUNT rule this string exists to distinguish
+    // itself from.
+    expect(message).toBe(
+      "Stoop can only dial a number written with 0 1 2 3 4 5 6 7 8 9. Type it again with those digits, switching your keyboard if you need to.",
+    );
+  });
+
+  it("every other unparsable shape keeps the existing generic message", () => {
+    expect(validatePhone("n/a")).toEqual({ ok: false, reason: "unparsable" });
+    expect(phoneErrorMessage("n/a")).toBe(
+      "Use 10 digits, 11 starting with 1, or + and your country code.",
+    );
+    expect(phoneErrorMessage("416-555-0134 x22")).toBe(
+      "Use 10 digits, 11 starting with 1, or + and your country code.",
+    );
   });
 });
