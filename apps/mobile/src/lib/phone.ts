@@ -103,29 +103,103 @@ function containsNonAsciiDigit(value: string): boolean {
 // the shape you get pasting a UK number off a web page that wrote it with
 // `&nbsp;`. Under `\s` the client would drop the trunk zero and the server
 // would not, which is the same Python-vs-JavaScript regex-semantics trap
-// that #232/#260 already cost us once. Spelled out, all three
-// implementations are literally the same set. The hyphen sits LAST so it is
-// a literal, not a range operator.
+// that #232/#260 already cost us once. The separator CLASS below (not the
+// leading `.trim()` call in `toE164` — see that function's own comment) is,
+// spelled out, literally the same set in all three files. The hyphen sits
+// LAST so it is a literal, not a range operator.
+//
+// Follow-up (adversarial safety review, 2026-08-04): this class had a hole
+// — it enumerated U+2011/U+2012/U+2013/U+2014 but skipped the character
+// literally named HYPHEN (U+2010), which is what a typographically correct
+// web page or Word's autocorrect actually produces, plus U+2015 HORIZONTAL
+// BAR / U+2212 MINUS SIGN / U+FF0D FULLWIDTH HYPHEN-MINUS (what a CJK IME
+// emits) and a bare line feed/carriage return (a line-wrapped paste off an
+// email signature). A miss here doesn't throw anything — the rule this
+// class exists for just silently fails to fire, storing the same
+// undialable-but-length-plausible value as before #277. All six are now
+// included.
+//
+// Zero-width / bidi format characters — U+00AD SOFT HYPHEN, U+200B ZWSP,
+// U+2060 WORD JOINER, U+FEFF (BOM / ZERO WIDTH NO-BREAK SPACE), U+200E LRM,
+// U+200F RLM — are invisible on screen, so a landlord who pastes
+// "+44\u200e(0)20 7946 0958" (an RTL paste that picked up a stray LRM)
+// has no way to see, let alone remove, the character breaking the match.
+// DELIBERATE DECISION: treat them as separators (permit them here) rather
+// than let the rule silently fail to fire on them — the alternative fails
+// exactly the audience #276 exists for, invisibly, for a character they
+// cannot see or type around. None of the six is a digit, so permitting
+// them here never widens what counts as a literal "0".
 const TRUNK_ZERO_SEPARATORS =
-  " \t\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\u2011\u2012\u2013\u2014-";
+  " \t\n\r\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000" +
+  "\u00ad\u200b\u2060\ufeff\u200e\u200f" +
+  "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d-";
 const PARENTHESIZED_TRUNK_ZERO_RE = new RegExp(
   `^(\\+\\d{1,3})[${TRUNK_ZERO_SEPARATORS}]*\\(0\\)[${TRUNK_ZERO_SEPARATORS}]*`,
 );
 
 /**
+ * #277 follow-up (adversarial safety review, 2026-08-04, BLOCKING): an
+ * ALLOWLIST of country codes where the trunk zero IS dropped internationally
+ * — not a skip list of the ones (Italy 39, San Marino 378, Vatican City 379,
+ * Cote d'Ivoire 225 — all retain it) where it is not. A skip list fails
+ * OPEN: the next country nobody has thought about gets its number silently
+ * mangled next. This allowlist fails CLOSED: an unlisted country code keeps
+ * the pre-#277 status quo (punctuation-stripped only, no digit dropped),
+ * never a new bug. Adding a country here is a deliberate act — check that
+ * country's own numbering plan first, don't guess. Byte-identical to
+ * apps/api/app/phone.py's `_TRUNK_ZERO_COUNTRY_ALLOWLIST` and
+ * apps/web/src/lib/phone.ts's copy of this same constant.
+ */
+const TRUNK_ZERO_COUNTRY_ALLOWLIST = new Set([
+  "44",
+  "49",
+  "33",
+  "31",
+  "32",
+  "41",
+  "43",
+  "45",
+  "46",
+  "47",
+  "48",
+  "351",
+  "353",
+  "61",
+  "64",
+  "27",
+  "91",
+  "81",
+  "86",
+  "7",
+  "20",
+  "30",
+  "36",
+  "40",
+  "420",
+  "421",
+]);
+
+/**
  * Drop a leading trunk `0` written parenthesized directly after the
- * country code (`"+44 (0)20 7946 0958"` -> `"+4420 7946 0958"`) — the
+ * country code (`"+44\u00a0(0)20 7946 0958"` -> `"+4420 7946 0958"`) — the
  * single most common written form of a UK number, previously normalizing
  * to a 13-digit non-number Twilio rejects (21211) on the field the
  * emergency chain dials. Must be called on the RAW (punctuation-intact)
  * string, before any digit stripping — once digits are collapsed a real
  * `(0)` can no longer be told apart from an ordinary digit `0`. A no-op
  * when the pattern doesn't match (e.g. `"+1 (416) 555 0100"`, where the
- * parenthesized content is an area code, not a literal `"0"`) or a
- * genuine un-parenthesized leading `0` (e.g. `"+44 020 7946 0958"`,
- * intentionally left alone — narrower "option 1" fix only, issue #277).
+ * parenthesized content is an area code, not a literal `"0"`), a genuine
+ * un-parenthesized leading `0` (e.g. `"+44 020 7946 0958"`, intentionally
+ * left alone — narrower "option 1" fix only, issue #277), OR the captured
+ * country code is not on `TRUNK_ZERO_COUNTRY_ALLOWLIST` (e.g.
+ * `"+39 (0)6 6982 1234"` — Italy retains its trunk zero internationally;
+ * dropping it here would produce an undialable number).
  */
 function dropParenthesizedTrunkZero(value: string): string {
+  const match = PARENTHESIZED_TRUNK_ZERO_RE.exec(value);
+  if (match === null) return value;
+  const countryCode = match[1].slice(1); // strip the leading "+"
+  if (!TRUNK_ZERO_COUNTRY_ALLOWLIST.has(countryCode)) return value;
   return value.replace(PARENTHESIZED_TRUNK_ZERO_RE, "$1");
 }
 
@@ -137,6 +211,20 @@ function dropParenthesizedTrunkZero(value: string): string {
  * here.
  */
 export function toE164(phone: string): string | null {
+  // KNOWN, NARROW divergence from apps/api/app/phone.py (flagged, not
+  // fixed — adversarial safety review, 2026-08-04, item 4; out of #277's
+  // scope): `String.prototype.trim()` DOES strip U+FEFF (BOM / ZERO WIDTH
+  // NO-BREAK SPACE), while Python's `str.strip()` does not (it is
+  // General_Category `Cf`, not whitespace, to Python). So
+  // "\ufeff+44 (0)20 7946 0958" is accepted HERE (the BOM is trimmed away
+  // before the "+" check) but would be rejected by the server if it ever
+  // saw that exact raw string. This is the LESS strict side of a
+  // fail-closed divergence (server is stricter, never the other way
+  // around) and harmless today because every write path sends the server
+  // this function's OUTPUT, never a landlord's raw pasted text. The
+  // TRUNK_ZERO_SEPARATORS comment above claims the three files' separator
+  // CLASSES are identical, which is still true; it does not claim the
+  // three files' overall trim behavior is identical, which is not.
   const trimmed = phone.trim();
   // #273 (safety review, client-side half — BLOCKING): must run before ANY
   // other processing, including the digit-strip below. `.replace(/\D/g,
@@ -207,8 +295,11 @@ function isPlausibleNanp(digits: string): boolean {
  * rejection.
  */
 export type PhoneValidation =
-  | { ok: true; value: string | null }
-  | { ok: false; reason: "non_ascii_digit" | "unparsable" };
+  // `value: null` means "no change" (blank field, keep the current
+  // number) — NOT "clear the number". A caller sending this straight to
+  // an API body must omit the key on `null`, never send it as an
+  // explicit clear (adversarial safety review, 2026-08-04, item 4).
+  { ok: true; value: string | null } | { ok: false; reason: "non_ascii_digit" | "unparsable" };
 
 /** Same rule as `toE164`, but reports WHY a non-blank value was rejected
  *  instead of collapsing every reason into `null` (issue #276). */
@@ -225,12 +316,17 @@ export function validatePhone(phone: string): PhoneValidation {
 export const PHONE_ERROR_UNPARSABLE =
   "Use 10 digits, 11 starting with 1, or + and your country code.";
 
-/** #276: names the actual problem — some of the characters on screen
- *  aren't the digits 0-9 — instead of restating the "use 10 digits" count
- *  rule a landlord typing on a non-Latin keyboard already believes
- *  they're following. */
+/** #276, revised (adversarial safety review, 2026-08-04): names Stoop's
+ *  own limitation rather than the landlord's mistake ("those aren't the
+ *  digits" reads as a flat contradiction of what's on screen — their ten
+ *  characters ARE digits, to them), spells the digits out one at a time
+ *  so the line can't be misread as a repeat of the "use 10 digits" COUNT
+ *  rule they already believe they're following, and gives a next step
+ *  ("switching your keyboard") for the Arabic/Persian-keyboard case this
+ *  string exists for, where there's often no obvious toggle. Byte
+ *  -identical to apps/web/src/lib/phone.ts's copy of this string. */
 export const PHONE_ERROR_NON_ASCII_DIGIT =
-  "Those aren't the digits 0 to 9. Please retype your number using 0 to 9.";
+  "Stoop can only dial a number written with 0 1 2 3 4 5 6 7 8 9. Type it again with those digits, switching your keyboard if you need to.";
 
 /**
  * The message a landlord should see for `phone`, or `null` when it's

@@ -61,6 +61,25 @@ describe("toE164 — #277: parenthesized trunk zero", () => {
     ["ideographic space", "\u3000"],
     ["en dash", "\u2013"],
     ["non-breaking hyphen", "\u2011"],
+    // Adversarial safety review, 2026-08-04, item 2 — the class had a
+    // hole: it enumerated U+2011/U+2012/U+2013/U+2014 but skipped the
+    // character literally named HYPHEN, plus the other look-alike dashes
+    // and a bare line break.
+    ["hyphen (the one literally named HYPHEN)", "\u2010"],
+    ["horizontal bar", "\u2015"],
+    ["minus sign", "\u2212"],
+    ["fullwidth hyphen-minus (a CJK IME's hyphen)", "\uff0d"],
+    ["line feed (a line-wrapped email-signature paste)", "\n"],
+    ["carriage return", "\r"],
+    // Zero-width / bidi format characters — invisible on screen, so a
+    // landlord has no way to see or remove one. DELIBERATE DECISION:
+    // permitted as separators (see the constant's own comment).
+    ["soft hyphen", "\u00ad"],
+    ["zero-width space", "\u200b"],
+    ["word joiner", "\u2060"],
+    ["BOM / zero-width no-break space", "\ufeff"],
+    ["left-to-right mark (an RTL paste)", "\u200e"],
+    ["right-to-left mark", "\u200f"],
   ])("the trunk-zero rule sees a %s separator, same as the server", (_label, sep) => {
     expect(toE164(`+44${sep}(0)20 7946 0958`)).toBe("+442079460958");
   });
@@ -73,6 +92,28 @@ describe("toE164 — #277: parenthesized trunk zero", () => {
 
   it("never fires outside the '+'-prefixed branch", () => {
     expect(toE164("(0)4165551234")).toBeNull();
+  });
+
+  describe("country-code allowlist (adversarial safety review, 2026-08-04, BLOCKING)", () => {
+    it("the UK (on the allowlist) still has its trunk zero dropped", () => {
+      expect(toE164("+44 (0)20 7946 0958")).toBe("+442079460958");
+    });
+
+    it("Italy (NOT on the allowlist) is left alone — libphonenumber's italian_leading_zero case", () => {
+      // Italy RETAINS the leading zero when dialed from abroad. The
+      // ungated rule turned this correct, dialable Rome number into
+      // "+39669821234" — undialable, on the field the escalation chain
+      // dials.
+      expect(toE164("+39 (0)6 6982 1234")).toBe("+390669821234");
+    });
+
+    it("San Marino (NOT on the allowlist) is left alone", () => {
+      expect(toE164("+378 (0)549 882345")).toBe("+3780549882345");
+    });
+
+    it("Cote d'Ivoire (NOT on the allowlist, post-2021 numbering plan) is left alone", () => {
+      expect(toE164("+225 (0)1 23 45 67 89")).toBe("+2250123456789");
+    });
   });
 });
 
@@ -204,7 +245,13 @@ describe("validatePhone / phoneErrorMessage — issue #276", () => {
     const message = phoneErrorMessage("+١4165551234");
     expect(message).not.toBeNull();
     expect(message).not.toBe("Use 10 digits, 11 starting with 1, or + and your country code.");
-    expect(message).toMatch(/0 to 9/);
+    // Copy revised (adversarial safety review, 2026-08-04): spells the
+    // digits out one at a time rather than "0 to 9", which reads as a
+    // repeat of the digit-COUNT rule this string exists to distinguish
+    // itself from.
+    expect(message).toBe(
+      "Stoop can only dial a number written with 0 1 2 3 4 5 6 7 8 9. Type it again with those digits, switching your keyboard if you need to.",
+    );
   });
 
   it("every other unparsable shape keeps the existing generic message", () => {

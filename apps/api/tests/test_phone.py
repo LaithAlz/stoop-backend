@@ -74,6 +74,25 @@ def test_to_e164_parenthesized_trunk_zero_dropped_after_country_code() -> None:
         pytest.param("\u3000", id="ideographic-space"),
         pytest.param("\u2013", id="en-dash"),
         pytest.param("\u2011", id="non-breaking-hyphen"),
+        # Adversarial safety review, 2026-08-04, item 2 \u2014 the class had a
+        # hole: it enumerated U+2011/U+2012/U+2013/U+2014 but skipped the
+        # character literally named HYPHEN, plus the other look-alike
+        # dashes and a bare line break.
+        pytest.param("\u2010", id="hyphen-the-one-literally-named-hyphen"),
+        pytest.param("\u2015", id="horizontal-bar"),
+        pytest.param("\u2212", id="minus-sign"),
+        pytest.param("\uff0d", id="fullwidth-hyphen-minus-cjk-ime"),
+        pytest.param("\n", id="line-feed"),
+        pytest.param("\r", id="carriage-return"),
+        # Zero-width / bidi format characters \u2014 invisible on screen, so a
+        # landlord has no way to see or remove one. DELIBERATE DECISION:
+        # permitted as separators (see the constant's own comment).
+        pytest.param("\u00ad", id="soft-hyphen"),
+        pytest.param("\u200b", id="zero-width-space"),
+        pytest.param("\u2060", id="word-joiner"),
+        pytest.param("\ufeff", id="bom-zero-width-no-break-space"),
+        pytest.param("\u200e", id="left-to-right-mark-rtl-paste"),
+        pytest.param("\u200f", id="right-to-left-mark"),
     ],
 )
 def test_to_e164_trunk_zero_rule_sees_unicode_separators(separator: str) -> None:
@@ -115,6 +134,48 @@ def test_to_e164_parenthesized_trunk_zero_only_applies_to_plus_branch() -> None:
     stays rejected exactly as before this change, not silently normalized
     to "+14165551234" by treating the "(0)" as a trunk marker."""
     assert to_e164("(0)4165551234") is None
+
+
+# ---------------------------------------------------------------------------
+# to_e164 — #277 follow-up: country-code allowlist (adversarial safety
+# review, 2026-08-04, BLOCKING). The trunk-zero drop is only correct for
+# countries that actually drop the leading 0 internationally; Italy, San
+# Marino, Vatican City, and (post-2021) Cote d'Ivoire all retain it, so
+# the ungated rule turned a correct, dialable number into an undialable
+# one. See app/phone.py's module docstring, "Country-code allowlist".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_to_e164_uk_on_allowlist_still_has_trunk_zero_dropped() -> None:
+    """The UK (44) IS on the allowlist — unchanged behavior, pinned so a
+    future edit to the allowlist can't silently regress the exact case
+    #277 was opened for."""
+    assert to_e164("+44 (0)20 7946 0958") == "+442079460958"
+
+
+@pytest.mark.unit
+def test_to_e164_italy_not_on_allowlist_is_left_alone() -> None:
+    """Italy (39) RETAINS its trunk zero internationally — libphonenumber
+    carries a dedicated ``italian_leading_zero`` field for exactly this.
+    The ungated rule turned this correct, dialable Rome number into
+    ``"+39669821234"`` — undialable, on the field the escalation chain
+    dials. Left alone, plain punctuation-stripping reproduces the correct
+    value on its own."""
+    assert to_e164("+39 (0)6 6982 1234") == "+390669821234"
+
+
+@pytest.mark.unit
+def test_to_e164_san_marino_not_on_allowlist_is_left_alone() -> None:
+    """San Marino (378) also retains its trunk zero internationally."""
+    assert to_e164("+378 (0)549 882345") == "+3780549882345"
+
+
+@pytest.mark.unit
+def test_to_e164_cote_divoire_not_on_allowlist_is_left_alone() -> None:
+    """Cote d'Ivoire (225), under its post-2021 ten-digit numbering plan,
+    also retains its trunk zero internationally."""
+    assert to_e164("+225 (0)1 23 45 67 89") == "+2250123456789"
 
 
 # ---------------------------------------------------------------------------
