@@ -3,7 +3,11 @@
  * mirrors apps/api/tests/test_phone.py's own matrix so the mobile client
  * and the server are provably testing the SAME policy (the F2/F3/N1/R1/R3/
  * R4 safety-review history referenced in ../phone.ts's header, plus the
- * 2026-08-03 non-ASCII-digit finding both sides now share).
+ * 2026-08-03 non-ASCII-digit finding both sides now share), and the
+ * fail-closed-allowlist shape apps/web/src/lib/phone.ts landed for #273
+ * (commit 155118a) — the "unassigned/newer-than-this-engine's-Unicode-
+ * table codepoint still rejects" and "realistic paste still accepts"
+ * cases below are that shape's own test matrix, ported.
  */
 import { phoneLooksValid, toE164 } from "../phone";
 
@@ -63,8 +67,44 @@ describe("toE164 — rejects", () => {
     "４１６５５５１２３４",
     // CJK ideographic numeral.
     "一4165551234",
+    // #273: an unassigned codepoint (Cn, no General_Category letter/space/
+    // format/punctuation/symbol) — not a digit under ANY Unicode version,
+    // but also not on the allowlist, so it fails closed rather than being
+    // silently stripped as "probably punctuation".
+    `416555${String.fromCodePoint(0x0378)}1234`,
+    // #273: a post-Unicode-15 digit (U+10D40, GARAY DIGIT ZERO — added in
+    // Unicode 16.0). The point of the fail-closed allowlist is that this
+    // rejects regardless of whether the running engine's Unicode table
+    // already recognizes it as Nd or not — it's never Letter/Space/Format/
+    // Punctuation/Symbol either way, so it can never silently pass.
+    `416555${String.fromCodePoint(0x10d40)}1234`,
   ])("rejects %s", (raw) => {
     expect(toE164(raw)).toBeNull();
+  });
+});
+
+describe("toE164 — #273: a realistic paste is still accepted (over-rejection is the failure that matters here)", () => {
+  it.each([
+    // NBSP and narrow NBSP — the copy-off-a-webpage case.
+    [`416${String.fromCodePoint(0x00a0)}555${String.fromCodePoint(0x00a0)}1234`, "+14165551234"],
+    [`416${String.fromCodePoint(0x202f)}555${String.fromCodePoint(0x202f)}1234`, "+14165551234"],
+    // En dash, em dash, non-breaking hyphen — Word autocorrect / pasted
+    // formatting.
+    [`416${String.fromCodePoint(0x2013)}555${String.fromCodePoint(0x2013)}1234`, "+14165551234"],
+    [`416${String.fromCodePoint(0x2014)}555${String.fromCodePoint(0x2014)}1234`, "+14165551234"],
+    [`416${String.fromCodePoint(0x2011)}555${String.fromCodePoint(0x2011)}1234`, "+14165551234"],
+    // LRM (RTL paste) and BOM (pasted from a file/webpage) — zero-width
+    // format controls that legitimately ride along with pasted text.
+    [`${String.fromCodePoint(0x200e)}416-555-1234`, "+14165551234"],
+    [`${String.fromCodePoint(0xfeff)}416-555-1234`, "+14165551234"],
+    // Labels in front of the number — ASCII, accented Latin, CJK, and
+    // Cyrillic — must never block saving the number itself.
+    ["Tel: 416-555-1234", "+14165551234"],
+    ["Célular: 416-555-1234", "+14165551234"],
+    ["携帯 416-555-1234", "+14165551234"],
+    ["моб. 416 555 1234", "+14165551234"],
+  ])("accepts %s", (raw, expected) => {
+    expect(toE164(raw)).toBe(expected);
   });
 });
 
