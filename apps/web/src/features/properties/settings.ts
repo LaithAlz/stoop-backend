@@ -159,9 +159,9 @@ export function backupContactClearTitle(contactName: string): string {
 
 export const BACKUP_CONTACT_CLEAR_MESSAGE =
   "Right now, if you don't answer during a real emergency, I call and text them about ten " +
-  "minutes later — what happened, your tenant's name, and a link that can stop the whole " +
-  "alert. After this, no one else gets contacted. I'll just keep calling you, every fifteen " +
-  "minutes, until you answer.";
+  "minutes later. They get what happened, your tenant's name, and a link that can stop the " +
+  "whole alert. After this, no one else gets contacted. I'll just keep calling you, every " +
+  "fifteen minutes, until you answer.";
 
 export const BACKUP_CONTACT_CLEAR_CONFIRM_LABEL = "Remove backup contact";
 

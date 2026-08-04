@@ -498,8 +498,8 @@ function SettingsForm({
           // an explicit confirmation (the dialog below) before anything is
           // sent; this line just previews that Save will ask.
           <p className="text-xs text-ink-muted">
-            Saving will remove {current.backup_contact?.name} as your backup contact — I&rsquo;ll
-            ask you to confirm first.
+            Saving will remove {current.backup_contact?.name} as your backup contact. I&rsquo;ll ask
+            you to confirm first.
           </p>
         ) : null}
       </section>
