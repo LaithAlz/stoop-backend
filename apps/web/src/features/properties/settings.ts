@@ -77,13 +77,43 @@ export interface PropertySettingsForm {
   quietEnd: string;
 }
 
+/**
+ * #307: every field pulled out of `backup_contact`/`quiet_hours` here is
+ * `String(x ?? "")`, not a bare `?? ""`: the coercion the type declares
+ * (`BackupContact.phone: string`, `QuietHours.start/end: string`)
+ * overstates what a legacy row can actually hold. `backup_contact` and
+ * `quiet_hours` are both `jsonb` with no column-level shape check, and
+ * `backup_contact.phone` was writable as a JSON *number* (not a string)
+ * until the 2026-08-03 review closed that path client-side and #290 closed
+ * it at the router (neither closes it for rows already written). A bare
+ * `property.backup_contact?.phone ?? ""` passes that number straight into
+ * `PropertySettingsForm.backupPhone` (typed `string`, but not actually one
+ * at runtime), and every downstream consumer that calls a string method on
+ * it (`backupContactError`'s `.trim()` here, `toE164`'s `.trim()` in
+ * src/lib/phone.ts) throws, white-screening both the settings form (this
+ * function runs on first render, unconditionally) and, via
+ * `backupContactPhoneLooksInvalid` below, the property detail page too.
+ *
+ * Fixed HERE, at the one place the API response becomes form state, rather
+ * than teaching every `.trim()` call site to defend itself: the same
+ * "fix at the boundary" discipline as the #234 campaign's `QueueItem.
+ * severity` fix. `backupName`/`quietStart`/`quietEnd` get the same
+ * treatment as `backupPhone` even though this issue's reported crash was
+ * phone-specific: `backupContactError` also calls `.trim()` on
+ * `backupName`, and `quietHoursError` also calls `.trim()` on
+ * `quietStart`/`quietEnd`, unconditionally, on every render, so a legacy
+ * row with a numeric `name` or a numeric quiet-hours boundary would
+ * white-screen exactly the same way. `houseRules` is untouched: it's a
+ * plain `text` column (schema-v1.md), not a field inside one of these
+ * untyped `jsonb` blobs, so it has no equivalent legacy-shape risk here.
+ */
 export function propertySettingsFormFromProperty(property: Property): PropertySettingsForm {
   return {
     houseRules: property.house_rules ?? "",
-    backupName: property.backup_contact?.name ?? "",
-    backupPhone: property.backup_contact?.phone ?? "",
-    quietStart: property.quiet_hours?.start ?? "",
-    quietEnd: property.quiet_hours?.end ?? "",
+    backupName: String(property.backup_contact?.name ?? ""),
+    backupPhone: String(property.backup_contact?.phone ?? ""),
+    quietStart: String(property.quiet_hours?.start ?? ""),
+    quietEnd: String(property.quiet_hours?.end ?? ""),
   };
 }
 
@@ -178,10 +208,35 @@ export const BACKUP_CONTACT_CLEAR_CONFIRM_LABEL = "Remove backup contact";
  * `backup_contact` (not the live, still-being-typed form values, which
  * already get their own `backupContactError`) and show a persistent
  * warning when it's `true`.
+ *
+ * #307: `typeof contact.phone !== "string"` is checked FIRST and
+ * separately, not folded into a `String(contact.phone ?? "")` coercion
+ * before the `toE164` call. Two reasons, both load-bearing:
+ *
+ * - Crash: this function runs directly against the RAW
+ *   `Property.backup_contact` on both screens (see above: never against
+ *   `PropertySettingsForm`, so `propertySettingsFormFromProperty`'s own
+ *   `String(...)` coercion doesn't cover it). A legacy row with a numeric
+ *   `phone` (writable until the 2026-08-03 review closed that path
+ *   client-side; #290 closes it at the router going forward, but neither
+ *   fixes rows already written) reaches `toE164` here un-coerced and
+ *   throws at its `.trim()`, white-screening the property detail page.
+ * - Correctness: coercing the number to a string first would be wrong, not
+ *   just crash-safe. `String(4165550134)` is `"4165550134"`, a real
+ *   10-digit NANP number that `toE164` normalizes successfully, so a naive
+ *   coercion would report this row as REACHABLE. The backend disagrees:
+ *   `_backup_phone` (apps/api/app/agent/emergency_chain.py) requires
+ *   `isinstance(phone, str)` and treats any non-string `phone` (a JSON
+ *   number, or an explicit JSON `null` on the `phone` key) as "no backup
+ *   contact configured" (`skipped`, `reason: "no_backup_contact"`),
+ *   regardless of what digits it might spell out. This function has to
+ *   agree with the code that actually places the call, not with what the
+ *   value would mean if it had been written as a string.
  */
 export function backupContactPhoneLooksInvalid(contact: BackupContact | null): boolean {
   if (contact === null) return false;
-  return toE164(contact.phone ?? "") === null;
+  if (typeof contact.phone !== "string") return true;
+  return toE164(contact.phone) === null;
 }
 
 export function quietHoursClearAttempted(form: PropertySettingsForm, current: Property): boolean {
