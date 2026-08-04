@@ -118,7 +118,8 @@ behavior"): a ``PATCH`` that actually changes ``house_rules`` OR
 ``action='settings_changed'``) — compared against the pre-update value so
 a no-op PATCH (same value resent, or clearing an already-empty field)
 never writes a spurious entry. ``backup_contact`` was added to this check
-by #268 (the escalation chain's T+10m backup-contact removal capability —
+by #268 (removing the backup contact from the escalation chain's T+10m
+step and its T+20m+ repeat cycles —
 see ``app/agent/emergency_chain.py``'s module docstring): the payload
 records only ``field: "backup_contact"``, never the contact's name or
 phone number (never-break rule #5). The AC's OTHER agent-behavior
@@ -356,11 +357,12 @@ def _canonicalize_backup_contact(
     backup_contact: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """#232/#260: ``backup_contact`` (schema-v1.md: ``{name, phone}`` for
-    the escalation chain's T+10m step, ``app/agent/emergency_chain.py``'s
-    ``_backup_phone``) is a free-form ``jsonb`` blob with no DB-level shape
-    enforcement — only its ``phone`` key is a phone number, so only that
-    key is validated here, in place, leaving everything else (including a
-    missing ``phone`` key entirely) untouched.
+    the escalation chain's T+10m step and its T+20m+ repeat cycles,
+    ``app/agent/emergency_chain.py``'s ``_backup_phone``) is a free-form
+    ``jsonb`` blob with no DB-level shape enforcement — only its ``phone``
+    key is a phone number, so only that key is validated here, in place,
+    leaving everything else (including a missing ``phone`` key entirely)
+    untouched.
 
     A present-but-BLANK ``phone`` (``""``/whitespace-only) — or an
     explicit JSON ``null`` — is left as-is rather than rejected:
@@ -383,7 +385,8 @@ def _canonicalize_backup_contact(
     ``False``, same branch as "blank/missing"). That silently stores a
     ``backup_contact`` that LOOKS configured (present, non-null) while
     ``_backup_phone`` returns ``None`` for it (not a ``str``) — the T+10m
-    escalation step never fires, with nothing landlord-visible saying so.
+    escalation step and every T+20m+ repeat's backup legs never fire, with
+    nothing landlord-visible saying so.
     Now REJECTED (422 ``invalid_field``), distinctly from the safe-no-op
     blank/null case.
     """
@@ -756,8 +759,9 @@ async def update_property(
             payload={"resource": "property", "property_id": prop_id, "field": "house_rules"},
         )
 
-    # #268: backup_contact feeds the emergency escalation chain's T+10m step
-    # (app/agent/emergency_chain.py) -- a landlord clearing (or setting, or
+    # #268: backup_contact feeds the emergency escalation chain's T+10m
+    # step AND every T+20m+ repeat cycle (app/agent/emergency_chain.py's
+    # actions_for_step) -- a landlord clearing (or setting, or
     # editing) it is exactly the kind of "affects agent behavior" change
     # #54's AC calls for auditing, same diff-against-pre-update-value
     # pattern as house_rules above (a no-op PATCH -- e.g. clearing an

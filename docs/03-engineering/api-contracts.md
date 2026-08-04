@@ -379,12 +379,19 @@ escalation chain's T+10m step (`app/agent/emergency_chain.py`,
 `docs/02-product/emergency-prefilter.md`'s escalation-chain table) is
 recorded `"skipped"` (`reason: "no_backup_contact"`) instead of calling
 and texting that person — same behavior as a property that never had a
-backup contact configured. **Nothing else about the chain changes**: the
-T+0/2/5/15/20m+ landlord-only steps are unaffected, and a chain already
-mid-flight when the contact is cleared picks up the change on its very
-next scheduled attempt (the chain re-reads `properties.backup_contact`
-fresh from the `notifications` row's `property_id` on every attempt — it
-is never cached/snapshotted at trigger time).
+backup contact configured. The T+20m+ repeat cycle is **also** a backup
+step, not a landlord-only one (`actions_for_step` returns `landlord_call`
++ `backup_call` + `backup_sms` for step 5 and every repeat after it, per
+`emergency-prefilter.md`'s "repeat landlord+backup cycle every 15 min"),
+so clearing the contact removes the backup legs from every repeat cycle
+too, for as long as the chain runs. What does **not** change: the
+landlord call/SMS legs at T+0/2/5/15/20m+ still fire exactly as before,
+and a chain already mid-flight when the contact is cleared picks up the
+change on its very next scheduled attempt (the chain re-reads
+`properties.backup_contact` fresh on every attempt: `_load_context`
+keys on the notification's `message_id` and joins `properties` through
+`messages.property_id`, and is called per step inside `_process_due_row`,
+so the value is never cached/snapshotted at trigger time).
 
 A `PATCH` that changes `backup_contact` (set, edit, or clear) now writes
 an `audit_log` row (`actor: "landlord"`, `action: "settings_changed"`,

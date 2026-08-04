@@ -813,6 +813,162 @@ async def test_backup_step_skips_gracefully_after_backup_contact_cleared_via_pat
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
+async def test_backup_step_skips_gracefully_after_backup_contact_cleared_mid_flight(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    """#268, api-contracts.md v1.25 amendment: unlike the test above (which
+    clears the backup contact BEFORE the chain ever starts, the "easy"
+    case), this proves the HARDER promise -- a contact cleared MID-FLIGHT,
+    after the chain has already run several steps with it still live, is
+    picked up "on its very next scheduled attempt" because the chain
+    "re-reads `properties.backup_contact` fresh on every attempt"
+    (``_load_context``, called per step inside ``_process_due_row``, never
+    cached/snapshotted at trigger time).
+
+    Starts with a LIVE backup contact, runs T+0/2/5m normally (no backup
+    leg is due yet), clears the contact through the REAL ``PATCH
+    /v1/properties/{id}`` handler mid-flight, then proves: (a) the T+10m
+    backup step -- the very next scheduled attempt -- skips both backup
+    legs with ``reason: "no_backup_contact"``, never "failed"; (b) the
+    T+20m+ repeat cycle (``actions_for_step``'s step 5 and every repeat
+    after it) keeps skipping the backup legs too, across more than one
+    repeat; and (c) the landlord call/SMS legs, untouched by this PATCH,
+    keep firing on schedule throughout -- clearing a backup contact must
+    never weaken the landlord side of the chain."""
+    from app.deps import Landlord
+    from app.routers.properties import PropertyUpdateRequest, update_property
+
+    landlord_id, property_id, tenant_id = await _seed(
+        db_session,
+        full_name="Sam",
+        tenant_name="Maria",
+        backup_contact={"name": "Bob", "phone": _BACKUP_PHONE},
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    notification_id = await _insert_emergency_call_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        categories=["fire"],
+    )
+
+    try:
+        t0 = datetime.now(UTC)
+
+        # T+0: landlord call + tenant safety sms -- backup contact still live.
+        await emergency_chain.handle_emergency_trigger(
+            notification_id=uuid.UUID(notification_id),
+            message_id=uuid.UUID(message_id),
+            property_id=uuid.UUID(property_id),
+            categories=["fire"],
+        )
+        assert len(fake_sender.calls) == 2
+
+        # T+2m: landlord SMS with an ack link -- no backup leg is due yet,
+        # so nothing about the still-live contact should surface here.
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=2, seconds=1))
+        assert len(fake_sender.calls) == 3
+        assert fake_sender.calls[2].kind == "sms"
+        assert fake_sender.calls[2].to == "+14165550100"  # landlord, not backup
+
+        # T+5m: second landlord call -- again, no backup leg due yet.
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=5, seconds=1))
+        assert len(fake_sender.calls) == 4
+        assert fake_sender.calls[3].kind == "call"
+        assert fake_sender.calls[3].to == "+14165550100"
+
+        calls_before_backup_step = len(fake_sender.calls)
+
+        # Clear the backup contact MID-FLIGHT -- through the REAL PATCH
+        # /v1/properties/{id} handler, not a raw SQL UPDATE -- proving the
+        # landlord-facing capability reaches the already-running chain.
+        # Three legs already sent above with the contact genuinely live.
+        await update_property(
+            uuid.UUID(property_id),
+            PropertyUpdateRequest(backup_contact=None),
+            (Landlord(id=uuid.UUID(landlord_id)), db_session),
+        )
+        # A separate admin-engine connection drives the sweep below -- make
+        # the PATCH durable so it's actually visible cross-connection.
+        await db_session.commit()
+
+        # T+10m -- the very next scheduled attempt after the clear: both
+        # backup legs must now skip, never fail, never dial/text the
+        # cleared number.
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=10, seconds=1))
+        assert len(fake_sender.calls) == calls_before_backup_step  # nothing new sent
+
+        attempts = await _fetch_attempt_audit_rows(db_session, landlord_id)
+        backup_step = attempts[3]["payload"]["actions"]
+        assert all(a["status"] == "skipped" for a in backup_step)
+        assert all(a["reason"] == "no_backup_contact" for a in backup_step)
+        assert not any(a["status"] == "failed" for a in backup_step)
+
+        # T+15m: third landlord call + honest tenant status update -- this
+        # leg is untouched by the PATCH and must keep firing on schedule.
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=15, seconds=1))
+        assert len(fake_sender.calls) == calls_before_backup_step + 2
+        step4_calls = fake_sender.calls[-2:]
+        assert any(c.kind == "call" and c.to == "+14165550100" for c in step4_calls)
+        tenant_status = next(c for c in step4_calls if c.kind == "sms")
+        assert "Still reaching Sam" in (tenant_status.body or "")
+
+        calls_before_repeat = len(fake_sender.calls)
+
+        # T+20m -- the first T+20m+ repeat. Per actions_for_step, step 5
+        # returns (landlord_call, backup_call, backup_sms): the landlord
+        # leg must still send; both backup legs must still skip.
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=20, seconds=1))
+        assert len(fake_sender.calls) == calls_before_repeat + 1  # landlord_call only
+        assert fake_sender.calls[-1].kind == "call"
+        assert fake_sender.calls[-1].to == "+14165550100"
+
+        attempts = await _fetch_attempt_audit_rows(db_session, landlord_id)
+        step5_actions = attempts[5]["payload"]["actions"]
+        landlord_call_action = next(a for a in step5_actions if a["action"] == "landlord_call")
+        backup_call_action = next(a for a in step5_actions if a["action"] == "backup_call")
+        backup_sms_action = next(a for a in step5_actions if a["action"] == "backup_sms")
+        assert landlord_call_action["status"] == "sent"
+        assert backup_call_action["status"] == "skipped"
+        assert backup_call_action["reason"] == "no_backup_contact"
+        assert backup_sms_action["status"] == "skipped"
+        assert backup_sms_action["reason"] == "no_backup_contact"
+
+        calls_before_second_repeat = len(fake_sender.calls)
+
+        # T+35m -- a SECOND repeat, proving "every repeat" (not just the
+        # one immediately after the PATCH) keeps honoring the cleared
+        # contact, and the landlord leg keeps firing.
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=35, seconds=1))
+        assert len(fake_sender.calls) == calls_before_second_repeat + 1  # landlord_call only
+        assert fake_sender.calls[-1].kind == "call"
+        assert fake_sender.calls[-1].to == "+14165550100"
+
+        attempts = await _fetch_attempt_audit_rows(db_session, landlord_id)
+        step6_actions = attempts[6]["payload"]["actions"]
+        landlord_call_action_2 = next(a for a in step6_actions if a["action"] == "landlord_call")
+        backup_call_action_2 = next(a for a in step6_actions if a["action"] == "backup_call")
+        backup_sms_action_2 = next(a for a in step6_actions if a["action"] == "backup_sms")
+        assert landlord_call_action_2["status"] == "sent"
+        assert backup_call_action_2["status"] == "skipped"
+        assert backup_call_action_2["reason"] == "no_backup_contact"
+        assert backup_sms_action_2["status"] == "skipped"
+        assert backup_sms_action_2["reason"] == "no_backup_contact"
+
+        # Across the entire chain, zero calls/texts ever reached the
+        # backup number once the contact was cleared.
+        assert all(c.to != _BACKUP_PHONE for c in fake_sender.calls)
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 # ---------------------------------------------------------------------------
 # Integration — acknowledgment stops the chain, from all three surfaces
 # ---------------------------------------------------------------------------

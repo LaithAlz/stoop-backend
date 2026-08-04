@@ -55,8 +55,9 @@
  * `apps/api/tests/test_properties_router.py`'s step-1 precondition test).
  * A landlord blanking both `backupName`/`backupPhone` on a previously-set
  * contact IS clearing it: pass `confirmedClear: true` (only after the
- * caller has shown a real confirmation — this removes redundancy on the
- * emergency escalation chain's T+10m step) and this builder sends
+ * caller has shown a real confirmation — this removes redundancy from the
+ * emergency escalation chain's T+10m step AND from every T+20m+ repeat
+ * cycle) and this builder sends
  * `backup_contact: null`. Without that flag, a blank-both pair is left out
  * of the payload exactly like the old behavior, so the caller can compute
  * `backupContactClearAttempted` first, show a confirm dialog, and only
@@ -146,8 +147,9 @@ export function backupContactClearAttempted(
  * only when `backupContactClearAttempted` is true, i.e. right before the
  * caller sends `buildPropertySettingsPayload(form, current, {confirmedClear:
  * true})`. States the real, concrete consequence (what stops happening on
- * the emergency escalation chain's T+10m step, `apps/api/app/agent/
- * emergency_chain.py`) rather than a generic "are you sure" — this removes
+ * the emergency escalation chain's T+10m step and its T+20m+ repeat
+ * cycles, `apps/api/app/agent/emergency_chain.py`) rather than a generic
+ * "are you sure" — this removes
  * redundancy on the emergency line, not an ordinary settings edit.
  * `contactName` is `current.backup_contact.name`, always present here since
  * callers only reach this once `backupContactClearAttempted` is true (which
@@ -198,8 +200,8 @@ export function quietHoursClearAttempted(form: PropertySettingsForm, current: Pr
  *
  * `confirmedClear` (#268): the caller must set this `true` only after
  * showing a real confirmation for the specific consequence of clearing
- * `backup_contact` (it removes the emergency escalation chain's T+10m
- * backup call/text entirely) — see `backupContactClearAttempted`. Without
+ * `backup_contact` (it removes the emergency escalation chain's backup
+ * call/text entirely, at T+10m and in every T+20m+ repeat cycle) — see `backupContactClearAttempted`. Without
  * it, a blank-both backup-contact pair is treated as "leave it alone",
  * same as before this issue.
  */
