@@ -217,6 +217,16 @@ Reverses upgrade() in dependency-safe order: drop all 13 policies, then
 ``USAGE ON SCHEMA public`` — and finally drop the role itself, but ONLY if
 ``pg_shdepend`` shows no remaining cluster-wide dependents.
 
+Table order within each of those first two blocks (#174, fixed after a
+flaky ``DeadlockDetectedError`` in ``tests/test_migrations.py::
+test_downgrade_removes_table``): SAME order upgrade() used to create them
+in, not the reverse — see downgrade()'s own docstring for the full
+lock-ordering rationale. "Dependency-safe order" above refers to the
+three-PHASE sequence (policies, then RLS-disable, then role/grants), which
+still matters and is unchanged; it does not mean the 13 tables within a
+phase need to be touched in reverse-of-creation order, and reversing them
+was an unforced, deadlock-prone choice.
+
 That ``pg_shdepend`` guard reuses the exact pattern an earlier revision of
 migration 0004 used for its (since-removed) ``landlord_sync_role`` — see
 that revision's git history for the original writeup. Reason it matters:
@@ -516,41 +526,66 @@ def downgrade() -> None:
     """Drop all 13 policies, disable RLS everywhere, revoke app_role's
     grants, and drop app_role itself (guarded, pg_shdepend-aware — see
     module docstring). The anon/authenticated REVOKEs from upgrade() are
-    deliberately NOT reversed here (see module docstring "DOWNGRADE")."""
+    deliberately NOT reversed here (see module docstring "DOWNGRADE").
 
-    # ── drop policies (reverse creation order) ──────────────────────────────
-    op.execute("DROP POLICY IF EXISTS message_status_events_isolation ON message_status_events")
-    op.execute("DROP POLICY IF EXISTS message_cases_isolation ON message_cases")
-    op.execute("DROP POLICY IF EXISTS landlords_isolation ON landlords")
-    op.execute("DROP POLICY IF EXISTS push_tokens_isolation ON push_tokens")
-    op.execute("DROP POLICY IF EXISTS notifications_isolation ON notifications")
-    op.execute("DROP POLICY IF EXISTS audit_log_isolation ON audit_log")
-    op.execute("DROP POLICY IF EXISTS trust_metrics_isolation ON trust_metrics")
-    op.execute("DROP POLICY IF EXISTS drafts_isolation ON drafts")
-    op.execute("DROP POLICY IF EXISTS messages_isolation ON messages")
-    op.execute("DROP POLICY IF EXISTS cases_isolation ON cases")
-    op.execute("DROP POLICY IF EXISTS tenants_isolation ON tenants")
-    op.execute("DROP POLICY IF EXISTS vendors_isolation ON vendors")
+    Table order in BOTH blocks below deliberately MATCHES upgrade()'s order
+    (properties, vendors, tenants, cases, messages, drafts, trust_metrics,
+    audit_log, notifications, push_tokens, landlords, message_cases,
+    message_status_events) rather than reversing it (#174). Each
+    ``DROP POLICY``/``DISABLE ROW LEVEL SECURITY`` statement takes an
+    ACCESS EXCLUSIVE lock on its table; an EARLIER revision of this
+    downgrade walked the 13 tables in the exact REVERSE of upgrade()'s
+    order, which is the textbook setup for a lock-ordering deadlock
+    (Postgres docs, "Explicit Locking": concurrent transactions that lock
+    the same objects in different orders can deadlock) the moment any
+    OTHER session ever acquires locks across two-or-more of these same
+    tables in upgrade()'s order while this downgrade is running — e.g. a
+    concurrent upgrade of this same migration (multi-worktree/lane-DB
+    topology, #193) or, more plausibly in this app's own read/write shape,
+    a query that touches several RLS tables in creation order (a JOIN or a
+    multi-table cleanup). Matching the order removes that specific,
+    self-inflicted deadlock class; it does not (and cannot, from inside a
+    single migration file) prevent contention with an arbitrary unrelated
+    transaction touching an overlapping but differently-ordered subset of
+    tables — full isolation (a dedicated database/lane per concurrent
+    migration run) is the only complete fix for that, and is already this
+    repo's convention for concurrent local/CI runs.
+    """
+
+    # ── drop policies (same table order as upgrade() — see docstring above) ─
     op.execute("DROP POLICY IF EXISTS properties_isolation ON properties")
+    op.execute("DROP POLICY IF EXISTS vendors_isolation ON vendors")
+    op.execute("DROP POLICY IF EXISTS tenants_isolation ON tenants")
+    op.execute("DROP POLICY IF EXISTS cases_isolation ON cases")
+    op.execute("DROP POLICY IF EXISTS messages_isolation ON messages")
+    op.execute("DROP POLICY IF EXISTS drafts_isolation ON drafts")
+    op.execute("DROP POLICY IF EXISTS trust_metrics_isolation ON trust_metrics")
+    op.execute("DROP POLICY IF EXISTS audit_log_isolation ON audit_log")
+    op.execute("DROP POLICY IF EXISTS notifications_isolation ON notifications")
+    op.execute("DROP POLICY IF EXISTS push_tokens_isolation ON push_tokens")
+    op.execute("DROP POLICY IF EXISTS landlords_isolation ON landlords")
+    op.execute("DROP POLICY IF EXISTS message_cases_isolation ON message_cases")
+    op.execute("DROP POLICY IF EXISTS message_status_events_isolation ON message_status_events")
 
-    # ── disable RLS on all 13 tables (explicit statements, not a Python loop
-    # over f-strings — ruff S608 flags string-built SQL even when, as here,
+    # ── disable RLS on all 13 tables, same table order as upgrade() (see
+    # docstring above) — explicit statements, not a Python loop over
+    # f-strings — ruff S608 flags string-built SQL even when, as here,
     # every interpolated value would be a fixed module-level constant never
     # touched by external input; explicit literals sidestep the false
     # positive and match every other migration's style in this repo) ───────
-    op.execute("ALTER TABLE message_status_events DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE message_cases DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE landlords DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE push_tokens DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE notifications DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE audit_log DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE trust_metrics DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE drafts DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE messages DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE cases DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE tenants DISABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE vendors DISABLE ROW LEVEL SECURITY")
     op.execute("ALTER TABLE properties DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE vendors DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE tenants DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE cases DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE messages DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE drafts DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE trust_metrics DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE audit_log DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE notifications DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE push_tokens DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE landlords DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE message_cases DISABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE message_status_events DISABLE ROW LEVEL SECURITY")
 
     # ── revoke app_role's grants and drop the role (guarded, pg_shdepend-
     # aware — reuses the pattern an earlier revision of migration 0004 used
