@@ -37,6 +37,7 @@ import { Button } from "@/components/Button";
 import { TextField } from "@/components/TextField";
 import { ChipGroup, type ChipOption } from "@/components/clarity/ChipGroup";
 import { MarginNote } from "@/components/clarity/MarginNote";
+import { toE164 } from "@/lib/phone";
 import { colors, spacing, type } from "@/theme/tokens";
 
 /** Display labels for schema-v1's `vulnerable_occupant` values (null =
@@ -81,8 +82,17 @@ function TenantFormContent({ propertyId, tenant, onClose }: Omit<TenantFormModal
   const [submitted, setSubmitted] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
 
-  const phoneDigits = phone.replace(/\D/g, "");
-  const phoneError = phoneDigits.length < 10 ? "Use a 10-digit phone number." : null;
+  const trimmedPhone = phone.trim();
+  // #269: same digit-count-only bug as the onboarding backup step, fixed
+  // the same way — `tenants.phone` is what the routing match and the
+  // draft/reply flow key off (schema-v1.md), so an un-normalized value
+  // stored here is silently un-matchable, not just un-dialable.
+  const phoneError =
+    trimmedPhone.length === 0
+      ? "Add a phone number."
+      : toE164(trimmedPhone) === null
+        ? "Use 10 digits, 11 starting with 1, or + and your country code."
+        : null;
 
   const mutation = useMutation({
     mutationFn: (input: CreateTenantInput) =>
@@ -104,7 +114,14 @@ function TenantFormContent({ propertyId, tenant, onClose }: Omit<TenantFormModal
     setSubmitted(true);
     setServerError(null);
     if (phoneError || mutation.isPending) return;
-    const input: CreateTenantInput = { phone: phone.trim() };
+    // #269: NORMALIZED, never the raw text — `phoneError` above already
+    // guarantees this is non-null; the early return keeps this function
+    // safe on its own too. `tenants.phone` is what the Twilio webhook's
+    // routing match keys off (schema-v1.md), so an un-normalized value
+    // here is silently un-matchable, not just un-dialable.
+    const e164 = toE164(trimmedPhone);
+    if (!e164) return;
+    const input: CreateTenantInput = { phone: e164 };
     if (name.trim()) input.name = name.trim();
     if (unit.trim()) input.unit = unit.trim();
     if (vulnerable) input.vulnerable_occupant = vulnerable;
