@@ -49,6 +49,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
+from tests import migration_harness
+
 
 def _get_db_url() -> str:
     url = os.environ.get(
@@ -89,9 +91,20 @@ def _migrate_once() -> None:  # type: ignore[misc]
     """Apply migrations exactly once per test session (ends at head — 0011
     when this file was written; a later migration, e.g. 0012 (#210), moves
     head further without affecting this file's own assertions, none of
-    which hardcode "0011" as a synonym for "head" anymore)."""
-    _alembic("downgrade", "base")
-    _alembic("upgrade", "head")
+    which hardcode "0011" as a synonym for "head" anymore).
+
+    Delegates to ``tests.migration_harness.migrate_from_base_to_head``,
+    see that module's docstring for why (issue #281: a migration's
+    fail-closed downgrade guard turning into a confusing ~200-error
+    cascade when a lane database has leftover rows from an interrupted
+    prior run). This migration's OWN downgrade (0011 -> 0010) has the
+    structurally identical hazard for its 'number_release' type on the
+    same notifications_type_check constraint that migration 0009's guard
+    uses, listed alongside 0009's in
+    ``migration_harness.NOTIFICATIONS_TYPE_CHECK_GUARDS`` so a stray
+    number_release row is covered too, not just tenant_ack/degraded_retry.
+    """
+    migration_harness.migrate_from_base_to_head(_alembic, _get_db_url())
     yield
 
 

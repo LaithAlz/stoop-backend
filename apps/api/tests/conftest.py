@@ -77,6 +77,47 @@ for _key, _value in _PLACEHOLDER_ENV.items():
 # (see the debugging playbook) is the real fix, not a bigger assertion.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Another dirty-DB mechanism (#281), distinct from the sender_tick one
+# above: more than one migration's downgrade() intentionally FAILS CLOSED
+# (raises, rolls back, stays put) rather than silently discard live rows it
+# cannot reconstruct -- migration 0009's if a `tenant_ack`/`degraded_retry`
+# row still exists in `notifications`, migration 0011's if a
+# `number_release` row does (same `notifications_type_check` constraint,
+# same mechanism, different guarded type; see each migration's own module
+# docstring, "ROUND-TRIP" section, for the individual hazard analysis). A
+# full test-suite run killed mid-flight (Ctrl-C, OOM, a crashed worker) can
+# leave exactly such a row behind. From then on, EVERY `_migrate_once`
+# -style session fixture that does `downgrade base` -> `upgrade head`
+# (~19 modules: every `test_migrations_000N.py`, plus
+# `test_rls_isolation.py`, `test_rls_isolation_matrix.py`,
+# `test_checkpointer.py`, `test_require_landlord.py`) genuinely fails,
+# deterministically, against that same lane database -- a cascade of
+# ~200 confusing setup errors with nothing pointing at the actual cause.
+#
+# Those ~19 fixtures now share their downgrade-base/upgrade-head sequence
+# via `tests/migration_harness.py::migrate_from_base_to_head()` (imported,
+# not duplicated -- see that module's docstring for why this one piece was
+# extracted while each file's own `_get_db_url`/`_alembic` stay local). If
+# `downgrade base` fails, that shared function PROBES the database directly
+# for leftover rows of any known guarded type (a table of
+# `NotificationsTypeCheckGuard`, one entry per migration, iterated over --
+# adding a newly-discovered guard is one line, not a new code path), rather
+# than pattern-matching alembic's own log text: a non-zero count IS the
+# diagnosis, with real counts, and a zero count means the failure is
+# unrelated and the original error propagates unchanged. On a match, it
+# re-raises `migration_harness.LaneDatabaseNeedsRecreateError` naming the
+# cause, the real counts, and the remedy (recreate the lane database),
+# chained onto the original `RuntimeError` so the raw alembic/Postgres
+# output is still visible. It does NOT catch any other alembic failure.
+#
+# If you hit the RAW cascade instead of the friendly message (e.g. from a
+# migration test module that predates this fix, a fixture that calls
+# alembic directly rather than through the harness, or a THIRD guard this
+# table does not know about yet), the fix is the same either way: recreate
+# the lane database, don't chase it as a code defect.
+# ---------------------------------------------------------------------------
+
 
 @pytest.fixture(autouse=True)
 def _reset_jwks_auth_state() -> Iterator[None]:

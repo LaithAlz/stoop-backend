@@ -32,6 +32,8 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from tests import migration_harness
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -80,9 +82,14 @@ def _migrate_once() -> None:  # type: ignore[misc]
     Synchronous + session-scoped avoids the pytest-asyncio ScopeMismatch
     error that occurs when module-scoped async fixtures conflict with the
     function-scoped event loop (``asyncio_default_fixture_loop_scope=function``).
+
+    Delegates to ``tests.migration_harness.migrate_from_base_to_head``,
+    see that module's docstring for why (issue #281: migration 0009's
+    fail-closed downgrade guard turning into a confusing ~200-error
+    cascade when a lane database has a leftover tenant_ack/degraded_retry
+    row from an interrupted prior run).
     """
-    _alembic("downgrade", "base")
-    _alembic("upgrade", "head")
+    migration_harness.migrate_from_base_to_head(_alembic, _get_db_url())
     yield
     # Leave schema in place; CI drops the DB container after the run.
 

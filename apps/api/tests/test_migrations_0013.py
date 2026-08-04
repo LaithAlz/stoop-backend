@@ -56,6 +56,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
+from tests import migration_harness
+
 
 def _get_db_url() -> str:
     url = os.environ.get(
@@ -83,9 +85,15 @@ def _alembic(*args: str) -> None:
 @pytest.fixture(scope="session", autouse=False)
 def _migrate_once() -> None:  # type: ignore[misc]
     """Apply migrations exactly once per test session (ends at head — 0013
-    when this file was written)."""
-    _alembic("downgrade", "base")
-    _alembic("upgrade", "head")
+    when this file was written).
+
+    Delegates to ``tests.migration_harness.migrate_from_base_to_head``,
+    see that module's docstring for why (issue #281: migration 0009's
+    fail-closed downgrade guard turning into a confusing ~200-error
+    cascade when a lane database has a leftover tenant_ack/degraded_retry
+    row from an interrupted prior run).
+    """
+    migration_harness.migrate_from_base_to_head(_alembic, _get_db_url())
     yield
 
 
