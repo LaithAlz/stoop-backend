@@ -1,5 +1,5 @@
 import type { Ref } from "react";
-import { useId, useRef } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 
 interface UndoTicketProps {
@@ -20,6 +20,12 @@ interface UndoTicketProps {
   className?: string;
 }
 
+/** One source for the window-length sentence, so the `aria-describedby`
+ *  description and the live announcement can never drift apart. */
+function noticeText(totalSeconds: number): string {
+  return `Undo is available for ${totalSeconds} second${totalSeconds === 1 ? "" : "s"} after you approve.`;
+}
+
 /**
  * The undo control drawn as a physical, perforated ticket strip — not a
  * toast that vanishes (docs/mockups/07 `.ticket`). Nothing else competes
@@ -37,6 +43,20 @@ export function UndoTicket({
   const pct = totalSeconds > 0 ? Math.max(0, Math.min(100, (clamped / totalSeconds) * 100)) : 0;
   const display = `00:${String(clamped).padStart(2, "0")}`;
   const noticeId = useId();
+
+  // #191 round 5 (safety review re-verify): a live region that is
+  // INSERTED already populated is unreliably announced by NVDA and JAWS.
+  // The pattern that actually works is an empty region first, populated
+  // on a later commit, so the AT observes a mutation rather than a new
+  // node. Round 4 mounted `role="status"` with its text already in place
+  // and asserted in a comment that it "fires once, right then", which is
+  // precisely the shape of claim this file's own house rule warns about.
+  // Two nodes now, each doing one job: the static paragraph below is the
+  // `aria-describedby` target, and this one is the announcement.
+  const [liveNotice, setLiveNotice] = useState("");
+  useEffect(() => {
+    setLiveNotice(noticeText(totalSeconds));
+  }, [totalSeconds]);
 
   // #191 F5 (safety review follow-up): `undoDisabled` used to be handed
   // straight to the button's own `disabled` attribute. A browser
@@ -66,30 +86,39 @@ export function UndoTicket({
         className,
       )}
     >
-      {/* #191 round 4 item 3 (safety review re-verify): `role="status"`
-          restored here, on THIS paragraph, a sibling of the Undo button,
-          not on the button itself. Round 3 dropped the live role reasoning
-          that pairing a live announcement with a FOCUS MOVE on the SAME
-          element makes them race: true, but that reasoning doesn't reach
-          a live region on a different node. This element is freshly
-          mounted the instant a draft starts sending (UndoTicket only ever
-          exists while `status === "sending"`), so the announcement fires
-          once, right then, independent of whether focus ever reaches the
-          button at all. That independence is the point: `markBusy`
-          disables Approve on click, so focus sits at `<body>` for the
-          whole in-flight request, and a landlord who presses Tab in that
-          window ends up on some other control by the time this ticket
-          renders, past the point the owner's own focus-move effect
-          (QueueRow / ConversationPage) can catch it. This region still
-          announces. `{totalSeconds}` is the real, server-derived window
+      {/* #191 round 4 item 3: a live announcement on a node that is NOT
+          the focus target. Round 3 dropped the live role reasoning that
+          pairing a live announcement with a FOCUS MOVE on the SAME
+          element makes them race. True, and it does not reach a live
+          region on a different node.
+
+          Why this matters: `markBusy` disables Approve on click, so
+          focus sits at `<body>` for the whole in-flight request. A
+          landlord who presses Tab in that window ends up on some other
+          control by the time this ticket renders, past the point the
+          owner's focus-move effect (QueueRow / ConversationPage) can
+          catch it. That path, and the one where a queue refetch unmounts
+          the card mid-window, are structurally out of reach of any focus
+          move. Only a live region covers them.
+
+          Round 5 (re-verify) split this into TWO nodes. The region below
+          starts EMPTY and is populated from an effect, because a live
+          region inserted already populated is unreliably announced by
+          NVDA and JAWS: they announce mutations to a region they were
+          already observing, not the arrival of a new one. The static
+          paragraph stays the `aria-describedby` target so a landlord who
+          tabs to Undo later in the window still hears the window length
+          read with the button's name.
+
+          `{totalSeconds}` is the real, server-derived window
           (queueEntries.ts's `totalUndoSeconds`), never a hardcoded "5"
           that could read wrong against an on-screen countdown showing
-          something else. Also still wired as `aria-describedby` below, so
-          a screen-reader user who tabs to Undo later in the window hears
-          the same window length again, read together with its name. */}
-      <p id={noticeId} role="status" className="sr-only">
-        Undo is available for {totalSeconds} second{totalSeconds === 1 ? "" : "s"} after you
-        approve.
+          something else. */}
+      <p role="status" className="sr-only">
+        {liveNotice}
+      </p>
+      <p id={noticeId} className="sr-only">
+        {noticeText(totalSeconds)}
       </p>
       <div className="flex items-center gap-3">
         <div className="min-w-0 flex-1">

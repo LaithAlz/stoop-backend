@@ -316,7 +316,14 @@ function ConversationPage() {
         return;
       }
     }
-    draftAreaRef.current?.focus();
+    // `preventScroll` (round 5 re-verify): same reasoning as QueueRow's.
+    // This landing is reached on transitions the landlord did not
+    // initiate, and on a long thread `focus()` would scroll them to the
+    // bottom, away from whatever they had scrolled up to read. On an
+    // emergency case that scroll can also push the EmergencyBanner off a
+    // phone-sized viewport with no user action at all. Recover the
+    // focus, leave the viewport alone.
+    draftAreaRef.current?.focus({ preventScroll: true });
   }, [draftEntry.status]);
   // #191 round 4 item 4 (safety review re-verify): refreshed every
   // render, not only on a status change, so it reflects the freshest real

@@ -420,7 +420,13 @@ function QueueRow({
         return;
       }
     }
-    rowRef.current?.focus();
+    // `preventScroll` (round 5 re-verify): this landing is reached on
+    // transitions the landlord did NOT initiate, including the one that
+    // fires five seconds after an approve. Recovering focus is right;
+    // yanking the viewport back to a card they scrolled away from is
+    // not. The announcement still happens, the scroll position does not
+    // move.
+    rowRef.current?.focus({ preventScroll: true });
   }, [entry.status]);
   // #191 round 4 item 4 (safety review re-verify): refreshed every
   // render, not only on a status change, so it reflects the freshest real
@@ -437,14 +443,21 @@ function QueueRow({
       // #191 round 4 item 5 (safety review re-verify): this wrapper's own
       // content is exactly one `<Link>` (SkippedCard.tsx, when it's given
       // a `conversationId`, which Home always does): `role="group"` is
-      // "a set of objects", and one link is not a set. Dropped here. No
-      // `aria-label` either: it would be an F10 regression (a roleless
-      // div doesn't support `aria-label` per WebKit/axe-core), and it
-      // isn't needed anyway, since the Link's own accessible name is
-      // already the tenant, property, "No reply sent", and timestamp text
-      // it wraps. `rowRef` still needs this div for the focus-recovery
-      // fallback above; it just carries no ARIA semantics of its own now.
-      <div ref={rowRef} tabIndex={-1}>
+      // "a set of objects", and one link is not a set. Round 5
+      // (re-verify) put both back: this div is where `rowRef.current
+      // ?.focus()` lands after a Skip, and round 4 left that landing
+      // computing `role=generic name=""` in Chrome's AX tree, where
+      // round 3 had a real name. "One link is not a set" is a purist
+      // reading of `group`, and it cost a real announcement on a
+      // programmatic focus landing. A named `group` is the cheaper
+      // trade, and it keeps `aria-label` on a role that supports it
+      // (which is what F10 was actually about).
+      <div
+        ref={rowRef}
+        tabIndex={-1}
+        role="group"
+        aria-label={`${tenantFirst}, ${item.property_label}`}
+      >
         <SkippedCard
           conversationId={item.case_id}
           tenantName={tenantFirst}
@@ -472,12 +485,28 @@ function QueueRow({
     // #191 round 4 item 5 (safety review re-verify): `aria-label` used to
     // be set here AND on `DecisionCard`'s own `<article>` inside it, the
     // identical string, so browsing this card announced the same name
-    // twice. Dropped here, kept on the article, which was already a
-    // valid, labelled host for it. `role="group"` stays: unlike the
-    // skipped branch above, this wrapper's one child is an `<article>`
-    // holding a genuine set of controls (Edit, Skip, Approve, or the Undo
-    // ticket), not a lone link.
-    <div ref={rowRef} tabIndex={-1} role="group">
+    // twice, and round 4 dropped it here to fix that. Round 5
+    // (re-verify) put it back, because the fix cost more than the
+    // duplicate did: Chrome's AX tree confirmed this div then computed
+    // `name=""`, and it is exactly where `rowRef.current?.focus()` lands
+    // on `sending -> sent`, on undo success, and on `already_sent`. Item
+    // 4 buys that focus landing precisely so the landlord is not dumped
+    // somewhere unannounced.
+    //
+    // The duplicate is now DELIBERATE, and the reasoning is the trade,
+    // not an oversight. Both this wrapper and DecisionCard's `<article>`
+    // are programmatic focus landings (the article is where an
+    // edit-cancel recovers to), and the article does not always re-read
+    // its containing group's name, because focus moving WITHIN a group
+    // does not re-announce it. Naming only one leaves the other landing
+    // silent. A repeated name while browsing is verbosity; a silent
+    // focus landing is a lost announcement on the approve loop's only
+    // escape hatch. Verbosity is the safer failure of the two.
+    // `role="group"` stays: unlike the skipped branch above, this
+    // wrapper's one child is an `<article>` holding a genuine set of
+    // controls (Edit, Skip, Approve, or the Undo ticket), not a lone
+    // link.
+    <div ref={rowRef} tabIndex={-1} role="group" aria-label={`${tenantFirst}, ${propertyLabel}`}>
       <DecisionCard
         severity={item.severity}
         conversationId={item.case_id}
