@@ -100,9 +100,9 @@ def _migrate_once() -> None:  # type: ignore[misc]
     row from an interrupted prior run). NOTE: this migration's OWN
     downgrade (0011 -> 0010) has the structurally identical hazard for
     its 'number_release' type on the same notifications_type_check
-    constraint — NOT covered by that shared catch (see migration_harness
-    .py's module docstring); a stray number_release row still produces
-    the raw cascade here.
+    constraint — NOT covered by that shared catch (see the module
+    docstring in ``tests/migration_harness.py``); a stray number_release
+    row still produces the raw cascade here.
     """
     migration_harness.migrate_from_base_to_head(_alembic)
     yield
