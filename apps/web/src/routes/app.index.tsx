@@ -359,38 +359,62 @@ function QueueRow({
     : item.property_label;
 
   // #191 F3/F6 (safety review follow-up): DecisionCard's own focus-return
-  // effect only ever sees `editingContext` changing, so it can handle the
-  // Edit round trip on its own. It cannot see these three, none of which
-  // touch `editingContext`: Approve moves this row's entry to "sending"
-  // (the Undo ticket takes the actions row's place), Skip replaces the
-  // WHOLE card with `SkippedCard` (a full unmount, so nothing inside the
-  // old DecisionCard could react even if it tried), and a successful Undo
-  // moves the entry back from "sending" to idle (the actions row
-  // reappears, unmounting the Undo button out from under a focused
-  // landlord). `rowRef` wraps whichever of the two branches below ever
-  // renders here, so it survives all three swaps as a stable landing
-  // spot, right where the Undo ticket now is.
+  // effect only ever sees `editingContext` changing (Cancel), so it can
+  // handle the Edit round trip on its own. It cannot see these three,
+  // none of which touch `editingContext`: Approve moves this row's entry
+  // to "sending" (the Undo ticket takes the actions row's place), Skip
+  // replaces the WHOLE card with `SkippedCard` (a full unmount, so
+  // nothing inside the old DecisionCard could react even if it tried),
+  // and a successful Undo moves the entry back from "sending" to idle
+  // (the actions row reappears, unmounting the Undo button out from
+  // under a focused landlord). `rowRef` wraps whichever of the two
+  // branches below ever renders here, so it survives all three swaps as
+  // a stable landing spot.
   const rowRef = useRef<HTMLDivElement>(null);
+  const undoButtonRef = useRef<HTMLButtonElement>(null);
   const prevEntryStatusRef = useRef(entry.status);
   useEffect(() => {
-    if (prevEntryStatusRef.current !== entry.status) {
-      // F6: only steal focus if it was plausibly inside this row, either
-      // still literally there, or reset to <body> because the control
-      // that had it was just removed as part of this very transition. A
-      // background change to a DIFFERENT row, or this row settling after
-      // the landlord has already tabbed elsewhere, leaves focus on some
-      // other, still-mounted element, which this correctly leaves alone.
-      const active = document.activeElement;
-      if (rowRef.current?.contains(active) || active === document.body) {
-        rowRef.current?.focus();
+    const prevStatus = prevEntryStatusRef.current;
+    prevEntryStatusRef.current = entry.status;
+    if (prevStatus === entry.status) return;
+    // #191 F2/F4/re-verify "two smaller ones" (safety review follow-up):
+    // `sending -> sent` is the 5-second countdown simply running out, a
+    // timer, never a landlord action. Focus can legitimately be anywhere
+    // by then (this is exactly the gap the guard below exists for on the
+    // OTHER transitions, but on a timer there's no click to have put
+    // focus here in the first place on a mouse-only Safari session,
+    // where clicking a button doesn't focus it, `activeElement` sits at
+    // `<body>` the whole time, which would otherwise satisfy the guard
+    // and scroll the page back to this row five seconds after every
+    // approve). Exempted outright rather than guarded.
+    if (prevStatus === "sending" && entry.status === "sent") return;
+    // F6: only steal focus if it was plausibly inside this row, either
+    // still literally there, or reset to <body> because the control that
+    // had it was just removed as part of this very transition. A
+    // background change to a DIFFERENT row, or this row settling after
+    // the landlord has already tabbed elsewhere, leaves focus on some
+    // other, still-mounted element, which this correctly leaves alone.
+    const active = document.activeElement;
+    if (!(rowRef.current?.contains(active) || active === document.body)) return;
+    if (entry.status === "sending") {
+      // F2/F4: Approve or a successful edit-and-send. Focus the Undo
+      // button itself, not just the row, so its accessible name and its
+      // `aria-describedby` text (UndoTicket.tsx) are read together at the
+      // instant they matter. F8: `.isConnected` alone isn't enough,
+      // `.focus()` on a DISABLED button is also a silent no-op, though in
+      // practice this button never mounts disabled.
+      const btn = undoButtonRef.current;
+      if (btn?.isConnected && !btn.disabled) {
+        btn.focus();
+        return;
       }
     }
-    prevEntryStatusRef.current = entry.status;
+    rowRef.current?.focus();
   }, [entry.status]);
 
   if (entry.status === "skipped") {
     return (
-      <div ref={rowRef} tabIndex={-1} aria-label={`${tenantFirst}, ${propertyLabel}`}>
+      <div ref={rowRef} tabIndex={-1} role="group" aria-label={`${tenantFirst}, ${propertyLabel}`}>
         <SkippedCard
           conversationId={item.case_id}
           tenantName={tenantFirst}
@@ -415,7 +439,7 @@ function QueueRow({
   const ctx = { draftId: item.draft_id, caseId: item.case_id, tenantName: item.tenant_name };
 
   return (
-    <div ref={rowRef} tabIndex={-1} aria-label={`${tenantFirst}, ${propertyLabel}`}>
+    <div ref={rowRef} tabIndex={-1} role="group" aria-label={`${tenantFirst}, ${propertyLabel}`}>
       <DecisionCard
         severity={item.severity}
         conversationId={item.case_id}
@@ -452,6 +476,7 @@ function QueueRow({
         onUndo={() => draftActions.undo(ctx)}
         onCancelEdit={() => draftActions.cancelEditor()}
         onSubmitEdit={(body) => draftActions.submitEdit(body)}
+        undoButtonRef={undoButtonRef}
       />
     </div>
   );

@@ -193,7 +193,17 @@ function ConversationPage() {
   const wasEditingRef = useRef(Boolean(editingContext));
   useEffect(() => {
     const isEditing = Boolean(editingContext);
-    if (wasEditingRef.current && !isEditing) {
+    // #191 F2/F4 (safety review re-verify): this used to fire on ANY
+    // isEditing true -> false edge, including a successful edit-and-send,
+    // which moves `draftEntry.status` straight to "sending" rather than
+    // back to idle. That would race the row-level effect below (added
+    // for F3), which now focuses the Undo button on that same
+    // transition: without this check both would move focus in one
+    // commit for a single user action. Checking `draftEntry.status` at
+    // close time narrows this effect to the one case it is actually for:
+    // Cancel, or the `draft_not_found` close, neither of which lands on
+    // "sending".
+    if (wasEditingRef.current && !isEditing && draftEntry.status !== "sending") {
       // F6 (safety review, #191 follow-up): only move focus if it was
       // plausibly here. Either it's still literally inside the draft
       // area, or it was reset to <body> because the element that had it
@@ -210,19 +220,67 @@ function ConversationPage() {
       // hijack shape the moment it does.
       const active = document.activeElement;
       if (draftAreaRef.current?.contains(active) || active === document.body) {
-        // F8: a stale ref pointing at an already-detached node would
-        // silently no-op `.focus()` and never reach the fallback below,
-        // so this checks the node is actually still in the document, not
-        // just non-null.
-        if (editButtonRef.current?.isConnected) {
-          editButtonRef.current.focus();
+        // Cancel just closed the editor. Land focus on the Edit button
+        // if it came back, otherwise the draft area, so a keyboard user
+        // is never dropped onto <body>.
+        // F8 (re-verify): `.isConnected` alone is not enough. `.focus()`
+        // on a DISABLED button is also a silent no-op that never reaches
+        // the fallback below, and Edit can come back disabled: an
+        // ambiguous edit-and-send sets `isSendUnverified`, `isBusy` stays
+        // true, the landlord taps Cancel, and Edit remounts connected but
+        // disabled, inside the #252 danger window.
+        const btn = editButtonRef.current;
+        if (btn?.isConnected && !btn.disabled) {
+          btn.focus();
         } else {
           draftAreaRef.current?.focus();
         }
       }
     }
     wasEditingRef.current = isEditing;
-  }, [editingContext]);
+  }, [editingContext, draftEntry.status]);
+
+  // #191 F3 (safety review re-verify): the identical three transitions
+  // exist here as in Home's QueueRow (src/routes/app.index.tsx): Approve
+  // moves `draftEntry.status` to "sending" (the Undo ticket takes
+  // DecisionActions' place), Skip replaces the whole footer with the
+  // thread's own "No reply sent" line (DraftFooter's `isSkipped`
+  // branch), and a successful Undo moves it back from "sending" to idle
+  // (the actions row reappears). Issue #191 filed this item under "From
+  // PR #190 (conversation thread)", and the first pass at this fix only
+  // ever touched Home's QueueRow. This mirrors it here, on the surface
+  // the item was actually about.
+  const undoButtonRef = useRef<HTMLButtonElement>(null);
+  const prevDraftStatusRef = useRef(draftEntry.status);
+  useEffect(() => {
+    const prevStatus = prevDraftStatusRef.current;
+    prevDraftStatusRef.current = draftEntry.status;
+    if (prevStatus === draftEntry.status) return;
+    // The `sending -> sent` transition is the five-second countdown
+    // simply running out, a timer, never a landlord action. See
+    // QueueRow's identical exemption for the full reasoning (Safari does
+    // not focus a button on click, so `activeElement` sits at <body> for
+    // whole mouse-only sessions, which would otherwise satisfy the guard
+    // below and scroll the page back here five seconds after approving).
+    if (prevStatus === "sending" && draftEntry.status === "sent") return;
+    // F6: only steal focus if it was plausibly inside the draft area,
+    // either still literally there, or reset to <body> because the
+    // control that had it was just removed as part of this transition.
+    const active = document.activeElement;
+    if (!(draftAreaRef.current?.contains(active) || active === document.body)) return;
+    if (draftEntry.status === "sending") {
+      // F2/F4: Approve or a successful edit-and-send. Focus the Undo
+      // button itself, not just the draft area, so its accessible name
+      // and its `aria-describedby` text (UndoTicket.tsx) are read
+      // together at the instant they matter.
+      const btn = undoButtonRef.current;
+      if (btn?.isConnected && !btn.disabled) {
+        btn.focus();
+        return;
+      }
+    }
+    draftAreaRef.current?.focus();
+  }, [draftEntry.status]);
 
   // Once the local approve overlay settles on "sent", the server's own
   // timeline (a real outbound `message` entry replacing the drafted one,
@@ -351,7 +409,12 @@ function ConversationPage() {
 
               {rows.map((row) => renderTimelineRow(row, tenantFirst))}
 
-              <div ref={draftAreaRef} tabIndex={-1} aria-label={`Reply to ${tenantFirst}`}>
+              <div
+                ref={draftAreaRef}
+                tabIndex={-1}
+                role="group"
+                aria-label={`Reply to ${tenantFirst}`}
+              >
                 {editingContext ? (
                   <div className="mt-2">
                     <EditDraftPanel
@@ -377,6 +440,7 @@ function ConversationPage() {
                       staleNotice={draftActions.staleNotices[caseDetail.id]}
                       isBusy={draftActions.isBusy(draftId)}
                       editButtonRef={editButtonRef}
+                      undoButtonRef={undoButtonRef}
                       onApprove={() =>
                         draftActions.approve({
                           draftId,
@@ -558,6 +622,7 @@ function DraftFooter({
   staleNotice,
   isBusy,
   editButtonRef,
+  undoButtonRef,
   onApprove,
   onEdit,
   onSkip,
@@ -571,6 +636,8 @@ function DraftFooter({
   isBusy: boolean;
   /** #191 item 1: see ConversationPage's own `editButtonRef` comment. */
   editButtonRef?: Ref<HTMLButtonElement>;
+  /** #191 F2/F4: see ConversationPage's own `undoButtonRef` comment. */
+  undoButtonRef?: Ref<HTMLButtonElement>;
   onApprove: () => void;
   onEdit: () => void;
   onSkip: () => void;
@@ -609,6 +676,7 @@ function DraftFooter({
           totalSeconds={totalSeconds}
           onUndo={onUndo}
           undoDisabled={isBusy}
+          undoButtonRef={undoButtonRef}
         />
       ) : isSent ? (
         <p className="mt-3.5 text-right font-clarity-sans text-[13px] font-semibold text-clarity-whenever">

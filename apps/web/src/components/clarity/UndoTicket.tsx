@@ -1,3 +1,4 @@
+import type { Ref } from "react";
 import { useId, useRef } from "react";
 import { cn } from "@/lib/utils";
 
@@ -10,6 +11,12 @@ interface UndoTicketProps {
    *  is already in flight — a second tap mid-request would just double-fire
    *  the DELETE. */
   undoDisabled?: boolean;
+  /** #191 F2/F4 (safety review follow-up): the owner (DecisionCard's row,
+   *  or the conversation thread) focuses THIS button the moment a draft
+   *  starts sending, so the button's own accessible name and its
+   *  `aria-describedby` text get read together at the one moment that
+   *  matters, on the control they describe. */
+  undoButtonRef?: Ref<HTMLButtonElement>;
   className?: string;
 }
 
@@ -23,6 +30,7 @@ export function UndoTicket({
   totalSeconds,
   onUndo,
   undoDisabled = false,
+  undoButtonRef,
   className,
 }: UndoTicketProps) {
   const clamped = Math.max(0, secondsLeft);
@@ -58,28 +66,28 @@ export function UndoTicket({
         className,
       )}
     >
-      {/* #191 F1/F2/F4 (safety review): a per-tick sr-only suffix on the
-          button's own name used to carry this. It was noisy (re-announced,
-          or not, unpredictably, every second), but at least SOMETHING told
-          a screen-reader user arriving at the button that a clock was
-          running. Replacing it with a stable "Undo" name and nothing else
-          made the control silently urgent instead. This restores that
-          context without the tick. It's `role="alert"`, not `status`,
-          because this element is INSERTED fresh every time a card starts
-          sending, and src/routes/sign-in.tsx's #248 F3 ruling already
-          established that a live region announced by insertion is
-          unreliable for `status` across assistive tech (higher stakes
-          here, since the design DEPENDS on this one firing). It's placed
-          first, above the "Sending" kicker, so it's read/announced before
-          the button in browse order, and wired to the button via
-          `aria-describedby` (the same idiom EditDraftPanel uses for its
-          blocked-Send explanation) so the text is ALSO read every time a
-          screen-reader user actually lands on Undo, not only once on
-          mount. `{totalSeconds}` is the real, server-derived window
+      {/* #191 F2/F4 (safety review follow-up): an earlier version of this
+          fix made this a `role="alert"` live region, on the theory that a
+          screen-reader user needs to be told a clock is running. The
+          reviewer's re-verify found the live region wasn't actually doing
+          that: nothing here focused the Undo button itself, so on Home
+          focus landed two tab stops above it (the row wrapper) and on the
+          thread it stayed at `<body>`, meaning the description only ever
+          fired if the landlord happened to tab in during the five-second
+          window, with the live region racing that same focus move. The
+          owner now focuses THIS button directly on the `-> sending`
+          transition (see QueueRow / ConversationPage), so the browser's
+          normal "read the accessible name plus its description on focus"
+          behavior delivers one clean announcement, "Undo, button, Undo is
+          available for N seconds after you approve", at the instant it
+          matters, on the control it describes. No live role here on
+          purpose: pairing a live announcement with a focus move on the
+          SAME element makes them race and can cancel each other.
+          `{totalSeconds}` is the real, server-derived window
           (queueEntries.ts's `totalUndoSeconds`), never a hardcoded "5"
           that could read wrong against an on-screen countdown showing
           something else. */}
-      <p id={noticeId} role="alert" className="sr-only">
+      <p id={noticeId} className="sr-only">
         Undo is available for {totalSeconds} second{totalSeconds === 1 ? "" : "s"} after you
         approve.
       </p>
@@ -97,6 +105,7 @@ export function UndoTicket({
         </div>
         <div className="shrink-0 border-l border-dashed border-clarity-line-strong pl-3.5">
           <button
+            ref={undoButtonRef}
             type="button"
             onClick={handleUndo}
             aria-busy={undoDisabled}
