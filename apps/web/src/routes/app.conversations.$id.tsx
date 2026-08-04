@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Ref } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Check, ChevronLeft, Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -180,6 +180,29 @@ function ConversationPage() {
   // whatever the landlord had just typed still in it.
   const editingContext = draftActions.editingContext;
 
+  // #191 item 1: same focus-return pattern as DecisionCard's own copy of
+  // this effect (src/components/clarity/DecisionCard.tsx) — this route
+  // has no single "card" to land on, so `draftAreaRef` (the wrapper below
+  // that holds the editor/footer either way) stands in for it. The Edit
+  // button unmounts the instant `editingContext` is set and only remounts
+  // if the landlord cancels back out — never on a successful
+  // edit-and-send — so `editButtonRef.current` being null is the normal,
+  // expected "not reachable" case, not a bug.
+  const editButtonRef = useRef<HTMLButtonElement>(null);
+  const draftAreaRef = useRef<HTMLDivElement>(null);
+  const wasEditingRef = useRef(Boolean(editingContext));
+  useEffect(() => {
+    const isEditing = Boolean(editingContext);
+    if (wasEditingRef.current && !isEditing) {
+      if (editButtonRef.current) {
+        editButtonRef.current.focus();
+      } else {
+        draftAreaRef.current?.focus();
+      }
+    }
+    wasEditingRef.current = isEditing;
+  }, [editingContext]);
+
   // Once the local approve overlay settles on "sent", the server's own
   // timeline (a real outbound `message` entry replacing the drafted one,
   // per src/features/cases/timeline.ts's docstring) is the honest next
@@ -307,69 +330,72 @@ function ConversationPage() {
 
               {rows.map((row) => renderTimelineRow(row, tenantFirst))}
 
-              {editingContext ? (
-                <div className="mt-2">
-                  <EditDraftPanel
-                    tenantName={tenantFirst}
-                    initialBody={editingContext.body}
-                    submitting={draftActions.isEditSubmitting}
-                    onCancel={() => draftActions.cancelEditor()}
-                    onSend={(body) => draftActions.submitEdit(body)}
-                  />
-                  {draftActions.staleNotices[caseDetail.id] && (
-                    <p className="mt-2.5 text-right font-clarity-sans text-[13px] font-semibold text-clarity-brand">
-                      {draftActions.staleNotices[caseDetail.id]}
-                    </p>
-                  )}
-                </div>
-              ) : draftId && draftBody !== undefined ? (
-                <div className="mt-2">
-                  <DraftFooter
-                    tenantFirst={tenantFirst}
-                    draftBody={draftBody}
-                    draftEntry={draftEntry}
-                    why={why}
-                    staleNotice={draftActions.staleNotices[caseDetail.id]}
-                    isBusy={draftActions.isBusy(draftId)}
-                    onApprove={() =>
-                      draftActions.approve({
-                        draftId,
-                        caseId: caseDetail.id,
-                        tenantName: caseDetail.tenant.name ?? "",
-                      })
-                    }
-                    onEdit={() =>
-                      draftActions.openEditor(
-                        {
+              <div ref={draftAreaRef} tabIndex={-1}>
+                {editingContext ? (
+                  <div className="mt-2">
+                    <EditDraftPanel
+                      tenantName={tenantFirst}
+                      initialBody={editingContext.body}
+                      submitting={draftActions.isEditSubmitting}
+                      onCancel={() => draftActions.cancelEditor()}
+                      onSend={(body) => draftActions.submitEdit(body)}
+                    />
+                    {draftActions.staleNotices[caseDetail.id] && (
+                      <p className="mt-2.5 text-right font-clarity-sans text-[13px] font-semibold text-clarity-brand">
+                        {draftActions.staleNotices[caseDetail.id]}
+                      </p>
+                    )}
+                  </div>
+                ) : draftId && draftBody !== undefined ? (
+                  <div className="mt-2">
+                    <DraftFooter
+                      tenantFirst={tenantFirst}
+                      draftBody={draftBody}
+                      draftEntry={draftEntry}
+                      why={why}
+                      staleNotice={draftActions.staleNotices[caseDetail.id]}
+                      isBusy={draftActions.isBusy(draftId)}
+                      editButtonRef={editButtonRef}
+                      onApprove={() =>
+                        draftActions.approve({
                           draftId,
                           caseId: caseDetail.id,
                           tenantName: caseDetail.tenant.name ?? "",
-                        },
-                        draftBody,
-                      )
-                    }
-                    onSkip={() =>
-                      draftActions.skip({
-                        draftId,
-                        caseId: caseDetail.id,
-                        tenantName: caseDetail.tenant.name ?? "",
-                      })
-                    }
-                    onUndo={() =>
-                      draftActions.undo({
-                        draftId,
-                        caseId: caseDetail.id,
-                        tenantName: caseDetail.tenant.name ?? "",
-                      })
-                    }
-                  />
-                </div>
-              ) : (
-                <p className="mt-4 font-clarity-sans text-xs leading-relaxed text-clarity-ink-dim">
-                  Nothing here can be edited or removed once it&rsquo;s sent — that&rsquo;s what
-                  makes it useful if you ever need the record.
-                </p>
-              )}
+                        })
+                      }
+                      onEdit={() =>
+                        draftActions.openEditor(
+                          {
+                            draftId,
+                            caseId: caseDetail.id,
+                            tenantName: caseDetail.tenant.name ?? "",
+                          },
+                          draftBody,
+                        )
+                      }
+                      onSkip={() =>
+                        draftActions.skip({
+                          draftId,
+                          caseId: caseDetail.id,
+                          tenantName: caseDetail.tenant.name ?? "",
+                        })
+                      }
+                      onUndo={() =>
+                        draftActions.undo({
+                          draftId,
+                          caseId: caseDetail.id,
+                          tenantName: caseDetail.tenant.name ?? "",
+                        })
+                      }
+                    />
+                  </div>
+                ) : (
+                  <p className="mt-4 font-clarity-sans text-xs leading-relaxed text-clarity-ink-dim">
+                    Nothing here can be edited or removed once it&rsquo;s sent — that&rsquo;s what
+                    makes it useful if you ever need the record.
+                  </p>
+                )}
+              </div>
 
               {caseIsOpen && (
                 <div className="mt-6 flex flex-col items-start gap-1">
@@ -510,6 +536,7 @@ function DraftFooter({
   why,
   staleNotice,
   isBusy,
+  editButtonRef,
   onApprove,
   onEdit,
   onSkip,
@@ -521,6 +548,8 @@ function DraftFooter({
   why: string;
   staleNotice?: string;
   isBusy: boolean;
+  /** #191 item 1 — see ConversationPage's own `editButtonRef` comment. */
+  editButtonRef?: Ref<HTMLButtonElement>;
   onApprove: () => void;
   onEdit: () => void;
   onSkip: () => void;
@@ -572,6 +601,7 @@ function DraftFooter({
             onSkip={onSkip}
             onApprove={onApprove}
             disabled={isBusy}
+            editButtonRef={editButtonRef}
           />
         </>
       )}

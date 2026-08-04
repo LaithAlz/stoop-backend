@@ -14,9 +14,14 @@ interface DayDividerProps {
  */
 export function DayDivider({ children, className }: DayDividerProps) {
   return (
+    // #191 item 3: `role="separator"` on a non-focusable element doesn't
+    // reliably pick up its text content as an accessible name, so the
+    // date was invisible to a screen reader. `aria-label` makes it
+    // explicit.
     <div
       role="separator"
       aria-orientation="horizontal"
+      aria-label={children}
       className={cn("my-4 flex items-center gap-2.5", className)}
     >
       <span className="h-px flex-1 bg-clarity-line-strong" aria-hidden="true" />

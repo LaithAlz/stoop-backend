@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { Link } from "@tanstack/react-router";
 import { ChevronRight, Image as ImageIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -103,8 +104,34 @@ export function DecisionCard({
   const isEditing = status === "editing";
   const isPending = status === "pending";
 
+  // #191 item 1: the Edit button (rendered by DecisionActions below)
+  // unmounts the instant edit mode opens and only remounts if the
+  // landlord cancels back to "pending" — never on a successful
+  // edit-and-send, which moves straight to "sending". `editButtonRef`
+  // always points at whichever Edit button is currently mounted (or
+  // `null` if none is), so the effect below can tell reachable from not.
+  const editButtonRef = useRef<HTMLButtonElement>(null);
+  const cardRef = useRef<HTMLElement>(null);
+  const wasEditingRef = useRef(isEditing);
+
+  useEffect(() => {
+    if (wasEditingRef.current && !isEditing) {
+      // Edit mode just closed (Cancel, or a successful edit-and-send) —
+      // land focus on the Edit button if it came back, otherwise the
+      // card itself, so a keyboard user is never dropped onto <body>.
+      if (editButtonRef.current) {
+        editButtonRef.current.focus();
+      } else {
+        cardRef.current?.focus();
+      }
+    }
+    wasEditingRef.current = isEditing;
+  }, [isEditing]);
+
   return (
     <article
+      ref={cardRef}
+      tabIndex={-1}
       className={cn(
         "rounded-clarity-lg border border-clarity-line-strong bg-clarity-surface p-[18px] shadow-clarity-card",
         className,
@@ -116,7 +143,7 @@ export function DecisionCard({
           <Link
             to="/app/conversations/$id"
             params={{ id: conversationId }}
-            className="inline-flex min-h-8 items-center gap-1 py-1 font-clarity-sans text-xs font-bold text-clarity-ink-dim hover:text-clarity-brand"
+            className="inline-flex min-h-11 items-center gap-1 py-1 font-clarity-sans text-xs font-bold text-clarity-ink-dim hover:text-clarity-brand"
           >
             Full view
             <ChevronRight className="size-3" aria-hidden="true" />
@@ -191,6 +218,7 @@ export function DecisionCard({
             onSkip={onSkip}
             onApprove={onApprove}
             disabled={actionsBusy}
+            editButtonRef={editButtonRef}
           />
         </>
       )}

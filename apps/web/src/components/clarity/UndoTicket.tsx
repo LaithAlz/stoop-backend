@@ -56,7 +56,6 @@ export function UndoTicket({
             className="min-h-11 px-1.5 font-clarity-sans text-[13.5px] font-extrabold uppercase tracking-[0.03em] text-clarity-emergency underline underline-offset-[3px] disabled:opacity-60"
           >
             Undo
-            <span className="sr-only"> the message that's sending — {clamped} seconds left</span>
           </button>
         </div>
       </div>
@@ -66,6 +65,18 @@ export function UndoTicket({
           style={{ width: `${pct}%` }}
         />
       </div>
+      {/* #191 item 2: the button's accessible name used to be "Undo the
+          message that's sending — N seconds left", recomputed (and
+          potentially re-announced) every tick. A screen-reader user needs
+          to know a reply is sending and that Undo exists, not a live
+          per-second clock — so the button keeps a stable "Undo" name, and
+          this static (non-ticking) `role="status"` text carries the rest,
+          announced once when the ticket first appears rather than every
+          second. The visible "00:05" digits stay `aria-hidden` above,
+          sighted-only, same as before. */}
+      <p role="status" className="sr-only">
+        Your reply is on its way. Undo is available for a few seconds.
+      </p>
     </div>
   );
 }

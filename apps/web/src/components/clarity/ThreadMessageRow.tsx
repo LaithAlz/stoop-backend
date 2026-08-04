@@ -50,8 +50,23 @@ function speakerLabel(entry: TimelineMessageEntry, tenantFirst: string): string 
  */
 export function ThreadMessageRow({ entry, tenantFirst, className }: ThreadMessageRowProps) {
   const isOutbound = entry.direction === "outbound";
+  const speaker = speakerLabel(entry, tenantFirst);
+  const relativeTime = formatRelativeTime(entry.at);
   return (
-    <div className={cn("mb-3.5 max-w-[83%]", isOutbound && "ml-auto", className)}>
+    // #191 item 3: the mockup puts the attribution/time line visually
+    // BELOW the bubble (docs/mockups/07-clarity-redesign.html `.thread-
+    // meta`), but DOM order before this fix matched that — bubble text
+    // first, "who sent it" second — so a screen reader read the message
+    // before saying who sent it. `role="group"` with an `aria-label`
+    // gives who-sent-it/when as the group's accessible name, announced
+    // on entry before its content, without moving anything on screen; the
+    // now-redundant meta `<p>` is hidden from the accessibility tree
+    // (still visible) so it isn't announced a second time.
+    <div
+      role="group"
+      aria-label={`${speaker} · ${relativeTime}`}
+      className={cn("mb-3.5 max-w-[83%]", isOutbound && "ml-auto", className)}
+    >
       <div
         className={cn(
           "rounded-clarity-lg px-[15px] py-[13px] text-[15px] leading-relaxed",
@@ -74,17 +89,14 @@ export function ThreadMessageRow({ entry, tenantFirst, className }: ThreadMessag
         ))}
       </div>
       <p
+        aria-hidden="true"
         className={cn(
           "mt-1.5 font-clarity-sans text-[11px] font-semibold text-clarity-ink-dim",
           isOutbound && "text-right",
         )}
       >
-        {isOutbound ? (
-          <span className="font-bold text-clarity-brand">{speakerLabel(entry, tenantFirst)}</span>
-        ) : (
-          speakerLabel(entry, tenantFirst)
-        )}{" "}
-        · {formatRelativeTime(entry.at)}
+        {isOutbound ? <span className="font-bold text-clarity-brand">{speaker}</span> : speaker} ·{" "}
+        {relativeTime}
       </p>
     </div>
   );

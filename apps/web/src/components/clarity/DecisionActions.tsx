@@ -1,3 +1,4 @@
+import type { Ref } from "react";
 import { Check, Pencil, SkipForward } from "lucide-react";
 
 interface DecisionActionsProps {
@@ -9,6 +10,12 @@ interface DecisionActionsProps {
    *  approve tap can't race a skip tap on the same card. Scoped per draft
    *  by the caller (useDraftActions' `isBusy`), never a global flag. */
   disabled?: boolean;
+  /** #191 item 1: lets the owner (DecisionCard / the conversation thread's
+   *  DraftFooter) hold a live reference to THIS Edit button so it can
+   *  return keyboard focus here once the editor it opens is closed —
+   *  the button unmounts and remounts across that round trip, so a plain
+   *  `useRef` captured once by the caller would go stale. */
+  editButtonRef?: Ref<HTMLButtonElement>;
   className?: string;
 }
 
@@ -24,11 +31,13 @@ export function DecisionActions({
   onSkip,
   onApprove,
   disabled = false,
+  editButtonRef,
   className,
 }: DecisionActionsProps) {
   return (
     <div className={className ? `mt-[15px] flex gap-2.5 ${className}` : "mt-[15px] flex gap-2.5"}>
       <button
+        ref={editButtonRef}
         type="button"
         onClick={onEdit}
         disabled={disabled}
