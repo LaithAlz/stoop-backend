@@ -92,3 +92,29 @@ describe("toHouseApiError — delete-property and tenant codes", () => {
     );
   });
 });
+
+describe("toHouseApiError: backup_contact_no_phone (#290/api-contracts.md v1.27, #307)", () => {
+  it("gets its own line, not the generic retry fallback", () => {
+    const line = houseLine("backup_contact_no_phone");
+    expect(line).not.toBe(houseLine("some_unknown_code"));
+    expect(line.length).toBeGreaterThan(0);
+  });
+
+  it("says what's actually missing (a phone number), not a vague 'form' complaint", () => {
+    expect(houseLine("backup_contact_no_phone")).toMatch(/phone number/i);
+  });
+
+  it("is distinct from invalid_field's line (a missing phone and an unparsable one are different failures)", () => {
+    expect(houseLine("backup_contact_no_phone")).not.toBe(houseLine("invalid_field"));
+  });
+
+  it("doesn't tell the landlord to retry, since retrying the identical submission can never succeed", () => {
+    expect(houseLine("backup_contact_no_phone")).not.toMatch(/try again/i);
+  });
+
+  it("never leaks the raw code or raw server message", () => {
+    const line = houseLine("backup_contact_no_phone");
+    expect(line).not.toContain("backup_contact_no_phone");
+    expect(line).not.toContain("raw server text");
+  });
+});

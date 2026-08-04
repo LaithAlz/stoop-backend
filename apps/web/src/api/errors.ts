@@ -114,6 +114,19 @@ export function toHouseApiError(error: ApiError): string {
       return "This property has tenants or saved history attached, so it can't be deleted.";
     case "property_not_found":
       return "That property isn't there anymore.";
+    // --- Backup contact (POST/PATCH /v1/properties, #290/api-contracts.md
+    // v1.27 amendment): deliberately distinct from `invalid_field` below
+    // (a `phone` that's present but can't be turned into a real number).
+    // This code fires when the phone is missing, `null`, or blank instead,
+    // so retrying the exact same submission can never succeed. #307: no
+    // shipped client sends that shape today (the web settings form and
+    // mobile onboarding step both already require a name AND a phone
+    // together, or send neither), so this was unmapped and fell through to
+    // the generic retry line below, telling a landlord to do the one thing
+    // guaranteed not to work. Mapped now, ahead of the first writer that
+    // can actually reach it.
+    case "backup_contact_no_phone":
+      return "A backup contact needs a phone number. Add one.";
     // --- Tenants ---
     case "tenant_not_found":
       return "That tenant isn't on file anymore.";
