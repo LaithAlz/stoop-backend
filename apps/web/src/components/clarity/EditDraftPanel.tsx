@@ -9,6 +9,19 @@ import { cn } from "@/lib/utils";
 export const UNVERIFIED_SEND_NOTICE =
   "Checking whether your last reply went out. You'll be able to send again in a moment.";
 
+/** BLOCKER 2's wall-clock ceiling (safety review, #291/#279,
+ *  useResolveUnverifiedSends.ts's `UNVERIFIED_CEILING_MS`): the one-time
+ *  toast when `UNVERIFIED_SEND_NOTICE` above has been showing for two
+ *  minutes with no server read ever confirming which way it went, and
+ *  the guard releases anyway rather than holding the landlord silent
+ *  forever. States plainly what did and didn't happen: the check never
+ *  came back either way (not "it failed", which would overclaim a
+ *  negative result this client doesn't have), and what to do about it:
+ *  the conversation, not this toast, is the source of truth for what
+ *  actually sent. */
+export const UNVERIFIED_GIVE_UP_NOTICE =
+  "Couldn't confirm whether your last edit sent. Open the conversation to check, then try again if it didn't.";
+
 interface EditDraftPanelProps {
   tenantName: string;
   initialBody: string;

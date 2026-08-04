@@ -31,6 +31,7 @@ import {
 import type { Session } from "@supabase/supabase-js";
 import { useQueryClient } from "@tanstack/react-query";
 import { supabase, supabaseConfigured } from "@/lib/supabase";
+import { resetUnverifiedSendStore } from "@/features/queue/unverifiedSendStore";
 
 interface AuthContextValue {
   session: Session | null;
@@ -167,6 +168,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         nextUserId !== lastUserIdRef.current;
       if (identityChanged) {
         queryClient.clear();
+        // BLOCKER 4 (safety review, #291/#279): the #252 unverified-send
+        // guard (src/features/queue/unverifiedSendStore.ts) is a
+        // process-global singleton, same PII-fence reasoning as the query
+        // cache clear right above: a flag the PREVIOUS account raised
+        // must not survive into a different landlord's session.
+        resetUnverifiedSendStore();
       }
       lastUserIdRef.current = nextUserId;
       return identityChanged;
@@ -203,6 +210,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // identityChanged already cleared inside settleIdentity; a plain
         // sign-out (next id null) clears here.
         queryClient.clear();
+        // BLOCKER 4: same reasoning as settleIdentity's own call above,
+        // an explicit sign-out must not leave this landlord's unverified-
+        // send flag up for whoever signs in next in this tab.
+        resetUnverifiedSendStore();
       }
       setSession(nextSession);
       setInitTimedOut(false); // NEW-3: any real auth settle self-heals

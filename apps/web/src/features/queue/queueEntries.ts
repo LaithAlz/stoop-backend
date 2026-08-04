@@ -165,11 +165,28 @@ export interface QueueViewRow {
 }
 
 /**
- * Merges fresh `GET /v1/queue` items with the local overlay. Two entry
+ * A last-known `QueueItem` plus WHERE it sat in the fresh `items` array
+ * the moment it needed pinning. Item 6 (safety review, #291/#279):
+ * without the index, a pinned row could only ever be appended to the
+ * end of the list, so approving the FIRST of several cards and then
+ * losing its server row to a mid-window refetch would visibly walk the
+ * card to the bottom of the queue while its 5 second Undo was still
+ * live: the landlord's thumb stays where it was, the card does not.
+ * Captured once, by this file's callers (src/routes/app.index.tsx), at
+ * the moment the local overlay first pins the draft; not recomputed on
+ * every render.
+ */
+export interface QueueSnapshot {
+  item: QueueItem;
+  index: number;
+}
+
+/**
+ * Merges fresh `GET /v1/queue` items with the local overlay. THREE entry
  * statuses persist past their server row disappearing from `items`, from
  * their own last-known snapshot in `queueSnapshots`: `skipped` (the
- * founder ruling, the card stays visible, muted) and `sending` (issue
- * #291).
+ * founder ruling, the card stays visible, muted), `sending` (issue #291),
+ * and `sent` (item 5, safety review #291/#279, see below).
  *
  * #291: `GET /v1/drafts/{id}/approve` moves the row to `status='approved'`
  * server-side immediately, and `GET /v1/queue` INNER JOINs the pending
@@ -180,11 +197,48 @@ export interface QueueViewRow {
  * landing mid-window (the 20s poll, the window-focus refetch, another
  * card's skip/error `onSettled`, or `useAcknowledge`'s unconditional queue
  * invalidation) deletes the card and its Undo control while the undo is
- * still live and the landlord has no way to press it. `sending` is
- * released from the pin the moment it stops being true: the countdown
- * hitting zero (`"sent"`) or a successful undo (the entry is deleted
- * outright), never before. See this function's callers for exactly
- * where each entry status's snapshot gets written.
+ * still live and the landlord has no way to press it.
+ *
+ * Item 8 (safety review, #291/#279, this file's own house rule: every
+ * defect found here so far has been a comment asserting a guarantee the
+ * code no longer had): a prior revision of this paragraph claimed
+ * `sending` "is released from the pin the moment it stops being true: the
+ * countdown hitting zero or a successful undo, never before." That was
+ * already wrong the day it was written. BLOCKER 1 (useDraftActions.ts's
+ * `undoMutation`) is a THIRD release path: an undo call that fails
+ * ambiguously (a dropped connection, a 5xx) must NOT clear the entry,
+ * because the reply may genuinely still be sending, and this function has
+ * no way to tell the difference from here. This docstring makes no claim
+ * about the exhaustive list of ways a `sending`/`sent` pin ever gets
+ * released, only about what it does while one of those three statuses is
+ * still the honest state, which is the one thing this function can
+ * actually promise.
+ *
+ * Item 5 (safety review, #291/#279): `sending` used to be released from
+ * the pin the instant it stopped being true, INCLUDING the countdown
+ * hitting zero, but that transition (to `"sent"`) is exactly the one
+ * `QueueRow`'s focus-return effect (src/routes/app.index.tsx) and the
+ * "Sent." confirmation text both need at least one more commit to react
+ * to. Unpinning in the SAME commit the status flips unmounts the row
+ * before either can run. `sent` is pinned here for that one reason only;
+ * src/routes/app.index.tsx's own "server confirms it's really gone"
+ * effect is what retires it for good, one read later, by dispatching
+ * `cleared` once the draft has genuinely left a fresh `items` read. This
+ * function has no opinion on when that happens, only on not unmounting
+ * the row out from under a status change it didn't cause.
+ *
+ * A `sending`/`sent` row already present in `items` uses the SNAPSHOT's
+ * `draft_body`, not the live item's, whenever a
+ * snapshot exists (item 3 / BLOCKER 3, safety review #291/#279): a
+ * successful edit-and-send does not itself trigger a refetch, so the very
+ * next commit after Approve can still find this draft in a STALE `items`
+ * read (any of the refetch triggers listed above, racing the edit) with
+ * its OLD, pre-edit body, while the snapshot captured at submit time
+ * already carries the body that actually went out. Without this, the
+ * pinned bubble shows the wrong text first and the right text moments
+ * later, for exactly the seconds the landlord is deciding whether to tap
+ * Undo. One body for the whole window, sourced from the same snapshot
+ * either way the row is built.
  *
  * EXCEPT the item currently open in the edit-and-send panel
  * (`pinnedEditingItem`, A7 below), a separate single-slot pin because at
@@ -193,21 +247,43 @@ export interface QueueViewRow {
 export function buildQueueView(
   items: QueueItem[],
   entries: QueueEntriesState,
-  queueSnapshots: Record<string, QueueItem>,
+  queueSnapshots: Record<string, QueueSnapshot>,
   pinnedEditingItem?: QueueItem | null,
 ): QueueViewRow[] {
   const seen = new Set(items.map((item) => item.draft_id));
-  const rows: QueueViewRow[] = items.map((item) => ({
-    item,
-    entry: entryFor(entries, item.draft_id),
-  }));
+  const rows: QueueViewRow[] = items.map((item) => {
+    const entry = entryFor(entries, item.draft_id);
+    const snapshot = queueSnapshots[item.draft_id];
+    // BLOCKER 3: prefer the snapshot's body for the row this live item
+    // would otherwise build, for as long as it's pinned-worthy. A plain
+    // Approve's snapshot body always matches the live item's anyway (the
+    // body never changed), so this is a no-op in that case.
+    if ((entry.status === "sending" || entry.status === "sent") && snapshot) {
+      return { item: { ...item, draft_body: snapshot.item.draft_body }, entry };
+    }
+    return { item, entry };
+  });
 
+  // Item 6: collect every row whose server item has already dropped out
+  // of `items`, sorted by where it was LAST seen, then splice each back
+  // into that position (adjusting for the ones already spliced ahead of
+  // it) instead of appending. An approved-and-dropped first card stays
+  // the first card while its Undo ticket is live.
+  const pinned: Array<{ index: number; row: QueueViewRow }> = [];
   for (const [draftId, entry] of Object.entries(entries)) {
-    if ((entry.status === "skipped" || entry.status === "sending") && !seen.has(draftId)) {
+    if (
+      (entry.status === "skipped" || entry.status === "sending" || entry.status === "sent") &&
+      !seen.has(draftId)
+    ) {
       const snapshot = queueSnapshots[draftId];
-      if (snapshot) rows.push({ item: snapshot, entry });
+      if (snapshot) pinned.push({ index: snapshot.index, row: { item: snapshot.item, entry } });
     }
   }
+  pinned.sort((a, b) => a.index - b.index);
+  pinned.forEach(({ index, row }, alreadySpliced) => {
+    const insertAt = Math.min(Math.max(index + alreadySpliced, 0), rows.length);
+    rows.splice(insertAt, 0, row);
+  });
 
   // A7 (safety review, #234 PR 2): a routine 20s background poll must
   // never unmount an open editor out from under the landlord mid-type. If
@@ -234,21 +310,22 @@ export function draftStaleNotice(tenantFirstName: string): string {
 
 /**
  * M1 senior advisory (mobile, ported here verbatim): drop any snapshot
- * whose entry is no longer one of the two statuses `buildQueueView` above
- * ever pins (`skipped` or, as of #291, `sending`). A skip or approve that
- * failed (its entry was `cleared` by the error handler), or an undo/expiry
- * that resolved it, would otherwise leave its snapshot in Home's map
- * forever, keeping a stale card resurrectable and tenant text pinned in
- * memory past its purpose. Returns the SAME object when nothing needs
- * pruning so a `setState` caller can bail without re-rendering.
+ * whose entry is no longer one of the statuses `buildQueueView` above
+ * ever pins (`skipped`, `sending`, or, item 5, safety review #291/#279,
+ * `sent`). A skip or approve that failed (its entry was `cleared` by the
+ * error handler), or an undo/expiry that resolved it, would otherwise
+ * leave its snapshot in Home's map forever, keeping a stale card
+ * resurrectable and tenant text pinned in memory past its purpose.
+ * Returns the SAME object when nothing needs pruning so a `setState`
+ * caller can bail without re-rendering.
  */
 export function pruneQueueSnapshots(
-  snapshots: Record<string, QueueItem>,
+  snapshots: Record<string, QueueSnapshot>,
   entries: QueueEntriesState,
-): Record<string, QueueItem> {
+): Record<string, QueueSnapshot> {
   const staleIds = Object.keys(snapshots).filter((draftId) => {
     const status = entries[draftId]?.status;
-    return status !== "skipped" && status !== "sending";
+    return status !== "skipped" && status !== "sending" && status !== "sent";
   });
   if (staleIds.length === 0) return snapshots;
   const next = { ...snapshots };

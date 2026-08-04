@@ -120,6 +120,7 @@ function ConversationPage() {
     dataUpdatedAt: queueQuery.dataUpdatedAt,
     unverifiedSendIds: draftActions.unverifiedSendIds,
     resolveUnverifiedSend: draftActions.resolveUnverifiedSend,
+    giveUpUnverifiedSend: draftActions.giveUpUnverifiedSend,
   });
 
   const caseDetail = caseQuery.data;
@@ -533,14 +534,21 @@ function ConversationPage() {
                           : undefined)
                       }
                       // #279: OR'd with `isSendUnverified`, same as Home's
-                      // `actionsBusy`: Approve/Edit/Skip/Undo all stay
-                      // locked while this draft's last edit-and-send is
-                      // still unresolved, so a landlord can't tap Approve
-                      // and silently send the ORIGINAL, un-edited body
-                      // while its fate is unknown.
+                      // `actionsBusy`: Approve/Edit stay locked while this
+                      // draft's last edit-and-send is still unresolved, so
+                      // a landlord can't tap Approve and silently send the
+                      // ORIGINAL, un-edited body while its fate is
+                      // unknown.
                       isBusy={
                         draftActions.isBusy(draftId) || draftActions.isSendUnverified(draftId)
                       }
+                      // BLOCKER 2 / item 7 (safety review, #291/#279):
+                      // mutation-only busy, deliberately NEVER OR'd with
+                      // `isSendUnverified`. Gates Skip (the escape hatch
+                      // that must survive a locked Approve/Edit) and Undo
+                      // (see DecisionCard's own `mutationBusy` comment,
+                      // the identical reasoning on the other surface).
+                      mutationBusy={draftActions.isBusy(draftId)}
                       editButtonRef={editButtonRef}
                       undoButtonRef={undoButtonRef}
                       onApprove={() =>
@@ -723,6 +731,7 @@ function DraftFooter({
   why,
   staleNotice,
   isBusy,
+  mutationBusy,
   editButtonRef,
   undoButtonRef,
   onApprove,
@@ -735,7 +744,13 @@ function DraftFooter({
   draftEntry: ReturnType<typeof entryFor>;
   why: string;
   staleNotice?: string;
+  /** Gates Edit and Approve, may be OR'd with `isSendUnverified` by the
+   *  caller. See ConversationPage's own `isBusy` comment. */
   isBusy: boolean;
+  /** BLOCKER 2 / item 7 (safety review, #291/#279): gates Skip and Undo
+   *  ONLY, `isBusy(draftId)` alone, never OR'd with `isSendUnverified`.
+   *  See ConversationPage's own `mutationBusy` comment. */
+  mutationBusy: boolean;
   /** #191 item 1: see ConversationPage's own `editButtonRef` comment. */
   editButtonRef?: Ref<HTMLButtonElement>;
   /** #191 F2/F4: see ConversationPage's own `undoButtonRef` comment. */
@@ -777,7 +792,7 @@ function DraftFooter({
           secondsLeft={secondsLeft}
           totalSeconds={totalSeconds}
           onUndo={onUndo}
-          undoDisabled={isBusy}
+          undoDisabled={mutationBusy}
           undoButtonRef={undoButtonRef}
         />
       ) : isSent ? (
@@ -792,6 +807,7 @@ function DraftFooter({
             onSkip={onSkip}
             onApprove={onApprove}
             disabled={isBusy}
+            skipDisabled={mutationBusy}
             editButtonRef={editButtonRef}
           />
         </>

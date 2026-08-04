@@ -18,6 +18,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { approveDraft, editAndSendDraft, rejectDraft, undoDraftApprove } from "@/api/drafts";
 import { ApiError, toHouseApiError } from "@/api/errors";
+import { UNVERIFIED_GIVE_UP_NOTICE } from "@/components/clarity/EditDraftPanel";
 import { firstName } from "@/lib/tenantName";
 import {
   computeUndoExpiresAt,
@@ -143,6 +144,25 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
     // body (`clearUnverifiedSend` reads the shared store directly), so
     // it's correctly gone from these deps rather than kept for a
     // resemblance to the old shape.
+    [onNotice],
+  );
+
+  // BLOCKER 2 (safety review, #291/#279): the wall-clock ceiling's
+  // resolution, a THIRD outcome, distinct from both branches
+  // `resolveUnverifiedSend` above handles. Not "a fresh read confirms
+  // still pending" and not "a fresh read confirms gone": no qualifying
+  // read ever arrived at all (see useResolveUnverifiedSends.ts's
+  // `UNVERIFIED_CEILING_MS`). Unlike `resolveUnverifiedSend`'s silent
+  // "still pending" branch, this ALWAYS notices: a guard that gives up
+  // without saying so would just look like it healed itself, when what
+  // actually happened is Stoop couldn't tell either way.
+  const giveUpUnverifiedSend = useCallback(
+    (draftId: string) => {
+      const wasFlagged = clearUnverifiedSend(draftId);
+      if (!wasFlagged) return;
+      onNotice(UNVERIFIED_GIVE_UP_NOTICE);
+      setEditingContext((current) => (current?.draftId === draftId ? null : current));
+    },
     [onNotice],
   );
 
@@ -301,7 +321,38 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
         onSettled();
         return;
       }
-      handleError(error, ctx);
+      // BLOCKER 1 (safety review, #291/#279): `draft_not_undoable` is,
+      // like `already_sent`, a DEFINITIVE server signal: there is no
+      // live send left for this draft to protect, so falling through to
+      // `handleError`'s `cleared` dispatch (drop the local overlay
+      // entirely) is correct here, same as it was before this fix.
+      if (error instanceof ApiError && error.code === "draft_not_undoable") {
+        handleError(error, ctx);
+        return;
+      }
+      // Everything else (a dropped connection, a 5xx, a timeout, any
+      // other code) is AMBIGUOUS: the DELETE may have applied server-side
+      // and only the response was lost, so the reply may genuinely still
+      // be on its way. `handleError` used to run for these too, and its
+      // unconditional `dispatch({type: "cleared"})` deletes this draft's
+      // local "sending" entry outright. `buildQueueView`
+      // (queueEntries.ts) only ever pins a snapshot for a NON-idle entry
+      // ("sending"/"sent"/"skipped"), so the instant the entry is
+      // cleared, the pinned card, and the Undo control the landlord just
+      // tapped and is still looking at, vanishes if a concurrent refetch
+      // has already dropped the server row from `items` (#291's whole
+      // reason for pinning in the first place), while the reply is, as
+      // far as this client honestly knows, still sending. Toast so the
+      // landlord knows the tap itself didn't confirm, refetch so the next
+      // server read (not a client guess) settles it, but leave the entry
+      // exactly where it was: "sending" is the one state that's still
+      // true here.
+      onNotice(
+        error instanceof ApiError
+          ? toHouseApiError(error)
+          : "Your undo didn't go through. The reply may still be on its way.",
+      );
+      onSettled();
     },
     onSettled: (_data, _error, ctx) => clearBusy(ctx.draftId),
   });
@@ -461,6 +512,10 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
      *  below (see src/routes/app.index.tsx). */
     unverifiedSendIds,
     resolveUnverifiedSend,
+    /** BLOCKER 2: the wall-clock ceiling's own release, see this
+     *  callback's own comment above and useResolveUnverifiedSends.ts's
+     *  `UNVERIFIED_CEILING_MS`. */
+    giveUpUnverifiedSend,
     approve: (ctx: DraftContext) => {
       markBusy(ctx.draftId);
       approveMutation.mutate(ctx);

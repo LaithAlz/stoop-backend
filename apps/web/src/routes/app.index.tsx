@@ -22,6 +22,7 @@ import {
   pruneQueueSnapshots,
   secondsRemaining,
   totalUndoSeconds,
+  type QueueSnapshot,
   type QueueViewRow,
 } from "@/features/queue/queueEntries";
 import { useDraftActions } from "@/features/queue/useDraftActions";
@@ -63,14 +64,15 @@ function AppQueuePage() {
   // already keeps this component from ever mounting unauthenticated.
   const queueQuery = useQueue({ enabled: Boolean(session) });
 
-  // Last-known QueueItem per draft id for the two entry statuses
-  // buildQueueView pins past their server row disappearing from a fresh
-  // `items` read: `skipped` (the founder ruling) and, as of #291,
-  // `sending` (the undo window must survive a refetch, see
-  // buildQueueView's own docstring). Written at `handleSkip`/`handleApprove`
-  // /`handleSubmitEdit` below, right before the local overlay entry moves
-  // to the status that needs it pinned.
-  const [queueSnapshots, setQueueSnapshots] = useState<Record<string, QueueItem>>({});
+  // Last-known QueueItem (plus its last-known position, item 6) per draft
+  // id for the three entry statuses buildQueueView pins past their server
+  // row disappearing from a fresh `items` read: `skipped` (the founder
+  // ruling), `sending` (the undo window must survive a refetch, #291),
+  // and `sent` (item 5, one more commit past the countdown hitting zero,
+  // see buildQueueView's own docstring for why). Written at
+  // `handleSkip`/`handleApprove`/`handleSubmitEdit` below, right before
+  // the local overlay entry moves to the status that needs it pinned.
+  const [queueSnapshots, setQueueSnapshots] = useState<Record<string, QueueSnapshot>>({});
   // A7 (safety review, #234 PR 2): the item whose editor is open, captured
   // at open time — buildQueueView pins it so a background poll that drops
   // the row can't unmount the editor mid-type. Cleared as soon as the
@@ -107,6 +109,7 @@ function AppQueuePage() {
     dataUpdatedAt: queueQuery.dataUpdatedAt,
     unverifiedSendIds: draftActions.unverifiedSendIds,
     resolveUnverifiedSend: draftActions.resolveUnverifiedSend,
+    giveUpUnverifiedSend: draftActions.giveUpUnverifiedSend,
   });
 
   const items = useMemo(() => queueQuery.data?.items ?? [], [queueQuery.data]);
@@ -148,10 +151,23 @@ function AppQueuePage() {
   const needYou = queueQuery.data?.counts.total ?? 0;
   const waitingOnTenants = queueQuery.data?.counts.awaiting_tenant ?? 0;
 
+  // Item 6 (safety review, #291/#279): where a draft sat in the CURRENT
+  // `decisionItems` order, the same array buildQueueView receives as its
+  // `items` param, at the moment it's about to need pinning. `-1` (not
+  // found, shouldn't happen: Approve/Skip/edit-and-send only ever act on
+  // a live pending row) falls back to the end rather than throwing.
+  const snapshotIndexOf = useCallback(
+    (draftId: string) => {
+      const idx = decisionItems.findIndex((i) => i.draft_id === draftId);
+      return idx === -1 ? decisionItems.length : idx;
+    },
+    [decisionItems],
+  );
+
   function handleSkip(item: QueueItem) {
     setQueueSnapshots((prev) => ({
       ...pruneQueueSnapshots(prev, entries),
-      [item.draft_id]: item,
+      [item.draft_id]: { item, index: snapshotIndexOf(item.draft_id) },
     }));
     draftActions.skip({
       draftId: item.draft_id,
@@ -167,7 +183,7 @@ function AppQueuePage() {
   function handleApprove(item: QueueItem) {
     setQueueSnapshots((prev) => ({
       ...pruneQueueSnapshots(prev, entries),
-      [item.draft_id]: item,
+      [item.draft_id]: { item, index: snapshotIndexOf(item.draft_id) },
     }));
     draftActions.approve({
       draftId: item.draft_id,
@@ -195,7 +211,10 @@ function AppQueuePage() {
     if (editingSnapshot) {
       setQueueSnapshots((prev) => ({
         ...pruneQueueSnapshots(prev, entries),
-        [editingSnapshot.draft_id]: { ...editingSnapshot, draft_body: body },
+        [editingSnapshot.draft_id]: {
+          item: { ...editingSnapshot, draft_body: body },
+          index: snapshotIndexOf(editingSnapshot.draft_id),
+        },
       }));
     }
     draftActions.submitEdit(body);
@@ -525,6 +544,11 @@ function QueueRow({
         actionsBusy={
           draftActions.isBusy(item.draft_id) || draftActions.isSendUnverified(item.draft_id)
         }
+        // BLOCKER 2 / item 7 (safety review, #291/#279): mutation-only
+        // busy, deliberately NOT OR'd with `isSendUnverified`. See
+        // DecisionCard's own `mutationBusy` comment for why Skip and Undo
+        // need this instead of `actionsBusy`.
+        mutationBusy={draftActions.isBusy(item.draft_id)}
         onApprove={() => onApprove(item)}
         onEdit={() => onOpenEditor(item)}
         onSkip={() => onSkip(item)}

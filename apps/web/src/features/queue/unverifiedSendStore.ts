@@ -85,9 +85,25 @@ export function clearUnverifiedSend(draftId: string): boolean {
   return true;
 }
 
-/** Test-only: resets the store between harness runs. Never called from
- *  app code. */
-export function __resetUnverifiedSendStoreForTests(): void {
+/**
+ * Resets the store to empty. BLOCKER 4 (safety review, #291/#279): no
+ * longer test-only, despite the name this used to have
+ * (`__resetUnverifiedSendStoreForTests`). This module is process-global
+ * (this file's own docstring above explains why it has to be, over a
+ * per-route `useState`), which means the flag it holds is cross-account
+ * state sitting in a singleton. src/auth/AuthProvider.tsx now calls this
+ * from the SAME two places it already clears the React Query cache for
+ * the identical reason (its own PII-fence comments): an explicit
+ * sign-out, and a detected identity change (a different landlord signing
+ * in on the same browser/tab). Left un-reset, a flag landlord A raised
+ * survives their sign-out and resolves against landlord B's first queue
+ * read in the same tab. No tenant data crosses (the notice string is
+ * static), but it's a cross-account artifact on a safety control, and it
+ * silently discards A's own guard at the same moment. Still exported
+ * plainly (not renamed back to a dunder-prefixed test helper) so it stays
+ * obviously callable from both app code and this file's own harness.
+ */
+export function resetUnverifiedSendStore(): void {
   state = new Map();
 }
 
