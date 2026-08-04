@@ -25,6 +25,7 @@ level every one of these endpoints actually uses.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -643,6 +644,191 @@ async def test_update_backup_contact_non_string_phone_rejected_422(session: Asyn
 
         unchanged = await get_property(prop.id, (landlord, session))
         assert unchanged.backup_contact is None
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+# ---------------------------------------------------------------------------
+# #268 — backup_contact removal. The step-1 precondition (before any of the
+# tests below): an explicit ``backup_contact: null`` PATCH goes through
+# ``json.dumps(None)`` + ``CAST(... AS jsonb)`` (see the generic jsonb-dump
+# loop in ``update_property`` above), which stores a JSON *null* literal in
+# the column -- NOT a SQL NULL. The test immediately below proves what
+# actually comes back out on the next read: SQLAlchemy's asyncpg dialect
+# registers a jsonb codec (``json.loads``) at the DBAPI-connection level for
+# every jsonb column, on every session, whether or not the query uses an ORM
+# type -- so a stored JSON ``null`` decodes straight back to Python ``None``,
+# not the string ``"null"``. Verified empirically here rather than assumed:
+# if this ever regressed (e.g. a driver/SQLAlchemy upgrade dropped the
+# codec), ``_backup_phone`` would receive the string ``"null"``,
+# ``"null".strip()`` would still be truthy, and the T+10m backup leg would
+# hand Twilio ``to="null"`` -- a "failed" Twilio 21211 rather than a clean
+# "skipped", i.e. silent-ish failure on the emergency path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_explicit_null_patch_stores_json_null_but_reads_back_as_python_none(
+    session: AsyncSession,
+) -> None:
+    """Step-1 precondition proof (issue #268). Confirms, against the real
+    column: (a) the stored value is a JSON ``null`` literal, not SQL NULL
+    (``... IS NULL`` is false, the raw text is the 4 bytes ``null``); (b)
+    reading it back through the exact same session/engine every request
+    handler uses yields Python ``None``; (c)
+    ``app.agent.emergency_chain._backup_phone`` on that value returns
+    ``None``, never raises, and never returns the literal string
+    ``"null"``."""
+    from app.agent.emergency_chain import _backup_phone
+
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(
+                label="Null-literal precondition test",
+                address_line1="8 Backup St",
+                city="Toronto",
+                backup_contact={"name": "Ex-Partner", "phone": "+14165550188"},
+            ),
+            (landlord, session),
+        )
+
+        await update_property(
+            prop.id, PropertyUpdateRequest(backup_contact=None), (landlord, session)
+        )
+
+        raw = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT backup_contact IS NULL AS is_sql_null, "
+                        "backup_contact::text AS as_text FROM properties WHERE id = :id"
+                    ),
+                    {"id": str(prop.id)},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert raw["is_sql_null"] is False  # a JSON null literal, not SQL NULL
+        assert raw["as_text"] == "null"
+
+        fetched = await get_property(prop.id, (landlord, session))
+        assert fetched.backup_contact is None  # Python None, not the string "null"
+
+        result = _backup_phone(fetched.backup_contact)
+        assert result is None
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_update_backup_contact_explicit_null_clears_it(session: AsyncSession) -> None:
+    """The core #268 capability: a landlord can actually remove a
+    previously-set backup contact."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(
+                label="Clear test",
+                address_line1="9 Backup St",
+                city="Toronto",
+                backup_contact={"name": "Ex-Partner", "phone": "+14165550188"},
+            ),
+            (landlord, session),
+        )
+        assert prop.backup_contact is not None
+
+        cleared = await update_property(
+            prop.id, PropertyUpdateRequest(backup_contact=None), (landlord, session)
+        )
+        assert cleared.backup_contact is None
+
+        refetched = await get_property(prop.id, (landlord, session))
+        assert refetched.backup_contact is None
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_clearing_an_already_empty_backup_contact_is_a_noop(
+    session: AsyncSession,
+) -> None:
+    """PATCHing ``backup_contact: null`` on a property that never had one
+    set succeeds and writes no spurious audit entry (same "no-op PATCH"
+    convention as house_rules)."""
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(
+                label="Already-empty test", address_line1="10 Backup St", city="Toronto"
+            ),
+            (landlord, session),
+        )
+        assert prop.backup_contact is None
+
+        updated = await update_property(
+            prop.id, PropertyUpdateRequest(backup_contact=None), (landlord, session)
+        )
+        assert updated.backup_contact is None
+
+        audit_rows = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE landlord_id = :lid "
+                    "AND action = 'settings_changed'"
+                ),
+                {"lid": landlord_id},
+            )
+        ).scalar_one()
+        assert audit_rows == 0
+    finally:
+        await _cleanup(session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_clearing_backup_contact_writes_audit_log_row(session: AsyncSession) -> None:
+    landlord_id = await factories.insert_landlord(session)
+    landlord = Landlord(id=uuid.UUID(landlord_id))
+    try:
+        prop = await create_property(
+            PropertyCreateRequest(
+                label="Audit test",
+                address_line1="11 Backup St",
+                city="Toronto",
+                backup_contact={"name": "Ex-Partner", "phone": "+14165550188"},
+            ),
+            (landlord, session),
+        )
+
+        await update_property(
+            prop.id, PropertyUpdateRequest(backup_contact=None), (landlord, session)
+        )
+
+        audit_row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT payload FROM audit_log WHERE landlord_id = :lid "
+                        "AND action = 'settings_changed'"
+                    ),
+                    {"lid": landlord_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert audit_row["payload"] == {
+            "resource": "property",
+            "property_id": str(prop.id),
+            "field": "backup_contact",
+        }
+        # Rule #5 — never a phone number or name in the payload.
+        assert "phone" not in json.dumps(audit_row["payload"])
+        assert "Ex-Partner" not in json.dumps(audit_row["payload"])
     finally:
         await _cleanup(session, landlord_id)
 

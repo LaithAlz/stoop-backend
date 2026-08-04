@@ -359,6 +359,73 @@ purchase before being rejected. A present-but-BLANK `phone` is left as-is
 not-nullable business rule, and the escalation chain already treats a
 blank value as "no backup contact configured," a safe no-op.
 
+**v1.25 amendment (2026-08-04 — #268 implementation):** `PATCH
+/v1/properties/{id}` with an explicit `"backup_contact": null` **clears
+it**. This is not a new server-side capability — `PropertyUpdateRequest.
+backup_contact: dict | None` already accepted it, and `app/routers/
+properties.py`'s `reject_explicit_null` call only 422s an explicit `null`
+for `label`/`address_line1`/`city`/`province`/`quiet_hours`/
+`heating_season` (all genuinely `NOT NULL` in schema-v1.md);
+`backup_contact` was already, correctly, absent from that list — but no
+doc previously said an explicit `null` clears it, no test previously
+proved the write is safe, and no web surface could send it: the dashboard
+property settings form (#261) silently dropped `backup_contact` from the
+request body whenever both its `name`/`phone` inputs were blank, and told
+the landlord to "contact support" instead. All three gaps are closed by
+this issue.
+
+Operationally: clearing `backup_contact` means the property's emergency
+escalation chain's T+10m step (`app/agent/emergency_chain.py`,
+`docs/02-product/emergency-prefilter.md`'s escalation-chain table) is
+recorded `"skipped"` (`reason: "no_backup_contact"`) instead of calling
+and texting that person — same behavior as a property that never had a
+backup contact configured. **Nothing else about the chain changes**: the
+T+0/2/5/15/20m+ landlord-only steps are unaffected, and a chain already
+mid-flight when the contact is cleared picks up the change on its very
+next scheduled attempt (the chain re-reads `properties.backup_contact`
+fresh from the `notifications` row's `property_id` on every attempt — it
+is never cached/snapshotted at trigger time).
+
+A `PATCH` that changes `backup_contact` (set, edit, or clear) now writes
+an `audit_log` row (`actor: "landlord"`, `action: "settings_changed"`,
+payload `{"resource": "property", "property_id", "field":
+"backup_contact"}` — never the contact's name or phone, never-break rule
+#5). This doc was previously silent on the fact that `app/routers/
+properties.py` already writes this same shape of `audit_log` row for
+`house_rules` changes (diff against the pre-update value; a no-op `PATCH`
+that resends the same value writes nothing) — undocumented here until
+now, not a new mechanism this issue invented. `backup_contact` simply
+wasn't included in that check until this issue's safety review surfaced
+it as exactly the kind of agent-behavior-affecting change #54's original
+acceptance criteria (an `audit_log` entry on changes that affect agent
+behavior) already calls for. Clearing an already-empty `backup_contact`
+(never set, or already cleared) is a true no-op: `200` with the unchanged
+`Property`, no audit entry.
+
+**Verified, not assumed** (this issue's step-1 precondition, before any of
+the above was built): an explicit `null` write goes through
+`json.dumps(None)` + `CAST(... AS jsonb)`, which stores a JSON *null*
+literal in the `jsonb` column — not a SQL `NULL` (`backup_contact IS NULL`
+is false; the raw column text is the four bytes `null`). This is safe, not
+a latent bug: SQLAlchemy's asyncpg dialect registers a `jsonb` type codec
+(`json.loads`) at the DBAPI-connection level for every session this API
+uses (the admin engine, the request engine, and the scheduler's sweep
+sessions alike) — a stored JSON `null` always decodes back to Python
+`None` on read, the same as a genuine SQL `NULL` would, so
+`_backup_phone` (`emergency_chain.py`) sees `None` and returns `None`,
+never the string `"null"`. No write-path change was needed. See
+`apps/api/tests/test_properties_router.py::
+test_explicit_null_patch_stores_json_null_but_reads_back_as_python_none`
+for the DB-level proof and
+`apps/api/tests/test_agent_emergency_chain.py::
+test_backup_step_skips_gracefully_after_backup_contact_cleared_via_patch`
+for the full escalation-chain-level proof (through the real `PATCH`
+handler, not a raw SQL update).
+
+schema-v1.md needs no change: `properties.backup_contact` is already
+declared `jsonb` with no `NOT NULL` (verified against the live column,
+not just the doc text).
+
 ## Tenants & Vendors
 
 `GET/POST /v1/properties/{id}/tenants` · `PATCH/DELETE /v1/tenants/{id}`

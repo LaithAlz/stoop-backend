@@ -38,21 +38,29 @@
  * to update." while the old text quietly reappeared from the next server
  * echo — with Stoop still quoting the retracted rule to tenants.
  *
- * `backup_contact`/`quiet_hours` genuinely ARE "blank-both means don't
- * touch it" — neither can be explicitly CLEARED back to null through this
- * builder: `UpdatePropertyInput`'s fields for them are typed as the full
- * object (`BackupContact`/`QuietHours`), not `| null` — matching
- * api-contracts.md's documented PATCH body, which gives no shape for
- * "unset this" on either. A landlord who blanks both fields in a pair
- * that was previously set is NOT clearing it — the pair is simply left
- * out of the payload and the existing value stays on the property. The
- * form surfaces this honestly (see `backupContactClearAttempted`/
- * `quietHoursClearAttempted` below) rather than silently no-op'ing like a
- * successful clear. (The backend DOES accept `backup_contact: null`
- * per properties.py's own comment — but shipping that clear needs a
- * doc-first api-contracts.md amendment plus a backend test confirming
- * `_backup_phone` reads a stored JSON `null` as `None`, not the string
- * `"null"`; tracked separately, not this PR.)
+ * `quiet_hours` still can NOT be explicitly cleared back to null through
+ * this builder: `UpdatePropertyInput.quiet_hours` is typed as the full
+ * `QuietHours` object, not `| null`, matching api-contracts.md's
+ * documented PATCH body, which gives no shape for "unset this" on it. A
+ * landlord who blanks both quiet-hours fields on a previously-set pair is
+ * NOT clearing it — the pair is simply left out of the payload and the
+ * existing value stays on the property (see `quietHoursClearAttempted`
+ * below, which the form uses to say so honestly).
+ *
+ * `backup_contact` is DIFFERENT (#268, api-contracts.md's v1.25
+ * amendment): `UpdatePropertyInput.backup_contact` is typed `| null`, and
+ * an explicit `null` genuinely clears the stored contact — verified
+ * end-to-end against the real column (`_backup_phone` reads it back as
+ * Python `None`, not the string `"null"`; see that amendment and
+ * `apps/api/tests/test_properties_router.py`'s step-1 precondition test).
+ * A landlord blanking both `backupName`/`backupPhone` on a previously-set
+ * contact IS clearing it: pass `confirmedClear: true` (only after the
+ * caller has shown a real confirmation — this removes redundancy on the
+ * emergency escalation chain's T+10m step) and this builder sends
+ * `backup_contact: null`. Without that flag, a blank-both pair is left out
+ * of the payload exactly like the old behavior, so the caller can compute
+ * `backupContactClearAttempted` first, show a confirm dialog, and only
+ * call this again with `confirmedClear: true` once the landlord agrees.
  */
 import type { BackupContact, Property, QuietHours, UpdatePropertyInput } from "@/api/types";
 import { toE164 } from "@/lib/phone";
@@ -134,6 +142,30 @@ export function backupContactClearAttempted(
 }
 
 /**
+ * #268: confirm-dialog copy for actually removing a backup contact — shown
+ * only when `backupContactClearAttempted` is true, i.e. right before the
+ * caller sends `buildPropertySettingsPayload(form, current, {confirmedClear:
+ * true})`. States the real, concrete consequence (what stops happening on
+ * the emergency escalation chain's T+10m step, `apps/api/app/agent/
+ * emergency_chain.py`) rather than a generic "are you sure" — this removes
+ * redundancy on the emergency line, not an ordinary settings edit.
+ * `contactName` is `current.backup_contact.name`, always present here since
+ * callers only reach this once `backupContactClearAttempted` is true (which
+ * itself requires `current.backup_contact !== null`).
+ */
+export function backupContactClearTitle(contactName: string): string {
+  return `Remove ${contactName} as your backup contact?`;
+}
+
+export const BACKUP_CONTACT_CLEAR_MESSAGE =
+  "Right now, if you don't answer during a real emergency, I call and text them about ten " +
+  "minutes later — what happened, your tenant's name, and a link that can stop the whole " +
+  "alert. After this, no one else gets contacted. I'll just keep calling you, every fifteen " +
+  "minutes, until you answer.";
+
+export const BACKUP_CONTACT_CLEAR_CONFIRM_LABEL = "Remove backup contact";
+
+/**
  * M1 (safety review): a `backup_contact` already stored with an
  * undialable phone (a pre-`toE164` row, or one written by a path that
  * never validated) is invisible until the landlord happens to open this
@@ -163,10 +195,18 @@ export function quietHoursClearAttempted(form: PropertySettingsForm, current: Pr
  * the caller skips the PATCH entirely rather than firing a no-op request.
  * Assumes `backupContactError`/`quietHoursError` are already checked
  * (null) by the caller; this never sends a one-sided pair.
+ *
+ * `confirmedClear` (#268): the caller must set this `true` only after
+ * showing a real confirmation for the specific consequence of clearing
+ * `backup_contact` (it removes the emergency escalation chain's T+10m
+ * backup call/text entirely) — see `backupContactClearAttempted`. Without
+ * it, a blank-both backup-contact pair is treated as "leave it alone",
+ * same as before this issue.
  */
 export function buildPropertySettingsPayload(
   form: PropertySettingsForm,
   current: Property,
+  options: { confirmedClear?: boolean } = {},
 ): UpdatePropertyInput | null {
   const payload: UpdatePropertyInput = {};
 
@@ -198,6 +238,10 @@ export function buildPropertySettingsPayload(
     }
     // else: unnormalizable phone — blocked by backupContactError before
     // this is ever called; never sent regardless.
+  } else if (options.confirmedClear && backupContactClearAttempted(form, current)) {
+    // #268: an explicitly confirmed clear of a previously-set contact —
+    // the one case this builder sends a real `null`, never guessed at.
+    payload.backup_contact = null;
   }
 
   const quietStart = form.quietStart.trim();

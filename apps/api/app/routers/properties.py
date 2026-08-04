@@ -113,14 +113,19 @@ note). The explicit ``ON DELETE RESTRICT`` columns targeting
 ``trust_metrics.property_id``.
 
 Audit trail (#54 AC: "audit entries on changes that affect agent
-behavior"): a ``PATCH`` that actually changes ``house_rules`` writes an
-``audit_log`` row (``actor='landlord'``, ``action='settings_changed'``) —
-compared against the pre-update value so a no-op PATCH (same value resent)
-never writes a spurious entry. The AC's OTHER agent-behavior-affecting
-field, "voice-profile fields," lives on ``landlords.voice_profile``
-(schema-v1.md) — not a ``properties`` column at all — so it is satisfied
-by ``PATCH /v1/me`` (``app/routers/me.py``), not by this router; see that
-module's own audit-trail note.
+behavior"): a ``PATCH`` that actually changes ``house_rules`` OR
+``backup_contact`` writes an ``audit_log`` row (``actor='landlord'``,
+``action='settings_changed'``) — compared against the pre-update value so
+a no-op PATCH (same value resent, or clearing an already-empty field)
+never writes a spurious entry. ``backup_contact`` was added to this check
+by #268 (the escalation chain's T+10m backup-contact removal capability —
+see ``app/agent/emergency_chain.py``'s module docstring): the payload
+records only ``field: "backup_contact"``, never the contact's name or
+phone number (never-break rule #5). The AC's OTHER agent-behavior
+-affecting field, "voice-profile fields," lives on
+``landlords.voice_profile`` (schema-v1.md) — not a ``properties`` column
+at all — so it is satisfied by ``PATCH /v1/me`` (``app/routers/me.py``),
+not by this router; see that module's own audit-trail note.
 """
 
 from __future__ import annotations
@@ -749,6 +754,23 @@ async def update_property(
             actor="landlord",
             action="settings_changed",
             payload={"resource": "property", "property_id": prop_id, "field": "house_rules"},
+        )
+
+    # #268: backup_contact feeds the emergency escalation chain's T+10m step
+    # (app/agent/emergency_chain.py) -- a landlord clearing (or setting, or
+    # editing) it is exactly the kind of "affects agent behavior" change
+    # #54's AC calls for auditing, same diff-against-pre-update-value
+    # pattern as house_rules above (a no-op PATCH -- e.g. clearing an
+    # already-empty contact -- never writes a spurious entry). The payload
+    # carries only the field name, never the contact's name or phone
+    # number (never-break rule #5).
+    if "backup_contact" in provided and updated["backup_contact"] != existing["backup_contact"]:
+        await record_audit_log(
+            session,
+            landlord_id=landlord_id,
+            actor="landlord",
+            action="settings_changed",
+            payload={"resource": "property", "property_id": prop_id, "field": "backup_contact"},
         )
 
     return _row_to_property(updated)

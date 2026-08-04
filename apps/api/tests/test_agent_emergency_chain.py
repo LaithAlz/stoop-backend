@@ -746,6 +746,73 @@ async def test_backup_step_skips_gracefully_when_not_configured(
         await _cleanup(db_session, landlord_id)
 
 
+@pytest.mark.integration
+async def test_backup_step_skips_gracefully_after_backup_contact_cleared_via_patch(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    """#268: a backup contact cleared through the REAL ``PATCH
+    /v1/properties/{id}`` write path (``backup_contact: null`` ->
+    ``json.dumps(None)`` + ``CAST(... AS jsonb)``, a JSON null literal, not
+    SQL NULL -- see ``tests/test_properties_router.py``'s step-1
+    precondition test) must make the T+10m step ``"skipped"``, never
+    ``"failed"`` -- the concrete failure mode this issue's step 1 verifies
+    against is ``_backup_phone`` receiving the *string* ``"null"``
+    (``"null".strip()`` is truthy) and handing Twilio ``to="null"``."""
+    from app.deps import Landlord
+    from app.routers.properties import PropertyUpdateRequest, update_property
+
+    landlord_id, property_id, tenant_id = await _seed(
+        db_session, backup_contact={"name": "Ex-Partner", "phone": _BACKUP_PHONE}
+    )
+
+    # Clear it through the actual router handler -- not a raw SQL UPDATE --
+    # so this test exercises the exact code path a real PATCH request runs.
+    await update_property(
+        uuid.UUID(property_id),
+        PropertyUpdateRequest(backup_contact=None),
+        (Landlord(id=uuid.UUID(landlord_id)), db_session),
+    )
+
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    notification_id = await _insert_emergency_call_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        categories=["fire"],
+    )
+
+    try:
+        t0 = datetime.now(UTC)
+        await emergency_chain.handle_emergency_trigger(
+            notification_id=uuid.UUID(notification_id),
+            message_id=uuid.UUID(message_id),
+            property_id=uuid.UUID(property_id),
+            categories=["fire"],
+        )
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=2, seconds=1))
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=5, seconds=1))
+        calls_before_backup_step = len(fake_sender.calls)
+
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=10, seconds=1))
+
+        # nothing sent -- cleared backup contact, same as never-configured.
+        assert len(fake_sender.calls) == calls_before_backup_step
+        attempts = await _fetch_attempt_audit_rows(db_session, landlord_id)
+        backup_step = attempts[3]["payload"]["actions"]
+        assert all(a["status"] == "skipped" for a in backup_step)
+        assert all(a["reason"] == "no_backup_contact" for a in backup_step)
+        # The failure mode this proves against: never "failed".
+        assert not any(a["status"] == "failed" for a in backup_step)
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
 # ---------------------------------------------------------------------------
 # Integration — acknowledgment stops the chain, from all three surfaces
 # ---------------------------------------------------------------------------
