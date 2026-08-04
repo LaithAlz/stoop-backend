@@ -203,7 +203,16 @@ export interface CreatePropertyInput {
 }
 
 /** PATCH /v1/properties/{id} body — "same fields + `quiet_hours`,
- *  `heating_season`" per the Properties section. */
+ *  `heating_season`" per the Properties section.
+ *
+ *  `backup_contact` is `| null` (#268, api-contracts.md's v1.25
+ *  amendment): unlike every other field here, an explicit `null` is a
+ *  real, distinct request — it CLEARS the stored contact, not "leave it
+ *  alone" (that's simply omitting the key, same as any other field).
+ *  `label`/`address_line1`/`city`/`province`/`quiet_hours`/
+ *  `heating_season` stay non-nullable — the backend 422s `invalid_field`
+ *  on an explicit `null` for any of those (all `NOT NULL` in
+ *  schema-v1.md). */
 export interface UpdatePropertyInput {
   label?: string;
   address_line1?: string;
@@ -211,7 +220,7 @@ export interface UpdatePropertyInput {
   province?: string;
   postal_code?: string;
   house_rules?: string;
-  backup_contact?: BackupContact;
+  backup_contact?: BackupContact | null;
   quiet_hours?: QuietHours;
   heating_season?: HeatingSeason;
 }

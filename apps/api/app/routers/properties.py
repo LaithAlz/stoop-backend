@@ -113,14 +113,20 @@ note). The explicit ``ON DELETE RESTRICT`` columns targeting
 ``trust_metrics.property_id``.
 
 Audit trail (#54 AC: "audit entries on changes that affect agent
-behavior"): a ``PATCH`` that actually changes ``house_rules`` writes an
-``audit_log`` row (``actor='landlord'``, ``action='settings_changed'``) —
-compared against the pre-update value so a no-op PATCH (same value resent)
-never writes a spurious entry. The AC's OTHER agent-behavior-affecting
-field, "voice-profile fields," lives on ``landlords.voice_profile``
-(schema-v1.md) — not a ``properties`` column at all — so it is satisfied
-by ``PATCH /v1/me`` (``app/routers/me.py``), not by this router; see that
-module's own audit-trail note.
+behavior"): a ``PATCH`` that actually changes ``house_rules`` OR
+``backup_contact`` writes an ``audit_log`` row (``actor='landlord'``,
+``action='settings_changed'``) — compared against the pre-update value so
+a no-op PATCH (same value resent, or clearing an already-empty field)
+never writes a spurious entry. ``backup_contact`` was added to this check
+by #268 (removing the backup contact from the escalation chain's T+10m
+step and its T+20m+ repeat cycles —
+see ``app/agent/emergency_chain.py``'s module docstring): the payload
+records only ``field: "backup_contact"``, never the contact's name or
+phone number (never-break rule #5). The AC's OTHER agent-behavior
+-affecting field, "voice-profile fields," lives on
+``landlords.voice_profile`` (schema-v1.md) — not a ``properties`` column
+at all — so it is satisfied by ``PATCH /v1/me`` (``app/routers/me.py``),
+not by this router; see that module's own audit-trail note.
 """
 
 from __future__ import annotations
@@ -351,11 +357,12 @@ def _canonicalize_backup_contact(
     backup_contact: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """#232/#260: ``backup_contact`` (schema-v1.md: ``{name, phone}`` for
-    the escalation chain's T+10m step, ``app/agent/emergency_chain.py``'s
-    ``_backup_phone``) is a free-form ``jsonb`` blob with no DB-level shape
-    enforcement — only its ``phone`` key is a phone number, so only that
-    key is validated here, in place, leaving everything else (including a
-    missing ``phone`` key entirely) untouched.
+    the escalation chain's T+10m step and its T+20m+ repeat cycles,
+    ``app/agent/emergency_chain.py``'s ``_backup_phone``) is a free-form
+    ``jsonb`` blob with no DB-level shape enforcement — only its ``phone``
+    key is a phone number, so only that key is validated here, in place,
+    leaving everything else (including a missing ``phone`` key entirely)
+    untouched.
 
     A present-but-BLANK ``phone`` (``""``/whitespace-only) — or an
     explicit JSON ``null`` — is left as-is rather than rejected:
@@ -378,7 +385,8 @@ def _canonicalize_backup_contact(
     ``False``, same branch as "blank/missing"). That silently stores a
     ``backup_contact`` that LOOKS configured (present, non-null) while
     ``_backup_phone`` returns ``None`` for it (not a ``str``) — the T+10m
-    escalation step never fires, with nothing landlord-visible saying so.
+    escalation step and every T+20m+ repeat's backup legs never fire, with
+    nothing landlord-visible saying so.
     Now REJECTED (422 ``invalid_field``), distinctly from the safe-no-op
     blank/null case.
     """
@@ -749,6 +757,24 @@ async def update_property(
             actor="landlord",
             action="settings_changed",
             payload={"resource": "property", "property_id": prop_id, "field": "house_rules"},
+        )
+
+    # #268: backup_contact feeds the emergency escalation chain's T+10m
+    # step AND every T+20m+ repeat cycle (app/agent/emergency_chain.py's
+    # actions_for_step) -- a landlord clearing (or setting, or
+    # editing) it is exactly the kind of "affects agent behavior" change
+    # #54's AC calls for auditing, same diff-against-pre-update-value
+    # pattern as house_rules above (a no-op PATCH -- e.g. clearing an
+    # already-empty contact -- never writes a spurious entry). The payload
+    # carries only the field name, never the contact's name or phone
+    # number (never-break rule #5).
+    if "backup_contact" in provided and updated["backup_contact"] != existing["backup_contact"]:
+        await record_audit_log(
+            session,
+            landlord_id=landlord_id,
+            actor="landlord",
+            action="settings_changed",
+            payload={"resource": "property", "property_id": prop_id, "field": "backup_contact"},
         )
 
     return _row_to_property(updated)

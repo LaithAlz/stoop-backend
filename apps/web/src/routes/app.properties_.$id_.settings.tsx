@@ -8,12 +8,25 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { useAuth } from "@/auth/AuthProvider";
 import { propertyQueryKey, updateProperty, useProperty } from "@/api/properties";
 import { ApiError, toHouseApiError } from "@/api/errors";
 import type { Property, UpdatePropertyInput } from "@/api/types";
 import {
+  BACKUP_CONTACT_CLEAR_CONFIRM_LABEL,
+  BACKUP_CONTACT_CLEAR_MESSAGE,
   backupContactClearAttempted,
+  backupContactClearTitle,
   backupContactError,
   backupContactPhoneLooksInvalid,
   buildPropertySettingsPayload,
@@ -241,6 +254,11 @@ function SettingsForm({
   const [dirty, setDirty] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
+  // #268: gates the real backup-contact-removal confirm dialog below —
+  // Save never sends `backup_contact: null` without this having been
+  // explicitly confirmed first (see buildPropertySettingsPayload's
+  // `confirmedClear` option).
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
   // L6-shaped latch (src/routes/app.properties_.add.tsx) — synchronous,
   // unlike a `mutation.isPending` read from the render closure, so two
   // submits inside one frame can't both PATCH.
@@ -348,12 +366,11 @@ function SettingsForm({
   // bare `mutation.isPending` — see the `saving` prop doc comment above.
   const busy = saving || mutation.isPending;
 
-  function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    setSubmitted(true);
-    setServerError(null);
-    if (backupError || quietError || busy || submitLatch.current) return;
-    const payload = buildPropertySettingsPayload(form, current);
+  // Shared by both the direct-save path and the post-confirm path below —
+  // never called twice for the same submit (guarded by submitLatch either
+  // way it's reached).
+  function submitPayload(options: { confirmedClear?: boolean } = {}) {
+    const payload = buildPropertySettingsPayload(form, current, options);
     if (!payload) {
       // Nothing changed (or the only change was a blank-both "clear" the
       // form already flags via backupCleared/quietCleared above) — say so
@@ -364,6 +381,26 @@ function SettingsForm({
     submitLatch.current = true;
     onSavingChange(true);
     mutation.mutate(payload);
+  }
+
+  function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setSubmitted(true);
+    setServerError(null);
+    if (backupError || quietError || busy || submitLatch.current) return;
+    // #268: a blank-both backup contact on a previously-set one is a real
+    // removal, not an ordinary edit — confirm the specific consequence
+    // before sending anything, rather than folding it into a generic Save.
+    if (backupCleared) {
+      setClearConfirmOpen(true);
+      return;
+    }
+    submitPayload();
+  }
+
+  function handleConfirmClearBackupContact() {
+    setClearConfirmOpen(false);
+    submitPayload({ confirmedClear: true });
   }
 
   return (
@@ -455,15 +492,14 @@ function SettingsForm({
             {backupError}
           </p>
         ) : backupCleared ? (
-          // B3 (safety review): the earlier line was a dead end ("can't be
-          // cleared" with no next step). A real clear needs a doc-first
-          // api-contracts.md amendment plus a backend test (tracked
-          // separately, not this PR — see features/properties/settings.ts's
-          // module docstring) — until then, this points at the one path
-          // that actually works.
+          // #268: a real clear now exists (PATCH backup_contact: null,
+          // api-contracts.md's v1.25 amendment) — this used to be a dead
+          // end ("can't be cleared, contact support"). Save still asks for
+          // an explicit confirmation (the dialog below) before anything is
+          // sent; this line just previews that Save will ask.
           <p className="text-xs text-ink-muted">
-            Backup contact can&rsquo;t be cleared from this form yet — contact support if you need
-            it removed.
+            Saving will remove {current.backup_contact?.name} as your backup contact. I&rsquo;ll ask
+            you to confirm first.
           </p>
         ) : null}
       </section>
@@ -567,6 +603,34 @@ function SettingsForm({
       >
         {busy ? "Saving…" : "Save settings"}
       </Button>
+
+      {/* #268 — Radix portals this out to document.body at render time, so
+          declaring it here (inside the <form> JSX) never nests real <button>
+          DOM inside the form's own subtree; its Cancel/Confirm actions can't
+          accidentally trigger a native form submit. */}
+      <AlertDialog open={clearConfirmOpen} onOpenChange={setClearConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="font-display">
+              {backupContactClearTitle(current.backup_contact?.name ?? "them")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>{BACKUP_CONTACT_CLEAR_MESSAGE}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={busy}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={(e) => {
+                e.preventDefault();
+                handleConfirmClearBackupContact();
+              }}
+            >
+              {busy ? "Removing…" : BACKUP_CONTACT_CLEAR_CONFIRM_LABEL}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </form>
   );
 }
