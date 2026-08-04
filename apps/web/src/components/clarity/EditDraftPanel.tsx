@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
  *  out of the editor (F7, src/routes/app.index.tsx). One string, so the
  *  two surfaces can't drift. */
 export const UNVERIFIED_SEND_NOTICE =
-  "Checking whether your last reply went out — you'll be able to send again in a moment.";
+  "Checking whether your last reply went out. You'll be able to send again in a moment.";
 
 interface EditDraftPanelProps {
   tenantName: string;

@@ -8,7 +8,7 @@ export function SiteFooter() {
         <div className="space-y-4">
           <Wordmark size="md" />
           <p className="max-w-md text-sm leading-relaxed text-ink-muted">
-            Built for Ontario landlords. GTA-based. We handle tenant comms — we don't give legal
+            Built for Ontario landlords. GTA-based. We handle tenant comms. We don't give legal
             advice on tenancy law.
           </p>
         </div>

@@ -12,7 +12,7 @@ import type { CreatePropertyInput } from "@/api/types";
 
 export const Route = createFileRoute("/app/properties_/add")({
   head: () => ({
-    meta: [{ title: "Add a property — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Add a property. Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: "/app/properties/add" }],
   }),
   component: AddPropertyPage,
@@ -136,7 +136,7 @@ function AddPropertyPage() {
         (error.status === 0 || error.status >= 500)
       ) {
         setServerError(
-          "That may have gone through — check your properties list before adding it again.",
+          "That may have gone through. Check your properties list before adding it again.",
         );
         void queryClient.invalidateQueries({ queryKey: propertiesQueryKey });
         return;

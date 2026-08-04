@@ -14,13 +14,13 @@ import { cn } from "@/lib/utils";
 export const Route = createFileRoute("/plans")({
   head: () => ({
     meta: [
-      { title: "Plans & pricing — Stoop." },
+      { title: "Plans & pricing. Stoop." },
       {
         name: "description",
         content:
-          "Free emergency line for every landlord. Full plan $10/month — $5/month locked in for as long as you stay with early access. Property managers from $1.50 per door.",
+          "Free emergency line for every landlord. Full plan $10/month ($5/month locked in for as long as you stay with early access). Property managers from $1.50 per door.",
       },
-      { property: "og:title", content: "Plans & pricing — Stoop." },
+      { property: "og:title", content: "Plans & pricing. Stoop." },
       {
         property: "og:description",
         content: "Free emergency line. Full plan $10/month. CAD pricing, cancel anytime.",
@@ -67,9 +67,9 @@ const plans: Plan[] = [
     features: [
       "Everything in Emergency Line",
       "Replies drafted in your voice, ready to send",
-      "You approve everything — with a 5-second undo",
+      "You approve everything, with a 5-second undo",
       "Routine replies go hands-off once Stoop earns your trust",
-      "Lines up your own plumber, electrician, or handyman — you approve every text",
+      "Lines up your own plumber, electrician, or handyman. You approve every text",
       "Full message history for every property",
     ],
     cta: { label: "Get early access", to: "/early-access" },
@@ -94,11 +94,11 @@ const plans: Plan[] = [
 const faqs = [
   {
     q: "What counts as an emergency?",
-    a: "Things that can't wait — burst pipes, water coming through a ceiling, gas smell, no heat in a deep freeze. Those ring your phone right away, day or night. A dripping tap waits politely until morning.",
+    a: "Things that can't wait: burst pipes, water coming through a ceiling, gas smell, no heat in a deep freeze. Those ring your phone right away, day or night. A dripping tap waits politely until morning.",
   },
   {
     q: "Does anything get sent without me seeing it?",
-    a: "No. Every reply waits for your approval. The only exception is safety instructions to a tenant during a real emergency — and you're being called at the same time.",
+    a: "No. Every reply waits for your approval. The only exception is safety instructions to a tenant during a real emergency, and you're being called at the same time.",
   },
   {
     q: "What do my tenants need to do?",

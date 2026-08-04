@@ -38,7 +38,7 @@ import {
 
 export const Route = createFileRoute("/app/properties_/$id_/settings")({
   head: ({ params }) => ({
-    meta: [{ title: "Property settings — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Property settings. Stoop." }, { name: "robots", content: "noindex" }],
     links: [{ rel: "canonical", href: `/app/properties/${params.id}/settings` }],
   }),
   component: PropertySettingsPage,
@@ -176,7 +176,7 @@ function PropertySettingsPage() {
                 role="status"
                 className="mx-4 mt-4 rounded-2xl border border-border bg-surface px-4 py-2.5 text-[13px] font-medium text-ink-muted"
               >
-                Couldn&apos;t refresh just now — showing the last update.
+                Couldn&apos;t refresh just now. Showing the last update.
               </div>
             )}
 
@@ -221,7 +221,7 @@ function isAmbiguousFailure(error: unknown): boolean {
 }
 
 const AMBIGUOUS_NOTICE =
-  "That may have gone through — give it a moment to update before trying again.";
+  "That may have gone through. Give it a moment to update before trying again.";
 
 function SettingsForm({
   id,
@@ -441,7 +441,7 @@ function SettingsForm({
             re-submitted — this warns as soon as the section loads. */}
         {storedBackupPhoneInvalid && (
           <p role="alert" className="text-[13px] font-medium text-urgent">
-            The phone number on file for your backup contact doesn&rsquo;t look valid — I may not be
+            The phone number on file for your backup contact doesn&rsquo;t look valid. I may not be
             able to reach them in an emergency. Fix it below.
           </p>
         )}
@@ -509,7 +509,7 @@ function SettingsForm({
         <div>
           <h2 className="font-display text-[16px] text-ink">Quiet hours</h2>
           <p className="mt-1 text-[13px] leading-relaxed text-ink-muted">
-            For your own reference. It never delays a real emergency — that always reaches you right
+            For your own reference. It never delays a real emergency. That always reaches you right
             away, any time.
           </p>
         </div>
@@ -559,7 +559,7 @@ function SettingsForm({
           </p>
         ) : quietCleared ? (
           <p className="text-xs text-ink-muted">
-            Quiet hours can&rsquo;t be cleared from this form — leaving both fields blank keeps the
+            Quiet hours can&rsquo;t be cleared from this form. Leaving both fields blank keeps the
             hours already on file.
           </p>
         ) : null}
@@ -570,7 +570,7 @@ function SettingsForm({
         <div>
           <h2 className="font-display text-[16px] text-ink">House rules</h2>
           <p className="mt-1 text-[13px] leading-relaxed text-ink-muted">
-            I use this to answer routine questions myself, in your voice — parking, garbage day,
+            I use this to answer routine questions myself, in your voice: parking, garbage day,
             anything specific to this property.
           </p>
         </div>

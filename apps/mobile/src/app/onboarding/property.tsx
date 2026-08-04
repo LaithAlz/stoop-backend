@@ -28,7 +28,7 @@ export default function PropertyStep() {
       <WizardChrome
         stepNumber={2}
         title="Your first property is set."
-        subtitle={`${property.label} already has its own number — nothing to redo here.`}
+        subtitle={`${property.label} already has its own number. Nothing to redo here.`}
         onBack={() => router.back()}
         onNext={() => router.push("/onboarding/tenants")}
       >
@@ -53,7 +53,7 @@ export default function PropertyStep() {
       />
       <View style={styles.noteWrap}>
         <Text style={styles.note}>
-          Adding a property reserves a real phone number for it — that takes a moment.
+          Adding a property reserves a real phone number for it. That takes a moment.
         </Text>
       </View>
     </WizardChrome>

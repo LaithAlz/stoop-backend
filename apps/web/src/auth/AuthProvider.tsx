@@ -72,7 +72,7 @@ const INIT_WATCHDOG_MS = 10_000;
 function toHouseAuthError(error: { message: string }): string {
   const message = error.message.toLowerCase();
   if (message.includes("rate limit")) {
-    return "Too many tries — wait a moment and try again.";
+    return "Too many tries. Wait a moment and try again.";
   }
   if (message.includes("unable to validate email") || message.includes("invalid format")) {
     return "That doesn't look like a valid email address.";

@@ -26,8 +26,8 @@ export function ConversationRow({ item, onPress }: ConversationRowProps) {
     >
       <View style={styles.headRow}>
         <Text style={styles.name} numberOfLines={1}>
-          {firstName(item.tenant_name)}{" "}
-          <Text style={styles.propertyLabel}>— {item.property_label}</Text>
+          {firstName(item.tenant_name)}
+          <Text style={styles.propertyLabel}>, {item.property_label}</Text>
         </Text>
         {item.severity && <SeverityPlaque severity={item.severity} size="sm" />}
       </View>

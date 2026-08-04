@@ -84,7 +84,7 @@ const joinWaitlist = createServerFn({ method: "POST" })
 export const Route = createFileRoute("/early-access")({
   head: () => ({
     meta: [
-      { title: "Get early access — Stoop." },
+      { title: "Get early access. Stoop." },
       {
         name: "description",
         content:
@@ -145,7 +145,7 @@ function OvernightCard() {
             reveal(2),
           )}
         >
-          Marked urgent — not an emergency. Your phone stayed silent.
+          Marked urgent, not an emergency. Your phone stayed silent.
         </p>
 
         <div
@@ -158,7 +158,7 @@ function OvernightCard() {
             Stoop's draft · waiting for your OK at 7 AM
           </p>
           <p className="text-sm leading-relaxed text-ink">
-            Hi Maria — so sorry. Try the breaker in the hall closet and text me in 10 min. Still
+            Hi Maria. So sorry. Try the breaker in the hall closet and text me in 10 min. Still
             cold? My HVAC guy will be there at 7:30.
           </p>
         </div>
@@ -203,7 +203,7 @@ function CaptureForm() {
         className="rounded-2xl border border-routine/30 bg-routine-soft px-6 py-5 text-[15px] leading-relaxed text-ink"
         role="status"
       >
-        <b className="font-bold">You're on the list.</b> You'll hear from Laith directly — no
+        <b className="font-bold">You're on the list.</b> You'll hear from Laith directly: no
         newsletter, no spam.
       </div>
     );
@@ -235,7 +235,7 @@ function CaptureForm() {
       </div>
       <label className="flex cursor-pointer items-center gap-2 text-[13px] font-medium text-ink-muted">
         <input type="checkbox" name="isPm" className="size-4 accent-brand" />
-        I'm a property manager (20+ doors) — join the Stoop Desk waitlist instead
+        I'm a property manager (20+ doors). Join the Stoop Desk waitlist instead
       </label>
       <input
         type="text"
@@ -247,7 +247,7 @@ function CaptureForm() {
       />
       {status === "error" && (
         <p className="text-sm text-destructive" role="alert">
-          That didn't go through —{" "}
+          That didn't go through:{" "}
           <a
             className="font-semibold text-brand underline"
             href="mailto:allaithalzoubi2@gmail.com?subject=Stoop%20early%20access"

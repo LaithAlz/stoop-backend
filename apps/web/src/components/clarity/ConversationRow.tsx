@@ -38,8 +38,8 @@ export function ConversationRow({ item, className }: ConversationRowProps) {
     >
       <div className="flex items-start justify-between gap-2.5">
         <p className="min-w-0 flex-1 truncate font-clarity-sans text-[15px] font-bold text-clarity-ink">
-          {firstName(item.tenant_name)}{" "}
-          <span className="font-semibold text-clarity-ink-dim">— {item.property_label}</span>
+          {firstName(item.tenant_name)}
+          <span className="font-semibold text-clarity-ink-dim">, {item.property_label}</span>
         </p>
         {item.severity && (
           <SeverityPlaque severity={item.severity} size="sm" className="shrink-0" />

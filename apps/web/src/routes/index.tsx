@@ -26,13 +26,13 @@ import { Wordmark } from "@/components/stoop/Wordmark";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Stoop. — Tenant maintenance, handled before it wakes you up" },
+      { title: "Stoop. Tenant maintenance, handled before it wakes you up" },
       {
         name: "description",
         content:
-          "Tenants text one number. Stoop reads every message, drafts a reply in your voice — you approve before it sends.",
+          "Tenants text one number. Stoop reads every message and drafts a reply in your voice. You approve before it sends.",
       },
-      { property: "og:title", content: "Stoop. — Tenant maintenance, handled" },
+      { property: "og:title", content: "Stoop. Tenant maintenance, handled" },
       {
         property: "og:description",
         content:
@@ -135,8 +135,8 @@ function HeroPhone() {
             property="128 Wythe Ave"
             receivedAgo="2 min ago"
             severity="urgent"
-            tenantMessage="Kitchen sink is backing up — water on the floor. Sorry to text so late."
-            draftReply="No worries — I've reached our on-call plumber and they'll be there within 90 minutes. Please clear the area under the sink and put towels around the base. I'll text again once they're 10 minutes out."
+            tenantMessage="Kitchen sink is backing up. Water on the floor. Sorry to text so late."
+            draftReply="No worries. I've reached our on-call plumber and they'll be there within 90 minutes. Please clear the area under the sink and put towels around the base. I'll text again once they're 10 minutes out."
           />
         </div>
       </div>
@@ -150,11 +150,11 @@ function ProblemSection() {
   const items = [
     {
       title: "The 2am text",
-      body: "\"Sorry to bother — the heat's out and the baby's room is freezing.\" You're in bed. You're trying to figure out if you call a tech tonight or if a space heater gets them to morning.",
+      body: "\"Sorry to bother: the heat's out and the baby's room is freezing.\" You're in bed. You're trying to figure out if you call a tech tonight or if a space heater gets them to morning.",
     },
     {
       title: "Is this an emergency?",
-      body: "\"The sink's been acting weird.\" Could be nothing. Could be a slab leak. You don't have time to interview them — and they don't have time to write you a novel.",
+      body: "\"The sink's been acting weird.\" Could be nothing. Could be a slab leak. You don't have time to interview them, and they don't have time to write you a novel.",
     },
     {
       title: "Same questions, every week",
@@ -201,19 +201,19 @@ function HowItWorksSection() {
       icon: Brain,
       eyebrow: "Step 2",
       title: "Stoop sorts the message",
-      body: "Asks clarifying questions, requests photos when useful, and classifies severity — Emergency, Urgent, or Routine.",
+      body: "Asks clarifying questions, requests photos when useful, and classifies severity: Emergency, Urgent, or Routine.",
     },
     {
       icon: Bell,
       eyebrow: "Step 3",
       title: "You approve every message",
-      body: "The reply to your tenant, the text lining up your plumber for Thursday — each one is a draft until you tap Approve. Edit first if you want. Fifteen seconds.",
+      body: "The reply to your tenant, the text lining up your plumber for Thursday: each one is a draft until you tap Approve. Edit first if you want. Fifteen seconds.",
     },
     {
       icon: TrendingUp,
       eyebrow: "Step 4",
       title: "It earns trust over time",
-      body: "Approve enough drafts unedited and Stoop graduates from Shadow mode toward Auto-Routine, then further — only if you decide.",
+      body: "Approve enough drafts unedited and Stoop graduates from Shadow mode toward Auto-Routine, then further, only if you decide.",
     },
   ];
 
@@ -271,7 +271,7 @@ function NotWhatSection() {
   const isIt = [
     "A smart filter for tenant text messages",
     "A draft-and-approve assistant in your voice",
-    "A trust ladder you control — Shadow to Full Auto",
+    "A trust ladder you control: Shadow to Full Auto",
   ];
 
   return (
@@ -387,7 +387,7 @@ function PlansPreview() {
       cap: "Up to 10 properties · $5/month with early access, locked in for as long as you stay",
       featured: true,
       bullets: [
-        "Replies drafted in your voice — you approve",
+        "Replies drafted in your voice: you approve",
         "Lines up your own plumber, electrician, handyman",
         "Routine replies go hands-off as trust builds",
       ],
@@ -483,7 +483,7 @@ function PlansPreview() {
 
 function TrustStrip() {
   const items = [
-    "You approve every message before it sends — until you decide otherwise.",
+    "You approve every message before it sends, until you decide otherwise.",
     "Cancel anytime. Your data exports in one click.",
   ];
 
@@ -515,11 +515,11 @@ function FAQSection() {
     },
     {
       q: "What about Ontario tenant law?",
-      a: "Stoop handles maintenance and everyday questions — parking, garbage, rent reminders. Anything beyond that, it hands the conversation back to you with context.",
+      a: "Stoop handles maintenance and everyday questions: parking, garbage, rent reminders. Anything beyond that, it hands the conversation back to you with context.",
     },
     {
       q: "Can I pause my subscription?",
-      a: "Yes. Pause anytime from your account — your number stays active for inbound texts so nothing breaks for tenants. Resume when you want.",
+      a: "Yes. Pause anytime from your account. Your number stays active for inbound texts so nothing breaks for tenants. Resume when you want.",
     },
     {
       q: "Do tenants know they're texting an AI?",

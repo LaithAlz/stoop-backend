@@ -21,7 +21,7 @@ import { hasEmergencyTrigger } from "@/features/cases/emergencySignal";
 
 export const Route = createFileRoute("/app/conversations/$id_/emergency")({
   head: () => ({
-    meta: [{ title: "Emergency — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Emergency. Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: EmergencyPage,
 });
@@ -285,7 +285,7 @@ function EmergencyPage() {
                   role="status"
                   className="mb-4 rounded-2xl border border-white/15 bg-white/[0.04] px-4 py-2.5 text-[13px] font-semibold text-white/80"
                 >
-                  Couldn&apos;t refresh just now — showing the last update.
+                  Couldn&apos;t refresh just now. Showing the last update.
                 </div>
               )}
               {!activeEmergency && (
@@ -370,7 +370,7 @@ function EmergencyPage() {
               // was a silent dead tap. Plain, honest line instead of a
               // broken-looking action.
               <p className="flex min-h-[60px] w-full items-center justify-center rounded-2xl border border-white/20 bg-white/[0.06] px-4 text-center text-sm font-semibold text-white/80">
-                No phone on file for {tenantFirst} — open the conversation to reply.
+                No phone on file for {tenantFirst}. Open the conversation to reply.
               </p>
             )}
             {caseDetail.vendor && vendorPhone && (
@@ -380,7 +380,7 @@ function EmergencyPage() {
               >
                 <Wrench className="size-5" aria-hidden="true" />
                 Call {caseDetail.vendor.name ?? "the vendor"}
-                {caseDetail.vendor.trade ? ` — ${caseDetail.vendor.trade}` : ""}
+                {caseDetail.vendor.trade ? ` (${caseDetail.vendor.trade})` : ""}
               </a>
             )}
           </div>

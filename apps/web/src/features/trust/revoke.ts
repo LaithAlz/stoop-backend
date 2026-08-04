@@ -50,12 +50,12 @@ export function revokeConfirmation(scope: RevokeTrustScope): RevokeConfirmation 
  *  the server's `revoked_count`, never assumed. */
 export function revokeResultNotice(scope: RevokeTrustScope, revokedCount: number): string {
   if (revokedCount === 0) {
-    return "Nothing was set to send automatically — every reply already waits for you.";
+    return "Nothing was set to send automatically. Every reply already waits for you.";
   }
   if (scope === "global") {
-    return "Done. Automatic sending is off at every property — every reply now waits for your approval.";
+    return "Done. Automatic sending is off at every property. Every reply now waits for your approval.";
   }
-  return "Done. Automatic sending is off here — every reply now waits for your approval.";
+  return "Done. Automatic sending is off here. Every reply now waits for your approval.";
 }
 
 /** What the property-detail section says ABOVE the button — describes the

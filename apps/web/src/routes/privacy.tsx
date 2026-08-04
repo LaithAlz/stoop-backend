@@ -5,16 +5,16 @@ import { SiteFooter } from "@/components/stoop/SiteFooter";
 export const Route = createFileRoute("/privacy")({
   head: () => ({
     meta: [
-      { title: "Privacy Policy — Stoop." },
+      { title: "Privacy Policy. Stoop." },
       {
         name: "description",
         content:
-          "How Stoop. handles landlord and tenant data — what we collect, what we don't, and your rights.",
+          "How Stoop. handles landlord and tenant data: what we collect, what we don't, and your rights.",
       },
-      { property: "og:title", content: "Privacy Policy — Stoop." },
+      { property: "og:title", content: "Privacy Policy. Stoop." },
       {
         property: "og:description",
-        content: "Privacy practices for Stoop. — tenant maintenance, handled.",
+        content: "Privacy practices for Stoop. Tenant maintenance, handled.",
       },
     ],
   }),
@@ -67,7 +67,7 @@ function PrivacyPage() {
 
         <Section title="How we use it">
           <p>
-            To run the service — receive tenant messages, draft replies, route emergencies to you,
+            To run the service: receive tenant messages, draft replies, route emergencies to you,
             and keep a record of the conversation.
           </p>
           <p>

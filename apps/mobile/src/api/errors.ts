@@ -43,24 +43,24 @@ export function toHouseApiError(error: ApiError): string {
     case "network_error":
       return "Couldn't reach Stoop. Check your connection and try again.";
     case "draft_stale":
-      return "A new message came in — this draft just updated.";
+      return "A new message came in. This draft just updated.";
     case "already_sent":
-      return "That reply already went out — there's nothing left to undo.";
+      return "That reply already went out. There's nothing left to undo.";
     case "draft_not_undoable":
       return "That draft isn't waiting to send anymore.";
     case "case_not_found":
       return "That conversation isn't there anymore.";
     case "rate_limited":
-      return "Too many tries — wait a moment and try again.";
+      return "Too many tries. Wait a moment and try again.";
     case "account_deleted":
       return "This account isn't active. Contact support if that's unexpected.";
     case "invalid_cursor":
-      return "Couldn't load more — try refreshing the list.";
+      return "Couldn't load more. Try refreshing the list.";
     // --- Property provisioning (POST /v1/properties, v1.12 amendment) ---
     case "property_limit_reached":
       return "Your account is at its property limit, so this one wasn't added. Contact support to raise it.";
     case "duplicate_property":
-      return "You've already added a property at this address — it's in your Properties list.";
+      return "You've already added a property at this address. It's in your Properties list.";
     case "no_numbers_available":
       return "No phone numbers were available just now, so nothing was set up. Try a different area code, or try again in a few minutes.";
     case "provisioning_failed":

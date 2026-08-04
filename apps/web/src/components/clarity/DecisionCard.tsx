@@ -189,7 +189,7 @@ export function DecisionCard({
       </div>
 
       <p className="mb-3 font-clarity-sans text-[12.5px] font-semibold leading-relaxed text-clarity-ink-dim">
-        <b className="font-bold text-clarity-ink">{tenantName}</b> — {propertyLabel}{" "}
+        <b className="font-bold text-clarity-ink">{tenantName}</b>, {propertyLabel}{" "}
         <TimestampChip>{timestamp}</TimestampChip>
       </p>
 

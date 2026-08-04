@@ -75,7 +75,7 @@ export default function ConversationsScreen() {
             <EmptyState
               icon="chatbubbles-outline"
               title="No conversations yet."
-              message="Every text between your tenants and Stoop will be saved here, with dates and times — nothing edited, nothing lost."
+              message="Every text between your tenants and Stoop will be saved here, with dates and times: nothing edited, nothing lost."
             />
           }
         />

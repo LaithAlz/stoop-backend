@@ -17,7 +17,7 @@ import { MarginNote } from "./MarginNote";
 import { DecisionActions } from "./DecisionActions";
 import { UndoTicket } from "./UndoTicket";
 
-const DEFAULT_WHY = "I sorted this the best I could — open the full view for the details.";
+const DEFAULT_WHY = "I sorted this the best I could. Open the full view for the details.";
 
 /** "sending" shows the live undo ticket; "sent" is the brief window after
  *  the local countdown hits zero but before the next queue refetch has
@@ -64,7 +64,7 @@ export function DecisionCard({
 
       <Text style={styles.metaLine}>
         <Text style={styles.metaBold}>{tenantFirst}</Text>
-        {" — "}
+        {", "}
         {item.property_label}
         {"  "}
         <TimestampChip>{formatRelativeTime(item.received_at)}</TimestampChip>

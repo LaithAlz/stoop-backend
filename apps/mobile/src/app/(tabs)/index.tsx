@@ -222,7 +222,7 @@ export default function HomeScreen() {
               <EmptyState
                 icon="checkmark-circle-outline"
                 title="That's everything."
-                message="I'm watching your messages — go enjoy your day. I'll text you if anything needs you."
+                message="I'm watching your messages. Go enjoy your day. I'll text you if anything needs you."
               />
             ) : null
           }

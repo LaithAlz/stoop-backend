@@ -17,6 +17,6 @@ export const DELETE_PROPERTY_TITLE = "Delete this property?";
 
 export const DELETE_PROPERTY_MESSAGE =
   "This can't be undone. Its phone number stops taking tenant texts right away, " +
-  "and the number itself is fully released after a 24-hour hold — a release isn't instant.";
+  "and the number itself is fully released after a 24-hour hold. A release isn't instant.";
 
 export const DELETE_PROPERTY_CONFIRM_LABEL = "Delete property";

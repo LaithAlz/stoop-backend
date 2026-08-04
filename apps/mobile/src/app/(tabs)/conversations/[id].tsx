@@ -45,7 +45,7 @@ import { useDraftActions } from "@/features/queue/useDraftActions";
 import { buildTimelineRows, type TimelineRow } from "@/features/cases/timeline";
 import { EditDraftModal } from "@/features/queue/EditDraftModal";
 
-const DEFAULT_WHY = "I sorted this the best I could — no note on file for this one.";
+const DEFAULT_WHY = "I sorted this the best I could. No note on file for this one.";
 
 export default function CaseDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -142,7 +142,7 @@ export default function CaseDetailScreen() {
         </View>
         <Text style={styles.title}>
           {tenantFirst}
-          {caseDetail?.tenant.unit ? ` — Unit ${caseDetail.tenant.unit}` : ""}
+          {caseDetail?.tenant.unit ? `, Unit ${caseDetail.tenant.unit}` : ""}
         </Text>
         <Text style={styles.subtitle}>every message, saved with dates and times</Text>
       </View>
@@ -177,7 +177,7 @@ export default function CaseDetailScreen() {
               // actually wires it to.
               <EmergencyBanner
                 headline={
-                  caseDetail.title ?? `${tenantFirst} needs you now — ${caseDetail.property.label}`
+                  caseDetail.title ?? `${tenantFirst} needs you now at ${caseDetail.property.label}`
                 }
                 subtext={`${caseDetail.property.label} · tap to see what's happening`}
                 onPress={() => {}}
@@ -246,12 +246,12 @@ export default function CaseDetailScreen() {
                       />
                     </>
                   ) : (
-                    <Text style={styles.sentNote}>No reply sent — case still open</Text>
+                    <Text style={styles.sentNote}>No reply sent. Case still open</Text>
                   )}
                 </View>
               ) : (
                 <Text style={styles.appendOnlyNote}>
-                  Nothing here can be edited or removed once it&rsquo;s sent — that&rsquo;s what
+                  Nothing here can be edited or removed once it&rsquo;s sent. That&rsquo;s what
                   makes it useful if you ever need the record.
                 </Text>
               )}

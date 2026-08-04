@@ -87,7 +87,7 @@ export default function BackupStep() {
     <WizardChrome
       stepNumber={4}
       title="Who do we call if you don't pick up?"
-      subtitle="Strongly encouraged, not required — a partner, super, or trusted neighbor."
+      subtitle="Strongly encouraged, not required: a partner, super, or trusted neighbor."
       onBack={() => router.back()}
       onSkip={goNext}
       onNext={handleContinue}
@@ -123,7 +123,7 @@ export default function BackupStep() {
           <Text style={styles.explainKicker}>Always free</Text>
         </View>
         <Text style={styles.explainBody}>
-          When a tenant sends something like this, I call your phone right away — free, no matter
+          When a tenant sends something like this, I call your phone right away. Free, no matter
           your plan. If you don&rsquo;t answer, I call again, then call {backupName} ten minutes
           later. Nobody has to wait alone.
         </Text>

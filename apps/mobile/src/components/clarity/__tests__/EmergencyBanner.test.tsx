@@ -24,13 +24,13 @@ describe("EmergencyBanner — no onAcknowledge prop (case-detail's usage today)"
   it("renders exactly the informational banner — no ack button at all", () => {
     render(
       <EmergencyBanner
-        headline="Maria needs you now — 41 Palmerston"
+        headline="Maria needs you now at 41 Palmerston"
         subtext="41 Palmerston · tap to see what's happening"
         onPress={jest.fn()}
       />,
     );
 
-    expect(screen.getByText("Maria needs you now — 41 Palmerston")).toBeOnTheScreen();
+    expect(screen.getByText("Maria needs you now at 41 Palmerston")).toBeOnTheScreen();
     expect(screen.queryByTestId("emergency-ack-button")).toBeNull();
     expect(screen.queryByText(EMERGENCY_ACK_LABEL)).toBeNull();
   });
@@ -39,13 +39,13 @@ describe("EmergencyBanner — no onAcknowledge prop (case-detail's usage today)"
     const onPress = jest.fn();
     render(
       <EmergencyBanner
-        headline="Maria needs you now — 41 Palmerston"
+        headline="Maria needs you now at 41 Palmerston"
         subtext="41 Palmerston · tap to see what's happening"
         onPress={onPress}
       />,
     );
 
-    fireEvent.press(screen.getByText("Maria needs you now — 41 Palmerston"));
+    fireEvent.press(screen.getByText("Maria needs you now at 41 Palmerston"));
     expect(onPress).toHaveBeenCalledTimes(1);
   });
 });
@@ -54,7 +54,7 @@ describe("EmergencyBanner — onAcknowledge provided (Home's usage for a non-nul
   it("shows the ack button with the house copy", () => {
     render(
       <EmergencyBanner
-        headline="Maria needs you now — 41 Palmerston"
+        headline="Maria needs you now at 41 Palmerston"
         subtext="41 Palmerston · tap to see what's happening"
         onPress={jest.fn()}
         onAcknowledge={jest.fn()}
@@ -71,7 +71,7 @@ describe("EmergencyBanner — onAcknowledge provided (Home's usage for a non-nul
     const onAcknowledge = jest.fn();
     render(
       <EmergencyBanner
-        headline="Maria needs you now — 41 Palmerston"
+        headline="Maria needs you now at 41 Palmerston"
         subtext="41 Palmerston · tap to see what's happening"
         onPress={onPress}
         onAcknowledge={onAcknowledge}
@@ -89,14 +89,14 @@ describe("EmergencyBanner — onAcknowledge provided (Home's usage for a non-nul
     const onAcknowledge = jest.fn();
     render(
       <EmergencyBanner
-        headline="Maria needs you now — 41 Palmerston"
+        headline="Maria needs you now at 41 Palmerston"
         subtext="41 Palmerston · tap to see what's happening"
         onPress={onPress}
         onAcknowledge={onAcknowledge}
       />,
     );
 
-    fireEvent.press(screen.getByText("Maria needs you now — 41 Palmerston"));
+    fireEvent.press(screen.getByText("Maria needs you now at 41 Palmerston"));
 
     expect(onPress).toHaveBeenCalledTimes(1);
     expect(onAcknowledge).not.toHaveBeenCalled();
@@ -105,7 +105,7 @@ describe("EmergencyBanner — onAcknowledge provided (Home's usage for a non-nul
   it("shows the pending label while acknowledging, never the idle label", () => {
     render(
       <EmergencyBanner
-        headline="Maria needs you now — 41 Palmerston"
+        headline="Maria needs you now at 41 Palmerston"
         subtext="41 Palmerston · tap to see what's happening"
         onPress={jest.fn()}
         onAcknowledge={jest.fn()}

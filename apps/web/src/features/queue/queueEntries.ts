@@ -211,7 +211,7 @@ export function buildQueueView(
  *  example "Maria replied — draft updated"). Kept as a named export so the
  *  exact wording lives in one place rather than inlined in the screen. */
 export function draftStaleNotice(tenantFirstName: string): string {
-  return `${tenantFirstName} replied — this draft just updated.`;
+  return `${tenantFirstName} replied. This draft just updated.`;
 }
 
 /**

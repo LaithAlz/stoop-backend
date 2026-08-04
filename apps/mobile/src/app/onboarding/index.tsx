@@ -66,7 +66,7 @@ export default function OnboardingWelcomeScreen() {
             style={styles.promiseIcon}
           />
           <Text style={styles.promiseText}>
-            The Emergency Line is free, forever — every message read, real emergencies ring your
+            The Emergency Line is free, forever: every message read, real emergencies ring your
             phone.
           </Text>
         </View>

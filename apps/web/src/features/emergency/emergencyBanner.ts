@@ -26,7 +26,7 @@ export function emergencyHeadline(
   // headline instead of the neutral fallback below.
   const trimmedTitle = item.title?.trim();
   if (trimmedTitle) return trimmedTitle;
-  return `${firstName(item.tenant_name)} needs you now — ${item.property_label}`;
+  return `${firstName(item.tenant_name)} needs you now at ${item.property_label}`;
 }
 
 /**

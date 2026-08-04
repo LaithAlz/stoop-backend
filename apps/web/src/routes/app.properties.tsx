@@ -12,7 +12,7 @@ import { NO_NUMBER_TITLE, formatStoopNumber } from "@/features/properties/stoopN
 
 export const Route = createFileRoute("/app/properties")({
   head: () => ({
-    meta: [{ title: "Properties — Stoop." }, { name: "robots", content: "noindex" }],
+    meta: [{ title: "Properties. Stoop." }, { name: "robots", content: "noindex" }],
   }),
   component: PropertiesPage,
 });
@@ -114,7 +114,7 @@ function PropertiesPage() {
                 role="status"
                 className="mb-3 rounded-2xl border border-border bg-surface px-4 py-2.5 text-[13px] font-medium text-ink-muted"
               >
-                Couldn&apos;t refresh just now — showing the last update.
+                Couldn&apos;t refresh just now. Showing the last update.
               </div>
             )}
 
