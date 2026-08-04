@@ -75,7 +75,7 @@ export function UndoTicket({
           second. The visible "00:05" digits stay `aria-hidden` above,
           sighted-only, same as before. */}
       <p role="status" className="sr-only">
-        Your reply is on its way. Undo is available for a few seconds.
+        Your reply is on its way. Undo is available for 5 seconds.
       </p>
     </div>
   );
