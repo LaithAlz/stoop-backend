@@ -172,6 +172,15 @@ def test_to_e164_san_marino_not_on_allowlist_is_left_alone() -> None:
 
 
 @pytest.mark.unit
+def test_to_e164_vatican_city_not_on_allowlist_is_left_alone() -> None:
+    """Vatican City (379) retains its trunk zero internationally too. Named
+    in the allowlist docstring and both docs, but until now asserted
+    nowhere (re-verify finding 1), which is how a country quietly gets
+    added to the allowlist later by someone reading only the tests."""
+    assert to_e164("+379 (0)6 698 12345") == "+3790669812345"
+
+
+@pytest.mark.unit
 def test_to_e164_cote_divoire_not_on_allowlist_is_left_alone() -> None:
     """Cote d'Ivoire (225), under its post-2021 ten-digit numbering plan,
     also retains its trunk zero internationally."""

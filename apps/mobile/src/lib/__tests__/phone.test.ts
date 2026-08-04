@@ -111,6 +111,13 @@ describe("toE164 — #277: parenthesized trunk zero", () => {
       expect(toE164("+378 (0)549 882345")).toBe("+3780549882345");
     });
 
+    // Named in the allowlist comment and in both docs, but asserted
+    // nowhere until now (re-verify finding 1), which is how a country
+    // quietly gets added later by someone reading only the tests.
+    it("Vatican City (NOT on the allowlist) is left alone", () => {
+      expect(toE164("+379 (0)6 698 12345")).toBe("+3790669812345");
+    });
+
     it("Cote d'Ivoire (NOT on the allowlist, post-2021 numbering plan) is left alone", () => {
       expect(toE164("+225 (0)1 23 45 67 89")).toBe("+2250123456789");
     });
