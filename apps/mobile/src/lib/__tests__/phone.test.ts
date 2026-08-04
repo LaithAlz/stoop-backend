@@ -47,6 +47,24 @@ describe("toE164 — #277: parenthesized trunk zero", () => {
     expect(toE164("+1 (416) 555 0100")).toBe("+14165550100");
   });
 
+  // The mirror of apps/api/tests/test_phone.py's
+  // test_to_e164_trunk_zero_rule_sees_unicode_separators. JavaScript's `\s`
+  // is Unicode-aware even WITHOUT the `u` flag and Python's under
+  // `re.ASCII` is not, so writing the separator class as `[\s-]` made the
+  // client drop the trunk zero here and the server keep it. A UK number
+  // pasted off a web page that wrote it with `&nbsp;` is the realistic
+  // input, not a contrived one. Both suites must agree on every case.
+  it.each([
+    ["nbsp", "\u00a0"],
+    ["thin space", "\u2009"],
+    ["narrow nbsp", "\u202f"],
+    ["ideographic space", "\u3000"],
+    ["en dash", "\u2013"],
+    ["non-breaking hyphen", "\u2011"],
+  ])("the trunk-zero rule sees a %s separator, same as the server", (_label, sep) => {
+    expect(toE164(`+44${sep}(0)20 7946 0958`)).toBe("+442079460958");
+  });
+
   it("leaves a genuine, un-parenthesized leading 0 alone (option 1 only)", () => {
     // Out of scope for this fix — still passes straight through to the
     // international branch's own digit-count check, exactly as before.
@@ -186,7 +204,7 @@ describe("validatePhone / phoneErrorMessage — issue #276", () => {
     const message = phoneErrorMessage("+١4165551234");
     expect(message).not.toBeNull();
     expect(message).not.toBe("Use 10 digits, 11 starting with 1, or + and your country code.");
-    expect(message).toMatch(/0-9/);
+    expect(message).toMatch(/0 to 9/);
   });
 
   it("every other unparsable shape keeps the existing generic message", () => {

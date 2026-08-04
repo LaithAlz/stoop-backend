@@ -114,7 +114,24 @@ _NANP_RE = re.compile(r"^(?!\d11)[2-9]\d{2}(?!\d11)[2-9]\d{6}$", re.ASCII)
 # more. 1-3 digits mirrors E.164's own country-code length bound. Requires
 # the LITERAL "(0)" (not just any parenthesized digit), which is what keeps
 # "+1 (416) 555 0100" (an area code, not a trunk marker) untouched.
-_PARENTHESIZED_TRUNK_ZERO_RE = re.compile(r"^(\+\d{1,3})[\s-]*\(0\)[\s-]*", re.ASCII)
+# The separator class is written out CHARACTER BY CHARACTER rather than as
+# ``\s`` on purpose. Python's ``\s`` under ``re.ASCII`` is ASCII-only,
+# but JavaScript's ``\s`` is Unicode-aware even WITHOUT the ``u`` flag, so
+# the two engines disagree on exactly the input this rule exists for:
+# ``"+44\u00a0(0)20 7946 0958"``, the shape you get pasting a UK number off
+# a web page that wrote it with ``&nbsp;``. Under ``\s`` the browser drops
+# the trunk zero and the server does not, which is the same
+# Python-vs-JavaScript regex-semantics trap that #232/#260 already cost us
+# once. Spelled out, all three implementations are literally the same set.
+# The hyphen sits LAST so it is a literal, not a range operator.
+_TRUNK_ZERO_SEPARATORS = (
+    " \t\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+    "\u2008\u2009\u200a\u202f\u205f\u3000\u2011\u2012\u2013\u2014-"
+)
+_PARENTHESIZED_TRUNK_ZERO_RE = re.compile(
+    rf"^(\+\d{{1,3}})[{_TRUNK_ZERO_SEPARATORS}]*\(0\)[{_TRUNK_ZERO_SEPARATORS}]*",
+    re.ASCII,
+)
 
 
 def is_plausible_nanp(digits: str) -> bool:

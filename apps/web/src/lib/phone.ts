@@ -80,9 +80,25 @@ function containsNonAsciiDigit(value: string): boolean {
  * more. 1-3 digits mirrors E.164's own country-code length bound. Requires
  * the LITERAL "(0)" (not just any parenthesized digit), which is what
  * keeps "+1 (416) 555 0100" (an area code, not a trunk marker) untouched.
- * Mirrors apps/api/app/phone.py's `_PARENTHESIZED_TRUNK_ZERO_RE` exactly.
+ * Mirrors apps/api/app/phone.py's `_PARENTHESIZED_TRUNK_ZERO_RE`. The
+ * separator set below is why that claim is true rather than aspirational:
+ * see its comment.
  */
-const PARENTHESIZED_TRUNK_ZERO_RE = /^(\+\d{1,3})[\s-]*\(0\)[\s-]*/;
+// The separator class is written out CHARACTER BY CHARACTER rather than as
+// `\s` on purpose. JavaScript's `\s` is Unicode-aware even WITHOUT the `u`
+// flag, while Python's under `re.ASCII` is not, so the two engines disagree
+// on exactly the input this rule exists for: "+44\u00a0(0)20 7946 0958",
+// the shape you get pasting a UK number off a web page that wrote it with
+// `&nbsp;`. Under `\s` the browser would drop the trunk zero and the server
+// would not, which is the same Python-vs-JavaScript regex-semantics trap
+// that #232/#260 already cost us once. Spelled out, all three
+// implementations are literally the same set. The hyphen sits LAST so it is
+// a literal, not a range operator.
+const TRUNK_ZERO_SEPARATORS =
+  " \t\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\u2011\u2012\u2013\u2014-";
+const PARENTHESIZED_TRUNK_ZERO_RE = new RegExp(
+  `^(\\+\\d{1,3})[${TRUNK_ZERO_SEPARATORS}]*\\(0\\)[${TRUNK_ZERO_SEPARATORS}]*`,
+);
 
 /**
  * Drop a leading trunk `0` written parenthesized directly after the
@@ -206,7 +222,7 @@ export const PHONE_ERROR_UNPARSABLE =
  *  rule a landlord typing on a non-Latin keyboard already believes
  *  they're following. */
 export const PHONE_ERROR_NON_ASCII_DIGIT =
-  "We can only dial the digits 0-9. Please retype your number using 0-9.";
+  "Those aren't the digits 0 to 9. Please retype your number using 0 to 9.";
 
 /**
  * The message a landlord should see for `phone`, or `null` when it's

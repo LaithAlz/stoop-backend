@@ -65,6 +65,33 @@ def test_to_e164_parenthesized_trunk_zero_dropped_after_country_code() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "separator",
+    [
+        pytest.param("\u00a0", id="nbsp"),
+        pytest.param("\u2009", id="thin-space"),
+        pytest.param("\u202f", id="narrow-nbsp"),
+        pytest.param("\u3000", id="ideographic-space"),
+        pytest.param("\u2013", id="en-dash"),
+        pytest.param("\u2011", id="non-breaking-hyphen"),
+    ],
+)
+def test_to_e164_trunk_zero_rule_sees_unicode_separators(separator: str) -> None:
+    """The separator class is spelled out character by character precisely
+    so this holds. Python's ``\\s`` under ``re.ASCII`` is ASCII-only while
+    JavaScript's is Unicode-aware even without the ``u`` flag, so writing
+    it as ``[\\s-]`` made the browser drop the trunk zero here and the
+    server keep it. A UK number pasted off a web page that wrote it with
+    ``&nbsp;`` is the realistic input, not a contrived one, and the same
+    Python-vs-JavaScript regex-semantics gap already cost us #232/#260.
+
+    The mirror of this test lives in apps/mobile/src/lib/__tests__/
+    phone.test.ts. Both must agree, byte for byte, on every case here.
+    """
+    assert to_e164(f"+44{separator}(0)20 7946 0958") == "+442079460958"
+
+
+@pytest.mark.unit
 def test_to_e164_parenthesized_area_code_is_not_a_trunk_zero() -> None:
     """`+1 (416) 555 0100` must be untouched: those parentheses hold an
     area code, not a trunk marker — the rule only fires on the LITERAL
