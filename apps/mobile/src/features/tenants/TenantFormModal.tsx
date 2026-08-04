@@ -14,6 +14,38 @@
  * inline note says so in plain English (same "Why" note as the web
  * onboarding).
  *
+ * #292: `phone` is validated and sent ONLY when the landlord actually
+ * changed it (src/features/tenants/tenantForm.ts's `buildTenantUpdatePayload`
+ * / `tenantPhoneUnchanged`), a legacy `tenants.phone` that predates
+ * #232/#260's server-side canonicalization must not block an otherwise-
+ * unrelated edit (most sharply `vulnerable_occupant`) just because it's
+ * along for the ride in the PATCH body. Create mode is unaffected: a new
+ * tenant's phone is always required and validated, same as before.
+ *
+ * Adversarial safety review, 2026-08-04, item 3 (FIX 3, MEDIUM): an
+ * unchanged, un-normalizable stored phone skips the blocking `phoneError`
+ * (by design, above), but that used to leave the field with zero signal:
+ * the neutral "The number they'll text from." helper kept rendering over a
+ * number Twilio can never dial and `_lookup_active_tenant` can never match.
+ *
+ * The re-verify corrected what the stake actually is, and the copy now
+ * says it. This is NOT the `unrouted_inbound` path: that dead-letters an
+ * unrecognized `To` (schema-v1.md v1.21 point 4), and this tenant's text
+ * still routes, because `To` finds the property. What happens instead is
+ * that `_lookup_active_tenant` returns None and the `messages` row is
+ * written with `tenant_id = NULL`, so the landlord DOES hear something,
+ * just unattributed. The real harm runs the other way:
+ * `emergency_chain.py` resolves the tenant's number through
+ * `messages.tenant_id -> tenants.phone`, so both tenant legs come back
+ * `skipped / no_tenant_phone`. This tenant gets no reply and no emergency
+ * safety SMS at 2am, and the `vulnerable_occupant` the landlord opened
+ * this modal to set can never attach to their message either, which is
+ * the irony at the middle of #292. `phoneUnchangedUnreachable`
+ * below renders a non-blocking warning in that exact case, mirroring
+ * apps/web/src/features/properties/settings.ts's
+ * `backupContactPhoneLooksInvalid` pattern (a persistent notice for a
+ * stored value, not a blocking form error) on this side of the fence.
+ *
  * Same remount-to-reset pattern as EditDraftModal (`key` on the inner
  * content), so switching between add/edit or reopening never leaks state
  * through a `useEffect`.
@@ -32,13 +64,18 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createTenant, tenantsQueryKey, updateTenant } from "@/api/tenants";
 import { ApiError, toHouseApiError } from "@/api/errors";
-import type { CreateTenantInput, Tenant, VulnerableOccupant } from "@/api/types";
+import type { CreateTenantInput, Tenant, UpdateTenantInput, VulnerableOccupant } from "@/api/types";
 import { Button } from "@/components/Button";
 import { TextField } from "@/components/TextField";
 import { ChipGroup, type ChipOption } from "@/components/clarity/ChipGroup";
 import { MarginNote } from "@/components/clarity/MarginNote";
 import { phoneErrorMessage, toE164 } from "@/lib/phone";
 import { colors, spacing, type } from "@/theme/tokens";
+import {
+  buildTenantCreatePayload,
+  buildTenantUpdatePayload,
+  tenantPhoneUnchanged,
+} from "./tenantForm";
 
 /** Display labels for schema-v1's `vulnerable_occupant` values (null =
  *  "No one") — same wording the web onboarding cleared with copy review. */
@@ -83,6 +120,13 @@ function TenantFormContent({ propertyId, tenant, onClose }: Omit<TenantFormModal
   const [serverError, setServerError] = useState<string | null>(null);
 
   const trimmedPhone = phone.trim();
+  // #292: an edit whose phone field is exactly what was loaded from
+  // `tenant` skips validation entirely, a legacy `tenants.phone` that
+  // predates #232/#260's server-side canonicalization must not block an
+  // otherwise-valid edit to an unrelated field (most sharply
+  // `vulnerable_occupant`, which feeds severity classification). Always
+  // `false` in create mode, so a new tenant's phone is unaffected.
+  const phoneUnchanged = tenantPhoneUnchanged(phone, tenant);
   // #269: same digit-count-only bug as the onboarding backup step, fixed
   // the same way — `tenants.phone` is what the routing match and the
   // draft/reply flow key off (schema-v1.md), so an un-normalized value
@@ -90,42 +134,75 @@ function TenantFormContent({ propertyId, tenant, onClose }: Omit<TenantFormModal
   // message itself comes from `phoneErrorMessage`, which names a
   // non-ASCII-digit input specifically instead of restating the "10
   // digits" count rule.
-  const phoneError =
-    trimmedPhone.length === 0 ? "Add a phone number." : phoneErrorMessage(trimmedPhone);
+  const phoneError = phoneUnchanged
+    ? null
+    : trimmedPhone.length === 0
+      ? "Add a phone number."
+      : phoneErrorMessage(trimmedPhone);
+  // Adversarial safety review, 2026-08-04, item 3 (FIX 3): non-blocking
+  // signal for the one case `phoneError` deliberately never covers, an
+  // unchanged legacy phone Twilio can't dial and the `/sms` webhook can
+  // never match (schema-v1.md v1.21 point 4). Never gates Save; only
+  // controls which helper text renders below the field. Always `false`
+  // when `phoneUnchanged` is `false` (create mode, or a phone the
+  // landlord is actively editing), same as `phoneError`'s own scope.
+  const phoneUnchangedUnreachable = phoneUnchanged && toE164(trimmedPhone) === null;
 
-  const mutation = useMutation({
-    mutationFn: (input: CreateTenantInput) =>
-      tenant ? updateTenant(tenant.id, input) : createTenant(propertyId, input),
-    onSuccess: () => {
-      void reactQueryClient.invalidateQueries({ queryKey: tenantsQueryKey(propertyId) });
-      onClose();
-    },
-    onError: (error) => {
-      setServerError(
-        error instanceof ApiError
-          ? toHouseApiError(error)
-          : "Something didn't go through. Try again in a moment.",
-      );
-    },
+  function handleMutationSuccess() {
+    void reactQueryClient.invalidateQueries({ queryKey: tenantsQueryKey(propertyId) });
+    onClose();
+  }
+
+  function handleMutationError(error: unknown) {
+    setServerError(
+      error instanceof ApiError
+        ? toHouseApiError(error)
+        : "Something didn't go through. Try again in a moment.",
+    );
+  }
+
+  // #292: two mutations, not one. `CreateTenantInput.phone` is required
+  // (api-contracts.md) while `UpdateTenantInput.phone` is optional, and
+  // omitting it on an unchanged edit is the whole point of this fix. A
+  // single shared mutation could only keep that distinction with an unsafe
+  // cast; splitting by verb keeps both request bodies honestly typed.
+  const createMutation = useMutation({
+    mutationFn: (input: CreateTenantInput) => createTenant(propertyId, input),
+    onSuccess: handleMutationSuccess,
+    onError: handleMutationError,
   });
+
+  const updateMutation = useMutation({
+    mutationFn: (args: { id: string; input: UpdateTenantInput }) =>
+      updateTenant(args.id, args.input),
+    onSuccess: handleMutationSuccess,
+    onError: handleMutationError,
+  });
+
+  const isSaving = createMutation.isPending || updateMutation.isPending;
 
   function handleSave() {
     setSubmitted(true);
     setServerError(null);
-    if (phoneError || mutation.isPending) return;
-    // #269: NORMALIZED, never the raw text — `phoneError` above already
-    // guarantees this is non-null; the early return keeps this function
-    // safe on its own too. `tenants.phone` is what the Twilio webhook's
-    // routing match keys off (schema-v1.md), so an un-normalized value
-    // here is silently un-matchable, not just un-dialable.
-    const e164 = toE164(trimmedPhone);
-    if (!e164) return;
-    const input: CreateTenantInput = { phone: e164 };
-    if (name.trim()) input.name = name.trim();
-    if (unit.trim()) input.unit = unit.trim();
-    if (vulnerable) input.vulnerable_occupant = vulnerable;
-    if (notes.trim()) input.notes = notes.trim();
-    mutation.mutate(input);
+    if (phoneError || isSaving) return;
+    const form = { name, phone, unit, vulnerable, notes };
+    if (tenant) {
+      // #292: omits `phone` entirely when unchanged, see
+      // tenantForm.ts's `buildTenantUpdatePayload` docstring. `null` means
+      // nothing at all changed; close without a no-op PATCH.
+      const payload = buildTenantUpdatePayload(form, tenant);
+      if (!payload) {
+        onClose();
+        return;
+      }
+      updateMutation.mutate({ id: tenant.id, input: payload });
+      return;
+    }
+    // Create mode: `phoneError` above already guarantees a valid phone;
+    // the null check keeps this safe on its own too.
+    const payload = buildTenantCreatePayload(form);
+    if (!payload) return;
+    createMutation.mutate(payload);
   }
 
   return (
@@ -169,6 +246,16 @@ function TenantFormContent({ propertyId, tenant, onClose }: Omit<TenantFormModal
             />
             {submitted && phoneError ? (
               <Text style={styles.fieldError}>{phoneError}</Text>
+            ) : phoneUnchangedUnreachable ? (
+              // Item 3 (FIX 3): non-blocking, never re-runs `phoneError` and
+              // never disables Save. Shown as soon as the modal opens for a
+              // tenant whose stored phone doesn't normalize, not only after
+              // a submit attempt, since the landlord may never touch this
+              // field on this visit.
+              <Text style={styles.fieldWarning} testID="tenant-phone-warning">
+                I can&rsquo;t text this number as it&rsquo;s saved, so this tenant won&rsquo;t get
+                my replies or emergency safety steps. Update it.
+              </Text>
             ) : (
               <Text style={styles.helper}>The number they&rsquo;ll text from.</Text>
             )}
@@ -220,9 +307,9 @@ function TenantFormContent({ propertyId, tenant, onClose }: Omit<TenantFormModal
           </View>
           <View style={styles.saveWrap}>
             <Button
-              label={mutation.isPending ? "Saving…" : tenant ? "Save changes" : "Add tenant"}
+              label={isSaving ? "Saving…" : tenant ? "Save changes" : "Add tenant"}
               variant="primary"
-              disabled={mutation.isPending}
+              disabled={isSaving}
               onPress={handleSave}
               testID="tenant-save"
             />
@@ -264,6 +351,15 @@ const styles = StyleSheet.create({
     marginTop: spacing.xs,
   },
   fieldError: {
+    ...type.footnote,
+    color: colors.emergency,
+    marginTop: spacing.xs,
+  },
+  // Item 3 (FIX 3): same visual weight as `fieldError`, apps/web's
+  // `backupContactPhoneLooksInvalid` notice reuses its blocking error color
+  // for a non-blocking stored-value warning too, this mirrors that choice
+  // rather than inventing a third, unreviewed warning color.
+  fieldWarning: {
     ...type.footnote,
     color: colors.emergency,
     marginTop: spacing.xs,

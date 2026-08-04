@@ -141,9 +141,23 @@ async function apiRequestInternal<T>(
     body = JSON.stringify(options.body);
   }
 
+  // Adversarial safety review, 2026-08-04, item 2 (FIX 2, HIGH): read
+  // OUTSIDE the try below. `env.apiUrl` throws for a misconfigured
+  // production build (src/lib/env.ts's `requireHttpsInProduction`, #292),
+  // and that throw used to happen INSIDE this function call expression,
+  // which put it inside the try's scope even though it has nothing to do
+  // with `fetch` itself. The unbound `catch` below mapped it to the same
+  // generic "Couldn't reach Stoop" `network_error` every dropped connection
+  // gets, silently swallowing the one diagnostic that would have told a
+  // developer or a landlord's device WHY nothing was ever sent (there is no
+  // Sentry in this app and no console.* on this path). Hoisting the read
+  // here means a config error surfaces as itself; only a genuine `fetch`
+  // failure below still maps to `network_error`.
+  const base = env.apiUrl;
+
   let response: Response;
   try {
-    response = await fetch(`${env.apiUrl}${path}`, {
+    response = await fetch(`${base}${path}`, {
       method: options.method ?? "GET",
       headers,
       body,
