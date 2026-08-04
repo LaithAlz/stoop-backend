@@ -87,6 +87,48 @@ capabilities and make a draft failure ambiguous (is the prompt bad at
 drafting, or did it inherit a bad classification?). This is a documented
 runner design decision, not a doc ambiguity.
 
+Fidelity note: the draft mirror's regeneration attempt gets a FRESH 20s
+budget, not the node's shared one (#178 follow-up)
+--------------------------------------------------------------------------
+``app/agent/nodes/draft_response.py``'s own ``for attempt in range(2)``
+loop calls ``anthropic_mod.new_deadline()`` ONCE, then derives each
+attempt's ``timeout_seconds`` via ``attempt_timeout(deadline, is_retry=...)``
+-- so the SAME 20-second wall-clock budget covers the initial call AND the
+one guard/length-driven regeneration TOGETHER; a regeneration triggered
+late in that window gets whatever time is LEFT (often much less than 20s),
+and the node deliberately SKIPS the regeneration entirely (keeping the
+first candidate as-is) if the deadline is already exhausted (see that
+module's docstring "20s END-TO-END budget" / ``draft_response_retry_
+skipped_budget_exhausted``).
+
+``_run_draft`` below, by contrast, mirrors the RETRY LOGIC (one regen
+attempt on a hard-guard or length violation, same triggering conditions)
+but NOT the shared-deadline arithmetic: each of its (up to) 2 calls passes
+``timeout_seconds=anthropic_mod.CLASSIFICATION_BUDGET_SECONDS`` (a flat
+20.0) directly, independently of how long the first call took, and it
+never skips the regeneration for being "out of budget" -- there is no
+budget-exhaustion branch here at all. This is a deliberate, narrow
+divergence from production fidelity (unlike the prompt/tool/transport
+reuse described above, which IS byte-for-byte identical to production):
+simulating the shared-deadline countdown would require this harness to
+race real wall-clock time against a real, separately-paced/backed-off
+network call whose OWN duration is already being adjusted for
+pacing/backoff sleep (see "Latency accounting excludes pacing/backoff
+sleep" below) -- doable, but adds real flakiness risk to a harness whose
+job is to grade PROMPT/RUBRIC quality deterministically, for a scenario
+(regeneration attempt starved of its remaining budget) this 20-scenario
+corpus does not specifically target. Practical effect: the eval's
+regeneration attempt is systematically MORE likely to have enough time to
+actually run (and to run with its full nominal timeout) than production's
+would be under the same slow-first-call conditions -- a false negative
+risk (the eval could pass a scenario that, in production, would have its
+regeneration skipped by the exhausted shared deadline and keep the
+over-length/guard-violating first candidate instead), never a false
+positive. Flagged here rather than silently assumed identical; not
+something this follow-up resolves (would need either a fake-clock-driven
+deadline simulation or an explicit product decision that a starved
+regeneration is out of scope for the eval gate).
+
 Release-blocker semantics (issue's requirement #3)
 -------------------------------------------------------
 Implemented in ``evals/scoring.py`` (``ScenarioResult.is_hard_failure`` /
@@ -104,7 +146,13 @@ Implemented in ``evals/scoring.py`` (``ScenarioResult.is_hard_failure`` /
 - ANY prefilter (Tier-0) assertion failure is treated as hard-fail-worthy
   regardless of category -- see ``evals/scoring.py``'s module docstring for
   why (a Tier-0 regression, missed OR false-positive, is safety-critical
-  either way).
+  either way) -- and regardless of whether a LATER call in the same
+  scenario run (classification/draft) also hit an infra error: a confirmed
+  ``prefilter_ok is False`` DOMINATES ``errored`` in ``ScenarioResult.
+  is_hard_failure`` (#178 follow-up), so that scenario id lands in
+  ``GateVerdict.hard_failed_scenario_ids`` (it may ALSO still appear in
+  ``errored_scenario_ids`` -- the two are no longer mutually exclusive in
+  this one case; see ``GateVerdict.errored_scenario_ids``'s docstring).
 - ``pytest -m eval`` gives per-scenario PASS/FAIL visibility (every
   scenario is its own parametrized test, so ANY assertion failure --
   hard or soft -- shows up as a red test in CI output/exit code, which is
@@ -686,6 +734,16 @@ async def _run_draft(scenario: Scenario, *, tool_caller: ToolCaller) -> DraftChe
     # Documented exception (draft_response.py's own module docstring
     # "Length discipline") -- a refusal-flagged scenario never has its
     # length enforced; the mandated deferral legitimately makes it longer.
+    # Keyed on severity_result.refusal_flags (the actual per-request signal
+    # draft_response.py itself uses) because that is what is available
+    # HERE, at generation time. #178 follow-up cross-reference: evals/
+    # scoring.py's length_budget_ok (the SCORING side of this same
+    # exemption) is keyed on `scenario.category == "refusal"` instead,
+    # because check_draft only has the static Scenario, not this runtime
+    # severity_result -- see that function's own docstring for why the two
+    # keys coincide exactly today (only f1/f2, both category="refusal",
+    # carry a non-empty expect.refusal_flags in the current corpus) without
+    # being logically the same field.
     enforce_length_budget = not severity_result.refusal_flags
     available_chars = draft_response_mod._available_ack_chars(severity_result.refusal_flags)
 
@@ -875,12 +933,17 @@ def _progress_line(
     result: ScenarioResult,
     cumulative_cost_cents: float,
 ) -> str:
-    if result.errored:
+    # is_hard_failure checked BEFORE errored -- a confirmed prefilter miss
+    # combined with a later infra error is still a confirmed hard failure,
+    # not merely "inconclusive, re-run" (see ScenarioResult.is_hard_failure's
+    # docstring, #178 follow-up). Every other combination is unaffected: for
+    # any result where is_hard_failure is False, this ordering is a no-op.
+    if result.is_hard_failure:
+        status = "HARD-FAIL"
+    elif result.errored:
         status = "ERRORED"
     elif result.passed:
         status = "passed"
-    elif result.is_hard_failure:
-        status = "HARD-FAIL"
     else:
         status = "soft-fail"
     samples_done = len(result.classification_samples)
@@ -1023,6 +1086,15 @@ def _classification_sample_to_dict(sample: ClassificationSample) -> dict[str, An
         "rules_fired": sample.rules_fired,
         "modifier": sample.modifier,
         "refusal_flags": sample.refusal_flags,
+        # #178 follow-up: previously omitted here, even though it is on
+        # ClassificationSample and IS part of what check_classification_
+        # sample's rule-anchor check searches (see evals/scoring.py's
+        # `_rule_anchor_matched` haystack, "rules_fired + reasoning
+        # combined") -- a rules_fired-anchor failure diagnosed from
+        # last-run.json alone couldn't show the evidence text that only
+        # lived in reasoning. Synthetic scenario messages only (no real
+        # tenant data), same as draft_body/ack_body already reported below.
+        "reasoning": sample.reasoning,
         # Derived, not independently model-graded -- see
         # evals/scoring.py's expected_actions_for docstring.
         "derived_actions": expected_actions_for(
@@ -1075,7 +1147,6 @@ def scenario_result_to_dict(result: ScenarioResult) -> dict[str, Any]:
         "is_hard_failure": result.is_hard_failure,
         "errored": result.errored,
         "infra_error": result.infra_error,
-        "top_level_failures": result.top_level_failures,
     }
 
 
@@ -1119,12 +1190,14 @@ def write_last_run_report(
 def format_report(results: list[ScenarioResult], verdict: GateVerdict) -> str:
     lines: list[str] = []
     for result in results:
-        if result.errored:
+        # is_hard_failure checked BEFORE errored -- same reasoning as
+        # _progress_line above (#178 follow-up).
+        if result.is_hard_failure:
+            marker = "HARD-FAIL"
+        elif result.errored:
             marker = "ERROR (inconclusive -- re-run)"
         elif result.passed:
             marker = "PASS"
-        elif result.is_hard_failure:
-            marker = "HARD-FAIL"
         else:
             marker = "SOFT-FAIL"
         lines.append(
@@ -1135,8 +1208,6 @@ def format_report(results: list[ScenarioResult], verdict: GateVerdict) -> str:
         )
         if result.infra_error:
             lines.append(f"    - INFRA (not a semantic miss): {result.infra_error}")
-        for failure in result.top_level_failures:
-            lines.append(f"    - {failure}")
         for sample in result.classification_samples:
             for failure in sample.failures:
                 lines.append(f"    - [sample {sample.sample_index}] {failure}")
