@@ -104,7 +104,17 @@ export function clearUnverifiedSend(draftId: string): boolean {
  * obviously callable from both app code and this file's own harness.
  */
 export function resetUnverifiedSendStore(): void {
-  state = new Map();
+  // Finding 4 (safety review round 3, #291/#279): this used to assign
+  // `state` directly, bypassing `setState`. Every other writer here
+  // (`markUnverifiedSend`, `clearUnverifiedSend`) notifies the
+  // `useSyncExternalStore` listeners; this one silently didn't. Masked
+  // today only because both AuthProvider call sites are immediately
+  // followed by `setSession(...)`, which forces a render anyway. The give-up
+  // ceiling's own interval (useResolveUnverifiedSends.ts) closes over
+  // `unverifiedSendIds` from the render it was created in, so a reset with
+  // no accompanying render leaves that closure checking a now-stale map
+  // until something else happens to re-render.
+  setState(new Map());
 }
 
 export function useUnverifiedSendIds(): UnverifiedSendMap {

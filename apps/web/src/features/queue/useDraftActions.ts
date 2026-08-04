@@ -18,7 +18,10 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { approveDraft, editAndSendDraft, rejectDraft, undoDraftApprove } from "@/api/drafts";
 import { ApiError, toHouseApiError } from "@/api/errors";
-import { UNVERIFIED_GIVE_UP_NOTICE } from "@/components/clarity/EditDraftPanel";
+import {
+  UNVERIFIED_GIVE_UP_CARD_NOTICE,
+  UNVERIFIED_GIVE_UP_NOTICE,
+} from "@/components/clarity/EditDraftPanel";
 import { firstName } from "@/lib/tenantName";
 import {
   computeUndoExpiresAt,
@@ -54,6 +57,16 @@ interface UseDraftActionsOptions {
 export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions) {
   const [entries, dispatch] = useReducer(queueEntriesReducer, {});
   const [staleNotices, setStaleNotices] = useState<Record<string, string>>({});
+  // BLOCKER 2 (safety review round 3, #291/#279): the give-up ceiling's
+  // own sticky notice, keyed by draft id, parallel to `staleNotices` above
+  // but deliberately with NO auto-dismiss timer. See
+  // `UNVERIFIED_GIVE_UP_CARD_NOTICE`'s own comment for why. Cleared by
+  // `markBusy` below the moment the landlord takes a fresh action on THIS
+  // draft (Approve, Skip, or a new edit-and-send attempt) rather than on
+  // any clock, since there is no honest wall-clock answer to "how long
+  // should a warning about an unconfirmed send stay up", only "until the
+  // landlord has acted on it knowing it was there."
+  const [giveUpNotices, setGiveUpNotices] = useState<Record<string, string>>({});
   const [editingContext, setEditingContext] = useState<(DraftContext & { body: string }) | null>(
     null,
   );
@@ -161,7 +174,27 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       const wasFlagged = clearUnverifiedSend(draftId);
       if (!wasFlagged) return;
       onNotice(UNVERIFIED_GIVE_UP_NOTICE);
-      setEditingContext((current) => (current?.draftId === draftId ? null : current));
+      // BLOCKER 2 (safety review round 3, #291/#279): the toast above is
+      // gone in a few seconds and was, before this fix, the ONLY trace
+      // this ever happened. A landlord who steps away and comes back
+      // past the two minute mark returned to a card that looked
+      // untouched, with Approve live and the pre-edit body, which is
+      // verbatim the F7 hazard this whole guard exists to prevent,
+      // reintroduced on a timer. This sticky per-draft notice is what the
+      // card renders instead once `isSendUnverified` (the flag just
+      // cleared above) stops being true.
+      setGiveUpNotices((prev) => ({ ...prev, [draftId]: UNVERIFIED_GIVE_UP_CARD_NOTICE }));
+      // BLOCKER 2: deliberately does NOT touch `editingContext`, unlike
+      // the version of this function that used to run here. The give-up
+      // ceiling firing is a clock, not a landlord action. A landlord who
+      // left the editor open with two minutes of typed reply still
+      // hasn't decided anything, and A7's rule ("Leave it open with the
+      // text intact") applies to this closure exactly as much as it does
+      // to any other failure that isn't `draft_not_found` (the editMutation
+      // onError's NEW-4, the one case closing it is actually correct).
+      // `sendDisabled` on the still-open editor simply goes false: Send
+      // becomes reachable again with whatever the landlord already typed
+      // still there.
     },
     [onNotice],
   );
@@ -171,6 +204,15 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       if (prev.has(draftId)) return prev;
       const next = new Set(prev);
       next.add(draftId);
+      return next;
+    });
+    // BLOCKER 2: the landlord acting on this draft again (Approve, Skip,
+    // or a new edit-and-send) is what retires the sticky give-up notice.
+    // See that state's own comment above for why this, not a timer.
+    setGiveUpNotices((prev) => {
+      if (!(draftId in prev)) return prev;
+      const next = { ...prev };
+      delete next[draftId];
       return next;
     });
   }, []);
@@ -498,6 +540,12 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
     entries,
     dispatch,
     staleNotices,
+    /** BLOCKER 2: the give-up ceiling's own sticky per-draft notice. See
+     *  this hook's own `giveUpNotices` state comment. A caller renders
+     *  this wherever it was already rendering `UNVERIFIED_SEND_NOTICE`
+     *  (`isSendUnverified` for the same draft id is false again by the
+     *  time this has anything in it, the two never both apply at once). */
+    giveUpNotices,
     editingContext,
     /** A2: true while an approve/undo/skip/edit-and-send is in flight for
      *  THIS draft id specifically — never a global "something is

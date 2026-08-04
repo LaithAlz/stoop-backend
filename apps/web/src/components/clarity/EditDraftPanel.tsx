@@ -22,6 +22,21 @@ export const UNVERIFIED_SEND_NOTICE =
 export const UNVERIFIED_GIVE_UP_NOTICE =
   "Couldn't confirm whether your last edit sent. Open the conversation to check, then try again if it didn't.";
 
+/** BLOCKER 2 (safety review round 3, #291/#279): a STICKY card-level twin
+ *  of the toast above, with no auto-dismiss timer. The toast is gone in a
+ *  few seconds; a landlord whose phone was in their pocket at the two
+ *  minute mark comes back to a card with no memory of any of this. Says
+ *  what's true (Stoop never got a confirmed answer) and what to do about
+ *  it (check the conversation FIRST) without inviting a blind retry:
+ *  "try again" on this exact card, on the exact draft whose fate is still
+ *  unconfirmed, is what feeds the idempotent-approve bug this whole guard
+ *  exists to prevent (an edit that already applied server-side accepting
+ *  a second approve/send as a no-op that silently keeps the FIRST body).
+ *  Rendered wherever `UNVERIFIED_SEND_NOTICE` was showing, once the flag
+ *  itself clears. See useDraftActions.ts's `giveUpNotices`. */
+export const UNVERIFIED_GIVE_UP_CARD_NOTICE =
+  "Stoop couldn't confirm your last edit sent. Check the conversation before approving or editing again.";
+
 interface EditDraftPanelProps {
   tenantName: string;
   initialBody: string;

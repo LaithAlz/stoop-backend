@@ -34,7 +34,7 @@ import type { QueueItem } from "@/api/types";
 export type QueueEntry =
   | { status: "idle" }
   | { status: "sending"; undoExpiresAtClient: number; approvedAtClient: number }
-  | { status: "sent" }
+  | { status: "sent"; approvedAtClient: number }
   | { status: "skipped" };
 
 /** Keyed by `draft_id` — the id that drives approve/undo/reject per the
@@ -67,7 +67,20 @@ export function queueEntriesReducer(
     case "expired": {
       const current = state[action.draftId];
       if (current?.status !== "sending") return state;
-      return { ...state, [action.draftId]: { status: "sent" } };
+      // BLOCKER 1 (safety review round 3, #291/#279): `approvedAtClient`
+      // used to be dropped here. Kept on "sent" now: src/routes/
+      // app.index.tsx's retirement effect (and app.conversations.$id.tsx's
+      // own copy) needs it to tell "the server hasn't said anything new
+      // yet" apart from "a fresh read still contradicts this card's own
+      // 'Sent.' claim" (an ambiguous undo whose DELETE actually committed,
+      // useDraftActions.ts's undoMutation onError). The ONLY honest signal
+      // that distinguishes those two is whether a read happened AFTER this
+      // moment, and that requires this timestamp to survive the
+      // sending -> sent transition, not just the approved -> sending one.
+      return {
+        ...state,
+        [action.draftId]: { status: "sent", approvedAtClient: current.approvedAtClient },
+      };
     }
     case "skipped":
       return { ...state, [action.draftId]: { status: "skipped" } };
@@ -214,18 +227,32 @@ export interface QueueSnapshot {
  * still the honest state, which is the one thing this function can
  * actually promise.
  *
- * Item 5 (safety review, #291/#279): `sending` used to be released from
- * the pin the instant it stopped being true, INCLUDING the countdown
- * hitting zero, but that transition (to `"sent"`) is exactly the one
- * `QueueRow`'s focus-return effect (src/routes/app.index.tsx) and the
- * "Sent." confirmation text both need at least one more commit to react
- * to. Unpinning in the SAME commit the status flips unmounts the row
- * before either can run. `sent` is pinned here for that one reason only;
- * src/routes/app.index.tsx's own "server confirms it's really gone"
- * effect is what retires it for good, one read later, by dispatching
- * `cleared` once the draft has genuinely left a fresh `items` read. This
- * function has no opinion on when that happens, only on not unmounting
- * the row out from under a status change it didn't cause.
+ * Item 5 (safety review, #291/#279; corrected in round 3's re-verify,
+ * see Finding 3): a prior revision of this paragraph claimed `sending`'s
+ * transition to `"sent"` needed to stay pinned for one more commit so
+ * `QueueRow`'s focus-return effect and the "Sent." confirmation text both
+ * had a chance to react to it before the row could unmount out from under
+ * them. Measured (a MutationObserver plus a `requestAnimationFrame` poll,
+ * both against the exact mid-window-refetch case this was written for):
+ * that benefit is a no-op. Home's own parent-level retirement effect
+ * (src/routes/app.index.tsx) commits in the SAME pass as this pin's own
+ * consumer, so "sent" is dispatched-and-cleared before the browser ever
+ * paints a frame with "Sent." on screen: zero of several hundred sampled
+ * painted frames showed it. Whatever benefit keeping this pin has, it
+ * isn't that one; take Item 8 above at its word instead: this docstring
+ * makes no claim about why a `sending`/`sent` pin is released when it is,
+ * only about what `buildQueueView` does while one of those three statuses
+ * is still the honest state. `sent` stays pinned here regardless, because
+ * BLOCKER 1 (useDraftActions.ts's `undoMutation` onError, src/routes/
+ * app.index.tsx's retirement effect) needs the snapshot's `approvedAtClient`
+ * to survive the sending -> sent transition to tell an honest "sent" apart
+ * from a stuck one, a real reason, just not the one originally written
+ * here. src/routes/app.index.tsx's own effect is what retires the pin for
+ * good, one read later, by dispatching `cleared` once the draft has
+ * genuinely left a fresh `items` read OR a fresh read contradicts this
+ * card's own "sent" claim. This function has no opinion on when that
+ * happens, only on not unmounting the row out from under a status change
+ * it didn't cause.
  *
  * A `sending`/`sent` row already present in `items` uses the SNAPSHOT's
  * `draft_body`, not the live item's, whenever a
@@ -293,6 +320,20 @@ export function buildQueueView(
   // (src/routes/app.index.tsx) only ever passes one in while that draft's
   // editor is actually open, and stops as soon as the landlord closes or
   // submits it.
+  // Finding 6 (safety review round 3, #291/#279, a trap noted, not fixed
+  // here): this push has no "is `pinnedEditingItem.draft_id` already one
+  // of the `pinned` rows spliced in above" check. Not reachable today.
+  // `entryFor` returns exactly one status per draft id, and the caller
+  // (src/routes/app.index.tsx) only ever passes a `pinnedEditingItem`
+  // while `editingContext` is open for that same id, a state Approve/Skip
+  // can't also be mid-flight on. But `sent` widened the set of statuses
+  // this file pins past their server row, and the widening is what makes
+  // the trap worth naming: a draft that were EVER both `sent`-pinned (via
+  // `queueSnapshots`) and the open-editor pin at once would render twice
+  // under the identical React key (`row.item.draft_id`, src/routes/
+  // app.index.tsx's `<QueueRow key={row.item.draft_id}>`). If a future
+  // change ever lets editing reopen on a draft this file still considers
+  // `sent`, this is where that breaks.
   if (pinnedEditingItem && !seen.has(pinnedEditingItem.draft_id)) {
     rows.push({ item: pinnedEditingItem, entry: entryFor(entries, pinnedEditingItem.draft_id) });
   }

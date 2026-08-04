@@ -363,6 +363,33 @@ function ConversationPage() {
     }
   }, [pinnedEntry?.status, queryClient, id]);
 
+  // BLOCKER 1 (safety review round 3, #291/#279): this route's own copy of
+  // Home's identical fix (src/routes/app.index.tsx's retirement effect,
+  // see its own comment for the full shape). An undo whose DELETE commits
+  // server-side (draft back to `pending`) but whose response is lost or
+  // ambiguous (useDraftActions.ts's undoMutation onError) is correctly
+  // left "sending", not cleared, but the 5s countdown alone still ticks
+  // it to "sent" with no idea the undo actually applied. On the thread,
+  // "the server contradicts the client's own 'Sent.' claim" is exactly
+  // `livePendingDraft` reporting THIS SAME draft id as genuinely
+  // `pending` again: the honest record that nothing went out. Gated on
+  // `caseQuery.dataUpdatedAt > entry.approvedAtClient`, same reasoning as
+  // Home: a read that predates the approve would also show this id as
+  // `pending` (it hasn't been approved yet as far as that stale read
+  // knows), and must not trip this. Only a read that landed AFTER the
+  // approve started can honestly contradict it.
+  useEffect(() => {
+    if (!livePendingDraft) return;
+    const entry = entryFor(draftActions.entries, livePendingDraft.id);
+    if (entry.status === "sent" && caseQuery.dataUpdatedAt > entry.approvedAtClient) {
+      draftActions.dispatch({ type: "cleared", draftId: livePendingDraft.id });
+    }
+    // draftActions.dispatch is stable (useReducer); draftActions.entries
+    // is the only real dependency besides the live draft's own id and the
+    // read that produced it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [livePendingDraft?.id, draftActions.entries, caseQuery.dataUpdatedAt]);
+
   const isClassifiedAudit = (
     entry: TimelineEntry,
   ): entry is Extract<TimelineEntry, { kind: "audit" }> =>
@@ -527,11 +554,17 @@ function ConversationPage() {
                       // action row itself needs the same explanation for
                       // why it's still locked, since the toast that raised
                       // the guard is long gone by then.
+                      //
+                      // BLOCKER 2 (safety review round 3, #291/#279):
+                      // mirrored from Home's own fix: once the give-up
+                      // ceiling clears `isSendUnverified`, the sticky
+                      // `giveUpNotices` entry is what keeps this footer
+                      // honest instead of falling silent.
                       staleNotice={
                         draftActions.staleNotices[caseDetail.id] ??
                         (draftActions.isSendUnverified(draftId)
                           ? UNVERIFIED_SEND_NOTICE
-                          : undefined)
+                          : draftActions.giveUpNotices[draftId])
                       }
                       // #279: OR'd with `isSendUnverified`, same as Home's
                       // `actionsBusy`: Approve/Edit stay locked while this
