@@ -5,6 +5,14 @@ on:
   push:
     branches: [main]
 
+# Least privilege, and explicit rather than inherited: the `changes` job
+# below calls the GitHub API to diff a PR, and if it fails for a
+# permissions reason every downstream job would skip, which branch
+# protection counts as passing (safety review, #267 finding B).
+permissions:
+  contents: read
+  pull-requests: read
+
 # Cancel superseded runs on the same ref to save minutes.
 concurrency:
   group: ci-${{ github.ref }}
@@ -12,12 +20,12 @@ concurrency:
 
 jobs:
   # Per-app path filtering (#267): each app's job only runs when its own
-  # tree, or something shared that could affect any of them, changed — so a
+  # tree, or something shared that could affect any of them, changed, so a
   # docs-only PR runs nothing and a single-app PR doesn't pay for the other
   # two apps. Job-level `if:`, not a workflow-level `on.paths` filter, on
   # purpose: with `on.paths`, a PR that doesn't match never triggers the
   # workflow at all, so a required status check for that job never reports
-  # and the PR gets stuck "expected — waiting for status". With a job-level
+  # and the PR gets stuck on "expected, waiting for status". With a job-level
   # `if:`, the workflow always triggers and the job reports as skipped,
   # which GitHub treats as a passing required check.
   changes:
@@ -38,9 +46,22 @@ jobs:
               - '.github/**'
               - '.pre-commit-config.yaml'
               - 'docker-compose.yml'
+              # Designated shared-code home. Empty today, but a filter that
+              # silently stops covering it the day someone uses it is the
+              # kind of gap nobody notices (safety review, #267 finding C).
+              - 'packages/**'
             backend:
               - *shared
               - 'apps/api/**'
+              # tests/test_rubric.py reads this file from OUTSIDE apps/api
+              # and pins its sha256, because the rubric is frozen
+              # (CLAUDE.md rule 4). Without this line a docs-only rubric
+              # edit runs no jobs at all, goes green, and turns main red on
+              # merge, where the tempting fix is bumping the pinned hash
+              # rather than running the evals. Verified: changing one word
+              # in that doc fails test_rubric_matches_doc_verbatim
+              # (safety review, #267 finding A).
+              - 'docs/02-product/severity-rubric-v1.md'
             mobile:
               - *shared
               - 'apps/mobile/**'
@@ -51,7 +72,14 @@ jobs:
   backend:
     name: backend (lint, type, test)
     needs: changes
-    if: needs.changes.outputs.backend == 'true'
+    # `always()` plus a result check, not a bare output test: if the
+    # `changes` job itself fails or is cancelled, its outputs are empty,
+    # `== 'true'` is false, this job reports `skipped`, and branch
+    # protection counts a skipped required check as PASSING. Zero tests
+    # would run and the PR would go green. Failing open on the gate is
+    # the silence direction, so an unhealthy gate now runs the job
+    # (safety review, #267 finding B).
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.backend == 'true') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -109,7 +137,14 @@ jobs:
   mobile:
     name: mobile (type, lint, test)
     needs: changes
-    if: needs.changes.outputs.mobile == 'true'
+    # `always()` plus a result check, not a bare output test: if the
+    # `changes` job itself fails or is cancelled, its outputs are empty,
+    # `== 'true'` is false, this job reports `skipped`, and branch
+    # protection counts a skipped required check as PASSING. Zero tests
+    # would run and the PR would go green. Failing open on the gate is
+    # the silence direction, so an unhealthy gate now runs the job
+    # (safety review, #267 finding B).
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.mobile == 'true') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -119,7 +154,7 @@ jobs:
       - uses: actions/checkout@v6
 
       # apps/mobile is a self-contained npm package (own package-lock.json,
-      # no workspace linkage to apps/web or the repo root) — installing here
+      # no workspace linkage to apps/web or the repo root), so installing here
       # doesn't touch or disturb the backend job.
       - name: Set up Node (with npm cache)
         uses: actions/setup-node@v7
@@ -144,7 +179,14 @@ jobs:
   web:
     name: web (lint, type, build)
     needs: changes
-    if: needs.changes.outputs.web == 'true'
+    # `always()` plus a result check, not a bare output test: if the
+    # `changes` job itself fails or is cancelled, its outputs are empty,
+    # `== 'true'` is false, this job reports `skipped`, and branch
+    # protection counts a skipped required check as PASSING. Zero tests
+    # would run and the PR would go green. Failing open on the gate is
+    # the silence direction, so an unhealthy gate now runs the job
+    # (safety review, #267 finding B).
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -170,7 +212,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       # Cheap checks first so CI fails fast. No dedicated test runner yet
-      # (apps/web has no test suite — see #234, #267); build compiles every
+      # (apps/web has no test suite, see #234 and #267); build compiles every
       # route through Vite/TanStack Start's SSR bundler, which does catch
       # some real bugs (unresolved imports, JSX errors) on top of lint/tsc.
       - name: Lint
