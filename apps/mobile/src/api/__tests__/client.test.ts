@@ -53,6 +53,18 @@ function rawResponse(status: number, text: string, dateHeader: string | null = n
   } as unknown as Response;
 }
 
+/** For H3-2 - a response whose `.text()` itself rejects, standing in for a
+ *  connection dropped mid-body (headers already arrived, so `response.ok`/
+ *  `status` are readable, but the body stream never completes). */
+function textRejectsResponse(status: number, dateHeader: string | null = null): Response {
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    text: () => Promise.reject(new Error("stream closed")),
+    headers: { get: (name: string) => (name.toLowerCase() === "date" ? dateHeader : null) },
+  } as unknown as Response;
+}
+
 describe("apiRequest", () => {
   beforeEach(() => {
     jest.resetAllMocks();
@@ -167,6 +179,119 @@ describe("apiRequest", () => {
 
     await expect(apiRequest("/v1/me")).rejects.toBeInstanceOf(ApiError);
     expect(mockSignOut).not.toHaveBeenCalled();
+  });
+
+  describe("B3-1 (safety review): the liveness clock anchors to the server's Date header, not the device clock", () => {
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it("does NOT sign out when a fast device clock alone would read the session as expired", async () => {
+      // Server time is "now"; the token is still live for another hour by
+      // the server's own clock.
+      const serverNow = new Date();
+      const expiresAtSeconds = Math.floor(serverNow.getTime() / 1000) + 3600;
+      mockGetSession.mockResolvedValue({
+        data: { session: { access_token: "still-live-token", expires_at: expiresAtSeconds } },
+      });
+      // The device clock is 2 hours fast (no auto-time, a traveler, a dead
+      // RTC) -- past the token's real expiry if it were ever consulted.
+      jest.useFakeTimers({ doNotFake: ["nextTick", "queueMicrotask"] });
+      jest.setSystemTime(new Date(serverNow.getTime() + 2 * 60 * 60 * 1000));
+      (globalThis.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(
+          401,
+          { error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" } },
+          serverNow.toUTCString(),
+        ),
+      );
+
+      await expect(apiRequest("/v1/me")).rejects.toBeInstanceOf(ApiError);
+      expect(mockSignOut).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the device clock when the response carries no Date header", async () => {
+      const pastSeconds = Math.floor(Date.now() / 1000) - 60;
+      mockGetSession.mockResolvedValue({
+        data: { session: { access_token: "stale-token", expires_at: pastSeconds } },
+      });
+      (globalThis.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(
+          401,
+          { error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" } },
+          null,
+        ),
+      );
+
+      await expect(apiRequest("/v1/me")).rejects.toBeInstanceOf(ApiError);
+      expect(mockSignOut).toHaveBeenCalledWith({ scope: "local" });
+    });
+
+    it("falls back to the device clock when the Date header is unparsable", async () => {
+      const pastSeconds = Math.floor(Date.now() / 1000) - 60;
+      mockGetSession.mockResolvedValue({
+        data: { session: { access_token: "stale-token", expires_at: pastSeconds } },
+      });
+      (globalThis.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(
+          401,
+          { error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" } },
+          "not a real date",
+        ),
+      );
+
+      await expect(apiRequest("/v1/me")).rejects.toBeInstanceOf(ApiError);
+      expect(mockSignOut).toHaveBeenCalledWith({ scope: "local" });
+    });
+  });
+
+  it("B3-2 (safety review): a getSession() that REJECTS (unreadable keychain) still surfaces a typed ApiError, and never signs out", async () => {
+    // First call is authHeader()'s own (pre-existing, unrelated to B3) read
+    // to build the Authorization header -- that one succeeds normally.
+    // The SECOND call is the 401 liveness check this finding is about; only
+    // that one rejects, standing in for a keychain read/decrypt failure.
+    mockGetSession
+      .mockResolvedValueOnce({ data: { session: null } })
+      .mockRejectedValueOnce(new Error("keychain read failed"));
+    (globalThis.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(401, {
+        error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" },
+      }),
+    );
+
+    const error = await apiRequest("/v1/me").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe("unauthorized");
+    // Fails toward "not dead": an unreadable keychain is not evidence the
+    // session is gone.
+    expect(mockSignOut).not.toHaveBeenCalled();
+  });
+
+  it("B3-4 (safety review): a signOut() that itself rejects never surfaces as an unhandled rejection", async () => {
+    mockGetSession.mockResolvedValue({ data: { session: null } });
+    mockSignOut.mockRejectedValue(new Error("storage write failed"));
+    (globalThis.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(401, {
+        error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" },
+      }),
+    );
+
+    // The call still resolves to the normal ApiError rejection -- a
+    // rejecting signOut() must not become the request's own error, and
+    // must not go unhandled (jest fails the run on an unhandled rejection
+    // it observes during the test).
+    await expect(apiRequest("/v1/me")).rejects.toBeInstanceOf(ApiError);
+    expect(mockSignOut).toHaveBeenCalledWith({ scope: "local" });
+  });
+
+  it("H3-2 (safety review): a connection dropped mid-body maps to network_error, never a raw exception", async () => {
+    (globalThis.fetch as jest.Mock).mockResolvedValue(textRejectsResponse(200));
+
+    const error = await apiRequest("/v1/queue").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe("network_error");
   });
 
   it("maps a dropped connection to a house-voice network_error, never the raw fetch failure", async () => {

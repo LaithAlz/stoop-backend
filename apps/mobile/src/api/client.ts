@@ -68,6 +68,26 @@ function safeJsonParse(text: string): unknown {
   }
 }
 
+/** B3-1 (safety review): the 401 liveness gate below has to anchor to the
+ *  SERVER's clock, not the device's. A device clock that is fast by more
+ *  than the token's remaining lifetime (auto-time off, a traveler, a dead
+ *  RTC) reads every still-valid session as expired, which defeats the
+ *  gate on exactly the device most likely to have a wrong clock: the
+ *  session gets wiped on the same transient 401 this fix exists to
+ *  survive. Same clock-mixing bug class as #250, which is why the undo
+ *  countdown is anchored to this same response header instead of
+ *  Date.now(). Falls back to the device clock only when the header is
+ *  missing or unparsable. */
+function resolveNowSeconds(dateHeader: string | null): number {
+  if (dateHeader) {
+    const parsed = new Date(dateHeader);
+    if (!Number.isNaN(parsed.getTime())) {
+      return Math.floor(parsed.getTime() / 1000);
+    }
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
 /** #250: the response envelope for a caller that needs the server's OWN
  *  clock alongside the body — e.g. anchoring the undo countdown to
  *  `undo_until` without ever mixing it with the device's wall clock (a
@@ -137,42 +157,76 @@ async function apiRequestInternal<T>(
     return { data: undefined as T, dateHeader };
   }
 
-  const text = await response.text();
+  // H3-2 (safety review): mirrors the fetch try/catch above. A connection
+  // dropped mid-body (more likely on a mobile network than a dropped
+  // connection before any bytes arrive) used to throw a raw TypeError past
+  // this module's own documented contract instead of the house
+  // network_error envelope.
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    throw new ApiError(0, {
+      code: "network_error",
+      message: "Couldn't reach Stoop. Check your connection and try again.",
+      request_id: "req_local",
+    });
+  }
   const parsed = text.length > 0 ? safeJsonParse(text) : null;
 
   if (!response.ok) {
     if (response.status === 401) {
       // B3 (#263, ported from apps/web/src/api/client.ts): a bare 401 is
-      // NOT proof the session is actually dead — a transient backend
+      // NOT proof the session is actually dead - a transient backend
       // hiccup (e.g. a JWKS rotation blip on the API side) can 401 a
       // token that's still genuinely live. This is materially worse on
-      // mobile than on web (#263 safety-review comment): mobile is the
-      // ONE device that receives emergency push, and the forced-401 path
-      // below deliberately skips the server-side device unregister (it
-      // has no live token to authenticate the DELETE with), so an
-      // unconditional sign-out here used to wipe the local session while
-      // pushes kept arriving at a device now showing a sign-in wall, with
-      // the deep link landing on the auth gate instead of the case.
+      // mobile than on web (#263 safety-review comment): this is the
+      // device holding the approval queue and push nudges, and the
+      // forced-401 path below deliberately skips the server-side device
+      // unregister (it has no live token to authenticate the DELETE
+      // with), so an unconditional sign-out here used to wipe the local
+      // session while push nudges kept arriving at a device now showing a
+      // sign-in wall. (The emergency path itself is voice and SMS, never
+      // push - CLAUDE.md rule 1, apps/api/app/push_outbox.py - so this is
+      // about a landlord losing sight of the ordinary queue, not the
+      // emergency chain, which reaches them by phone regardless.)
       //
       // Check the LOCAL session before reacting: only sign out when it's
       // genuinely absent or past its own `expires_at` (the server and the
       // local client disagreeing on a still-valid token is not grounds to
       // destroy it); otherwise let the `ApiError` below surface normally
       // and leave the session alone so the caller can retry.
-      const { data } = await supabase.auth.getSession();
-      const localSession = data.session;
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      const sessionLooksDead =
-        !localSession ||
-        (typeof localSession.expires_at === "number" && localSession.expires_at <= nowSeconds);
+      let sessionLooksDead = false;
+      try {
+        const { data } = await supabase.auth.getSession();
+        const localSession = data.session;
+        // B3-1: anchored to the server's own clock (this response's Date
+        // header), never the device's - see resolveNowSeconds above.
+        const nowSeconds = resolveNowSeconds(dateHeader);
+        sessionLooksDead =
+          !localSession ||
+          (typeof localSession.expires_at === "number" && localSession.expires_at <= nowSeconds);
+      } catch {
+        // B3-2 (safety review): getSession() can REJECT, not just resolve
+        // to a null session - expo-secure-store's getItemAsync throws on a
+        // keychain read or decrypt failure (restore from backup, a
+        // keychain error), and auth-js's own session-load path has no
+        // catch around that read, so getSession() itself rejects. An
+        // unreadable keychain is not evidence the session is gone, so this
+        // fails toward "not dead" rather than signing out on a read it
+        // could not actually complete.
+        sessionLooksDead = false;
+      }
       if (sessionLooksDead) {
-        // `scope: "local"` — this device's session only (matches
+        // `scope: "local"` - this device's session only (matches
         // src/auth/AuthProvider.tsx's explicit sign-out). A transient API
         // 401 (or a session that's actually expired here) must never
-        // reach out and kill the landlord's OTHER signed-in devices —
-        // the only device left to receive an emergency push must not be
-        // one of the ones taken down by this device's own 401.
-        void supabase.auth.signOut({ scope: "local" });
+        // reach out and kill the landlord's OTHER signed-in devices.
+        // B3-4: `.catch` so a storage-write failure or a non-AuthError
+        // rethrow from signOut itself can never surface as an unhandled
+        // rejection - this call is already fire-and-forget by design (the
+        // `ApiError` thrown below is what the caller actually awaits).
+        void supabase.auth.signOut({ scope: "local" }).catch(() => {});
       }
     }
     throw new ApiError(response.status, coerceErrorBody(parsed, response.status));
