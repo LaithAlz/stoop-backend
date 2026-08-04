@@ -18,6 +18,7 @@ import { SeverityPlaque } from "@/components/clarity/SeverityPlaque";
 import { TextField } from "@/components/TextField";
 import { WizardChrome } from "@/features/onboarding/WizardChrome";
 import { useOnboarding } from "@/features/onboarding/OnboardingContext";
+import { toE164 } from "@/lib/phone";
 import { colors, radius, spacing, type } from "@/theme/tokens";
 
 export default function BackupStep() {
@@ -47,8 +48,20 @@ export default function BackupStep() {
   });
 
   const engaged = name.trim().length > 0 || phone.trim().length > 0;
-  const phoneDigits = phone.replace(/\D/g, "");
-  const phoneError = engaged && phoneDigits.length < 10 ? "Use a 10-digit phone number." : null;
+  const trimmedPhone = phone.trim();
+  // #269: digit-count-only validation ("416 555 0177", "4165550177 ext 22",
+  // and "(416) 555-0177 — Jordan's cell" all passed and were stored
+  // verbatim) replaced with the shared, safety-reviewed normalizer —
+  // src/lib/phone.ts's `toE164` — so this screen agrees with the server
+  // about what's dialable (apps/api/app/phone.py) instead of trusting a
+  // weaker local check.
+  const phoneError = engaged
+    ? trimmedPhone.length === 0
+      ? "Add their phone number too, or clear the name."
+      : toE164(trimmedPhone) === null
+        ? "Use 10 digits, 11 starting with 1, or + and your country code."
+        : null
+    : null;
   const nameError = engaged && !name.trim() ? "Add their name." : null;
 
   function handleContinue() {
@@ -59,7 +72,13 @@ export default function BackupStep() {
       return;
     }
     if (phoneError || nameError) return;
-    mutation.mutate({ name: name.trim(), phone: phone.trim() });
+    // #269: NORMALIZED, never the raw text — this is the second number the
+    // emergency chain dials (apps/api/app/agent/emergency_chain.py) after
+    // the landlord's own. `phoneError` above already guarantees this is
+    // non-null; the fallback keeps the builder safe on its own too.
+    const e164 = toE164(trimmedPhone);
+    if (!e164) return;
+    mutation.mutate({ name: name.trim(), phone: e164 });
   }
 
   const backupName = name.trim() || "your backup contact";
