@@ -9,7 +9,7 @@ import { renderHook, act, waitFor } from "@testing-library/react-native";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ApiError } from "@/api/errors";
-import { approveDraft, undoDraftApprove } from "@/api/drafts";
+import { approveDraft, editAndSendDraft, undoDraftApprove } from "@/api/drafts";
 import { useDraftActions } from "../useDraftActions";
 
 jest.mock("@/api/drafts", () => ({
@@ -21,6 +21,26 @@ jest.mock("@/api/drafts", () => ({
 
 const mockApprove = approveDraft as jest.Mock;
 const mockUndo = undoDraftApprove as jest.Mock;
+const mockEditAndSend = editAndSendDraft as jest.Mock;
+
+/** A response envelope whose `.data` throws the instant any property is
+ *  read off it — stands in for "the client resolved 2xx, but our own
+ *  post-success bookkeeping breaks reading it" (#263's A1 finding; H3
+ *  makes the concrete `undo_until`-on-a-null-body case impossible at the
+ *  client layer, but the hook's own guard is tested independently here). */
+function throwingDataEnvelope(): { data: { undo_until: string }; dateHeader: string } {
+  return {
+    data: new Proxy(
+      {},
+      {
+        get() {
+          throw new Error("boom");
+        },
+      },
+    ) as { undo_until: string },
+    dateHeader: new Date().toUTCString(),
+  };
+}
 
 function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({
@@ -152,5 +172,55 @@ describe("useDraftActions — undo 409 already_sent (M1 advisory)", () => {
     // the old math it would be 10 minutes in the past → instant expiry.
     expect(entry.undoExpiresAtClient).toBeGreaterThanOrEqual(before);
     expect(entry.undoExpiresAtClient).toBeLessThanOrEqual(Date.now() + 6_000);
+  });
+});
+
+describe("useDraftActions — A1 guard (#263, ported from web's #234 PR 2)", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("approve: a throw reading the success payload is never presented as a rejected approve", async () => {
+    mockApprove.mockResolvedValue(throwingDataEnvelope());
+    const onNotice = jest.fn();
+    const onSettled = jest.fn();
+
+    const { result } = renderHook(() => useDraftActions({ onNotice, onSettled }), { wrapper });
+
+    act(() => result.current.approve(ctx));
+
+    await waitFor(() =>
+      expect(onNotice).toHaveBeenCalledWith(
+        "That went through, but the on-screen countdown didn't update.",
+      ),
+    );
+    expect(onSettled).toHaveBeenCalled();
+    // Never the onError/handleError line — that would misreport a
+    // successful approve as a failed request.
+    expect(onNotice).not.toHaveBeenCalledWith(
+      "Something didn't go through. Try again in a moment.",
+    );
+    // No "cleared" dispatch either — the card must not revert to an
+    // approvable-looking idle state on a reply that's already sending.
+    expect(result.current.entries["draft-1"]).toBeUndefined();
+  });
+
+  it("edit-and-send: same guard, and still closes the editor since the send succeeded", async () => {
+    mockEditAndSend.mockResolvedValue(throwingDataEnvelope());
+    const onNotice = jest.fn();
+    const onSettled = jest.fn();
+
+    const { result } = renderHook(() => useDraftActions({ onNotice, onSettled }), { wrapper });
+
+    act(() => result.current.openEditor(ctx, "original body"));
+    expect(result.current.editingContext).not.toBeNull();
+
+    act(() => result.current.submitEdit("edited body"));
+
+    await waitFor(() =>
+      expect(onNotice).toHaveBeenCalledWith(
+        "That went through, but the on-screen countdown didn't update.",
+      ),
+    );
+    expect(onSettled).toHaveBeenCalled();
+    expect(result.current.editingContext).toBeNull();
   });
 });
