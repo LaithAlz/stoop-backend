@@ -16,7 +16,7 @@ import { ApiError, toHouseApiError } from "@/api/errors";
 import type { UpdateMeInput } from "@/api/types";
 import { TextField } from "@/components/TextField";
 import { WizardChrome } from "@/features/onboarding/WizardChrome";
-import { buildMeUpdatePayload, phoneLooksValid } from "@/features/account/profileEdit";
+import { buildMeUpdatePayload, phoneErrorMessage } from "@/features/account/profileEdit";
 import { colors, spacing, type } from "@/theme/tokens";
 
 export default function AboutYouStep() {
@@ -46,13 +46,12 @@ export default function AboutYouStep() {
       ),
   });
 
-  // #269: the message now matches what src/lib/phone.ts's `phoneLooksValid`
-  // actually checks (10 digits, 11 starting with 1, or a + and country
-  // code) — the old "Use a 10-digit phone number." line was already
-  // inaccurate for the +country escape hatch this form has always accepted.
-  const phoneError = phoneLooksValid(phone)
-    ? null
-    : "Use 10 digits, 11 starting with 1, or + and your country code.";
+  // #269/#276: `phoneErrorMessage` (src/lib/phone.ts) picks a specific line
+  // for a non-ASCII-digit input (an Arabic/Persian/Devanagari keyboard,
+  // e.g. — whose screen already shows ten digits, so the old generic "use
+  // 10 digits" line left no path forward) and falls back to the same
+  // generic line as before for every other rejection reason.
+  const phoneError = phoneErrorMessage(phone);
 
   function handleContinue() {
     setSubmitted(true);

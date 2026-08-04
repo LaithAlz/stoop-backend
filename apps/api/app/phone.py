@@ -49,7 +49,9 @@ Canonicalization policy (mirrors the TS implementation exactly)
   code and exchange must both plausibly be NANP (see ``is_plausible_nanp``).
 - **11-digit, leading ``1``** (e.g. ``"14165551234"``) -> ``+`` prepended,
   same NANP plausibility check on the trailing 10 digits.
-- **Already ``+``-prefixed** -> punctuation stripped, then:
+- **Already ``+``-prefixed** -> a leading parenthesized trunk zero is
+  dropped first (see "Parenthesized trunk zero" below), then punctuation
+  is stripped, then:
   - if the remaining digits start with ``1``, treated as NANP: must be
     exactly 11 digits and pass the same plausibility check (a ``+1``
     number gets no less scrutiny than a bare one — a dropped digit like
@@ -61,6 +63,31 @@ Canonicalization policy (mirrors the TS implementation exactly)
 - **Extensions / any other junk** (e.g. ``"416-555-0134 x22"``, ``"n/a"``)
   -> rejected (``None``) — the digit-soup either fails the NANP
   plausibility check or the international length bound.
+
+Parenthesized trunk zero (#277)
+------------------------------------------------------------------------
+``"+44 (0)20 7946 0958"`` — the single most common *written* form of a UK
+number — used to normalize to ``"+4402079460958"``: a 13-digit non-number
+Twilio rejects (21211), landing on the field the emergency chain dials
+(``app/agent/emergency_chain.py``'s ``_execute_action`` swallows that
+failure into ``status="failed"`` without re-raising, so the failure is
+silent). The ``(0)`` is a trunk prefix, dialed only for calls placed
+*inside* the country and never part of the number in E.164 form.
+
+This module now drops a leading trunk ``0`` when it appears
+**parenthesized, directly after the country code** — narrow and
+well-understood, not a general trunk-prefix rule for every country. It
+must run on the RAW string, before punctuation is stripped: once digits
+are collapsed a real ``(0)`` is indistinguishable from an ordinary digit
+``0`` that happens to sit there. The match is anchored to the very start
+of the ``+``-prefixed string (immediately after the country code) and
+requires the literal parenthesized ``(0)`` (spaces/hyphens allowed
+around it, per the anchor) — ``"+1 (416) 555 0100"`` is untouched: those
+parentheses hold an area code, not a trunk marker, so the literal
+``"(0)"`` never matches ``"(416)"``. A genuine, un-parenthesized leading
+``0`` (e.g. ``"+44 020 7946 0958"``) is left exactly as before — this is
+option 1 only (see the issue); it does not attempt to detect or repair
+that case.
 
 ``is_plausible_nanp``: area code and exchange code both start ``2``-``9``
 and neither is an N11 service code (``211``/``411``/``911``/… — never
@@ -82,6 +109,12 @@ from app.errors import AppError
 # ASCII-only — see module docstring, "Non-ASCII 'digit' characters".
 _NON_DIGIT_RE = re.compile(r"\D+", re.ASCII)
 _NANP_RE = re.compile(r"^(?!\d11)[2-9]\d{2}(?!\d11)[2-9]\d{6}$", re.ASCII)
+# #277: anchored to the start of the string — "the country code" means
+# whatever digit run sits between "+" and the parenthesized "(0)", nothing
+# more. 1-3 digits mirrors E.164's own country-code length bound. Requires
+# the LITERAL "(0)" (not just any parenthesized digit), which is what keeps
+# "+1 (416) 555 0100" (an area code, not a trunk marker) untouched.
+_PARENTHESIZED_TRUNK_ZERO_RE = re.compile(r"^(\+\d{1,3})[\s-]*\(0\)[\s-]*", re.ASCII)
 
 
 def is_plausible_nanp(digits: str) -> bool:
@@ -108,6 +141,18 @@ def _contains_non_ascii_digit(value: str) -> bool:
     return any(ch.isnumeric() and not ch.isascii() for ch in value)
 
 
+def _drop_parenthesized_trunk_zero(value: str) -> str:
+    """Drop a leading trunk ``0`` written parenthesized directly after the
+    country code (``"+44 (0)20 7946 0958"`` -> ``"+4420 7946 0958"``) —
+    see module docstring, "Parenthesized trunk zero" (#277). Must be
+    called on the RAW (punctuation-intact) string, before any digit
+    stripping — once digits are collapsed a real ``(0)`` can no longer be
+    told apart from an ordinary digit ``0``. A no-op when the pattern
+    doesn't match (e.g. ``"+1 (416) 555 0100"``, where the parenthesized
+    content is an area code, not a literal ``"0"``)."""
+    return _PARENTHESIZED_TRUNK_ZERO_RE.sub(r"\1", value, count=1)
+
+
 def to_e164(raw: str) -> str | None:
     """Best-effort canonicalization of *raw* to E.164, or ``None`` if it
     cannot be confidently canonicalized — see module docstring for the
@@ -124,6 +169,11 @@ def to_e164(raw: str) -> str | None:
 
     trimmed = raw.strip()
     plus = trimmed.startswith("+")
+    if plus:
+        # #277: only the international branch — must run before the
+        # punctuation strip below, and only on a "+"-prefixed value (a
+        # bare NANP input has no country code for "(0)" to sit after).
+        trimmed = _drop_parenthesized_trunk_zero(trimmed)
     digits = _NON_DIGIT_RE.sub("", trimmed)
 
     if plus:

@@ -9,7 +9,7 @@
  * table codepoint still rejects" and "realistic paste still accepts"
  * cases below are that shape's own test matrix, ported.
  */
-import { phoneLooksValid, toE164 } from "../phone";
+import { phoneErrorMessage, phoneLooksValid, toE164, validatePhone } from "../phone";
 
 describe("toE164 — accepts", () => {
   it.each([
@@ -23,8 +23,38 @@ describe("toE164 — accepts", () => {
     ["+1 (416) 555-1234", "+14165551234"],
     ["+44 20 7946 0958", "+442079460958"],
     ["+442079460958", "+442079460958"],
+    // #277: the single most common WRITTEN form of a UK number — a
+    // parenthesized trunk zero directly after the country code — is
+    // dropped, not carried through into a 13-digit non-number Twilio
+    // rejects (21211).
+    ["+44 (0)20 7946 0958", "+442079460958"],
+    ["+44(0)2079460958", "+442079460958"],
+    ["+44-(0)20-7946-0958", "+442079460958"],
+    ["+44  (0)  20 7946 0958", "+442079460958"],
   ])("normalizes %s to %s", (raw, expected) => {
     expect(toE164(raw)).toBe(expected);
+  });
+});
+
+describe("toE164 — #277: parenthesized trunk zero", () => {
+  it("drops a leading trunk 0 parenthesized directly after the country code", () => {
+    expect(toE164("+44 (0)20 7946 0958")).toBe("+442079460958");
+  });
+
+  it("leaves an area code's parentheses alone — not a trunk marker", () => {
+    // Those parentheses hold "416" (an area code), not a literal "0" —
+    // the rule only fires on the literal parenthesized "0".
+    expect(toE164("+1 (416) 555 0100")).toBe("+14165550100");
+  });
+
+  it("leaves a genuine, un-parenthesized leading 0 alone (option 1 only)", () => {
+    // Out of scope for this fix — still passes straight through to the
+    // international branch's own digit-count check, exactly as before.
+    expect(toE164("+44 020 7946 0958")).toBe("+4402079460958");
+  });
+
+  it("never fires outside the '+'-prefixed branch", () => {
+    expect(toE164("(0)4165551234")).toBeNull();
   });
 });
 
@@ -136,5 +166,36 @@ describe("phoneLooksValid", () => {
     expect(phoneLooksValid("n/a")).toBe(false);
     expect(phoneLooksValid("416-555-0134 x22")).toBe(false);
     expect(phoneLooksValid("+١4165551234")).toBe(false);
+  });
+});
+
+describe("validatePhone / phoneErrorMessage — issue #276", () => {
+  it("blank is valid, with no value to write", () => {
+    expect(validatePhone("")).toEqual({ ok: true, value: null });
+    expect(validatePhone("   ")).toEqual({ ok: true, value: null });
+    expect(phoneErrorMessage("")).toBeNull();
+  });
+
+  it("a dialable number is ok, carrying the normalized value", () => {
+    expect(validatePhone("(416) 555-1234")).toEqual({ ok: true, value: "+14165551234" });
+    expect(phoneErrorMessage("(416) 555-1234")).toBeNull();
+  });
+
+  it("a non-ASCII digit gets its own reason and its own message — not the generic line", () => {
+    expect(validatePhone("+١4165551234")).toEqual({ ok: false, reason: "non_ascii_digit" });
+    const message = phoneErrorMessage("+١4165551234");
+    expect(message).not.toBeNull();
+    expect(message).not.toBe("Use 10 digits, 11 starting with 1, or + and your country code.");
+    expect(message).toMatch(/0-9/);
+  });
+
+  it("every other unparsable shape keeps the existing generic message", () => {
+    expect(validatePhone("n/a")).toEqual({ ok: false, reason: "unparsable" });
+    expect(phoneErrorMessage("n/a")).toBe(
+      "Use 10 digits, 11 starting with 1, or + and your country code.",
+    );
+    expect(phoneErrorMessage("416-555-0134 x22")).toBe(
+      "Use 10 digits, 11 starting with 1, or + and your country code.",
+    );
   });
 });

@@ -28,7 +28,7 @@
  */
 import type { UpdateMeInput } from "@/api/types";
 import { toE164 } from "@/lib/phone";
-export { phoneLooksValid } from "@/lib/phone";
+export { phoneErrorMessage, phoneLooksValid } from "@/lib/phone";
 
 export interface ProfileEditForm {
   /** The name field's current text. */

@@ -87,6 +87,34 @@ function containsNonAsciiDigit(value: string): boolean {
 }
 
 /**
+ * #277: anchored to the start of the string — "the country code" means
+ * whatever digit run sits between "+" and the parenthesized "(0)", nothing
+ * more. 1-3 digits mirrors E.164's own country-code length bound. Requires
+ * the LITERAL "(0)" (not just any parenthesized digit), which is what
+ * keeps "+1 (416) 555 0100" (an area code, not a trunk marker) untouched.
+ * Mirrors apps/api/app/phone.py's `_PARENTHESIZED_TRUNK_ZERO_RE` (and
+ * apps/web/src/lib/phone.ts's copy of it) exactly.
+ */
+const PARENTHESIZED_TRUNK_ZERO_RE = /^(\+\d{1,3})[\s-]*\(0\)[\s-]*/;
+
+/**
+ * Drop a leading trunk `0` written parenthesized directly after the
+ * country code (`"+44 (0)20 7946 0958"` -> `"+4420 7946 0958"`) — the
+ * single most common written form of a UK number, previously normalizing
+ * to a 13-digit non-number Twilio rejects (21211) on the field the
+ * emergency chain dials. Must be called on the RAW (punctuation-intact)
+ * string, before any digit stripping — once digits are collapsed a real
+ * `(0)` can no longer be told apart from an ordinary digit `0`. A no-op
+ * when the pattern doesn't match (e.g. `"+1 (416) 555 0100"`, where the
+ * parenthesized content is an area code, not a literal `"0"`) or a
+ * genuine un-parenthesized leading `0` (e.g. `"+44 020 7946 0958"`,
+ * intentionally left alone — narrower "option 1" fix only, issue #277).
+ */
+function dropParenthesizedTrunkZero(value: string): string {
+  return value.replace(PARENTHESIZED_TRUNK_ZERO_RE, "$1");
+}
+
+/**
  * Best-effort E.164 for the NANP inputs these forms actually see. Anything
  * this can't confidently normalize is rejected by `phoneLooksValid` below
  * rather than sent — storing a string Twilio can't dial is strictly worse
@@ -112,7 +140,12 @@ export function toE164(phone: string): string | null {
   // "+442079460958" — a landlord with an international mobile shouldn't
   // have to guess our spacing rules.
   const plus = trimmed.startsWith("+");
-  const digits = trimmed.replace(/\D/g, "");
+  // #277: only the international branch, and only on the RAW (not-yet-
+  // digit-stripped) string — a bare NANP input has no country code for
+  // "(0)" to sit after, and once digits are collapsed a real "(0)" is
+  // indistinguishable from a bare digit "0".
+  const normalized = plus ? dropParenthesizedTrunkZero(trimmed) : trimmed;
+  const digits = normalized.replace(/\D/g, "");
   if (plus) {
     // N1 (safety re-verify): the international escape hatch must NOT
     // disable the NANP gate for NANP numbers. "+1416555013" — one digit
@@ -148,6 +181,55 @@ function isPlausibleNanp(digits: string): boolean {
 }
 
 /**
+ * Small discriminated result for a phone field (issue #276). `toE164`
+ * collapses every rejection into the same `null`, so a caller has no way
+ * to tell "this can't possibly be a phone number" (a non-ASCII digit —
+ * someone typing on an Arabic, Persian, or Devanagari keyboard, whose
+ * screen already shows ten digits when the generic message tells them to
+ * "use 10 digits") apart from any other unparsable shape. Blank is its
+ * own `ok: true` case (`value: null`, "keep current" / "don't set one" —
+ * the existing contract every call site already relies on) — it is not a
+ * rejection.
+ */
+export type PhoneValidation =
+  | { ok: true; value: string | null }
+  | { ok: false; reason: "non_ascii_digit" | "unparsable" };
+
+/** Same rule as `toE164`, but reports WHY a non-blank value was rejected
+ *  instead of collapsing every reason into `null` (issue #276). */
+export function validatePhone(phone: string): PhoneValidation {
+  const trimmed = phone.trim();
+  if (trimmed.length === 0) return { ok: true, value: null };
+  if (containsNonAsciiDigit(trimmed)) return { ok: false, reason: "non_ascii_digit" };
+  const value = toE164(trimmed);
+  return value === null ? { ok: false, reason: "unparsable" } : { ok: true, value };
+}
+
+/** Unchanged from before #276 — every rejection reason except
+ *  `non_ascii_digit` still gets this line. */
+export const PHONE_ERROR_UNPARSABLE =
+  "Use 10 digits, 11 starting with 1, or + and your country code.";
+
+/** #276: names the actual problem — some of the characters on screen
+ *  aren't the digits 0-9 — instead of restating the "use 10 digits" count
+ *  rule a landlord typing on a non-Latin keyboard already believes
+ *  they're following. */
+export const PHONE_ERROR_NON_ASCII_DIGIT =
+  "We can only dial the digits 0-9. Please retype your number using 0-9.";
+
+/**
+ * The message a landlord should see for `phone`, or `null` when it's
+ * valid (including blank). Every call site's old
+ * `phoneLooksValid(x) ? null : "<generic line>"` pattern collapses to this
+ * one call (issue #276).
+ */
+export function phoneErrorMessage(phone: string): string | null {
+  const result = validatePhone(phone);
+  if (result.ok) return null;
+  return result.reason === "non_ascii_digit" ? PHONE_ERROR_NON_ASCII_DIGIT : PHONE_ERROR_UNPARSABLE;
+}
+
+/**
  * Blank is valid ("keep my current number" / "don't set one"). Anything
  * NON-blank must carry a dialable number.
  *
@@ -158,12 +240,12 @@ function isPlausibleNanp(digits: string): boolean {
  * `length > 0` send rule. The result was `landlords.phone = "n/a"`, a
  * green "Saved", and an emergency chain that silently never reaches
  * anyone. A non-empty field now has to look like a real number.
+ *
+ * Kept (issue #276 added `validatePhone`/`phoneErrorMessage` alongside
+ * this, not instead of it) — existing callers and tests that only need a
+ * yes/no answer still get one, now defined in terms of the same single
+ * source of truth.
  */
 export function phoneLooksValid(phone: string): boolean {
-  const trimmed = phone.trim();
-  if (trimmed.length === 0) return true;
-  // Single source of truth with the normalizer (R1): valid means exactly
-  // "toE164 can produce something dialable", so the two can never disagree
-  // the way the pre-F2 pair did.
-  return toE164(trimmed) !== null;
+  return validatePhone(phone).ok;
 }

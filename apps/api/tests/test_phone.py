@@ -37,10 +37,57 @@ from app.phone import canonicalize_phone, is_plausible_nanp, to_e164
         # Non-NANP international: punctuation-stripped, digit-count only.
         ("+44 20 7946 0958", "+442079460958"),
         ("+442079460958", "+442079460958"),
+        # #277: the single most common WRITTEN form of a UK number — a
+        # parenthesized trunk zero directly after the country code — is
+        # dropped, not carried through into a 13-digit non-number.
+        ("+44 (0)20 7946 0958", "+442079460958"),
+        # Same rule, no separators / hyphen separators / doubled spaces.
+        ("+44(0)2079460958", "+442079460958"),
+        ("+44-(0)20-7946-0958", "+442079460958"),
+        ("+44  (0)  20 7946 0958", "+442079460958"),
     ],
 )
 def test_to_e164_accepts(raw: str, expected: str) -> None:
     assert to_e164(raw) == expected
+
+
+# ---------------------------------------------------------------------------
+# to_e164 — #277: parenthesized trunk zero
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_to_e164_parenthesized_trunk_zero_dropped_after_country_code() -> None:
+    """The exact case from the issue: the UK's single most common written
+    form must normalize to a real, dialable number, not the 13-digit
+    non-number Twilio rejects (21211)."""
+    assert to_e164("+44 (0)20 7946 0958") == "+442079460958"
+
+
+@pytest.mark.unit
+def test_to_e164_parenthesized_area_code_is_not_a_trunk_zero() -> None:
+    """`+1 (416) 555 0100` must be untouched: those parentheses hold an
+    area code, not a trunk marker — the rule only fires on the LITERAL
+    parenthesized "0", never any other parenthesized digit run."""
+    assert to_e164("+1 (416) 555 0100") == "+14165550100"
+
+
+@pytest.mark.unit
+def test_to_e164_unparenthesized_leading_zero_is_left_alone() -> None:
+    """A genuine leading zero that was NOT parenthesized is out of scope
+    for this fix (option 1 only, issue #277) — still passes straight
+    through to the international branch's own digit-count check, exactly
+    as before this change."""
+    assert to_e164("+44 020 7946 0958") == "+4402079460958"
+
+
+@pytest.mark.unit
+def test_to_e164_parenthesized_trunk_zero_only_applies_to_plus_branch() -> None:
+    """A bare (non-"+") NANP input has no country code for "(0)" to sit
+    after — the trunk-zero regex is anchored on a leading "+", so this
+    stays rejected exactly as before this change, not silently normalized
+    to "+14165551234" by treating the "(0)" as a trunk marker."""
+    assert to_e164("(0)4165551234") is None
 
 
 # ---------------------------------------------------------------------------
