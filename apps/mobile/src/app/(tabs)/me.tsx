@@ -43,12 +43,18 @@ import {
 } from "@/features/push/pushCopy";
 
 // B3-5 (#284): shown when `signOut()` comes back `{ ok: false }`, which
-// after the F1 re-verify means one thing: the session is still live. It
-// covers a `/logout` that could not reach Stoop (most commonly offline)
-// AND a keychain read that threw, because AuthProvider now asks the
-// session itself rather than inferring from the error. It does NOT fire
-// for a sign-out that worked and threw on the way out, which an earlier
-// version of this comment (and of that code) got wrong. Same
+// means "NOT CONFIRMED signed out", not "definitely still signed in".
+// Three states reach it: the session is genuinely still live (offline
+// `/logout`, or a throw before teardown); the state is UNKNOWN (the
+// reject-path session read itself threw, or timed out, or came back with
+// an error, all of which AuthProvider deliberately collapses to false);
+// and one false negative auth-js hands us, where `_signOut` returns a
+// `sessionError` after `_callRefreshToken` already removed the session.
+//
+// Over-warning is the deliberate direction. The state that must never be
+// missed is "still signed in on a device you just handed to someone",
+// and an earlier version of this comment (and of that code) claimed a
+// precision here that neither has. Same
 // house-voice shape as the network_error message src/api/client.ts already
 // uses elsewhere in this app, reused rather than inventing new copy for the
 // same underlying situation.

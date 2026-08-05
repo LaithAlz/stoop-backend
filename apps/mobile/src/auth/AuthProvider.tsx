@@ -61,6 +61,16 @@ function toHouseAuthError(error: { message: string }): string {
   return "Sign-in didn't go through. Try again.";
 }
 
+/** Bound on the reject-path session read in `signOut` (re-verify finding
+ *  2). Same value and same reasoning as `api/client.ts`'s
+ *  `LIVENESS_CHECK_TIMEOUT_MS`: `getSession()` can enter
+ *  `_callRefreshToken`, whose individual fetches carry no AbortSignal, so
+ *  the read is unbounded. The Me tab awaits this before it can show
+ *  anything, with no spinner and no disabled button, so an unbounded read
+ *  is tens of seconds of nothing and an invitation to tap again. A
+ *  timeout is "could not tell", which reports the failure. */
+const SIGN_OUT_SESSION_READ_TIMEOUT_MS = 2000;
+
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -239,8 +249,47 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           // keychain leaves us no better informed than before: report the
           // failure, which is the honest answer and the safe direction.
           try {
-            const { data } = await supabase.auth.getSession();
-            return { ok: !data.session };
+            // `!error` is load-bearing, and getting it wrong was a HIGH
+            // in the catastrophic direction (re-verify finding 1).
+            // `data.session === null` is NOT the same fact as "there is
+            // no session on this device". When the stored access token is
+            // past EXPIRY_MARGIN_MS, `__loadSession` calls
+            // `_callRefreshToken`, and on a RETRYABLE fetch error (i.e.
+            // offline) auth-js deliberately does NOT call
+            // `_removeSession()`. The refresh token stays in SecureStore
+            // and resolves `{ session: null, error }` on a device that is
+            // still fully signed in.
+            //
+            // Reading that as "signed out" told a landlord handing over
+            // their phone in a basement unit that the sign-out worked,
+            // with no alert, no SIGNED_OUT, the tenant cache intact, and
+            // full access restored the moment the phone found signal.
+            //
+            // A timeout is also "could not tell": there is no bound on
+            // this read (`_callRefreshToken` can sit on a network refresh
+            // that carries no AbortSignal, see client.ts's own note), and
+            // the Me tab awaits this before it can say anything.
+            //
+            // All three unknowns collapse to `{ ok: false }`, which
+            // over-warns and never claims a sign-out that did not happen.
+            let readTimer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              const read = await Promise.race([
+                supabase.auth.getSession(),
+                new Promise<null>((resolve) => {
+                  readTimer = setTimeout(() => resolve(null), SIGN_OUT_SESSION_READ_TIMEOUT_MS);
+                }),
+              ]);
+              if (read === null) return { ok: false };
+              return { ok: !read.error && !read.data.session };
+            } finally {
+              // Cleared on every path, same as the liveness gate's own
+              // timer in api/client.ts. Leaving it armed keeps a handle
+              // alive for the full timeout after the answer is already
+              // known, which held a Jest worker open when this landed and
+              // would hold a timer on device for no reason.
+              if (readTimer !== undefined) clearTimeout(readTimer);
+            }
           } catch {
             return { ok: false };
           }

@@ -155,6 +155,32 @@ describe("signOut, FIX 1 (#284 adversarial review): a signOut() that itself reje
     expect(result).toEqual({ ok: true });
   });
 
+  it("F1 (re-verify, HIGH): resolves { ok: false } when getSession() returns a NULL session WITH an error", async () => {
+    // The state no test covered, and the one the first version of this
+    // fix got wrong in the catastrophic direction.
+    //
+    // `data.session === null` is not "there is no session on this
+    // device". Past EXPIRY_MARGIN_MS, `__loadSession` calls
+    // `_callRefreshToken`, and on a RETRYABLE fetch error (offline)
+    // auth-js deliberately does NOT call `_removeSession()`. The refresh
+    // token stays in SecureStore and this resolves `{ session: null,
+    // error }` on a device that is still fully signed in.
+    //
+    // The landlord: phone backgrounded two hours so the access token is
+    // expired, basement unit with no data, hands the phone to their
+    // super. Reading this as "signed out" gave them no alert, no
+    // SIGNED_OUT, an intact tenant cache, and full access restored the
+    // moment the phone found signal.
+    mockSupabaseSignOut.mockRejectedValue(new Error("keychain read failed"));
+    renderHarness();
+    mockGetSession.mockResolvedValueOnce({
+      data: { session: null },
+      error: { name: "AuthRetryableFetchError", message: "network" },
+    });
+
+    await expect(captured.ctx!.signOut()).resolves.toEqual({ ok: false });
+  });
+
   it("F1 (re-verify): resolves { ok: false } when the reject-path getSession() ALSO throws", async () => {
     // An unreadable keychain leaves us no better informed than the throw
     // did, so report the failure. That is the honest answer and the safe
@@ -163,8 +189,16 @@ describe("signOut, FIX 1 (#284 adversarial review): a signOut() that itself reje
     mockSupabaseSignOut.mockRejectedValue(new Error("keychain read failed"));
     renderHarness();
     // Rejected only AFTER mount, so this pins the catch path's own read
-    // rather than the provider's startup read (which has its own
-    // handling, and is not what this test is about).
+    // rather than the provider's startup read.
+    //
+    // To be accurate about why that ordering is needed: the startup read
+    // does NOT have its own handling. `AuthProvider`'s mount `.then` has
+    // no `.catch`, and auth-js does not cover for it either, so a
+    // keychain throw at launch means no INITIAL_SESSION, an unhandled
+    // rejection, `initializing` stuck true, and a splash screen that
+    // never hides. Pre-existing since M0 and out of this PR's diff,
+    // tracked separately. An earlier version of this comment said the
+    // opposite, which would have steered the next reader away from it.
     mockGetSession.mockRejectedValueOnce(new Error("keychain unreadable"));
 
     await expect(captured.ctx!.signOut()).resolves.toEqual({ ok: false });

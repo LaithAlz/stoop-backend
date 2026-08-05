@@ -70,5 +70,15 @@ describe("unregisterDevice (DELETE /v1/devices/{id}, v1.18)", () => {
       method: "DELETE",
       signal: controller.signal,
     });
+    // Identity, not just shape (re-verify finding 4): two distinct
+    // un-aborted AbortSignals compare EQUAL under
+    // `toHaveBeenCalledWith`'s recursive equality, so the assertion above
+    // catches "the forwarding line was deleted" but not "a DIFFERENT
+    // signal was forwarded" (`options?.signal ? new AbortController()
+    // .signal : undefined`, or an `AbortSignal.timeout(...)`). That is
+    // the break-in-the-middle, and only `toBe` closes it.
+    expect((mockApiRequest.mock.calls[0][1] as { signal?: AbortSignal }).signal).toBe(
+      controller.signal,
+    );
   });
 });
