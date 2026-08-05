@@ -41,57 +41,73 @@ Security:
   existing ``auth_user_id``-only structlog convention already used by
   ``routers/me.py`` — no additional PII surface here.
 
-Two-session rationale for ``require_landlord`` (found during #54/#55/#57's
-spec review; fixed here since it blocks every endpoint those issues add)
+Identity-lookup design history for ``require_landlord``
 ------------------------------------------------------------------------
 ``landlords`` is RLS-enabled and (schema-v1.md's v1.2 amendments) is
 **id-keyed, not landlord_id-keyed**: its one policy's ``USING`` clause is
 ``id = current_setting('app.current_landlord_id', true)::uuid``. That policy
 covers SELECT too (a single ``FOR ALL`` policy, no separate read rule). This
-is a genuine chicken-and-egg problem for the ORIGINAL single-session design
-(look up the row on the request-scoped session, THEN set the GUC on that
-same session): once ``APP_DATABASE_URL`` actually points at ``app_role``
-(the documented production role-separation flip in ``app/db/session.py``),
-the very FIRST query on the request-path session — ``SELECT id FROM
-landlords WHERE auth_user_id = ...`` — runs BEFORE the GUC is ever set. An
-unset GUC reads back as SQL ``NULL`` (``current_setting(..., true)``'s
-``missing_ok`` behavior), and ``id = NULL`` is never true for any row —
-so the lookup returns ZERO rows for every caller, always, forever, even
-for a real, live, correctly-provisioned landlord. The GUC would have to
-already equal the row's ``id`` before that row could ever be found by this
-query, which is exactly backwards — the same structural bug ``routers/
-me.py``'s module docstring already documents for the ``landlords`` INSERT
-path ("a freshly ``gen_random_uuid()``'d id can never equal a GUC value
-that would have to be set BEFORE that id exists"), just on the SELECT side
-of the same table instead of the INSERT side. Locally this was invisible:
-``APP_DATABASE_URL`` is unset in dev/CI, so ``get_session`` falls back to
-the admin engine, and Postgres superusers always bypass RLS regardless of
-the GUC (``app/db/session.py``'s module docstring) — every existing test
-that exercises ``require_landlord`` end-to-end was, without realizing it,
-running the lookup with RLS effectively off. The fix below is proven
-under REAL enforcement (``SET LOCAL ROLE app_role``, the migration-0005
-test convention) in ``tests/test_require_landlord.py``.
+is a genuine chicken-and-egg problem for a single-session design (look up
+the row on the request-scoped session, THEN set the GUC on that same
+session): once ``APP_DATABASE_URL`` actually points at ``app_role`` (the
+documented production role-separation flip in ``app/db/session.py``), a
+plain ``SELECT id FROM landlords WHERE auth_user_id = ...`` run directly on
+the request session would execute BEFORE the GUC is ever set. An unset GUC
+reads back as SQL ``NULL`` (``current_setting(..., true)``'s ``missing_ok``
+behavior), and ``id = NULL`` is never true for any row, so the lookup
+would return ZERO rows for every caller, always, forever, even for a real,
+live, correctly-provisioned landlord. The GUC would have to already equal
+the row's ``id`` before that row could ever be found by this query, which
+is exactly backwards -- the same structural bug ``routers/me.py``'s module
+docstring already documents for the ``landlords`` INSERT path ("a freshly
+``gen_random_uuid()``'d id can never equal a GUC value that would have to
+be set BEFORE that id exists"), just on the SELECT side of the same table
+instead of the INSERT side.
 
-The fix: TWO sessions, same pattern ``GET /v1/me`` already established for
-this exact class of problem — resolve ``landlords.id`` on a short-lived,
-RLS-UNSCOPED **admin** session (``get_admin_session``, scoped narrowly to
-just this one lookup via the same ``asynccontextmanager(get_admin_session)``
-idiom already used by ``app/agent/nodes/identify_property.py``/
-``load_context.py`` — NOT as a ``Depends(get_admin_session)`` parameter,
-which would hold an extra admin-pool connection open for the entire
-request lifetime on literally every authenticated endpoint), then set the
-GUC on the caller's REAL request-path ``session`` (the one ``get_session``
-yields and every downstream query in the handler actually uses) before
-returning it. The identity lookup never needs RLS in the first place (it
-is filtered by ``auth_user_id``, not landlord-scoped data), and the GUC
-still ends up set on exactly the session whose transaction commits/rolls
-back at request teardown — nothing about the GUC's lifetime or scoping
-semantics (the ``is_local``/``SET LOCAL`` notes below) changes.
+**Superseded design (found during #54/#55/#57's spec review, fixed then;
+replaced by #194, kept here as the historical record of what it cost, per
+that fix's own safety review):** the first fix was TWO sessions, the same
+pattern ``GET /v1/me`` already established for this exact class of problem:
+resolve ``landlords.id`` on a short-lived, RLS-UNSCOPED **admin** session
+(``app/db/session.py``'s dedicated admin-session helper), then set the GUC
+on the caller's REAL request-path ``session``. It worked (proven under
+real ``app_role`` enforcement in
+``tests/test_require_landlord.py``), but its own safety review found it
+cost a SECOND database connection on every single authenticated request,
+and created two couplings that never should have existed: (1) with
+``APP_DATABASE_URL`` unset (local/CI, and production before the one-time
+operator flip), request and admin sessions share ONE 5+5 pool, so every
+authenticated request held two connections simultaneously instead of one,
+roughly halving how many concurrent requests that shared pool could serve
+before the 30s ``pool_timeout`` cascade; (2) post-flip, every authenticated
+dashboard request's admin-session lookup shared the ADMIN pool with the
+UNAUTHENTICATED Twilio emergency-ingestion webhook
+(``routers/webhooks/twilio.py``, which depends on that same admin-session
+helper for its whole request lifetime), and
+never-break rule #1 says the emergency line's resources must never queue
+behind dashboard reads, and that coupling existed even though it took an
+extreme burst to actually bite.
+
+**Current design (#194):** a ``SECURITY DEFINER`` Postgres function,
+``public.landlord_id_for_auth_user(uuid)`` (migration 0019; see
+schema-v1.md's v1.24 amendment for the full writeup), invoked on the
+caller's OWN request session, zero extra connection, both couplings above
+gone. ``SECURITY DEFINER`` runs with the function OWNER's rights, which is
+what lets it resolve ``landlords.id`` on the caller's own, still-GUC-unset,
+possibly ``app_role``-scoped session: the lookup runs unscoped by
+construction (identical to what the admin session provided), just on the
+SAME connection instead of a second one. The GUC is then set on that same
+session, exactly as before -- nothing about the GUC's lifetime or scoping
+semantics (the ``is_local``/``SET LOCAL`` notes below) changes. Proven
+under REAL enforcement (``SET LOCAL ROLE app_role``, the migration-0005
+test convention) in ``tests/test_require_landlord.py``, and adversarially
+at the raw-SQL level (another landlord's real ``auth_user_id``, a
+nonexistent one, ``NULL``, no GUC set at all) in
+``tests/test_migrations_0019.py``.
 """
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated
 from uuid import UUID
@@ -100,7 +116,7 @@ from fastapi import Depends, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import get_admin_session, get_session
+from app.db.session import get_session
 from app.errors import AppError
 from app.integrations.supabase_auth import AuthError, AuthUser, verify_jwt
 
@@ -162,9 +178,13 @@ class Landlord:
     id: UUID
 
 
-_LANDLORD_LOOKUP_SQL = text(
-    "SELECT id FROM landlords WHERE auth_user_id = :auth_user_id AND deleted_at IS NULL"
-)
+# SECURITY DEFINER lookup (#194, migration 0019) -- runs with the function
+# OWNER's rights, bypassing RLS by construction, so it resolves
+# `landlords.id` on the caller's OWN request session even before the GUC
+# below is ever set (see module docstring "Current design (#194)"). Same
+# filtering semantics as the two-session design it replaces: excludes
+# soft-deleted rows, at most one row, `NULL` for no match.
+_LANDLORD_LOOKUP_SQL = text("SELECT landlord_id_for_auth_user(:auth_user_id) AS id")
 
 # `set_config(name, value, is_local)` rather than a bare
 # `SET LOCAL app.current_landlord_id = '...'` string: this way the landlord
@@ -181,16 +201,16 @@ async def require_landlord(
     """Resolve the caller's ``landlords`` row and scope ``session`` to it.
 
     Looks up the ``landlords`` row for ``user.user_id`` (excluding
-    soft-deleted rows) on a short-lived ADMIN (RLS-unscoped) session — see
-    the module docstring's "Two-session rationale" for why this lookup
-    structurally cannot run under RLS at all, even correctly, no matter
-    what GUC value it tries — then sets the ``app.current_landlord_id``
-    Postgres session variable that migration 0005's RLS policies key off
-    on the REAL request-path ``session`` (the one this function returns,
-    and the only one any handler ever touches) — every subsequent query on
-    that session is scoped to this landlord automatically, fail-closed if
-    this were somehow skipped (an unset GUC reads back as ``NULL``, which
-    matches zero rows under RLS).
+    soft-deleted rows) via the ``SECURITY DEFINER`` function
+    ``landlord_id_for_auth_user`` (migration 0019, #194), invoked on the
+    SAME request-path ``session`` this function returns (see the module
+    docstring's "Current design (#194)" for why that function structurally
+    can resolve this id even before any GUC is set, no second connection
+    needed), then sets the ``app.current_landlord_id`` Postgres session
+    variable that migration 0005's RLS policies key off on that same
+    ``session`` -- every subsequent query on it is scoped to this landlord
+    automatically, fail-closed if this were somehow skipped (an unset GUC
+    reads back as ``NULL``, which matches zero rows under RLS).
 
     Returns
     -------
@@ -238,20 +258,17 @@ async def require_landlord(
     ``get_session``'s teardown commit (``app/db/session.py``) is the only
     commit that should ever happen for that session.
     """
-    async with asynccontextmanager(get_admin_session)() as admin_session:
-        result = await admin_session.execute(
-            _LANDLORD_LOOKUP_SQL, {"auth_user_id": str(user.user_id)}
-        )
-        row = result.mappings().one_or_none()
+    result = await session.execute(_LANDLORD_LOOKUP_SQL, {"auth_user_id": str(user.user_id)})
+    landlord_id = result.scalar_one_or_none()
 
-    if row is None:
+    if landlord_id is None:
         raise AppError(
             status_code=403,
             code=ACCOUNT_DELETED_CODE,
             message=ACCOUNT_DELETED_MESSAGE,
         )
 
-    landlord = Landlord(id=row["id"])
+    landlord = Landlord(id=landlord_id)
 
     await session.execute(_SET_CURRENT_LANDLORD_SQL, {"landlord_id": str(landlord.id)})
 
