@@ -246,19 +246,29 @@ never a guess.
 Revocation: :func:`revoke_backup_ack_tokens` strips ``ack_token_backup``
 from every in-flight (``status='pending'``, not yet acknowledged)
 ``emergency_call`` notification for a property — called by
-``app/routers/properties.py`` the moment a ``PATCH`` genuinely CLEARS
-``backup_contact`` (a non-null value transitioning to an explicit
-``null`` — the same "clears it" definition api-contracts.md's v1.25
-amendment (#268) already established), in the SAME transaction as the
-property update. The very next time that chain's next step is claimed,
-:data:`_CLAIM_STEP_SQL`'s healing mints a FRESH ``ack_token_backup`` —
-distinct from the revoked one, and not yet disclosed to anyone — so a
-removed backup contact's already-held link stops matching immediately,
-while the landlord's own ``ack_token`` (a different key, never touched by
-this revocation) keeps working exactly as before. Editing
-``backup_contact`` to a DIFFERENT phone number (not a clear) does not
-revoke anything today — flagged, not solved, see that function's own
-docstring.
+``app/routers/properties.py`` whenever a ``PATCH`` changes the CANONICAL
+phone ``backup_contact`` points at: a genuine CLEAR (a non-null value
+transitioning to an explicit ``null`` — the same "clears it" definition
+api-contracts.md's v1.25 amendment (#268) already established) OR an EDIT
+to a DIFFERENT phone number. The edit case matters as much as the clear
+case, not less: a landlord leaving a relationship with their backup
+contact typically REPLACES them (their sister, their super) in one
+request rather than clearing the field and adding someone else later, and
+the consequence of leaving that unrevoked is identical to leaving a clear
+unrevoked. Both run in the SAME transaction as the property update. The
+comparison is CANONICAL phones (``to_e164`` on both the pre- and
+post-update value), never the raw ``phone`` string and never the whole
+``backup_contact`` blob — see ``app/routers/properties.py``'s
+``_backup_contact_canonical_phone`` docstring for why: a name-only edit,
+or the identical number re-saved in a different written form, must be a
+safe no-op, since revoking either would take away a still-current backup
+contact's own working link in the middle of a live emergency. The very
+next time that chain's next step is claimed, :data:`_CLAIM_STEP_SQL`'s
+healing mints a FRESH ``ack_token_backup`` — distinct from the revoked
+one, and not yet disclosed to anyone — so a removed or replaced backup
+contact's already-held link stops matching immediately, while the
+landlord's own ``ack_token`` (a different key, never touched by this
+revocation) keeps working exactly as before.
 
 Existing tokens at deploy time: a chain already mid-flight when this
 ships keeps its pre-existing, pre-split ``ack_token`` — which still
@@ -2120,10 +2130,20 @@ async def revoke_backup_ack_tokens(
     ``emergency_call`` notification for *property_id* — see module
     docstring "Per-recipient ack tokens" / "Revocation".
 
-    Called by ``app/routers/properties.py`` the moment a ``PATCH`` genuinely
-    CLEARS ``backup_contact`` (a non-null value transitioning to an
-    explicit ``null`` — api-contracts.md's v1.25 amendment's "clears it"
-    definition, #268), in the SAME transaction as the property update.
+    Called by ``app/routers/properties.py`` whenever a ``PATCH`` changes the
+    CANONICAL phone ``backup_contact`` points at — a genuine CLEAR (a
+    non-null value transitioning to an explicit ``null`` — api-contracts.md's
+    v1.25 amendment's "clears it" definition, #268) OR an EDIT to a
+    DIFFERENT phone number (the common real-world flow — a landlord
+    replacing one backup contact with another in a single request, never
+    clearing the field first). ``app/routers/properties.py`` decides WHEN
+    to call this (comparing ``to_e164`` output on both the pre- and
+    post-update ``backup_contact``, never the raw phone string or the whole
+    blob, so a name-only edit or the same number re-saved in a different
+    written form is a safe no-op — see its own
+    ``_backup_contact_canonical_phone`` docstring); this function only
+    knows how to revoke, unconditionally, once called. Runs in the SAME
+    transaction as the property update either way.
 
     DELIBERATELY DIVERGES from this module's own "admin engine only"
     convention (module docstring "DB access"): every other function here
@@ -2152,10 +2172,7 @@ async def revoke_backup_ack_tokens(
     chain keeps running exactly as before for the landlord's own side.
 
     Does NOT revoke the landlord's own ``ack_token`` (a different payload
-    key, never touched here) and does NOT revoke anything when
-    ``backup_contact`` is merely EDITED to a different phone number rather
-    than cleared (out of this issue's scope — flagged, not solved; see
-    module docstring "Revocation").
+    key, never touched here).
     """
     await session.execute(
         _REVOKE_BACKUP_ACK_TOKENS_SQL,

@@ -158,7 +158,7 @@ from app.pagination import (
     decode_cursor,
     paginate_rows,
 )
-from app.phone import canonicalize_phone
+from app.phone import canonicalize_phone, to_e164
 from app.validation import reject_explicit_null
 
 log = structlog.get_logger(__name__)
@@ -422,6 +422,38 @@ def _canonicalize_backup_contact(
         )
     canonical = canonicalize_phone(phone, field="backup_contact.phone")
     return {**backup_contact, "phone": canonical}
+
+
+def _backup_contact_canonical_phone(backup_contact: dict[str, Any] | None) -> str | None:
+    """#289: the CANONICAL (``to_e164``) phone inside *backup_contact*, or
+    ``None`` if there isn't a usable one -- used ONLY to decide whether a
+    ``PATCH`` changed WHO the backup contact's phone actually points at
+    (see ``update_property``'s ack-token-revocation call below), never to
+    validate/reject a request body (that is ``_canonicalize_backup_contact``
+    above, already run on ``provided`` before this function ever sees the
+    UPDATED side).
+
+    Runs ``to_e164`` explicitly on BOTH the pre- and post-update value
+    rather than trusting raw string/blob equality. The post-update side is
+    already guaranteed canonical (``_canonicalize_backup_contact`` ran
+    before the write, or the request would have 422'd first) -- calling
+    ``to_e164`` on it again is a harmless no-op (idempotent for any value
+    it already accepted). The PRE-update side is not guaranteed: a row
+    written before phone canonicalization shipped (schema-v1.md's v1.21
+    amendment) could still hold a non-canonical, or genuinely
+    uncanonicalizable, raw value that migration 0017's backfill left
+    untouched (its own "UNCANONICALIZABLE ROWS" carve-out). Comparing
+    canonical forms on both sides -- not the raw ``phone`` string, and
+    never the whole ``backup_contact`` blob -- is what makes "the same
+    number written in a different format" and "a name-only edit" both
+    resolve to "unchanged," so neither one revokes a backup contact's
+    still-valid ack token mid-emergency (#289 acceptance)."""
+    if not backup_contact:
+        return None
+    phone = backup_contact.get("phone")
+    if not isinstance(phone, str) or not phone.strip():
+        return None
+    return to_e164(phone)
 
 
 def _row_to_property(row: RowMapping) -> PropertyResponse:
@@ -792,15 +824,25 @@ async def update_property(
             payload={"resource": "property", "property_id": prop_id, "field": "backup_contact"},
         )
 
-        # #289: a genuine CLEAR (a real backup_contact -> explicit null,
-        # same "clears it" definition as the v1.25 amendment above -- never
-        # an edit to a different phone, which is out of this issue's scope,
-        # see emergency_chain.py's own docstring) invalidates the backup
-        # contact's own ack token on every in-flight emergency chain for
-        # this property, in the SAME transaction as this update -- so a
-        # removed backup contact can never silence a live emergency using a
-        # link they already hold. The landlord's own ack token is untouched.
-        if existing["backup_contact"] is not None and updated["backup_contact"] is None:
+        # #289: revoke the backup contact's own ack token on every in-flight
+        # emergency chain for this property whenever the CANONICAL phone
+        # actually changes -- a clear (a phone -> no phone) OR an edit to a
+        # DIFFERENT phone (a phone -> a different phone), in the SAME
+        # transaction as this update. This is the common real-world flow,
+        # not just the literal "clear" case: a landlord leaving a
+        # relationship with their backup contact typically REPLACES them
+        # (their sister, their super) rather than clearing the field and
+        # adding someone later -- the person removed from that role must
+        # not keep a live link that can permanently silence a real
+        # emergency, whether they were cleared outright or simply swapped
+        # out for someone else. Comparing CANONICAL phones (never the raw
+        # phone string, never the whole blob) is what makes a name-only
+        # edit, or the identical number re-saved in a different written
+        # form, a safe no-op -- see _backup_contact_canonical_phone's own
+        # docstring. The landlord's own ack token is never touched by this.
+        existing_backup_phone = _backup_contact_canonical_phone(existing["backup_contact"])
+        updated_backup_phone = _backup_contact_canonical_phone(updated["backup_contact"])
+        if existing_backup_phone is not None and existing_backup_phone != updated_backup_phone:
             await revoke_backup_ack_tokens(
                 session, landlord_id=landlord.id, property_id=property_id
             )

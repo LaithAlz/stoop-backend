@@ -957,18 +957,32 @@
 >    **Never the recipient's phone number** (never-break rule #5) — a
 >    role is enough for the audit trail to show who silenced an
 >    emergency, without storing who that person is.
-> 3. **Revocation**: `PATCH /v1/properties/{id}` clearing `backup_contact`
->    (a real value → explicit `null` — the same "clears it" definition
->    the v1.25 amendment above already established) now also strips
+> 3. **Revocation**: `PATCH /v1/properties/{id}` now strips
 >    `ack_token_backup` from every in-flight (`status='pending'`, not yet
->    acknowledged) `emergency_call` notification for that property, in
->    the SAME transaction as the property update
+>    acknowledged) `emergency_call` notification for that property,
+>    in the SAME transaction as the property update
 >    (`app/agent/emergency_chain.py::revoke_backup_ack_tokens`, called
->    from `app/routers/properties.py`). The landlord's own `ack_token` is
->    never touched by this. Editing `backup_contact` to a DIFFERENT phone
->    number (not a clear) does not revoke anything today — a known,
->    flagged gap, not solved by this amendment (see api-contracts.md's
->    matching v1.28 amendment).
+>    from `app/routers/properties.py`), whenever the request changes the
+>    CANONICAL (`to_e164`) phone `backup_contact` points at — a clear (a
+>    real value → explicit `null`, the same "clears it" definition the
+>    v1.25 amendment above already established) OR an edit to a
+>    DIFFERENT phone number. The common real-world flow is the edit, not
+>    the clear: a landlord leaving a relationship with their backup
+>    contact typically REPLACES them (their sister, their super) rather
+>    than clearing the field and adding someone else later, and the
+>    consequence of leaving that case unrevoked is identical to the clear
+>    case — the removed person keeps a live link that can permanently
+>    silence a real emergency. **Comparing canonical phones, never the
+>    raw `phone` string and never the whole `backup_contact` blob, is
+>    load-bearing**: a name-only edit, or the identical number re-saved
+>    in a differently-formatted written form, must NOT revoke a still
+>    -current backup contact's own token mid-emergency —
+>    `app/routers/properties.py::_backup_contact_canonical_phone` runs
+>    `to_e164` on both the pre- and post-update value for exactly this
+>    reason (the post-update side is already guaranteed canonical by
+>    `_canonicalize_backup_contact`; the pre-update side is not, for a
+>    row stored before the v1.21 amendment's write-time canonicalization
+>    shipped). The landlord's own `ack_token` is never touched by this.
 > 4. **Existing tokens at deploy time.** A chain already mid-flight when
 >    this ships keeps its pre-existing, pre-split `ack_token` — which
 >    still authenticates BOTH the landlord and anyone who already holds a

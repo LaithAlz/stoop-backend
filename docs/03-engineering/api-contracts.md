@@ -535,25 +535,39 @@ below — the ack token behind `landlord_sms`/`backup_sms` links is now
 amendment; `app/agent/emergency_chain.py`'s own docstring "Per-recipient
 ack tokens".
 
-1. **New side effect on `PATCH /v1/properties/{id}`**: clearing
-   `backup_contact` (the v1.25 amendment above's "clears it" — a real
-   value → explicit `null`) now ALSO invalidates the backup contact's own
-   ack token on every in-flight (not yet acknowledged) emergency chain for
-   that property, in the SAME request/transaction as the clear. Response
-   shape is completely unchanged (`Property`, same fields as always) —
-   this is a side effect on `notifications` rows, invisible to this
-   endpoint's own response body. Practically: a removed backup contact who
-   already holds a `/ack/{token}` link from an earlier text can no longer
-   use it to silence a live emergency — the exact "ex-partner" scenario
-   #268 (v1.25 amendment) could not close on its own, because before this
+1. **New side effect on `PATCH /v1/properties/{id}`**: the request now
+   ALSO invalidates the backup contact's own ack token on every in-flight
+   (not yet acknowledged) emergency chain for that property, in the SAME
+   request/transaction as the update, whenever the CANONICAL phone
+   `backup_contact` points at actually changes — a clear (the v1.25
+   amendment above's "clears it," a real value → explicit `null`) OR an
+   edit to a DIFFERENT phone number. Response shape is completely
+   unchanged (`Property`, same fields as always) — this is a side effect
+   on `notifications` rows, invisible to this endpoint's own response
+   body. Practically: a removed OR replaced backup contact who already
+   holds a `/ack/{token}` link from an earlier text can no longer use it
+   to silence a live emergency — the exact "ex-partner" scenario #268
+   (v1.25 amendment) could not close on its own, because before this
    amendment the SAME token was handed to both the landlord and the
-   backup contact, so revoking one meant revoking both. **Not covered**:
-   editing `backup_contact` to a DIFFERENT phone number (as opposed to
-   clearing it) does not revoke anything — flagged as a known gap, not
-   solved here (scope discipline; see #289's own "sequencing" note — the
-   softer question of what a backup contact should be ABLE to do with
-   their own ack link is a separate, not-yet-decided product question,
-   deliberately out of this amendment).
+   backup contact, so revoking one meant revoking both. **The edit case
+   is the common real-world flow**, not the rarer one: a landlord leaving
+   a relationship with their backup contact typically replaces them
+   (their sister, their super) in one `PATCH` rather than clearing the
+   field and adding someone else later — the consequence of leaving that
+   case unrevoked is identical to leaving the clear case unrevoked, so
+   both are covered the same way. **What does NOT revoke**: a request
+   that resends the SAME canonical phone number, whether byte-identical
+   or simply written in a different format (e.g. `"4165550199"` vs. the
+   already-stored `"+14165550199"`), and a request that changes only
+   `backup_contact.name` while the phone stays the same — revoking either
+   of those would take away a still-current backup contact's own working
+   link in the middle of a live emergency, which is worse than doing
+   nothing. **Still not covered**: the softer question of what a backup
+   contact should be ABLE to do with their own ack link (e.g. a
+   non-silencing "I've got it") is a separate, not-yet-decided product
+   question, deliberately out of this amendment (#289's own "sequencing"
+   note — per-recipient tokens are the foundation that question needs,
+   not the answer to it).
 2. **`GET`/`POST /ack/{token}` now accept EITHER the landlord's or the
    backup contact's own token** for the same notification — both response
    shapes are byte-identical to before (this amendment adds no new field

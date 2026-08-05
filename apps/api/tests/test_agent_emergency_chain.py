@@ -130,6 +130,7 @@ def fake_sender() -> FakeTwilioSender:
 _LANDLORD_PHONE = "+14165550100"
 _PROPERTY_TWILIO_NUMBER = "+14165559999"
 _BACKUP_PHONE = "+14165550199"
+_NEW_BACKUP_PHONE = "+14165550188"  # a DIFFERENT backup contact (#289 edit-in-place case)
 
 
 async def _seed(
@@ -1444,6 +1445,222 @@ async def test_clearing_backup_contact_with_no_in_flight_chain_is_a_safe_no_op(
             (Landlord(id=uuid.UUID(landlord_id)), db_session),
         )
         assert response.backup_contact is None
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_changing_backup_contact_to_a_different_phone_revokes_old_backup_token(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    """#289 follow-up: the common real-world flow is REPLACING a backup
+    contact, not clearing the field. A landlord swapping their ex-partner
+    out for their sister in ONE ``PATCH`` (never clearing `backup_contact`
+    in between) must revoke the old backup contact's own ack token exactly
+    as a clear does -- the removed person otherwise keeps a live link that
+    can permanently silence a real emergency, and this is the flow people
+    actually use, not the edge case."""
+    from app.deps import Landlord
+    from app.routers.properties import PropertyUpdateRequest, update_property
+
+    landlord_id, property_id, tenant_id = await _seed(
+        db_session, backup_contact={"name": "Ex-Partner", "phone": _BACKUP_PHONE}
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    notification_id = await _insert_emergency_call_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        categories=["fire"],
+    )
+
+    try:
+        t0 = datetime.now(UTC)
+        await emergency_chain.handle_emergency_trigger(
+            notification_id=uuid.UUID(notification_id),
+            message_id=uuid.UUID(message_id),
+            property_id=uuid.UUID(property_id),
+            categories=["fire"],
+        )
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=2, seconds=1))
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=5, seconds=1))
+        # T+10m: the OLD backup contact's own ack token is minted and
+        # texted to them here.
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=10, seconds=1))
+
+        notif = await _fetch_notification(db_session, notification_id)
+        landlord_token = notif["payload"]["ack_token"]
+        old_backup_token = notif["payload"]["ack_token_backup"]
+        assert old_backup_token is not None
+
+        # Replace the backup contact in ONE PATCH -- never clearing
+        # backup_contact in between, the flow the coordinator's review
+        # says people actually use.
+        await update_property(
+            uuid.UUID(property_id),
+            PropertyUpdateRequest(backup_contact={"name": "Sister", "phone": _NEW_BACKUP_PHONE}),
+            (Landlord(id=uuid.UUID(landlord_id)), db_session),
+        )
+        await db_session.commit()
+
+        # The OLD backup contact's already-held link must no longer
+        # acknowledge anything.
+        revoked_result = await emergency_chain.acknowledge_by_token(
+            old_backup_token, channel="sms_link"
+        )
+        assert revoked_result is None
+
+        chain_after_revoked_attempt = await _fetch_notification(db_session, notification_id)
+        assert chain_after_revoked_attempt["status"] == "pending"
+        assert chain_after_revoked_attempt["acknowledged_at"] is None
+
+        # The landlord's own token for the SAME notification still works.
+        landlord_result = await emergency_chain.acknowledge_by_token(
+            landlord_token, channel="sms_link"
+        )
+        assert landlord_result is not None
+        acked_notification_id, _acknowledged_at = landlord_result
+        assert str(acked_notification_id) == notification_id
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_editing_backup_contact_name_only_does_not_revoke_token(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    """#289 follow-up: revoking would actively hurt here -- the backup
+    contact is UNCHANGED (same phone), an emergency is live, and the
+    person about to tap their own link must not find it dead. Only the
+    ``name`` key changes (a typo fix); the canonical phone stays the
+    same."""
+    from app.deps import Landlord
+    from app.routers.properties import PropertyUpdateRequest, update_property
+
+    landlord_id, property_id, tenant_id = await _seed(
+        db_session, backup_contact={"name": "Bob", "phone": _BACKUP_PHONE}
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    notification_id = await _insert_emergency_call_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        categories=["fire"],
+    )
+
+    try:
+        t0 = datetime.now(UTC)
+        await emergency_chain.handle_emergency_trigger(
+            notification_id=uuid.UUID(notification_id),
+            message_id=uuid.UUID(message_id),
+            property_id=uuid.UUID(property_id),
+            categories=["fire"],
+        )
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=2, seconds=1))
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=5, seconds=1))
+        # T+10m: the backup contact's own ack token is minted here.
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=10, seconds=1))
+
+        notif_before = await _fetch_notification(db_session, notification_id)
+        backup_token_before = notif_before["payload"]["ack_token_backup"]
+        assert backup_token_before is not None
+
+        # Fix a typo in the name only -- same phone, same person.
+        await update_property(
+            uuid.UUID(property_id),
+            PropertyUpdateRequest(backup_contact={"name": "Bobby", "phone": _BACKUP_PHONE}),
+            (Landlord(id=uuid.UUID(landlord_id)), db_session),
+        )
+        await db_session.commit()
+
+        notif_after = await _fetch_notification(db_session, notification_id)
+        assert notif_after["payload"]["ack_token_backup"] == backup_token_before
+
+        # The still-current backup contact's own link keeps working.
+        result = await emergency_chain.acknowledge_by_token(backup_token_before, channel="sms_link")
+        assert result is not None
+    finally:
+        await _cleanup(db_session, landlord_id)
+
+
+@pytest.mark.integration
+async def test_resaving_the_same_backup_phone_in_a_different_format_does_not_revoke_token(
+    db_session: AsyncSession, fake_sender: FakeTwilioSender
+) -> None:
+    """#289 follow-up: the SAME number, written differently (a bare
+    10-digit NANP form instead of the stored E.164 form), must canonicalize
+    to the same value and therefore never revoke -- comparing raw strings
+    (or the whole blob) instead of ``to_e164`` output would get this
+    wrong."""
+    from app.deps import Landlord
+    from app.routers.properties import PropertyUpdateRequest, update_property
+
+    landlord_id, property_id, tenant_id = await _seed(
+        db_session, backup_contact={"name": "Bob", "phone": _BACKUP_PHONE}
+    )
+    message_id = await factories.insert_message(
+        db_session,
+        landlord_id=landlord_id,
+        property_id=property_id,
+        tenant_id=tenant_id,
+    )
+    notification_id = await _insert_emergency_call_notification(
+        db_session,
+        landlord_id=landlord_id,
+        message_id=message_id,
+        property_id=property_id,
+        categories=["fire"],
+    )
+
+    try:
+        t0 = datetime.now(UTC)
+        await emergency_chain.handle_emergency_trigger(
+            notification_id=uuid.UUID(notification_id),
+            message_id=uuid.UUID(message_id),
+            property_id=uuid.UUID(property_id),
+            categories=["fire"],
+        )
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=2, seconds=1))
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=5, seconds=1))
+        # T+10m: the backup contact's own ack token is minted here.
+        await emergency_chain.run_emergency_chain_sweep(now=t0 + timedelta(minutes=10, seconds=1))
+
+        notif_before = await _fetch_notification(db_session, notification_id)
+        backup_token_before = notif_before["payload"]["ack_token_backup"]
+        assert backup_token_before is not None
+
+        # _BACKUP_PHONE == "+14165550199" -- resubmit the identical number
+        # as a bare 10-digit NANP string instead.
+        response = await update_property(
+            uuid.UUID(property_id),
+            PropertyUpdateRequest(backup_contact={"name": "Bob", "phone": "4165550199"}),
+            (Landlord(id=uuid.UUID(landlord_id)), db_session),
+        )
+        await db_session.commit()
+
+        # The bare 10-digit input DID canonicalize back to the same E.164
+        # value -- proves this is a genuinely unchanged canonical phone,
+        # not a silent write failure.
+        assert response.backup_contact is not None
+        assert response.backup_contact["phone"] == _BACKUP_PHONE
+
+        notif_after = await _fetch_notification(db_session, notification_id)
+        assert notif_after["payload"]["ack_token_backup"] == backup_token_before
+
+        result = await emergency_chain.acknowledge_by_token(backup_token_before, channel="sms_link")
+        assert result is not None
     finally:
         await _cleanup(db_session, landlord_id)
 
