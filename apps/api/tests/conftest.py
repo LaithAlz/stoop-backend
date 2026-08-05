@@ -287,12 +287,12 @@ async def _reset_admin_engine_pool() -> AsyncIterator[None]:
     directly-invoked-handler tests exercise that call far more densely,
     back-to-back, than any previous caller did. (At the time this fixture
     was written, ``require_landlord`` also opened its own, separate admin
-    session on every call — see ``tests/test_require_landlord.py``'s
-    ``_dispose_admin_engine`` below; #194 later replaced that design with a
+    session on every call (see ``tests/test_require_landlord.py``'s
+    ``_dispose_admin_engine`` below); #194 later replaced that design with a
     ``SECURITY DEFINER`` function invoked on the request session itself,
     so ``require_landlord`` no longer touches the admin engine at all, but
-    this fixture's own rationale — protecting every OTHER admin-session
-    caller from the same cross-loop hazard — is unchanged by that.)
+    this fixture's own rationale, protecting every OTHER admin-session
+    caller from the same cross-loop hazard, is unchanged by that.)
 
     Two OTHER, narrower fixtures already patch around this exact class of
     bug locally (``tests/test_me.py``'s ``dispose_app_engine``,

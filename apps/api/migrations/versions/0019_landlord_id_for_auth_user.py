@@ -4,7 +4,7 @@ Revision ID: 0019
 Revises: 0017
 Create Date: 2026-08-05 00:00:00.000000
 
-Canonical schema source: docs/03-engineering/schema-v1.md — the v1.24
+Canonical schema source: docs/03-engineering/schema-v1.md -- the v1.24
 amendment block (2026-08-05). Read that block first.
 
 NUMBERING NOTE (house convention -- see schema-v1.md's v1.16 amendment

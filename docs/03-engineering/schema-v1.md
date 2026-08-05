@@ -875,23 +875,23 @@
 
 <!-- DDL-body annotation for v1.24 lives on `landlords.auth_user_id` below,
      per the house annotate-don't-silently-edit convention. -->
-> **v1.24 amendment (2026-08-05 — #194 implementation)**: migration 0019
+> **v1.24 amendment (2026-08-05, #194 implementation)**: migration 0019
 > adds one new database object, a `SECURITY DEFINER` function,
 > `public.landlord_id_for_auth_user(p_auth_user_id uuid) RETURNS uuid`,
-> invoked on the caller's own REQUEST session — zero extra database
+> invoked on the caller's own REQUEST session, zero extra database
 > connection per authenticated request. It replaces the per-request
 > TWO-SESSION `landlords` identity bootstrap
 > (`app/deps.py::require_landlord`'s former "Two-session rationale",
 > introduced during #54/#55/#57's spec review) that a safety review on
 > that fix flagged as costing a second connection on every authenticated
-> request and coupling two things that should never share resources — see
+> request and coupling two things that should never share resources, see
 > `app/deps.py`'s module docstring for the full cost/history writeup, kept
 > there rather than repeated here. Follows migration 0004's `SECURITY
 > DEFINER` precedent exactly (pinned `search_path`, no dedicated owner
-> role — see 0004's "OWNERSHIP MODEL" for why that's platform-forced on
+> role, see 0004's "OWNERSHIP MODEL" for why that's platform-forced on
 > Supabase).
 > 1. **What it does**: `SELECT id FROM public.landlords WHERE
->    auth_user_id = p_auth_user_id AND deleted_at IS NULL LIMIT 1` — the
+>    auth_user_id = p_auth_user_id AND deleted_at IS NULL LIMIT 1`, the
 >    exact same query the old admin-session lookup ran, unchanged in
 >    filtering semantics (soft-deleted rows still excluded, still
 >    collapsing to the same `account_deleted` 403). Because it is
@@ -900,14 +900,14 @@
 >    `landlords.id` on the caller's OWN, still-GUC-unset, possibly
 >    `app_role`-scoped session: `landlords`' RLS policy is `id`-keyed (v1.2
 >    amendments above), so the row can never be found by a query that
->    needs the GUC set to that same id FIRST — the same chicken-and-egg
+>    needs the GUC set to that same id FIRST. The same chicken-and-egg
 >    problem the two-session design solved with a second connection is now
 >    solved by running the lookup unscoped-by-construction, on the SAME
 >    connection.
 > 2. **Why `SECURITY DEFINER` here stays inside the tenancy boundary**: the
 >    function returns at most one row, keyed on `auth_user_id`, and the
 >    ONLY caller in this codebase (`app/deps.py::require_landlord`) always
->    supplies `user.user_id` — the `sub` claim of a signature-verified
+>    supplies `user.user_id`, the `sub` claim of a signature-verified
 >    Supabase JWT (`app/integrations/supabase_auth.py::verify_jwt`), never
 >    raw request input. The function itself is a pure identity-mapping
 >    utility, not an authorization boundary: authorization ("is this
@@ -916,12 +916,12 @@
 >    arbitrary argument (a different landlord's real `auth_user_id`, a
 >    nonexistent one, `NULL`, or from a session with no
 >    `app.current_landlord_id` set at all) returns that argument's own
->    mapped id or `NULL` uniformly — no error path, no behavioral
+>    mapped id or `NULL` uniformly: no error path, no behavioral
 >    distinction between "no such row" and "row exists but soft-deleted",
 >    and no dependency on that GUC (the function takes its input as an
 >    explicit argument, never reads the GUC).
 > 3. **`EXECUTE` grant**: `PUBLIC` revoked (defense-in-depth, matching
->    migration 0004), `app_role` granted explicitly — required so the
+>    migration 0004), `app_role` granted explicitly, required so the
 >    REQUEST session (once `APP_DATABASE_URL` points at `app_role`, per
 >    the v1.2 amendments' production flip) can call it; the function
 >    owner (the migrating/admin role) always retains implicit `EXECUTE`
@@ -929,17 +929,17 @@
 > 4. **Deliberately NOT exception-wrapped**, unlike migration 0004's
 >    trigger functions: those must never block `auth.users` writes, so
 >    they swallow errors by design. This function backs an ordinary
->    authenticated API request instead — a real failure here (e.g. a
+>    authenticated API request instead, a real failure here (e.g. a
 >    connectivity blip) must surface as a request error, exactly like the
 >    admin-session lookup it replaces would have, not be silently
 >    swallowed into a false `account_deleted` 403.
 > 5. `app/db/session.py`'s `get_admin_session` allowlist (migration 0005's
->    #22 safety review item 12) drops `app/deps.py` accordingly —
+>    #22 safety review item 12) drops `app/deps.py` accordingly:
 >    `require_landlord` no longer opens a second connection at all.
 >    `tests/test_migrations_0005.py::
 >    test_get_admin_session_referenced_only_by_allowlisted_files` enforces
 >    it.
-> 6. No column change, no RLS policy change on any existing table — this
+> 6. No column change, no RLS policy change on any existing table, this
 >    amendment adds exactly one new database object.
 
 <!-- DDL-body annotation for v1.23 lives on `properties.backup_contact`

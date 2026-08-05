@@ -1,10 +1,10 @@
 """Integration tests for the ``require_landlord`` dependency (#22, fixed per
-the #54/#55/#57 spec review; the fix's design has since changed under #194 —
+the #54/#55/#57 spec review; the fix's design has since changed under #194,
 see ``app/deps.py``'s module docstring "Identity-lookup design history" for
 both the original two-session fix and the current ``SECURITY DEFINER``
 design that replaced it. The regression pin below (test 5) is unchanged by
-that: it proves the SAME contract — a correct lookup under real ``app_role``
-enforcement, before any GUC is set — regardless of which design satisfies it).
+that: it proves the SAME contract, a correct lookup under real ``app_role``
+enforcement, before any GUC is set, regardless of which design satisfies it).
 
 Marker: ``integration`` — requires a running Postgres instance.
 Use ``docker compose up -d`` at the repo root before running locally.
@@ -33,20 +33,20 @@ Covers:
    redesign must also satisfy**: ``require_landlord`` resolves the landlord
    and sets the GUC correctly even when the CALLER's session is genuinely
    subject to RLS (``SET LOCAL ROLE app_role``, the same technique
-   ``tests/test_rls_isolation.py`` uses — see that module's docstring for
+   ``tests/test_rls_isolation.py`` uses, see that module's docstring for
    why a superuser can ``SET ROLE`` without prior membership). Before the
    original #22 fix, this exact scenario 403'd ``account_deleted`` for a
    real, live, committed landlord row, every time, because the
    ``landlords`` lookup ran on the SAME app_role-scoped transaction the GUC
-   hadn't been set on yet — ``landlords``' RLS policy is ``id =
+   hadn't been set on yet: ``landlords``' RLS policy is ``id =
    current_setting('app.current_landlord_id', true)::uuid``, and an unset
    GUC reads back as SQL ``NULL``, matching zero rows. Manually verified
-   red under the pre-fix code (via ``git stash``) and green under the fix
-   — see that PR's report for the transcript. Still green, unmodified,
+   red under the pre-fix code (via ``git stash``) and green under the fix,
+   see that PR's report for the transcript. Still green, unmodified,
    under #194's later ``SECURITY DEFINER`` redesign (proven by this same
    test, run as part of that PR).
 
-Cross-loop pool hazard note (historical — kept for #194 readers): before
+Cross-loop pool hazard note (historical, kept for #194 readers): before
 #194, tests below that use ``require_landlord`` ALSO touched the
 module-level ADMIN engine (``app.db.session.engine``) IN ADDITION to each
 test's own ``db_engine`` fixture, because ``require_landlord`` itself opened
@@ -175,7 +175,7 @@ async def _insert_landlord_committed(
     helper always writes on its OWN, separate connection/engine from the
     caller's own ``session``/``app_role_session`` fixture that
     ``require_landlord`` actually reads on (the ``db_engine`` used here is
-    never the same connection as the one under test) — an uncommitted write
+    never the same connection as the one under test); an uncommitted write
     on one connection is invisible to any other connection, by ordinary
     transaction-isolation semantics, so the row must be durably committed
     for that lookup to ever see it (exactly
@@ -308,18 +308,18 @@ async def test_session_without_require_landlord_has_guc_unset(session: AsyncSess
 async def test_require_landlord_resolves_under_real_rls_enforcement(
     db_engine: AsyncEngine,
 ) -> None:
-    """The authoritative proof for the #22 fix (app/deps.py) — still green,
+    """The authoritative proof for the #22 fix (app/deps.py), still green,
     unmodified, under #194's later ``SECURITY DEFINER`` redesign.
 
     Seeds a committed landlord row on an ordinary (superuser) connection,
     then calls ``require_landlord`` with a caller ``session`` that is
     GENUINELY ``app_role``-scoped (``SET LOCAL ROLE app_role`` on its own
     connection/transaction, with the GUC deliberately still UNSET at call
-    time — exactly the state a fresh request-path session is in). Before
+    time, exactly the state a fresh request-path session is in). Before
     the original #22 fix, ``require_landlord``'s ``landlords`` lookup ran
     on this SAME app_role-scoped, GUC-unset transaction and was rejected by
     RLS (zero rows, since ``id = current_setting(..., true)::uuid`` can
-    never match while the GUC is NULL) — this test would have 403'd
+    never match while the GUC is NULL); this test would have 403'd
     account_deleted for a real landlord, exactly the production bug found
     in spec review. Under #194's current design, the lookup runs via the
     ``SECURITY DEFINER`` function ``landlord_id_for_auth_user`` on THIS
@@ -331,7 +331,7 @@ async def test_require_landlord_resolves_under_real_rls_enforcement(
 
     Manually confirmed red against the original pre-#22-fix single-session
     code (via a local ``git stash`` of the ``app/deps.py`` fix) and green
-    against that fix — see that PR's report for the transcript; this test
+    against that fix, see that PR's report for the transcript; this test
     is what stays in the suite permanently, and #194's PR confirms it is
     still green under the redesign.
     """

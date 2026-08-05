@@ -506,7 +506,7 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
         # of `landlords` by `auth_user_id`), but that two-session design was
         # replaced by a `SECURITY DEFINER` function,
         # `landlord_id_for_auth_user` (migration 0019), invoked on the
-        # caller's OWN request session — `require_landlord` no longer opens
+        # caller's OWN request session -- `require_landlord` no longer opens
         # a second connection at all. See `app/deps.py`'s module docstring,
         # "Identity-lookup design history", for the full writeup.
         # #40: Twilio inbound webhooks (POST /webhooks/twilio/sms,
