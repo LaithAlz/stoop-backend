@@ -43,9 +43,16 @@ interface DecisionCardProps {
   status?: DecisionCardStatus;
   secondsLeft?: number;
   totalSeconds?: number;
-  /** The `draft_stale` one-line notice (src/features/queue/
-   *  queueEntries.ts's `draftStaleNotice`) — shown for a few seconds after
-   *  a concurrent tenant reply invalidates this card's draft mid-action. */
+  /** The card's one-line notice slot, the caller (src/routes/
+   *  app.index.tsx's `QueueRow`) merges three sources into this ONE
+   *  string in priority order: the `draft_stale` notice
+   *  (src/features/queue/queueEntries.ts's `draftStaleNotice`, shown for
+   *  a few seconds after a concurrent tenant reply invalidates this
+   *  card's draft mid-action), else `UNVERIFIED_SEND_NOTICE` while
+   *  `sendUnverified` is true, else the give-up ceiling's sticky notice
+   *  once it isn't. Rendered below the draft bubble while `!isEditing`,
+   *  AND (round 4, BLOCKER 2) threaded straight into `EditDraftPanel`'s
+   *  own `notice` prop while editing, see that branch below. */
   staleNotice?: string;
   /** True while the edit-and-send mutation for THIS card is in flight. */
   editSubmitting?: boolean;
@@ -55,9 +62,22 @@ interface DecisionCardProps {
    *  own comment on `sendDisabled`. */
   sendUnverified?: boolean;
   /** A2 (safety review, #234 PR 2): true while ANY mutation for this
-   *  card's draft is in flight — disables the Edit/Skip/Approve row and
-   *  the Undo tap so two actions can't race on the same draft. */
+   *  card's draft is in flight, OR'd with `sendUnverified` by the caller.
+   *  Disables the Edit/Approve pair so neither can race a mutation or
+   *  silently resend a draft whose last edit-and-send is still
+   *  unconfirmed. Skip and Undo do NOT use this, see `mutationBusy`
+   *  below (BLOCKER 2, safety review #291/#279). */
   actionsBusy?: boolean;
+  /** BLOCKER 2 / item 7 (safety review, #291/#279): true while a mutation
+   *  for THIS draft is in flight, `isBusy(draftId)` alone, deliberately
+   *  NEVER OR'd with `sendUnverified`. Gates Skip (it provably sends
+   *  nothing to the tenant, so it must stay reachable even while an
+   *  unrelated edit-and-send is unconfirmed: the escape hatch a locked
+   *  card would otherwise have none of) and Undo (the ambiguity an
+   *  unconfirmed edit-and-send raises is never about THIS undo call; an
+   *  Undo tap already can't reach a draft that's mid-edit-and-send, since
+   *  those two states are mutually exclusive on one draft id). */
+  mutationBusy?: boolean;
   onApprove?: () => void;
   onEdit?: () => void;
   onSkip?: () => void;
@@ -95,6 +115,7 @@ export function DecisionCard({
   editSubmitting = false,
   sendUnverified = false,
   actionsBusy = false,
+  mutationBusy = actionsBusy,
   onApprove,
   onEdit,
   onSkip,
@@ -215,6 +236,14 @@ export function DecisionCard({
           initialBody={draftMessage}
           submitting={editSubmitting}
           sendDisabled={sendUnverified}
+          // BLOCKER 2 (safety review round 4, #291/#279): the same
+          // `staleNotice` this card would otherwise show below the draft
+          // bubble (the block right under this ternary, gated on
+          // `!isEditing`), passed straight through so the give-up
+          // ceiling's sticky notice keeps showing once the landlord opens
+          // Edit, instead of disappearing at exactly the moment they can
+          // act on it.
+          notice={staleNotice}
           onCancel={() => onCancelEdit?.()}
           onSend={(body) => onSubmitEdit?.(body)}
         />
@@ -237,7 +266,7 @@ export function DecisionCard({
           secondsLeft={secondsLeft}
           totalSeconds={totalSeconds}
           onUndo={onUndo}
-          undoDisabled={actionsBusy}
+          undoDisabled={mutationBusy}
           undoButtonRef={undoButtonRef}
         />
       )}
@@ -256,6 +285,7 @@ export function DecisionCard({
             onSkip={onSkip}
             onApprove={onApprove}
             disabled={actionsBusy}
+            skipDisabled={mutationBusy}
             editButtonRef={editButtonRef}
           />
         </>

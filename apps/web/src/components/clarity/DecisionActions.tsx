@@ -6,10 +6,27 @@ interface DecisionActionsProps {
   onSkip?: () => void;
   onApprove?: () => void;
   /** A2 (safety review, #234 PR 2): true while a mutation for THIS card's
-   *  draft is in flight — disables all three controls at once so an
-   *  approve tap can't race a skip tap on the same card. Scoped per draft
-   *  by the caller (useDraftActions' `isBusy`), never a global flag. */
+   *  draft is in flight, disabling Edit and Approve so an approve tap
+   *  can't race an edit-and-send on the same card. Scoped per draft by
+   *  the caller (useDraftActions' `isBusy`), never a global flag.
+   *
+   *  BLOCKER 2 (safety review, #291/#279): the caller may also fold in
+   *  `isSendUnverified` here (an ambiguous edit-and-send this draft is
+   *  still waiting to hear back about), correct for Edit and Approve,
+   *  both of which would otherwise risk silently resending a draft whose
+   *  true state is unknown. Skip has its own `skipDisabled` below
+   *  specifically so it is NEVER gated by that flag. */
   disabled?: boolean;
+  /** BLOCKER 2 (safety review, #291/#279): Skip's own disabled state,
+   *  separate from `disabled` above. Skip provably sends nothing to the
+   *  tenant, so it must stay reachable even while `isSendUnverified` has
+   *  Edit and Approve locked (otherwise a landlord whose queue endpoint
+   *  is also down, BLOCKER 2's own failure mode, has no in-app escape
+   *  from this card at all until the flag eventually clears on its own).
+   *  Defaults to `disabled` when the caller doesn't pass one explicitly,
+   *  which is only correct as long as every real caller DOES pass one:
+   *  both do (DecisionCard.tsx, app.conversations.$id.tsx's DraftFooter). */
+  skipDisabled?: boolean;
   /** #191 item 1: lets the owner (DecisionCard / the conversation thread's
    *  DraftFooter) hold a live reference to THIS Edit button so it can
    *  return keyboard focus here once the editor it opens is closed. The
@@ -31,6 +48,7 @@ export function DecisionActions({
   onSkip,
   onApprove,
   disabled = false,
+  skipDisabled = disabled,
   editButtonRef,
   className,
 }: DecisionActionsProps) {
@@ -49,7 +67,7 @@ export function DecisionActions({
       <button
         type="button"
         onClick={onSkip}
-        disabled={disabled}
+        disabled={skipDisabled}
         className="inline-flex min-h-12 items-center gap-1.5 rounded-clarity-md border-[1.5px] border-clarity-line-strong bg-clarity-panel px-4 font-clarity-sans text-[15px] font-extrabold text-clarity-ink-dim transition-transform duration-150 ease-clarity hover:-translate-y-px disabled:translate-y-0 disabled:opacity-60 motion-reduce:transition-none motion-reduce:hover:translate-y-0"
       >
         <SkipForward className="size-4" aria-hidden="true" />

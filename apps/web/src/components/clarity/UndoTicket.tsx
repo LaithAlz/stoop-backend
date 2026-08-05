@@ -67,12 +67,31 @@ export function UndoTicket({
   // without touching focusability; this ref is what actually stops a
   // second DELETE. It's read synchronously inside the click handler, so
   // it also covers a same-tick double-activation the next `undoDisabled`
-  // prop update hasn't reached yet. Every path the undo mutation can
-  // resolve through (success, generic failure, `already_sent`) removes
-  // this "sending" entry (queueEntries.ts's reducer), which always
-  // unmounts THIS component, so there's no later legitimate tap on the
-  // same instance that would need `firedRef` reset.
+  // prop update hasn't reached yet.
+  //
+  // BLOCKER 1 correction (safety review, #291/#279): the comment that
+  // used to live here claimed every path the undo mutation can resolve
+  // through unmounts this component, so `firedRef` never needed a reset.
+  // That's no longer true: an AMBIGUOUS undo failure (a dropped
+  // connection, a 5xx) now deliberately leaves the "sending" entry alone
+  // (useDraftActions.ts's `undoMutation.onError`) instead of clearing it,
+  // so THIS SAME instance stays mounted with `firedRef.current` still
+  // `true`, which would permanently block every future tap, the
+  // landlord's one recovery path after a failed undo tap, gone silently.
+  // The effect below resets it the moment `undoDisabled` goes back to
+  // `false` after having been `true`: on this row, that transition only
+  // ever means "the undo mutation for THIS draft just settled" (nothing
+  // else can flip `isBusy` for a draft that's still "sending", since
+  // every other action is hidden while the undo ticket is showing), so
+  // it can't misfire on some unrelated busy toggle.
   const firedRef = useRef(false);
+  const wasUndoDisabledRef = useRef(undoDisabled);
+  useEffect(() => {
+    if (wasUndoDisabledRef.current && !undoDisabled) {
+      firedRef.current = false;
+    }
+    wasUndoDisabledRef.current = undoDisabled;
+  }, [undoDisabled]);
   const handleUndo = () => {
     if (undoDisabled || firedRef.current) return;
     firedRef.current = true;

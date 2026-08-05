@@ -18,6 +18,10 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { approveDraft, editAndSendDraft, rejectDraft, undoDraftApprove } from "@/api/drafts";
 import { ApiError, toHouseApiError } from "@/api/errors";
+import {
+  UNVERIFIED_GIVE_UP_CARD_NOTICE,
+  UNVERIFIED_GIVE_UP_NOTICE,
+} from "@/components/clarity/EditDraftPanel";
 import { firstName } from "@/lib/tenantName";
 import {
   computeUndoExpiresAt,
@@ -25,11 +29,30 @@ import {
   queueEntriesReducer,
   secondsRemaining,
 } from "./queueEntries";
+import {
+  clearGiveUpNotice,
+  clearUnverifiedSend,
+  markUnverifiedSend,
+  setGiveUpNotice,
+  useGiveUpNotices,
+  useUnverifiedSendIds,
+} from "./unverifiedSendStore";
 
 export interface DraftContext {
   draftId: string;
   caseId: string;
   tenantName: string;
+}
+
+/** F2 (safety review round 6): Undo carries the `approvedAtClient` of the
+ *  approve cycle it was fired from, so an ambiguous failure can only ever
+ *  stamp the entry it actually belongs to. Without it, a cycle-1 DELETE
+ *  still hung when cycle 2 begins stamps cycle 2's entry with cycle 1's
+ *  failure. `apiRequest` passes no AbortSignal for undo, so that hung
+ *  fetch is genuinely unbounded and the class is worth closing outright
+ *  rather than relying on a refetch winning the race. */
+interface UndoContext extends DraftContext {
+  approvedAtClient: number;
 }
 
 interface UseDraftActionsOptions {
@@ -45,9 +68,38 @@ interface UseDraftActionsOptions {
   onSettled: () => void;
 }
 
+/** F1 (safety review round 6): shown when an Undo request fails in a way
+ *  that leaves the outcome genuinely unknown (a dropped connection or a
+ *  5xx, as opposed to `already_sent` or `draft_not_undoable`, which are
+ *  the server answering). It must not claim the reply was stopped and it
+ *  must not claim it went out, because neither is known. It also must not
+ *  say "try again": by the time this surfaces the countdown has usually
+ *  expired and the Undo control is gone. Pointing at the conversation is
+ *  the only advice that is true and actionable in every case. */
+export const UNDO_AMBIGUOUS_NOTICE =
+  "I couldn't tell whether your undo went through. Open the conversation to see whether the reply went out.";
+
 export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions) {
   const [entries, dispatch] = useReducer(queueEntriesReducer, {});
   const [staleNotices, setStaleNotices] = useState<Record<string, string>>({});
+  // BLOCKER 2 (safety review round 3, #291/#279): the give-up ceiling's
+  // own sticky notice, keyed by draft id, parallel to `staleNotices` above
+  // but deliberately with NO auto-dismiss timer. See
+  // `UNVERIFIED_GIVE_UP_CARD_NOTICE`'s own comment for why. Cleared by
+  // `markBusy` below the moment the landlord takes a fresh action on THIS
+  // draft (Approve, Skip, or a new edit-and-send attempt) rather than on
+  // any clock, since there is no honest wall-clock answer to "how long
+  // should a warning about an unconfirmed send stay up", only "until the
+  // landlord has acted on it knowing it was there."
+  //
+  // FIX 3 (safety review round 4, #291/#279): sourced from
+  // unverifiedSendStore.ts's own module-scope map now, not a local
+  // `useState`, for the identical reason #279 already hoisted
+  // `unverifiedSendIds` out of local state, this hook is instantiated
+  // PER ROUTE, and the give-up toast's own advice ("Open the conversation
+  // to check") sends the landlord to the OTHER route, which used to mount
+  // a fresh hook instance with no memory of the notice at all.
+  const giveUpNotices = useGiveUpNotices();
   const [editingContext, setEditingContext] = useState<(DraftContext & { body: string }) | null>(
     null,
   );
@@ -86,25 +138,28 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   // "still pending", re-enabled Send about one frame later, and the whole
   // guard was inert. A resolution is only trustworthy against a read that
   // completed AFTER the failure, which is what the generation comparison
-  // in src/routes/app.index.tsx enforces.
-  const [unverifiedSendIds, setUnverifiedSendIds] = useState<ReadonlyMap<string, number>>(
-    () => new Map(),
-  );
+  // in src/features/queue/useResolveUnverifiedSends.ts (shared by every
+  // caller as of #279) enforces.
+  //
+  // #279: this used to be a local `useState`, invisible to any OTHER
+  // `useDraftActions` instance (this hook is instantiated PER ROUTE:
+  // Home, the conversation thread), so a flag raised on one route was
+  // simply gone the moment that route's instance unmounted. Sourced from
+  // `unverifiedSendStore.ts` now, a module-scope store every instance
+  // reads and writes through, so a flag raised on either surface is
+  // visible, and resolvable, on both.
+  const unverifiedSendIds = useUnverifiedSendIds();
 
   const resolveUnverifiedSend = useCallback(
     (draftId: string, stillPending: boolean) => {
-      // F12 (safety re-verify round 2): read membership BEFORE the update.
-      // The early-out below lives inside the state updater, so it stops the
-      // map write but not the notice — today's only caller iterates the map
-      // so it can't misfire, but this is exported API and the planned
-      // thread wiring would call it per-draft-per-read, double-toasting.
-      const wasFlagged = unverifiedSendIds.has(draftId);
-      setUnverifiedSendIds((prev) => {
-        if (!prev.has(draftId)) return prev;
-        const next = new Map(prev);
-        next.delete(draftId);
-        return next;
-      });
+      // F12 (safety re-verify round 2): `clearUnverifiedSend` reports
+      // whether `draftId` WAS flagged, atomically with the removal.
+      // Today's callers (one shared resolution effect per mounted route,
+      // as of #279) each iterate their own snapshot of the map, so two
+      // mounted routes could in principle both observe the same flagged
+      // id and both call this; the atomic check-and-clear is what keeps
+      // only the first from firing the notice below.
+      const wasFlagged = clearUnverifiedSend(draftId);
       if (!wasFlagged) return;
       // Draft still pending → the ambiguous edit-and-send never applied;
       // clearing the flag above already re-enables Send, nothing else to
@@ -131,7 +186,52 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       // invoked more than once, which would have double-toasted.
       setEditingContext((current) => (current?.draftId === draftId ? null : current));
     },
-    [onNotice, unverifiedSendIds],
+    // #279: `unverifiedSendIds` is no longer read inside this callback's
+    // body (`clearUnverifiedSend` reads the shared store directly), so
+    // it's correctly gone from these deps rather than kept for a
+    // resemblance to the old shape.
+    [onNotice],
+  );
+
+  // BLOCKER 2 (safety review, #291/#279): the wall-clock ceiling's
+  // resolution, a THIRD outcome, distinct from both branches
+  // `resolveUnverifiedSend` above handles. Not "a fresh read confirms
+  // still pending" and not "a fresh read confirms gone": no qualifying
+  // read ever arrived at all (see useResolveUnverifiedSends.ts's
+  // `UNVERIFIED_CEILING_MS`). Unlike `resolveUnverifiedSend`'s silent
+  // "still pending" branch, this ALWAYS notices: a guard that gives up
+  // without saying so would just look like it healed itself, when what
+  // actually happened is Stoop couldn't tell either way.
+  const giveUpUnverifiedSend = useCallback(
+    (draftId: string) => {
+      const wasFlagged = clearUnverifiedSend(draftId);
+      if (!wasFlagged) return;
+      onNotice(UNVERIFIED_GIVE_UP_NOTICE);
+      // BLOCKER 2 (safety review round 3, #291/#279): the toast above is
+      // gone in a few seconds and was, before this fix, the ONLY trace
+      // this ever happened. A landlord who steps away and comes back
+      // past the two minute mark returned to a card that looked
+      // untouched, with Approve live and the pre-edit body, which is
+      // verbatim the F7 hazard this whole guard exists to prevent,
+      // reintroduced on a timer. This sticky per-draft notice is what the
+      // card renders instead once `isSendUnverified` (the flag just
+      // cleared above) stops being true. FIX 3: written to the shared
+      // module store now, not local state, see `giveUpNotices`'s own
+      // comment above.
+      setGiveUpNotice(draftId, UNVERIFIED_GIVE_UP_CARD_NOTICE);
+      // BLOCKER 2: deliberately does NOT touch `editingContext`, unlike
+      // the version of this function that used to run here. The give-up
+      // ceiling firing is a clock, not a landlord action. A landlord who
+      // left the editor open with two minutes of typed reply still
+      // hasn't decided anything, and A7's rule ("Leave it open with the
+      // text intact") applies to this closure exactly as much as it does
+      // to any other failure that isn't `draft_not_found` (the editMutation
+      // onError's NEW-4, the one case closing it is actually correct).
+      // `sendDisabled` on the still-open editor simply goes false: Send
+      // becomes reachable again with whatever the landlord already typed
+      // still there.
+    },
+    [onNotice],
   );
 
   const markBusy = useCallback((draftId: string) => {
@@ -141,6 +241,11 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       next.add(draftId);
       return next;
     });
+    // BLOCKER 2: the landlord acting on this draft again (Approve, Skip,
+    // or a new edit-and-send) is what retires the sticky give-up notice.
+    // See that state's own comment above for why this, not a timer. FIX
+    // 3: clears the shared module store now, not local state.
+    clearGiveUpNotice(draftId);
   }, []);
 
   const clearBusy = useCallback((draftId: string) => {
@@ -247,7 +352,7 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   });
 
   const undoMutation = useMutation({
-    mutationFn: (ctx: DraftContext) => undoDraftApprove(ctx.draftId),
+    mutationFn: (ctx: UndoContext) => undoDraftApprove(ctx.draftId),
     // #256 comment item 2 (safety re-verify): this used to only clear the
     // local overlay — fine for Home, which self-heals on the queue's own
     // 20s poll (src/api/queue.ts), but the conversation thread's
@@ -289,7 +394,74 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
         onSettled();
         return;
       }
-      handleError(error, ctx);
+      // BLOCKER 1 (safety review, #291/#279): `draft_not_undoable` is,
+      // like `already_sent`, a DEFINITIVE server signal: there is no
+      // live send left for this draft to protect, so falling through to
+      // `handleError`'s `cleared` dispatch (drop the local overlay
+      // entirely) is correct here, same as it was before this fix.
+      if (error instanceof ApiError && error.code === "draft_not_undoable") {
+        handleError(error, ctx);
+        return;
+      }
+      // Everything else (a dropped connection, a 5xx, a timeout, any
+      // other code) is AMBIGUOUS: the DELETE may have applied server-side
+      // and only the response was lost, so the reply may genuinely still
+      // be on its way. `handleError` used to run for these too, and its
+      // unconditional `dispatch({type: "cleared"})` deletes this draft's
+      // local "sending" entry outright. `buildQueueView`
+      // (queueEntries.ts) only ever pins a snapshot for a NON-idle entry
+      // ("sending"/"sent"/"skipped"), so the instant the entry is
+      // cleared, the pinned card, and the Undo control the landlord just
+      // tapped and is still looking at, vanishes if a concurrent refetch
+      // has already dropped the server row from `items` (#291's whole
+      // reason for pinning in the first place), while the reply is, as
+      // far as this client honestly knows, still sending. Toast so the
+      // landlord knows the tap itself didn't confirm, refetch so the next
+      // server read (not a client guess) settles it, but leave the entry
+      // exactly where it was: "sending" is the one state that's still
+      // true here.
+      //
+      // BLOCKER 1 (safety review ROUND 4, #291/#279): this is the ONE
+      // place `undoAmbiguousAt` gets DISPATCHED. Whether it is STAMPED is
+      // decided in the reducer, from the entry's status, and round 5
+      // found that distinction load-bearing: round 4 accepted the
+      // dispatch only while "sending", which dropped it for every
+      // ambiguous failure slower than the 5 second countdown, i.e. nearly
+      // all of them. See queueEntries.ts's
+      // `undoAmbiguous` action), the positive evidence the two retirement
+      // effects (src/routes/app.index.tsx, app.conversations.$id.tsx) gate
+      // on instead of the false guarantee round 3's `dataUpdatedAt >
+      // approvedAtClient` check assumed it had. See those effects' own
+      // comments for the full reasoning; the short version is that
+      // `dataUpdatedAt` is stamped when a response RESOLVES on the client,
+      // not when the server computed it, so a read issued before ANY
+      // approve and resolving after it could trip that comparison on a
+      // draft nothing was ever attempted against. `undoAmbiguousAt` is
+      // only ever set here, from a genuine ambiguous Undo failure, so no
+      // stale read can trip it on a plain Approve.
+      dispatch({
+        type: "undoAmbiguous",
+        draftId: ctx.draftId,
+        at: Date.now(),
+        approvedAtClient: ctx.approvedAtClient,
+      });
+      // F1 (safety review round 6): this used to be
+      // `error instanceof ApiError ? toHouseApiError(error) : <honest line>`,
+      // and the honest line was DEAD CODE. `apiRequest` wraps a dropped
+      // connection into `new ApiError(0, { code: "network_error" })`, so
+      // the instanceof is always true here and the landlord got
+      // "Couldn't reach Stoop. Check your connection and try again.", or
+      // for a 5xx the generic "Something didn't go through. Try again in
+      // a moment." Both assert that NOTHING happened, in the one case
+      // where Stoop provably cannot know, and both point at "try again"
+      // on an Undo button that is gone by then.
+      //
+      // One unconditional, ambiguity-honest line instead, the same shape
+      // the edit-and-send ambiguous branch below already uses (and for
+      // the same reason it deliberately does not route through
+      // `toHouseApiError` either).
+      onNotice(UNDO_AMBIGUOUS_NOTICE);
+      onSettled();
     },
     onSettled: (_data, _error, ctx) => clearBusy(ctx.draftId),
   });
@@ -390,8 +562,11 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
         // TanStack's `dataUpdatedAt` (same clock, same units) — the screen
         // refuses to resolve against any read that didn't complete AFTER
         // this moment. No plumbing needed for the query's generation.
+        // #279: written to the shared module-scope store (not local
+        // state) so this flag is visible to whichever route, this one or
+        // the other, ends up resolving it.
         const failedAt = Date.now();
-        setUnverifiedSendIds((prev) => new Map(prev).set(ctx.draftId, failedAt));
+        markUnverifiedSend(ctx.draftId, failedAt);
         onNotice("That may have gone through. Give it a moment to update before sending again.");
         onSettled();
         return;
@@ -432,6 +607,20 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
     entries,
     dispatch,
     staleNotices,
+    /** BLOCKER 2: the give-up ceiling's own sticky per-draft notice
+     *  (`draftId -> message`). See this hook's own `giveUpNotices`
+     *  comment above for where the map itself lives now (FIX 3, round 4).
+     *
+     *  Round 4 correction: this is NOT simply "wherever
+     *  `UNVERIFIED_SEND_NOTICE` was showing" as a prior revision of this
+     *  comment claimed, `isSendUnverified` for the same draft id is
+     *  false again by the time this has anything in it, but that only
+     *  covers the CARD'S own notice line. The editor
+     *  (EditDraftPanel.tsx's `notice` prop) is a SEPARATE render target
+     *  that needs this passed in explicitly too; both call sites
+     *  (src/routes/app.index.tsx's DecisionCard, app.conversations.$id
+     *  .tsx's own editing branch) now do. */
+    giveUpNotices,
     editingContext,
     /** A2: true while an approve/undo/skip/edit-and-send is in flight for
      *  THIS draft id specifically — never a global "something is
@@ -446,13 +635,24 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
      *  below (see src/routes/app.index.tsx). */
     unverifiedSendIds,
     resolveUnverifiedSend,
+    /** BLOCKER 2: the wall-clock ceiling's own release, see this
+     *  callback's own comment above and useResolveUnverifiedSends.ts's
+     *  `UNVERIFIED_CEILING_MS`. */
+    giveUpUnverifiedSend,
     approve: (ctx: DraftContext) => {
       markBusy(ctx.draftId);
       approveMutation.mutate(ctx);
     },
     undo: (ctx: DraftContext) => {
+      // Read the cycle stamp off the live entry (see `UndoContext`). Undo
+      // is only ever offered from a `sending` entry, so this is present
+      // whenever this is reachable; the fallback keeps the reducer's own
+      // equality check honest rather than stamping a cycle that is not
+      // this one.
+      const entry = entries[ctx.draftId];
+      const approvedAtClient = entry?.status === "sending" ? entry.approvedAtClient : Number.NaN;
       markBusy(ctx.draftId);
-      undoMutation.mutate(ctx);
+      undoMutation.mutate({ ...ctx, approvedAtClient });
     },
     skip: (ctx: DraftContext) => {
       markBusy(ctx.draftId);

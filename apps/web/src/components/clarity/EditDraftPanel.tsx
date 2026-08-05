@@ -9,6 +9,51 @@ import { cn } from "@/lib/utils";
 export const UNVERIFIED_SEND_NOTICE =
   "Checking whether your last reply went out. You'll be able to send again in a moment.";
 
+/** BLOCKER 2's wall-clock ceiling (safety review, #291/#279,
+ *  useResolveUnverifiedSends.ts's `UNVERIFIED_CEILING_MS`): the one-time
+ *  toast when `UNVERIFIED_SEND_NOTICE` above has been showing for two
+ *  minutes with no server read ever confirming which way it went, and
+ *  the guard releases anyway rather than holding the landlord silent
+ *  forever. States plainly what did and didn't happen: the check never
+ *  came back either way (not "it failed", which would overclaim a
+ *  negative result this client doesn't have), and what to do about it:
+ *  the conversation, not this toast, is the source of truth for what
+ *  actually sent. */
+export const UNVERIFIED_GIVE_UP_NOTICE =
+  "Couldn't confirm whether your last edit sent. Open the conversation to check, then try again if it didn't.";
+
+/** BLOCKER 2 (safety review round 3, #291/#279): a STICKY card-level twin
+ *  of the toast above, with no auto-dismiss timer. The toast is gone in a
+ *  few seconds; a landlord whose phone was in their pocket at the two
+ *  minute mark comes back to a card with no memory of any of this. Says
+ *  what's true (Stoop never got a confirmed answer) and what to do about
+ *  it (check the conversation FIRST) without inviting a blind retry:
+ *  "try again" on this exact card, on the exact draft whose fate is still
+ *  unconfirmed, is what feeds the idempotent-approve bug this whole guard
+ *  exists to prevent (an edit that already applied server-side accepting
+ *  a second approve/send as a no-op that silently keeps the FIRST body).
+ *
+ *  COPY (round 4 correction): the previous wording ("Stoop couldn't
+ *  confirm your last edit sent. Check the conversation before approving
+ *  or editing again.") permitted approving or editing again AFTER a check
+ *  without ever saying that a resend on this exact draft lands on a
+ *  no-op that keeps the FIRST body, a landlord who checks quickly, sees
+ *  nothing obvious, and taps Send walks straight into the bug this notice
+ *  exists to prevent. It also drifted to third person ("Stoop couldn't");
+ *  every other string on these surfaces, including this notice's own
+ *  sibling toast, speaks as Stoop in first person. Rewritten to name the
+ *  actual consequence.
+ *
+ *  Rendered wherever `UNVERIFIED_SEND_NOTICE` was showing on the CARD,
+ *  once the flag itself clears, AND (round 4, BLOCKER 2) inside the
+ *  editor itself via this component's own `notice` prop below, a prior
+ *  revision of this comment claimed the card alone was enough, which was
+ *  false the moment the landlord reopened Edit: the notice used to vanish
+ *  at exactly the moment they could act on it. See useDraftActions.ts's
+ *  `giveUpNotices`. */
+export const UNVERIFIED_GIVE_UP_CARD_NOTICE =
+  "I couldn't confirm your last edit went out. Check the conversation first. If the reply is already there, sending again won't replace it.";
+
 interface EditDraftPanelProps {
   tenantName: string;
   initialBody: string;
@@ -20,6 +65,16 @@ interface EditDraftPanelProps {
    *  retype-and-resend can't silently overwrite an already-delivered body
    *  while its fate is still unknown. */
   sendDisabled?: boolean;
+  /** BLOCKER 2 (safety review round 4, #291/#279): a notice to show in the
+   *  SAME slot as `UNVERIFIED_SEND_NOTICE` below, once `sendDisabled` is
+   *  false, the give-up ceiling's own sticky `UNVERIFIED_GIVE_UP_CARD_
+   *  NOTICE` (useDraftActions.ts's `giveUpNotices`), or a `draft_stale`
+   *  notice, both of which need to keep showing even while the editor is
+   *  open, not just on the card behind it. Ignored while `sendDisabled`
+   *  is true; that state already renders `UNVERIFIED_SEND_NOTICE`, and
+   *  the two are mutually exclusive by construction (see
+   *  `UNVERIFIED_GIVE_UP_CARD_NOTICE`'s own comment). */
+  notice?: string;
   onCancel: () => void;
   onSend: (body: string) => void;
   className?: string;
@@ -45,6 +100,7 @@ export function EditDraftPanel({
   initialBody,
   submitting = false,
   sendDisabled = false,
+  notice,
   onCancel,
   onSend,
   className,
@@ -53,6 +109,11 @@ export function EditDraftPanel({
   const fieldId = useId();
   const canSend = body.trim().length > 0 && !submitting && !sendDisabled;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // BLOCKER 2 (safety review round 4, #291/#279): `sendDisabled` always
+  // wins the slot below, it's the more urgent, actively-blocking state,
+  // and the two are mutually exclusive by construction (see `notice`'s
+  // own prop comment above), so this is a plain fallback, not a merge.
+  const displayNotice = sendDisabled ? UNVERIFIED_SEND_NOTICE : notice;
 
   // #191 item 1: this panel is only ever mounted while edit mode is open
   // (both call sites swap it in via a ternary rather than toggling its
@@ -91,7 +152,7 @@ export function EditDraftPanel({
           type="button"
           onClick={() => onSend(body.trim())}
           disabled={!canSend}
-          aria-describedby={sendDisabled ? `${fieldId}-unverified` : undefined}
+          aria-describedby={displayNotice ? `${fieldId}-unverified` : undefined}
           className="flex min-h-[52px] items-center justify-center gap-2 rounded-clarity-md border-[1.5px] border-clarity-brand-deep bg-clarity-brand font-clarity-sans text-base font-extrabold text-clarity-brand-on shadow-clarity-banner transition-transform duration-150 ease-clarity hover:-translate-y-px motion-reduce:transition-none motion-reduce:hover:translate-y-0 disabled:opacity-60"
         >
           <Check className="size-4" aria-hidden="true" />
@@ -103,14 +164,18 @@ export function EditDraftPanel({
           resolves only against a genuinely newer read, Send can stay dead
           for a whole poll interval (or longer while the API is down,
           which is the safe direction but only if it's understandable).
-          The toast that raised it is gone in four seconds; this isn't. */}
-      {sendDisabled && !submitting && (
+          The toast that raised it is gone in four seconds; this isn't.
+          BLOCKER 2 (round 4): also the one place `notice` (the give-up
+          ceiling's sticky card notice, or a draft_stale notice) renders
+          once `sendDisabled` itself has cleared, see `displayNotice`
+          above. */}
+      {displayNotice && !submitting && (
         <p
           id={`${fieldId}-unverified`}
           role="status"
           className="mt-2.5 font-clarity-sans text-[13px] font-semibold text-clarity-ink-dim"
         >
-          {UNVERIFIED_SEND_NOTICE}
+          {displayNotice}
         </p>
       )}
     </div>

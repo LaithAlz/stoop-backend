@@ -12,36 +12,21 @@ import { UNVERIFIED_SEND_NOTICE } from "@/components/clarity/EditDraftPanel";
 import { SkippedCard } from "@/components/clarity/SkippedCard";
 import { AllClearState } from "@/components/clarity/AllClearState";
 import { useAuth } from "@/auth/AuthProvider";
-import { QUEUE_REFETCH_INTERVAL_MS, useQueue } from "@/api/queue";
-
-/**
- * How long past an ambiguous edit-and-send failure a queue read must be
- * before "the draft is still pending" is trusted enough to re-enable Send
- * (F11 — see the effect below).
- *
- * Sized against the SERVER's worst case, not the poll interval. The API's
- * per-case advisory lock retries for `_CASE_LOCK_MAX_WAIT_SECONDS = 30s`
- * (apps/api/app/agent/graph.py) BEFORE the graph resume even begins, so an
- * edit-and-send can legitimately commit ~30s after the request started
- * while the client stamped its failure in the first second. One poll
- * interval was shorter than that ceiling and left a window where a
- * qualifying read still predated the commit. Two intervals clears it with
- * margin; the cost is Send staying disabled a little longer under an
- * on-screen explanation, which is the safe direction by construction.
- */
-const UNVERIFIED_SETTLE_MS = 2 * QUEUE_REFETCH_INTERVAL_MS;
+import { useQueue } from "@/api/queue";
 import { ApiError, toHouseApiError } from "@/api/errors";
 import type { QueueItem } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
 import { formatRelativeTime } from "@/lib/relativeTime";
 import {
   buildQueueView,
-  pruneSkippedSnapshots,
+  pruneQueueSnapshots,
   secondsRemaining,
   totalUndoSeconds,
+  type QueueSnapshot,
   type QueueViewRow,
 } from "@/features/queue/queueEntries";
 import { useDraftActions } from "@/features/queue/useDraftActions";
+import { useResolveUnverifiedSends } from "@/features/queue/useResolveUnverifiedSends";
 import {
   emergencyHeadline,
   emergencySubtext,
@@ -79,12 +64,39 @@ function AppQueuePage() {
   // already keeps this component from ever mounting unauthenticated.
   const queueQuery = useQueue({ enabled: Boolean(session) });
 
-  const [skippedSnapshots, setSkippedSnapshots] = useState<Record<string, QueueItem>>({});
+  // Last-known QueueItem (plus its last-known position, item 6) per draft
+  // id for the three entry statuses buildQueueView pins past their server
+  // row disappearing from a fresh `items` read: `skipped` (the founder
+  // ruling), `sending` (the undo window must survive a refetch, #291),
+  // and `sent` (item 5, one more commit past the countdown hitting zero,
+  // see buildQueueView's own docstring for why). Written at
+  // `handleSkip`/`handleApprove`/`handleSubmitEdit` below, right before
+  // the local overlay entry moves to the status that needs it pinned.
+  const [queueSnapshots, setQueueSnapshots] = useState<Record<string, QueueSnapshot>>({});
   // A7 (safety review, #234 PR 2): the item whose editor is open, captured
   // at open time — buildQueueView pins it so a background poll that drops
   // the row can't unmount the editor mid-type. Cleared as soon as the
   // editor closes (the effect below).
-  const [editingSnapshot, setEditingSnapshot] = useState<QueueItem | null>(null);
+  //
+  // Finding 5 (safety review round 3, #291/#279; corrected round 4, see
+  // `handleSubmitEdit` below): `index` is captured HERE too, at the same
+  // open-time moment as `item`, but only as a FALLBACK now, not the
+  // value `handleSubmitEdit` always uses. A prior revision of this
+  // comment claimed the open-time value was used as-is because a
+  // submit-time lookup "would find nothing" if the row had fallen out of
+  // `decisionItems` while the editor sat open, true for THAT case, but
+  // it ignored the opposite one: a row ABOVE the edited card leaving
+  // `decisionItems` during the same window shifts every row after it up
+  // one slot, so the STALE open-time index is now too LARGE, and
+  // `buildQueueView`'s clamp walks the card toward the end of the queue,
+  // item 6's harm arriving a different way, self-inflicted this time.
+  // `handleSubmitEdit` now looks the row up FRESH at submit time and only
+  // falls back to this captured value once the row has genuinely left
+  // `decisionItems` (the one case a fresh lookup can't answer at all).
+  const [editingSnapshot, setEditingSnapshot] = useState<{
+    item: QueueItem;
+    index: number;
+  } | null>(null);
 
   const onNotice = useCallback((message: string) => toast(message), []);
   const onSettled = useCallback(() => void queueQuery.refetch(), [queueQuery]);
@@ -94,71 +106,88 @@ function AppQueuePage() {
 
   // Once the server confirms a "sent" card is really gone from the queue,
   // drop its local entry too — otherwise it just sits inert forever.
+  //
+  // BLOCKER 1 (safety review round 3, #291/#279): that was the only exit
+  // this effect had, and it depends on the draft actually LEAVING a fresh
+  // `items` read. An undo whose DELETE commits server-side (draft back to
+  // `pending`) but whose response is lost or arrives ambiguously
+  // (useDraftActions.ts's undoMutation onError) is correctly left
+  // "sending" by that fix, not cleared: the reply may genuinely still be
+  // on its way. But the countdown itself is a plain timer with no
+  // knowledge of any of that: five seconds later it ticks "sending" to
+  // "sent" regardless, and the draft NEVER left `items` (the undo put it
+  // right back), so the first branch above never fires either. The card
+  // freezes on "Sent." with zero controls, forever, while the tenant is
+  // genuinely still unanswered.
+  //
+  // BLOCKER 1 (safety review ROUND 4, #291/#279): round 3's fix here (the
+  // paragraph above) compared `queueQuery.dataUpdatedAt > entry.
+  // approvedAtClient` and claimed a read from before the approve "must
+  // NOT trip this." That is false. TanStack Query stamps `dataUpdatedAt`
+  // when a response RESOLVES on the client (`successState()`,
+  // `@tanstack/query-core`), not when the server computed it, so a read
+  // ISSUED before the approve and RESOLVING after it (an ordinary
+  // refetch: window focus, another card's `onSettled`, `useAcknowledge`'s
+  // queue invalidation) satisfies that inequality while still carrying a
+  // pre-approve snapshot that honestly still lists the draft. Measured: a
+  // plain Approve, no undo tap involved at all, cleared within the
+  // ordinary 5s window purely because such a read happened to land, then
+  // a landlord's "correction" edit-and-send on the reopened editor POSTed
+  // successfully but hit the API's idempotent 200 (the draft was already
+  // approved) and never changed the delivered text.
+  //
+  // The fix is evidence, not a clock. `entry.undoAmbiguousAt`
+  // (queueEntries.ts) is set from EXACTLY ONE place: useDraftActions.ts's
+  // `undoMutation` onError's ambiguous branch, the one case where an
+  // Undo was genuinely attempted and the server's answer is genuinely
+  // unknown. A plain Approve, or a clean undo success/failure, never sets
+  // it, so no stale read can ever satisfy `undoAmbiguousAt !== undefined`
+  // on an entry nothing was ever attempted against. The reverse does not
+  // hold and must not be assumed: undefined does NOT mean no undo was
+  // attempted, because `already_sent` and `draft_not_undoable` also leave
+  // it unset (the server answered those, so they need no evidence). Once
+  // it IS set, a
+  // read that completed AFTER that ambiguous attempt (not the approve) is
+  // the one honest signal that the server has since said something new
+  // about this exact draft.
+  //
+  // `approvedAtClient`/`undoAmbiguousAt` and `dataUpdatedAt` are both
+  // client `Date.now()` in the same browser, so #283's clock-skew class
+  // doesn't apply here, and this app never dehydrates/hydrates the query
+  // cache, so `dataUpdatedAt` is never server-stamped either, but
+  // `Date.now()` is still non-monotonic (an NTP step could invert either
+  // comparison), a second reason to gate on evidence an undo was
+  // attempted rather than on any timestamp comparison at all.
   useEffect(() => {
     if (!queueQuery.data) return;
     const freshIds = new Set(queueQuery.data.items.map((item) => item.draft_id));
     for (const [draftId, entry] of Object.entries(entries)) {
-      if (entry.status === "sent" && !freshIds.has(draftId)) {
+      if (entry.status !== "sent") continue;
+      if (!freshIds.has(draftId)) {
+        draftActions.dispatch({ type: "cleared", draftId });
+      } else if (
+        entry.undoAmbiguousAt !== undefined &&
+        queueQuery.dataUpdatedAt > entry.undoAmbiguousAt
+      ) {
         draftActions.dispatch({ type: "cleared", draftId });
       }
     }
     // draftActions.dispatch is stable (useReducer) — entries is the only
-    // real dependency here.
+    // real dependency here besides the read itself.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queueQuery.data, entries]);
+  }, [queueQuery.data, queueQuery.dataUpdatedAt, entries]);
 
-  // R3-1 (safety review round 3 follow-up, issue #252): resolve any
-  // edit-and-send left `unverifiedSendIds` by useDraftActions.ts's
-  // ambiguous-failure branch against THIS successful queue read — still
-  // listed as a card means the edit never applied (re-enable Send); gone
-  // means it did (close the editor + notice if it's still open on it).
-  //
-  // F1 (safety re-verify, #252): resolve ONLY against a read that
-  // completed after the failure. Without the `dataUpdatedAt` comparison
-  // this effect fired on the very next commit — when `queueQuery.data` is
-  // still the last successful payload from BEFORE the send, which of
-  // course still lists the draft — so it resolved "still pending",
-  // re-enabled Send about one frame later, and the guard did nothing at
-  // all. `isFetching` alone isn't sufficient; the generation is.
-  //
-  // F11 (safety re-verify round 2, #252): the two directions need
-  // DIFFERENT evidence, because the server request outlives the client's
-  // error. `POST /v1/drafts/{id}/edit-and-send` synchronously resumes the
-  // LangGraph thread under a per-case lock — hundreds of ms to seconds —
-  // and the ambiguous triggers (edge 504, client timeout, dropped
-  // connection) all leave the origin still working. So a read completing
-  // 200ms after the failure can honestly report the draft still `pending`
-  // while the origin commits a second later. Resolving "still pending" on
-  // that read re-enables Send permanently, and the retype-and-resend
-  // lands on the idempotent 200 that discards the new body.
-  //   gone          → definitive on the FIRST post-failure read (the
-  //                   editor closes either way; a resend can only 409 or
-  //                   hit the idempotent 200).
-  //   still pending → only trustworthy once a full poll interval has
-  //                   elapsed past the failure, by which time an
-  //                   in-flight commit has long landed. Costs one extra
-  //                   poll of dead Send under the explanatory line —
-  //                   the safe direction, by construction.
-  useEffect(() => {
-    if (!queueQuery.data) return;
-    const freshIds = new Set(queueQuery.data.items.map((item) => item.draft_id));
-    for (const [draftId, failedAt] of draftActions.unverifiedSendIds) {
-      if (queueQuery.dataUpdatedAt <= failedAt) continue;
-      const stillPending = freshIds.has(draftId);
-      if (stillPending && queueQuery.dataUpdatedAt <= failedAt + UNVERIFIED_SETTLE_MS) {
-        continue;
-      }
-      draftActions.resolveUnverifiedSend(draftId, stillPending);
-    }
-    // `draftActions.resolveUnverifiedSend` is a useCallback over
-    // [onNotice, unverifiedSendIds] — both already covered by the deps
-    // below, so listing the whole `draftActions` object would only add
-    // churn. (It was `[onNotice]` alone until F12 added the membership
-    // read; keeping this comment truthful matters, since every defect
-    // found in this file so far has been a comment asserting a guarantee
-    // the code no longer had.)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queueQuery.data, queueQuery.dataUpdatedAt, draftActions.unverifiedSendIds]);
+  // #279: the resolution rule itself now lives in
+  // useResolveUnverifiedSends.ts, shared with the conversation thread.
+  // See that file's docstring for the full F1/F11 reasoning this used to
+  // carry inline.
+  useResolveUnverifiedSends({
+    data: queueQuery.data,
+    dataUpdatedAt: queueQuery.dataUpdatedAt,
+    unverifiedSendIds: draftActions.unverifiedSendIds,
+    resolveUnverifiedSend: draftActions.resolveUnverifiedSend,
+    giveUpUnverifiedSend: draftActions.giveUpUnverifiedSend,
+  });
 
   const items = useMemo(() => queueQuery.data?.items ?? [], [queueQuery.data]);
   // Rule #1: the emergency line is never paywalled, throttled, or gated —
@@ -190,19 +219,61 @@ function AppQueuePage() {
       buildQueueView(
         decisionItems,
         entries,
-        skippedSnapshots,
-        editingContext ? editingSnapshot : null,
+        queueSnapshots,
+        editingContext ? (editingSnapshot?.item ?? null) : null,
       ),
-    [decisionItems, entries, skippedSnapshots, editingContext, editingSnapshot],
+    [decisionItems, entries, queueSnapshots, editingContext, editingSnapshot],
   );
 
   const needYou = queueQuery.data?.counts.total ?? 0;
   const waitingOnTenants = queueQuery.data?.counts.awaiting_tenant ?? 0;
 
+  // Item 6 (safety review, #291/#279): where a draft sat in the CURRENT
+  // `decisionItems` order, the same array buildQueueView receives as its
+  // `items` param, at the moment it's about to need pinning. `-1` (not
+  // found) falls back to the end rather than throwing.
+  //
+  // Finding 5 (safety review round 3, #291/#279; corrected round 4): this
+  // comment used to claim `-1` "shouldn't happen: Approve/Skip/
+  // edit-and-send only ever act on a live pending row", true for Approve
+  // and Skip, which always call this with the exact item the caller just
+  // clicked ON, but WRONG for edit-and-send: `handleSubmitEdit` used to
+  // call this again at SUBMIT time against `editingSnapshot.draft_id`,
+  // and A7's whole reason to pin an editing item is that it can already
+  // have fallen out of `decisionItems` by then (a background poll while
+  // the editor sits open). That combination made `-1` reachable, and its
+  // fallback (walk the row to the very end) is precisely what item 6
+  // above was added to prevent.
+  //
+  // Round 3 "fixed" this by having `handleOpenEditor` capture the index
+  // once, at open time, and claimed that was "the one moment a call here
+  // is actually guaranteed to find the item", overstated. The open-time
+  // capture is guaranteed to find the item, but by SUBMIT time it can be
+  // WRONG in the opposite direction: if a row ABOVE the edited card
+  // leaves `decisionItems` while the editor sits open, every row after it
+  // shifts up one slot, so the captured index is now too LARGE, and the
+  // same clamp walks the card toward the end, item 6's harm arriving a
+  // different way, self-inflicted this time by a stale index rather than
+  // a missing one. `handleSubmitEdit` below now calls this function AGAIN
+  // at submit time and only falls back to the captured value on the `-1`
+  // (not-found) sentinel, the one case a fresh lookup genuinely cannot
+  // answer. This function itself still only promises "shouldn't happen"
+  // for a caller passing the draft id of a row it can currently see; it
+  // makes no promise about a stale id, which is exactly why its `-1`
+  // fallback is load-bearing for `handleSubmitEdit` now, not just a
+  // defensive last resort.
+  const snapshotIndexOf = useCallback(
+    (draftId: string) => {
+      const idx = decisionItems.findIndex((i) => i.draft_id === draftId);
+      return idx === -1 ? decisionItems.length : idx;
+    },
+    [decisionItems],
+  );
+
   function handleSkip(item: QueueItem) {
-    setSkippedSnapshots((prev) => ({
-      ...pruneSkippedSnapshots(prev, entries),
-      [item.draft_id]: item,
+    setQueueSnapshots((prev) => ({
+      ...pruneQueueSnapshots(prev, entries),
+      [item.draft_id]: { item, index: snapshotIndexOf(item.draft_id) },
     }));
     draftActions.skip({
       draftId: item.draft_id,
@@ -211,12 +282,71 @@ function AppQueuePage() {
     });
   }
 
+  // #291: captured BEFORE `draftActions.approve` so the snapshot exists
+  // the instant the mutation's `onSuccess` flips this draft's local entry
+  // to "sending": buildQueueView needs it on that very first render in
+  // case a concurrent refetch has already dropped the row from `items`.
+  function handleApprove(item: QueueItem) {
+    setQueueSnapshots((prev) => ({
+      ...pruneQueueSnapshots(prev, entries),
+      [item.draft_id]: { item, index: snapshotIndexOf(item.draft_id) },
+    }));
+    draftActions.approve({
+      draftId: item.draft_id,
+      caseId: item.case_id,
+      tenantName: item.tenant_name,
+    });
+  }
+
   function handleOpenEditor(item: QueueItem) {
-    setEditingSnapshot(item);
+    // Finding 5 (safety review round 3, #291/#279): captured HERE, while
+    // `item` is still guaranteed live in `decisionItems` (Edit only ever
+    // renders on a currently-visible pending row). See `editingSnapshot`'s
+    // own comment above for why this can't wait until submit time.
+    setEditingSnapshot({ item, index: snapshotIndexOf(item.draft_id) });
     draftActions.openEditor(
       { draftId: item.draft_id, caseId: item.case_id, tenantName: item.tenant_name },
       item.draft_body,
     );
+  }
+
+  // #291: same reasoning as `handleApprove` above: a successful
+  // edit-and-send dispatches the identical "approved" action (it's one
+  // mutation outcome shape, per useDraftActions.ts), so it needs the same
+  // pin. `editingSnapshot` is the queue item the editor opened with;
+  // `draft_body` is overridden to the body actually just submitted so the
+  // pinned "On its way to {tenant}" bubble shows the sent text, not the
+  // pre-edit draft.
+  //
+  // Finding 5 (safety review round 3, #291/#279; corrected round 4): this
+  // used to reuse `editingSnapshot.index` unconditionally, captured back
+  // at `handleOpenEditor` time, on the claim that a fresh
+  // `snapshotIndexOf` call here "could legitimately miss ... and silently
+  // walk this card to the bottom of the queue." True, but incomplete: the
+  // captured value can ALSO be wrong by now (see `snapshotIndexOf`'s own
+  // comment above) if a row above the edited card left `decisionItems`
+  // while the editor sat open, which walks the card toward the end just
+  // as surely. A fresh lookup is honest for as long as the row is still
+  // actually in `decisionItems`; only fall back to the captured value
+  // once the row has genuinely left it (`snapshotIndexOf`'s own `-1`
+  // sentinel, `decisionItems.length`), the one case a fresh lookup can't
+  // answer. No ambiguity between "found at the last slot" and "not
+  // found": a real found index is always `< decisionItems.length`, so the
+  // sentinel can never collide with one.
+  function handleSubmitEdit(body: string) {
+    if (editingSnapshot) {
+      const draftId = editingSnapshot.item.draft_id;
+      const freshIndex = snapshotIndexOf(draftId);
+      const index = freshIndex === decisionItems.length ? editingSnapshot.index : freshIndex;
+      setQueueSnapshots((prev) => ({
+        ...pruneQueueSnapshots(prev, entries),
+        [draftId]: {
+          item: { ...editingSnapshot.item, draft_body: body },
+          index,
+        },
+      }));
+    }
+    draftActions.submitEdit(body);
   }
 
   // `Boolean(data)`, not `isSuccess` — during a failed background refetch
@@ -322,7 +452,9 @@ function AppQueuePage() {
                         row={row}
                         draftActions={draftActions}
                         onSkip={handleSkip}
+                        onApprove={handleApprove}
                         onOpenEditor={handleOpenEditor}
+                        onSubmitEdit={handleSubmitEdit}
                       />
                     ))}
                   </div>
@@ -342,12 +474,16 @@ function QueueRow({
   row,
   draftActions,
   onSkip,
+  onApprove,
   onOpenEditor,
+  onSubmitEdit,
 }: {
   row: QueueViewRow;
   draftActions: ReturnType<typeof useDraftActions>;
   onSkip: (item: QueueItem) => void;
+  onApprove: (item: QueueItem) => void;
   onOpenEditor: (item: QueueItem) => void;
+  onSubmitEdit: (body: string) => void;
 }) {
   const { item, entry } = row;
   const tenantFirst = firstName(item.tenant_name);
@@ -528,21 +664,38 @@ function QueueRow({
         // body: exactly the wording the landlord opened the editor to
         // fix. The card now carries the same explanation and the same
         // block.
+        //
+        // BLOCKER 2 (safety review round 3, #291/#279): once the ceiling
+        // gives up, `isSendUnverified` goes false. The fallback above
+        // used to end there, which is the exact regression this fix
+        // closes: `giveUpNotices` is checked last so the card keeps
+        // warning even after the flag itself is gone. FIX 3 (round 4):
+        // `giveUpNotices` is a `ReadonlyMap` now (unverifiedSendStore.ts),
+        // not a Record, `.get()`, not bracket access. DecisionCard
+        // itself now also forwards this same value into the editor while
+        // editing (see its own `notice` prop).
         staleNotice={
           draftActions.staleNotices[item.case_id] ??
-          (draftActions.isSendUnverified(item.draft_id) ? UNVERIFIED_SEND_NOTICE : undefined)
+          (draftActions.isSendUnverified(item.draft_id)
+            ? UNVERIFIED_SEND_NOTICE
+            : draftActions.giveUpNotices.get(item.draft_id))
         }
         editSubmitting={draftActions.isEditSubmitting}
         sendUnverified={draftActions.isSendUnverified(item.draft_id)}
         actionsBusy={
           draftActions.isBusy(item.draft_id) || draftActions.isSendUnverified(item.draft_id)
         }
-        onApprove={() => draftActions.approve(ctx)}
+        // BLOCKER 2 / item 7 (safety review, #291/#279): mutation-only
+        // busy, deliberately NOT OR'd with `isSendUnverified`. See
+        // DecisionCard's own `mutationBusy` comment for why Skip and Undo
+        // need this instead of `actionsBusy`.
+        mutationBusy={draftActions.isBusy(item.draft_id)}
+        onApprove={() => onApprove(item)}
         onEdit={() => onOpenEditor(item)}
         onSkip={() => onSkip(item)}
         onUndo={() => draftActions.undo(ctx)}
         onCancelEdit={() => draftActions.cancelEditor()}
-        onSubmitEdit={(body) => draftActions.submitEdit(body)}
+        onSubmitEdit={(body) => onSubmitEdit(body)}
         undoButtonRef={undoButtonRef}
       />
     </div>
