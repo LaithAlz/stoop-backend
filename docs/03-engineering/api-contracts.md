@@ -528,6 +528,51 @@ client. The web marketing/demo onboarding route
 (`apps/web/src/routes/onboarding.tsx`) collects a backup contact into
 local component state only and never calls the real API at all.
 
+**v1.28 amendment (2026-08-05, #289 implementation):** two additions, one
+to this endpoint and one to the "Notifications / emergencies" section
+below — the ack token behind `landlord_sms`/`backup_sms` links is now
+**per-recipient**, not shared. Full rationale: schema-v1.md's v1.24
+amendment; `app/agent/emergency_chain.py`'s own docstring "Per-recipient
+ack tokens".
+
+1. **New side effect on `PATCH /v1/properties/{id}`**: clearing
+   `backup_contact` (the v1.25 amendment above's "clears it" — a real
+   value → explicit `null`) now ALSO invalidates the backup contact's own
+   ack token on every in-flight (not yet acknowledged) emergency chain for
+   that property, in the SAME request/transaction as the clear. Response
+   shape is completely unchanged (`Property`, same fields as always) —
+   this is a side effect on `notifications` rows, invisible to this
+   endpoint's own response body. Practically: a removed backup contact who
+   already holds a `/ack/{token}` link from an earlier text can no longer
+   use it to silence a live emergency — the exact "ex-partner" scenario
+   #268 (v1.25 amendment) could not close on its own, because before this
+   amendment the SAME token was handed to both the landlord and the
+   backup contact, so revoking one meant revoking both. **Not covered**:
+   editing `backup_contact` to a DIFFERENT phone number (as opposed to
+   clearing it) does not revoke anything — flagged as a known gap, not
+   solved here (scope discipline; see #289's own "sequencing" note — the
+   softer question of what a backup contact should be ABLE to do with
+   their own ack link is a separate, not-yet-decided product question,
+   deliberately out of this amendment).
+2. **`GET`/`POST /ack/{token}` now accept EITHER the landlord's or the
+   backup contact's own token** for the same notification — both response
+   shapes are byte-identical to before (this amendment adds no new field
+   to either response; which recipient a token belongs to is recorded
+   internally, in the `audit_log` row this action already writes, never
+   surfaced in the HTTP response). A token that has been revoked (case 1
+   above) 404s `notification_not_found`, the SAME code an unrecognized
+   token has always returned — a removed backup contact's stale link is
+   indistinguishable from a token that never existed, never a distinct
+   "revoked" state leaked back to whoever is holding it.
+
+**Existing links keep working.** A chain already mid-flight when this
+ships keeps its pre-existing, single shared token functioning for BOTH
+the landlord and anyone who already holds a copy of it — this cannot be
+retroactively split (a secret already texted to two people cannot be
+un-sent). Full per-recipient separation, and therefore full revocation
+capability, applies to every chain created after this ships. See
+schema-v1.md's v1.24 amendment, point 4, for the complete account.
+
 ## Tenants & Vendors
 
 `GET/POST /v1/properties/{id}/tenants` · `PATCH/DELETE /v1/tenants/{id}`
@@ -1028,6 +1073,18 @@ rejected. `rate_limited` joins this doc's stable error-code vocabulary
 (alongside `draft_stale`, `already_sent`, `has_open_cases`,
 `email_required`, `account_deleted`) — codes are stable snake_case
 strings per this doc's own "Conventions" section.
+
+**v1.28 amendment (2026-08-05, #289 implementation — see the Properties
+section's own v1.28 amendment for the full write-up):** `token` in
+`GET`/`POST /ack/{token}` may now be either the landlord's or the backup
+contact's own ack token for the same notification — both were previously
+one shared token. Response shapes are byte-for-byte unchanged; which
+recipient a given token belongs to is recorded only in the `audit_log`
+row this action writes (`recipient_role`, schema-v1.md's matching v1.24
+amendment), never in the HTTP response. A revoked backup token (a removed
+backup contact's stale link) 404s `notification_not_found` — the same
+code an unrecognized token has always returned, never a distinct
+"revoked" state.
 
 ## Devices (push notifications, #210 M3)
 

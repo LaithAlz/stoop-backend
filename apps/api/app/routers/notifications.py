@@ -243,7 +243,7 @@ async def ack_notification(
         )
 
     acknowledged_at = await emergency_chain.acknowledge_notification(
-        notification_id, actor="landlord", channel="dashboard"
+        notification_id, actor="landlord", channel="dashboard", recipient_role="landlord"
     )
     if acknowledged_at is None:  # pragma: no cover — invariant: just confirmed it exists above
         raise AppError(

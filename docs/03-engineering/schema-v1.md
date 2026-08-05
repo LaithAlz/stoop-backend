@@ -915,6 +915,76 @@
 >    the detector genuinely does miss because `toE164` returns those
 >    13-digit values unchanged.)
 
+<!-- No DDL-body annotation for v1.24 -- same precedent v1.9's own
+     uq_notifications_ack_token index already set: a payload-key-scoped
+     expression index is documented here, in the amendment prose, not
+     inlined onto the `notifications` CREATE TABLE block below (which
+     never gained one for `ack_token` either). -->
+> **v1.24 amendment (2026-08-05, #289 implementation)**: migration 0018
+> implements this — per-recipient emergency-chain ack tokens, closing the
+> gap #268 (v1.25 amendment above) could not: clearing `backup_contact`
+> stopped a removed backup contact from being CALLED/TEXTED going
+> forward, but the ack LINK they already held (identical to the
+> landlord's own link — one shared `ack_token` per notification) kept
+> silencing the chain forever, since nothing distinguished the two
+> recipients at all.
+> 1. **New key, no new column or table**: `notifications.payload` gains
+>    `ack_token_backup`, sibling to the pre-existing `ack_token` (v1.9
+>    amendment, migration 0010) — which this amendment repurposes as "the
+>    landlord's own token" going forward, same key name, unchanged for
+>    every existing reader/writer. `ack_token_backup` is minted lazily —
+>    the first time ANY step of a chain is claimed
+>    (`app/agent/emergency_chain.py`'s `_CLAIM_STEP_SQL`), not at the
+>    webhook's own `INSERT` — see that module's docstring "Per-recipient
+>    ack tokens" for why the "born enriched" reasoning that applies to
+>    `ack_token` does not apply here (the row is already due either way;
+>    there is no silence-window risk to close).
+>    ```sql
+>    CREATE UNIQUE INDEX uq_notifications_ack_token_backup
+>      ON notifications ((payload ->> 'ack_token_backup'))
+>      WHERE payload ->> 'ack_token_backup' IS NOT NULL
+>    ```
+>    Byte-for-byte the same shape as `uq_notifications_ack_token` (v1.9
+>    amendment), for the identical reason: an unindexed token lookup on
+>    every SMS-link tap would sequential-scan the whole table, and UNIQUE
+>    is a real data-integrity guarantee, not just a lookup optimization.
+> 2. **`audit_log`'s `'acknowledged'` action payload gains a new key,
+>    `recipient_role`** — `'landlord'` / `'backup'` / `null` (genuinely
+>    unknown — the voice press-1 surface cannot tell which physical call
+>    is ringing). No migration required for this half — same "doc-first,
+>    no schema change" evolution path v1.6/v1.7/v1.10/v1.12/v1.14 already
+>    used for a payload-key addition on an append-only table.
+>    **Never the recipient's phone number** (never-break rule #5) — a
+>    role is enough for the audit trail to show who silenced an
+>    emergency, without storing who that person is.
+> 3. **Revocation**: `PATCH /v1/properties/{id}` clearing `backup_contact`
+>    (a real value → explicit `null` — the same "clears it" definition
+>    the v1.25 amendment above already established) now also strips
+>    `ack_token_backup` from every in-flight (`status='pending'`, not yet
+>    acknowledged) `emergency_call` notification for that property, in
+>    the SAME transaction as the property update
+>    (`app/agent/emergency_chain.py::revoke_backup_ack_tokens`, called
+>    from `app/routers/properties.py`). The landlord's own `ack_token` is
+>    never touched by this. Editing `backup_contact` to a DIFFERENT phone
+>    number (not a clear) does not revoke anything today — a known,
+>    flagged gap, not solved by this amendment (see api-contracts.md's
+>    matching v1.28 amendment).
+> 4. **Existing tokens at deploy time.** A chain already mid-flight when
+>    this ships keeps its pre-existing, pre-split `ack_token` — which
+>    still authenticates BOTH the landlord and anyone who already holds a
+>    copy of that link, including a backup contact who received it before
+>    this deploy. This cannot be retroactively fixed (a secret already
+>    disclosed to two people over SMS cannot be un-sent), and is not
+>    attempted: revoking `backup_contact` on such a chain removes only
+>    `ack_token_backup` (freshly minted post-deploy, not yet disclosed to
+>    anyone); the pre-existing shared value under `ack_token` keeps
+>    working for whoever already has it. Full closure applies to every
+>    chain CREATED after this ships. **Deliberately out of scope**: giving
+>    the backup contact a softer acknowledgment semantic (e.g. "I've got
+>    it" without permanently silencing the chain) — issue #289 explicitly
+>    sequences per-recipient tokens first as the foundation that product
+>    decision would need; this amendment builds only the foundation.
+
 > **v1.22 amendment (2026-08-04 — #277/#276 implementation, adversarial
 > safety review):** two corrections to `app/phone.py::to_e164`'s
 > canonicalization policy (v1.21 amendment below), plus one doc

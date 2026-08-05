@@ -146,6 +146,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import property_provisioning
 from app.agent.case_lifecycle import OPEN_STATUSES
+from app.agent.emergency_chain import revoke_backup_ack_tokens
 from app.audit import record_audit_log
 from app.config import settings
 from app.deps import Landlord, require_landlord
@@ -790,6 +791,19 @@ async def update_property(
             action="settings_changed",
             payload={"resource": "property", "property_id": prop_id, "field": "backup_contact"},
         )
+
+        # #289: a genuine CLEAR (a real backup_contact -> explicit null,
+        # same "clears it" definition as the v1.25 amendment above -- never
+        # an edit to a different phone, which is out of this issue's scope,
+        # see emergency_chain.py's own docstring) invalidates the backup
+        # contact's own ack token on every in-flight emergency chain for
+        # this property, in the SAME transaction as this update -- so a
+        # removed backup contact can never silence a live emergency using a
+        # link they already hold. The landlord's own ack token is untouched.
+        if existing["backup_contact"] is not None and updated["backup_contact"] is None:
+            await revoke_backup_ack_tokens(
+                session, landlord_id=landlord.id, property_id=property_id
+            )
 
     return _row_to_property(updated)
 
