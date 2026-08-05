@@ -500,18 +500,15 @@ _ADMIN_SESSION_ALLOWLIST: frozenset[str] = frozenset(
     {
         "app/db/session.py",
         "app/routers/me.py",
-        # #54/#55/#57 spec-review fix: `require_landlord`'s `landlords`
-        # lookup by `auth_user_id` is a genuine pre-identity/chicken-and-egg
-        # case, same class as GET /v1/me's provisioning upsert — the
-        # `landlords` RLS policy is id-keyed (`id = current_setting(...)`),
-        # so this SELECT can never see its own row under `app_role` until
-        # AFTER the GUC is set to that row's id, which is exactly what this
-        # lookup exists to determine. Scoped narrowly (``asynccontextmanager
-        # (get_admin_session)()``, not a `Depends(...)` parameter) so it
-        # doesn't hold an extra admin-pool connection open for the whole
-        # request on every authenticated endpoint — see `app/deps.py`'s
-        # module docstring, "Two-session rationale".
-        "app/deps.py",
+        # NOTE: `app/deps.py` is DELIBERATELY ABSENT here (#194). It used to
+        # be allowlisted for the same pre-identity/chicken-and-egg reason as
+        # GET /v1/me's provisioning upsert (a second, admin-session lookup
+        # of `landlords` by `auth_user_id`), but that two-session design was
+        # replaced by a `SECURITY DEFINER` function,
+        # `landlord_id_for_auth_user` (migration 0019), invoked on the
+        # caller's OWN request session — `require_landlord` no longer opens
+        # a second connection at all. See `app/deps.py`'s module docstring,
+        # "Identity-lookup design history", for the full writeup.
         # #40: Twilio inbound webhooks (POST /webhooks/twilio/sms,
         # /webhooks/twilio/status) — no landlord JWT exists here to
         # resolve a `landlord_id` GUC from; persisting an inbound tenant
