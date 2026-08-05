@@ -399,8 +399,13 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       // exactly where it was: "sending" is the one state that's still
       // true here.
       //
-      // BLOCKER 1 (safety review ROUND 4, #291/#279): this is now also the
-      // ONE place `undoAmbiguousAt` gets stamped (queueEntries.ts's
+      // BLOCKER 1 (safety review ROUND 4, #291/#279): this is the ONE
+      // place `undoAmbiguousAt` gets DISPATCHED. Whether it is STAMPED is
+      // decided in the reducer, from the entry's status, and round 5
+      // found that distinction load-bearing: round 4 accepted the
+      // dispatch only while "sending", which dropped it for every
+      // ambiguous failure slower than the 5 second countdown, i.e. nearly
+      // all of them. See queueEntries.ts's
       // `undoAmbiguous` action), the positive evidence the two retirement
       // effects (src/routes/app.index.tsx, app.conversations.$id.tsx) gate
       // on instead of the false guarantee round 3's `dataUpdatedAt >

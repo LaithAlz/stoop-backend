@@ -51,6 +51,11 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
     // the undo APPLIES server-side (draft back to pending) and the response is lost
     SERVER.caseDraft = { id: d[1], body: SERVER.caseDraft.body, status: "pending" };
     SERVER.items = [routine(d[1], SERVER.caseDraft.body)];
+    // ROUND 5: see entry7.tsx's note. Throwing synchronously here made
+    // the error always beat the 5s countdown, which is the one ordering
+    // where round 4's dropped-stamp bug could not appear. The delay is
+    // what makes this entry reproduce the realistic case.
+    await new Promise((r) => setTimeout(r, UNDO_FAILURE_DELAY_MS));
     throw new TypeError("Failed to fetch");
   }
   const m = url.match(/\/v1\/drafts\/([^/]+)\/(approve|edit-and-send)$/);
@@ -64,6 +69,8 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
   }
   return json(200, {});
 }) as any;
+
+const UNDO_FAILURE_DELAY_MS = 6000;
 
 const Thread = (ThreadRoute as any).options.component as () => any;
 let qc: QueryClient = createQueryClient();

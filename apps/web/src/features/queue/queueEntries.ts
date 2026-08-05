@@ -35,8 +35,11 @@ import type { QueueItem } from "@/api/types";
  * `undoAmbiguousAt` (BLOCKER 1, safety review ROUND 4, #291/#279): the
  * CLIENT `Date.now()` moment an Undo tap on THIS entry hit an ambiguous
  * failure (useDraftActions.ts's `undoMutation` onError, the network-error/
- * 5xx branch), undefined on every entry an undo was never attempted
- * against, including a plain, uneventful Approve. This is deliberately
+ * 5xx branch), undefined on every entry that arm never fired for,
+ * including a plain, uneventful Approve. Note what it is NOT: a reliable
+ * "no undo was attempted" signal. A `draft_not_undoable` or an
+ * `already_sent` undo also leaves it undefined, because the server
+ * answered those and they need no evidence. This is deliberately
  * NOT derived from `approvedAtClient`; see the two retirement effects that
  * read it (src/routes/app.index.tsx, app.conversations.$id.tsx) for why
  * round 3's `dataUpdatedAt > approvedAtClient` check was wrong on its own
@@ -108,13 +111,32 @@ export function queueEntriesReducer(
     // BLOCKER 1 (safety review round 4, #291/#279): stamps the ONE piece
     // of positive evidence the two retirement effects can trust, see the
     // action's own comment above and `undoAmbiguousAt`'s comment on the
-    // type. Only applies while the entry is still "sending" (the only
-    // status Undo is ever offered from); a stray dispatch against an
-    // already-cleared or already-skipped entry is silently dropped, same
-    // as `expired` above.
+    // type.
+    //
+    // Round 5 found round 4 gated this on "sending" alone, which threw
+    // the evidence away in the DOMINANT case. The countdown that flips
+    // sending to sent is an independent 1s timer that does not know an
+    // undo is in flight, and an ambiguous failure is BY CONSTRUCTION the
+    // slow kind (dropped TCP, client timeout, edge 504). `already_sent`
+    // and `draft_not_undoable` are fast because the server answered;
+    // this arm is the one that does not. So the stamp landed only on
+    // ambiguous failures quick enough to beat a 5 second timer, which is
+    // the least likely ambiguous failure there is, and everything slower
+    // settled on a permanent controls-less "Sent." with the draft still
+    // pending on the server and the tenant unanswered.
+    //
+    // Accepting "sent" keeps this positive evidence: still written from
+    // exactly one arm (the ambiguous branch of undoMutation.onError), and
+    // never by an approve, an edit-and-send, a successful undo,
+    // `already_sent`, or `draft_not_undoable`. Both retirement effects
+    // re-run on `entries`, and that arm calls `onSettled()` right after
+    // this dispatch, so the qualifying read lands immediately behind it.
+    // A dispatch against a cleared, undone or skipped entry is still
+    // dropped: those no longer exist, or no longer describe something
+    // that could be in flight.
     case "undoAmbiguous": {
       const current = state[action.draftId];
-      if (current?.status !== "sending") return state;
+      if (current?.status !== "sending" && current?.status !== "sent") return state;
       return {
         ...state,
         [action.draftId]: { ...current, undoAmbiguousAt: action.at },

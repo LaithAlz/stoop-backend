@@ -42,12 +42,22 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
     if (SERVER.undoAppliesThenDropsConnection) {
       // the server COMMITS the undo (draft back to pending, back in the queue)
       SERVER.items = [routine(m[1], "BODY P"), ...SERVER.items.filter((i) => i.draft_id !== m[1])];
+      // ROUND 5: this delay is the whole point, and its absence is why the
+      // committed harness MISSED round 4's regression. An ambiguous undo
+      // failure is by construction the SLOW kind (dropped TCP, client
+      // timeout, edge 504), so it normally surfaces AFTER the 5s
+      // countdown has already flipped the entry to "sent". Throwing
+      // synchronously made the error always beat that timer, which is the
+      // one ordering where round 4's bug could not appear.
+      await new Promise((r) => setTimeout(r, UNDO_FAILURE_DELAY_MS));
       throw new TypeError("Failed to fetch"); // ...and the response never arrives
     }
     return new Response(null, { status: 204, headers: { date: new Date().toUTCString() } });
   }
   return json(200, {});
 }) as any;
+
+const UNDO_FAILURE_DELAY_MS = 6000;
 
 const Home = (HomeRoute as any).options.component as () => any;
 let qc: QueryClient = createQueryClient();

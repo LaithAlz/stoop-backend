@@ -3,11 +3,11 @@ import {
   pruneQueueSnapshots,
   queueEntriesReducer,
   type QueueEntriesState,
-} from "/Users/laith/Businesses/LandlordAI-queue291/apps/web/src/features/queue/queueEntries";
+} from "../src/features/queue/queueEntries";
 import {
   dueUnverifiedResolutions,
   UNVERIFIED_SETTLE_MS,
-} from "/Users/laith/Businesses/LandlordAI-queue291/apps/web/src/features/queue/useResolveUnverifiedSends";
+} from "../src/features/queue/useResolveUnverifiedSends";
 
 function item(id: string, body = "body-" + id) {
   return {
@@ -98,3 +98,42 @@ for (const [label, updatedAt, items] of cases) {
 }
 log("data undefined ->", JSON.stringify(dueUnverifiedResolutions(undefined, failedAt + 999999, flags)));
 log("empty items, fresh read ->", JSON.stringify(dueUnverifiedResolutions([], failedAt + 1, flags)));
+
+// ---------------------------------------------------------------------
+// ROUND 5: the stamp must survive the countdown winning the race.
+//
+// An ambiguous undo failure is BY CONSTRUCTION the slow kind, so it
+// normally surfaces AFTER the independent 1s countdown has already
+// flipped the entry to "sent". Round 4 gated `undoAmbiguous` on
+// "sending" alone, so that dominant ordering threw the evidence away and
+// the card settled on a permanent controls-less "Sent." with the draft
+// still pending on the server.
+// ---------------------------------------------------------------------
+console.log("\n--- ROUND 5: undoAmbiguous after the countdown already flipped to sent ---");
+{
+  let st: QueueEntriesState = {};
+  st = queueEntriesReducer(st, { type: "approved", draftId: "d1", approvedAtClient: 1_000, undoExpiresAtClient: 6_000 } as never);
+  st = queueEntriesReducer(st, { type: "expired", draftId: "d1" } as never);
+  console.log("after countdown, status:", (st.d1 as { status: string }).status);
+  st = queueEntriesReducer(st, { type: "undoAmbiguous", draftId: "d1", at: 7_500 } as never);
+  const e = st.d1 as { status: string; undoAmbiguousAt?: number };
+  console.log("status:", e.status, "| undoAmbiguousAt:", e.undoAmbiguousAt);
+  console.log(
+    e.undoAmbiguousAt === 7_500
+      ? "PASS: the late ambiguous failure is still recorded, so the card can recover"
+      : "FAIL: evidence dropped, this is the permanent stuck-Sent card",
+  );
+}
+
+console.log("\n--- ROUND 5: the arms that must NOT stamp still do not ---");
+{
+  let st: QueueEntriesState = {};
+  st = queueEntriesReducer(st, { type: "approved", draftId: "d2", approvedAtClient: 1_000, undoExpiresAtClient: 6_000 } as never);
+  st = queueEntriesReducer(st, { type: "expired", draftId: "d2" } as never);
+  const plain = st.d2 as { undoAmbiguousAt?: number };
+  console.log("plain approve then expire  -> undoAmbiguousAt:", plain.undoAmbiguousAt);
+
+  let cleared: QueueEntriesState = queueEntriesReducer(st, { type: "cleared", draftId: "d2" } as never);
+  cleared = queueEntriesReducer(cleared, { type: "undoAmbiguous", draftId: "d2", at: 9_000 } as never);
+  console.log("dispatch against a CLEARED entry -> entry:", cleared.d2 ?? "(absent, correctly dropped)");
+}

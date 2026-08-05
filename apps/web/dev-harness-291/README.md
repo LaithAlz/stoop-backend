@@ -25,8 +25,10 @@ and rendered outside an actual router).
 **Pure (`pure.ts`, `pure_idx.ts`)**, no DOM, no React, no build step.
 Exercise `queueEntriesReducer` / `buildQueueView` / `pruneQueueSnapshots`
 / `dueUnverifiedResolutions` directly. Run with `bun run pure.ts` or
-`bun run pure_idx.ts` straight from this directory (they import the real
-source files by absolute path).
+`bun run pure_idx.ts` straight from this directory. They import the real
+source by RELATIVE path (`../src/...`); an earlier version used the
+worktree's absolute path, which would have broken the moment that
+worktree was removed, on the very files the README calls the quick path.
 
 **DOM (`entries/*.tsx`)**, a real route component, a real `QueryClient`,
 mounted with `react-dom/client`, driven by a fetch mock, read back through

@@ -142,7 +142,11 @@ function AppQueuePage() {
   // Undo was genuinely attempted and the server's answer is genuinely
   // unknown. A plain Approve, or a clean undo success/failure, never sets
   // it, so no stale read can ever satisfy `undoAmbiguousAt !== undefined`
-  // on an entry nothing was ever attempted against. Once it IS set, a
+  // on an entry nothing was ever attempted against. The reverse does not
+  // hold and must not be assumed: undefined does NOT mean no undo was
+  // attempted, because `already_sent` and `draft_not_undoable` also leave
+  // it unset (the server answered those, so they need no evidence). Once
+  // it IS set, a
   // read that completed AFTER that ambiguous attempt (not the approve) is
   // the one honest signal that the server has since said something new
   // about this exact draft.

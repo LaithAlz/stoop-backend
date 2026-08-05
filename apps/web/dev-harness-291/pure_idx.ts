@@ -1,7 +1,7 @@
 import {
   buildQueueView, pruneQueueSnapshots, queueEntriesReducer,
   type QueueEntriesState,
-} from "/Users/laith/Businesses/LandlordAI-queue291/apps/web/src/features/queue/queueEntries";
+} from "../src/features/queue/queueEntries";
 
 const it = (id: string) => ({
   case_id: "c-" + id, draft_id: id, severity: "routine", title: null,
