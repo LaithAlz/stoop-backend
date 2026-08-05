@@ -118,6 +118,47 @@ for _key, _value in _PLACEHOLDER_ENV.items():
 # the lane database, don't chase it as a code defect.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# A third dirty-DB mechanism (found implementing #289), same family as the
+# two above but a different shape again: some `test_migrations_000N.py`
+# round-trip tests (e.g. `test_migrations_0010.py`/`test_migrations_0018.py`
+# ::`test_downgrade_to_00XX_drops_index_reupgrade_restores_it`) deliberately
+# insert a landlord + a bare `notifications` row and COMMIT it, on purpose,
+# to prove a downgrade doesn't touch data -- unlike the #281 mechanism
+# above, this is not a crash/interruption artifact, it is the intended,
+# successful behavior of those tests, and they never clean the row up
+# (matching migration 0010's own precedent, not a bug in either file).
+#
+# That row can still bite a LATER test file run against the SAME,
+# not-recreated lane database: `app/agent/emergency_chain.py`'s
+# `run_emergency_chain_sweep` candidate SELECT
+# (`_SELECT_DUE_EMERGENCY_CALLS_SQL`) is INTENTIONALLY unscoped, cluster
+# -wide, same "the production ticker drains every landlord's due rows"
+# reasoning already given for `sender_tick`/`run_landlord_sms_drain_sweep`
+# above -- so it picks up the migration test's bare seed row too. That row
+# was built with only the columns ITS OWN test needed (typically just
+# `message_id`, sometimes an `ack_token`/`ack_token_backup`), never a full
+# `emergency_call` payload (no `property_id`), so
+# `emergency_chain.py::_candidate_from_row` raises `KeyError: 'property_id'`
+# the instant any `tests/test_agent_emergency_chain.py` test calls
+# `run_emergency_chain_sweep` afterward -- observed running
+# `test_migrations_0018.py` before `test_agent_emergency_chain.py` by hand,
+# against a lane database that was not recreated in between.
+#
+# This is exactly the class `tests/migration_harness.py` (#281) exists
+# for -- a lane database carrying state from an earlier, unrelated test
+# run that a later test's own assertions were never written to expect. It
+# never surfaces in a single `uv run pytest` invocation against a fresh
+# container (CI's actual shape, and this repo's default collection order
+# runs `test_agent_emergency_chain.py` before any `test_migrations_000N.py`
+# file alphabetically) -- only when tests are invoked file-by-file, by
+# hand, against a lane database that persists between invocations. If you
+# hit a `KeyError`/`AssertionError` in an emergency-chain (or similar
+# unscoped-sweep) test that makes no sense against the diff in front of
+# you, recreate the lane database before debugging further, same remedy as
+# the #281 mechanism above -- don't chase it as a code defect.
+# ---------------------------------------------------------------------------
+
 
 @pytest.fixture(autouse=True)
 def _reset_jwks_auth_state() -> Iterator[None]:

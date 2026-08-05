@@ -528,6 +528,65 @@ client. The web marketing/demo onboarding route
 (`apps/web/src/routes/onboarding.tsx`) collects a backup contact into
 local component state only and never calls the real API at all.
 
+**v1.28 amendment (2026-08-05, #289 implementation):** two additions, one
+to this endpoint and one to the "Notifications / emergencies" section
+below — the ack token behind `landlord_sms`/`backup_sms` links is now
+**per-recipient**, not shared. Full rationale: schema-v1.md's v1.24
+amendment; `app/agent/emergency_chain.py`'s own docstring "Per-recipient
+ack tokens".
+
+1. **New side effect on `PATCH /v1/properties/{id}`**: the request now
+   ALSO invalidates the backup contact's own ack token on every in-flight
+   (not yet acknowledged) emergency chain for that property, in the SAME
+   request/transaction as the update, whenever the CANONICAL phone
+   `backup_contact` points at actually changes — a clear (the v1.25
+   amendment above's "clears it," a real value → explicit `null`) OR an
+   edit to a DIFFERENT phone number. Response shape is completely
+   unchanged (`Property`, same fields as always) — this is a side effect
+   on `notifications` rows, invisible to this endpoint's own response
+   body. Practically: a removed OR replaced backup contact who already
+   holds a `/ack/{token}` link from an earlier text can no longer use it
+   to silence a live emergency — the exact "ex-partner" scenario #268
+   (v1.25 amendment) could not close on its own, because before this
+   amendment the SAME token was handed to both the landlord and the
+   backup contact, so revoking one meant revoking both. **The edit case
+   is the common real-world flow**, not the rarer one: a landlord leaving
+   a relationship with their backup contact typically replaces them
+   (their sister, their super) in one `PATCH` rather than clearing the
+   field and adding someone else later — the consequence of leaving that
+   case unrevoked is identical to leaving the clear case unrevoked, so
+   both are covered the same way. **What does NOT revoke**: a request
+   that resends the SAME canonical phone number, whether byte-identical
+   or simply written in a different format (e.g. `"4165550199"` vs. the
+   already-stored `"+14165550199"`), and a request that changes only
+   `backup_contact.name` while the phone stays the same — revoking either
+   of those would take away a still-current backup contact's own working
+   link in the middle of a live emergency, which is worse than doing
+   nothing. **Still not covered**: the softer question of what a backup
+   contact should be ABLE to do with their own ack link (e.g. a
+   non-silencing "I've got it") is a separate, not-yet-decided product
+   question, deliberately out of this amendment (#289's own "sequencing"
+   note — per-recipient tokens are the foundation that question needs,
+   not the answer to it).
+2. **`GET`/`POST /ack/{token}` now accept EITHER the landlord's or the
+   backup contact's own token** for the same notification — both response
+   shapes are byte-identical to before (this amendment adds no new field
+   to either response; which recipient a token belongs to is recorded
+   internally, in the `audit_log` row this action already writes, never
+   surfaced in the HTTP response). A token that has been revoked (case 1
+   above) 404s `notification_not_found`, the SAME code an unrecognized
+   token has always returned — a removed backup contact's stale link is
+   indistinguishable from a token that never existed, never a distinct
+   "revoked" state leaked back to whoever is holding it.
+
+**Existing links keep working.** A chain already mid-flight when this
+ships keeps its pre-existing, single shared token functioning for BOTH
+the landlord and anyone who already holds a copy of it — this cannot be
+retroactively split (a secret already texted to two people cannot be
+un-sent). Full per-recipient separation, and therefore full revocation
+capability, applies to every chain created after this ships. See
+schema-v1.md's v1.24 amendment, point 4, for the complete account.
+
 ## Tenants & Vendors
 
 `GET/POST /v1/properties/{id}/tenants` · `PATCH/DELETE /v1/tenants/{id}`
@@ -1028,6 +1087,18 @@ rejected. `rate_limited` joins this doc's stable error-code vocabulary
 (alongside `draft_stale`, `already_sent`, `has_open_cases`,
 `email_required`, `account_deleted`) — codes are stable snake_case
 strings per this doc's own "Conventions" section.
+
+**v1.28 amendment (2026-08-05, #289 implementation — see the Properties
+section's own v1.28 amendment for the full write-up):** `token` in
+`GET`/`POST /ack/{token}` may now be either the landlord's or the backup
+contact's own ack token for the same notification — both were previously
+one shared token. Response shapes are byte-for-byte unchanged; which
+recipient a given token belongs to is recorded only in the `audit_log`
+row this action writes (`recipient_role`, schema-v1.md's matching v1.24
+amendment), never in the HTTP response. A revoked backup token (a removed
+backup contact's stale link) 404s `notification_not_found` — the same
+code an unrecognized token has always returned, never a distinct
+"revoked" state.
 
 ## Devices (push notifications, #210 M3)
 
