@@ -188,6 +188,98 @@ def test_to_e164_cote_divoire_not_on_allowlist_is_left_alone() -> None:
 
 
 # ---------------------------------------------------------------------------
+# to_e164 - #303: allowlist extension (18 newly-verified countries)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("+82 (0)10 1234 5678", "+821012345678", id="south-korea"),
+        pytest.param("+90 (0)532 123 4567", "+905321234567", id="turkey"),
+        pytest.param("+380 (0)44 123 4567", "+380441234567", id="ukraine"),
+        pytest.param("+385 (0)1 234 5678", "+38512345678", id="croatia"),
+        pytest.param("+386 (0)1 234 5678", "+38612345678", id="slovenia"),
+        pytest.param("+381 (0)11 234 5678", "+381112345678", id="serbia"),
+        pytest.param("+62 (0)812 3456 789", "+628123456789", id="indonesia"),
+        pytest.param("+60 (0)12 345 6789", "+60123456789", id="malaysia"),
+        pytest.param("+66 (0)81 234 5678", "+66812345678", id="thailand"),
+        pytest.param("+63 (0)917 123 4567", "+639171234567", id="philippines"),
+        pytest.param("+84 (0)912 345 678", "+84912345678", id="vietnam"),
+        pytest.param("+234 (0)803 123 4567", "+2348031234567", id="nigeria"),
+        pytest.param("+254 (0)712 345 678", "+254712345678", id="kenya"),
+        pytest.param("+92 (0)300 1234567", "+923001234567", id="pakistan"),
+        pytest.param("+880 (0)1712 345678", "+8801712345678", id="bangladesh"),
+        pytest.param("+212 (0)612 345678", "+212612345678", id="morocco"),
+        pytest.param("+233 (0)24 123 4567", "+233241234567", id="ghana"),
+        pytest.param("+94 (0)71 234 5678", "+94712345678", id="sri-lanka"),
+    ],
+)
+def test_to_e164_newly_allowlisted_countries_drop_trunk_zero(raw: str, expected: str) -> None:
+    assert to_e164(raw) == expected
+
+
+@pytest.mark.unit
+def test_to_e164_brazil_left_off_the_303_allowlist_deliberately() -> None:
+    """Brazil (55) was checked and deliberately left out (see the module
+    docstring, "Allowlist extension (#303, 2026-08-05)"): its domestic
+    long-distance dialing prefix is "0" + a carrier-selection code, not the
+    simple trunk zero this rule assumes, so a parenthesized "(0)" right
+    after "55" is left exactly as before this issue, same as any other
+    unlisted country."""
+    assert to_e164("+55 (0)21 91234 5678") == "+55021912345678"
+
+
+# ---------------------------------------------------------------------------
+# to_e164 - #304: a leading zero right after "+" is never valid E.164
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_to_e164_rejects_leading_zero_with_no_country_code() -> None:
+    """The exact first example from the issue: no digits between "+" and
+    the parenthesized "(0)", so the trunk-zero rule never matches, and the
+    result used to pass the international branch's digit-count-only check
+    even though a country code can never be empty or "0"."""
+    assert to_e164("+ (0)20 7946 0958") is None
+
+
+@pytest.mark.unit
+def test_to_e164_rejects_leading_zero_behind_a_fake_country_code() -> None:
+    """The exact second example from the issue: "044" is not a real country
+    code and is not on ``_TRUNK_ZERO_COUNTRY_ALLOWLIST``, so the trunk-zero
+    rule leaves it alone, and the result used to pass the international
+    branch's digit-count-only check (14 digits, 8-15) even though nothing
+    can dial a value starting "+0"."""
+    assert to_e164("+044 (0)20 7946 0958") is None
+
+
+@pytest.mark.unit
+def test_to_e164_rejects_bare_leading_zero_no_parens() -> None:
+    """Not just the parenthesized-trunk-zero shape: any international
+    value whose first digit is a plain "0" is undialable."""
+    assert to_e164("+0207946 0958") is None
+
+
+@pytest.mark.unit
+def test_to_e164_leading_zero_check_runs_after_an_allowlisted_trunk_zero_drop() -> None:
+    """A real, allowlisted country code is never mistaken for a leading
+    zero: the UK's own trunk zero is dropped first, leaving digits that
+    start with "44", not "0"."""
+    assert to_e164("+44 (0)20 7946 0958") == "+442079460958"
+
+
+@pytest.mark.unit
+def test_to_e164_leading_zero_rejection_does_not_touch_retained_zero_countries() -> None:
+    """Italy is NOT on the allowlist, so its trunk zero is never dropped,
+    so ``digits`` starts with "3" (from "39"), never "0" -- the #304 rule
+    never fires for it. Confirms #304 and #303's allowlist compose
+    correctly rather than one silently undoing the other."""
+    assert to_e164("+39 (0)6 6982 1234") == "+390669821234"
+
+
+# ---------------------------------------------------------------------------
 # to_e164 — reject cases
 # ---------------------------------------------------------------------------
 

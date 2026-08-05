@@ -57,7 +57,10 @@ Canonicalization policy (mirrors the TS implementation exactly)
     number gets no less scrutiny than a bare one — a dropped digit like
     ``"+1416555013"`` must not slip through just because it has a plus).
   - otherwise treated as non-NANP international: accepted if the total
-    digit count is between 8 and 15 inclusive (E.164's own bound), no
+    digit count is between 8 and 15 inclusive (E.164's own bound) AND the
+    first digit is not ``0`` (#304: no country code ever begins with
+    ``0``, so this is the one shape rule this codebase enforces even
+    without knowing anything else about the destination country), no
     further shape validation — this codebase has no non-NANP dialing
     rules to check against.
 - **Extensions / any other junk** (e.g. ``"416-555-0134 x22"``, ``"n/a"``)
@@ -89,6 +92,25 @@ code, not a trunk marker, so the literal ``"(0)"`` never matches
 7946 0958"``) is left exactly as before — this is option 1 only (see the
 issue); it does not attempt to detect or repair that case.
 
+No leading zero after "+" (#304)
+------------------------------------------------------------------------
+A country code never begins with ``0``, so nothing can dial a value whose
+first digit after ``"+"`` is ``0``. Before this rule, the international
+branch checked only the total digit count (8 to 15), with no shape
+validation, so ``"+ (0)20 7946 0958"`` (no digits between ``"+"`` and the
+parenthesized ``"(0)"``, so the trunk-zero rule above never matches it)
+and ``"+044 (0)20 7946 0958"`` (a 3-digit run, ``"044"``, that is not on
+``_TRUNK_ZERO_COUNTRY_ALLOWLIST``, so the trunk-zero rule leaves it alone
+too) both normalized to ``"+02079460958"`` / ``"+04402079460958"``,
+neither dialable by anyone. Unlike the trunk-zero rule, this needs no
+country-specific knowledge: it is checked on ``digits`` (i.e. after any
+allowlisted trunk-zero drop has already happened), so a real, allowlisted
+country code is never mistaken for a leading zero, and it applies only in
+the international branch (a bare NANP input never reaches this check at
+all, and a ``+1`` NANP input is rejected or accepted by
+``is_plausible_nanp`` alone, which already can't produce a result starting
+with ``0``).
+
 **Country-code allowlist (adversarial safety review, 2026-08-04,
 BLOCKING).** The rule above is only correct for countries that actually
 DROP the leading ``0`` when dialed from abroad. Italy, San Marino, Vatican
@@ -114,6 +136,25 @@ pre-#277 status quo, not a new bug. Adding a country to this list is a
 deliberate act: check that specific country's numbering plan (does it
 retain or drop the trunk zero when dialed internationally?) before adding
 its code — do not guess from the shape of an example.
+
+**Allowlist extension (#303, 2026-08-05).** The original 26-country list
+above left every other country on the pre-#277 status quo, so e.g.
+``"+82 (0)10 1234 5678"`` (Korea) still stored as a 13-digit undialable
+value. Added, each verified to drop its national trunk prefix ``0`` when
+dialed internationally (i.e. the national significant number itself never
+starts with ``0``): South Korea (82), Turkey (90), Ukraine (380), Croatia
+(385), Slovenia (386), Serbia (381), Indonesia (62), Malaysia (60),
+Thailand (66), the Philippines (63), Vietnam (84), Nigeria (234), Kenya
+(254), Pakistan (92), Bangladesh (880), Morocco (212), Ghana (233), and
+Sri Lanka (94). **Left out, not confident:** Brazil (55). Brazil's
+domestic long-distance dialing prefixes a 2-digit carrier-selection code
+between the trunk ``0`` and the area code (``0`` + carrier code + area
+code + number, and a purely local call uses neither the ``0`` nor an area
+code at all), so it is not the simple "``0`` immediately before the rest
+of the number" shape this rule assumes, and applying the rule anyway risks
+mangling a number this narrow check was never designed to reason about.
+Left off the list rather than guessed at; see #303 for the full candidate
+list this was checked against.
 
 ``is_plausible_nanp``: area code and exchange code both start ``2``-``9``
 and neither is an N11 service code (``211``/``411``/``911``/… — never
@@ -223,6 +264,29 @@ _TRUNK_ZERO_COUNTRY_ALLOWLIST = frozenset(
         "40",
         "420",
         "421",
+        # #303 (2026-08-05): each verified to drop its national trunk
+        # prefix "0" internationally, i.e. the national significant number
+        # itself never starts with "0". See the module docstring,
+        # "Allowlist extension (#303, 2026-08-05)", for the full rationale
+        # and for the one candidate (Brazil, 55) deliberately left out.
+        "82",  # South Korea
+        "90",  # Turkey
+        "380",  # Ukraine
+        "385",  # Croatia
+        "386",  # Slovenia
+        "381",  # Serbia
+        "62",  # Indonesia
+        "60",  # Malaysia
+        "66",  # Thailand
+        "63",  # Philippines
+        "84",  # Vietnam
+        "234",  # Nigeria
+        "254",  # Kenya
+        "92",  # Pakistan
+        "880",  # Bangladesh
+        "212",  # Morocco
+        "233",  # Ghana
+        "94",  # Sri Lanka
     }
 )
 
@@ -316,6 +380,12 @@ def to_e164(raw: str) -> str | None:
     if plus:
         if digits.startswith("1"):
             return f"+{digits}" if len(digits) == 11 and is_plausible_nanp(digits[1:]) else None
+        # #304: a country code never begins with "0", the one shape rule
+        # this codebase enforces on a non-NANP international number without
+        # needing to know anything else about the destination country. See
+        # module docstring, "No leading zero after '+'".
+        if digits.startswith("0"):
+            return None
         return f"+{digits}" if 8 <= len(digits) <= 15 else None
 
     if len(digits) == 10 and is_plausible_nanp(digits):
