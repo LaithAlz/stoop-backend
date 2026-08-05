@@ -30,8 +30,11 @@ import {
   secondsRemaining,
 } from "./queueEntries";
 import {
+  clearGiveUpNotice,
   clearUnverifiedSend,
   markUnverifiedSend,
+  setGiveUpNotice,
+  useGiveUpNotices,
   useUnverifiedSendIds,
 } from "./unverifiedSendStore";
 
@@ -66,7 +69,15 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   // any clock, since there is no honest wall-clock answer to "how long
   // should a warning about an unconfirmed send stay up", only "until the
   // landlord has acted on it knowing it was there."
-  const [giveUpNotices, setGiveUpNotices] = useState<Record<string, string>>({});
+  //
+  // FIX 3 (safety review round 4, #291/#279): sourced from
+  // unverifiedSendStore.ts's own module-scope map now, not a local
+  // `useState`, for the identical reason #279 already hoisted
+  // `unverifiedSendIds` out of local state, this hook is instantiated
+  // PER ROUTE, and the give-up toast's own advice ("Open the conversation
+  // to check") sends the landlord to the OTHER route, which used to mount
+  // a fresh hook instance with no memory of the notice at all.
+  const giveUpNotices = useGiveUpNotices();
   const [editingContext, setEditingContext] = useState<(DraftContext & { body: string }) | null>(
     null,
   );
@@ -182,8 +193,10 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       // verbatim the F7 hazard this whole guard exists to prevent,
       // reintroduced on a timer. This sticky per-draft notice is what the
       // card renders instead once `isSendUnverified` (the flag just
-      // cleared above) stops being true.
-      setGiveUpNotices((prev) => ({ ...prev, [draftId]: UNVERIFIED_GIVE_UP_CARD_NOTICE }));
+      // cleared above) stops being true. FIX 3: written to the shared
+      // module store now, not local state, see `giveUpNotices`'s own
+      // comment above.
+      setGiveUpNotice(draftId, UNVERIFIED_GIVE_UP_CARD_NOTICE);
       // BLOCKER 2: deliberately does NOT touch `editingContext`, unlike
       // the version of this function that used to run here. The give-up
       // ceiling firing is a clock, not a landlord action. A landlord who
@@ -208,13 +221,9 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
     });
     // BLOCKER 2: the landlord acting on this draft again (Approve, Skip,
     // or a new edit-and-send) is what retires the sticky give-up notice.
-    // See that state's own comment above for why this, not a timer.
-    setGiveUpNotices((prev) => {
-      if (!(draftId in prev)) return prev;
-      const next = { ...prev };
-      delete next[draftId];
-      return next;
-    });
+    // See that state's own comment above for why this, not a timer. FIX
+    // 3: clears the shared module store now, not local state.
+    clearGiveUpNotice(draftId);
   }, []);
 
   const clearBusy = useCallback((draftId: string) => {
@@ -389,6 +398,21 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       // server read (not a client guess) settles it, but leave the entry
       // exactly where it was: "sending" is the one state that's still
       // true here.
+      //
+      // BLOCKER 1 (safety review ROUND 4, #291/#279): this is now also the
+      // ONE place `undoAmbiguousAt` gets stamped (queueEntries.ts's
+      // `undoAmbiguous` action), the positive evidence the two retirement
+      // effects (src/routes/app.index.tsx, app.conversations.$id.tsx) gate
+      // on instead of the false guarantee round 3's `dataUpdatedAt >
+      // approvedAtClient` check assumed it had. See those effects' own
+      // comments for the full reasoning; the short version is that
+      // `dataUpdatedAt` is stamped when a response RESOLVES on the client,
+      // not when the server computed it, so a read issued before ANY
+      // approve and resolving after it could trip that comparison on a
+      // draft nothing was ever attempted against. `undoAmbiguousAt` is
+      // only ever set here, from a genuine ambiguous Undo failure, so no
+      // stale read can trip it on a plain Approve.
+      dispatch({ type: "undoAmbiguous", draftId: ctx.draftId, at: Date.now() });
       onNotice(
         error instanceof ApiError
           ? toHouseApiError(error)
@@ -540,11 +564,19 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
     entries,
     dispatch,
     staleNotices,
-    /** BLOCKER 2: the give-up ceiling's own sticky per-draft notice. See
-     *  this hook's own `giveUpNotices` state comment. A caller renders
-     *  this wherever it was already rendering `UNVERIFIED_SEND_NOTICE`
-     *  (`isSendUnverified` for the same draft id is false again by the
-     *  time this has anything in it, the two never both apply at once). */
+    /** BLOCKER 2: the give-up ceiling's own sticky per-draft notice
+     *  (`draftId -> message`). See this hook's own `giveUpNotices`
+     *  comment above for where the map itself lives now (FIX 3, round 4).
+     *
+     *  Round 4 correction: this is NOT simply "wherever
+     *  `UNVERIFIED_SEND_NOTICE` was showing" as a prior revision of this
+     *  comment claimed, `isSendUnverified` for the same draft id is
+     *  false again by the time this has anything in it, but that only
+     *  covers the CARD'S own notice line. The editor
+     *  (EditDraftPanel.tsx's `notice` prop) is a SEPARATE render target
+     *  that needs this passed in explicitly too; both call sites
+     *  (src/routes/app.index.tsx's DecisionCard, app.conversations.$id
+     *  .tsx's own editing branch) now do. */
     giveUpNotices,
     editingContext,
     /** A2: true while an approve/undo/skip/edit-and-send is in flight for

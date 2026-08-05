@@ -363,25 +363,40 @@ function ConversationPage() {
     }
   }, [pinnedEntry?.status, queryClient, id]);
 
-  // BLOCKER 1 (safety review round 3, #291/#279): this route's own copy of
-  // Home's identical fix (src/routes/app.index.tsx's retirement effect,
-  // see its own comment for the full shape). An undo whose DELETE commits
-  // server-side (draft back to `pending`) but whose response is lost or
-  // ambiguous (useDraftActions.ts's undoMutation onError) is correctly
-  // left "sending", not cleared, but the 5s countdown alone still ticks
-  // it to "sent" with no idea the undo actually applied. On the thread,
-  // "the server contradicts the client's own 'Sent.' claim" is exactly
-  // `livePendingDraft` reporting THIS SAME draft id as genuinely
-  // `pending` again: the honest record that nothing went out. Gated on
-  // `caseQuery.dataUpdatedAt > entry.approvedAtClient`, same reasoning as
-  // Home: a read that predates the approve would also show this id as
-  // `pending` (it hasn't been approved yet as far as that stale read
-  // knows), and must not trip this. Only a read that landed AFTER the
-  // approve started can honestly contradict it.
+  // BLOCKER 1 (safety review round 3, #291/#279; corrected ROUND 4, this
+  // route's own copy of Home's identical fix, src/routes/app.index.tsx's
+  // retirement effect carries the full reasoning, kept in sync here). An
+  // undo whose DELETE commits server-side (draft back to `pending`) but
+  // whose response is lost or ambiguous (useDraftActions.ts's
+  // undoMutation onError) is correctly left "sending", not cleared, but
+  // the 5s countdown alone still ticks it to "sent" with no idea the undo
+  // actually applied. On the thread, "the server contradicts the
+  // client's own 'Sent.' claim" is exactly `livePendingDraft` reporting
+  // THIS SAME draft id as genuinely `pending` again: the honest record
+  // that nothing went out.
+  //
+  // Round 4: round 3 gated this on `caseQuery.dataUpdatedAt > entry.
+  // approvedAtClient`, on the same false premise Home's copy of this
+  // effect had, `dataUpdatedAt` is stamped when a response RESOLVES on
+  // the client, not when the server computed it, so a read issued before
+  // ANY approve and resolving after it can satisfy that inequality while
+  // still carrying a pre-approve snapshot that honestly still lists the
+  // draft as pending. That is reachable here too: any case-query refetch
+  // in flight across an ordinary Approve (this route has no polling, but
+  // window focus and `onSettled`-triggered invalidations still apply)
+  // measurably reproduced it. Gated on `entry.undoAmbiguousAt` instead,
+  // set ONLY from useDraftActions.ts's `undoMutation` onError's ambiguous
+  // branch, the one case an undo was genuinely attempted and the
+  // server's answer is genuinely unknown, for the same reasoning Home's
+  // copy of this effect now carries in full.
   useEffect(() => {
     if (!livePendingDraft) return;
     const entry = entryFor(draftActions.entries, livePendingDraft.id);
-    if (entry.status === "sent" && caseQuery.dataUpdatedAt > entry.approvedAtClient) {
+    if (
+      entry.status === "sent" &&
+      entry.undoAmbiguousAt !== undefined &&
+      caseQuery.dataUpdatedAt > entry.undoAmbiguousAt
+    ) {
       draftActions.dispatch({ type: "cleared", draftId: livePendingDraft.id });
     }
     // draftActions.dispatch is stable (useReducer); draftActions.entries
@@ -533,6 +548,17 @@ function ConversationPage() {
                       // live here: the exact gap this issue closes. Same
                       // prop Home's DecisionCard already threads through.
                       sendDisabled={draftActions.isSendUnverified(editingContext.draftId)}
+                      // BLOCKER 2 (safety review round 4, #291/#279): this
+                      // route never passed the give-up ceiling's sticky
+                      // notice into the editor AT ALL, the non-editing
+                      // `DraftFooter` branch below got it (see its own
+                      // `staleNotice` prop), but the editing branch here
+                      // did not, so the one notice that matters most,
+                      // "a resend on this exact draft won't replace what
+                      // already went out", disappeared the moment the
+                      // landlord reopened Edit, the moment they could act
+                      // on it.
+                      notice={draftActions.giveUpNotices.get(editingContext.draftId)}
                       onCancel={() => draftActions.cancelEditor()}
                       onSend={(body) => draftActions.submitEdit(body)}
                     />
@@ -559,12 +585,14 @@ function ConversationPage() {
                       // mirrored from Home's own fix: once the give-up
                       // ceiling clears `isSendUnverified`, the sticky
                       // `giveUpNotices` entry is what keeps this footer
-                      // honest instead of falling silent.
+                      // honest instead of falling silent. FIX 3 (round 4):
+                      // `giveUpNotices` is a `ReadonlyMap` now
+                      // (unverifiedSendStore.ts), not a Record, `.get()`.
                       staleNotice={
                         draftActions.staleNotices[caseDetail.id] ??
                         (draftActions.isSendUnverified(draftId)
                           ? UNVERIFIED_SEND_NOTICE
-                          : draftActions.giveUpNotices[draftId])
+                          : draftActions.giveUpNotices.get(draftId))
                       }
                       // #279: OR'd with `isSendUnverified`, same as Home's
                       // `actionsBusy`: Approve/Edit stay locked while this

@@ -102,6 +102,13 @@ export function clearUnverifiedSend(draftId: string): boolean {
  * silently discards A's own guard at the same moment. Still exported
  * plainly (not renamed back to a dunder-prefixed test helper) so it stays
  * obviously callable from both app code and this file's own harness.
+ *
+ * FIX 3 (safety review round 4, #291/#279): also resets the give-up
+ * notice map below, the same cross-account reasoning as the flag itself,
+ * a sticky notice landlord A's session raised is exactly as much a
+ * cross-account artifact as the flag it explains, and the two must clear
+ * together or a reset that only clears one leaves the other lying about
+ * whether anything is still unverified.
  */
 export function resetUnverifiedSendStore(): void {
   // Finding 4 (safety review round 3, #291/#279): this used to assign
@@ -115,8 +122,69 @@ export function resetUnverifiedSendStore(): void {
   // no accompanying render leaves that closure checking a now-stale map
   // until something else happens to re-render.
   setState(new Map());
+  setGiveUpNoticeState(new Map());
 }
 
 export function useUnverifiedSendIds(): UnverifiedSendMap {
   return useSyncExternalStore(subscribe, getUnverifiedSendSnapshot, getUnverifiedSendSnapshot);
+}
+
+/**
+ * FIX 3 (safety review round 4, #291/#279): the give-up ceiling's sticky
+ * card notice (BLOCKER 2, useDraftActions.ts's `giveUpUnverifiedSend`),
+ * hoisted here beside the flag it reports on, for the exact reason #279
+ * hoisted `unverifiedSendIds` itself above: `useDraftActions` is
+ * instantiated PER ROUTE (Home, the conversation thread). This notice
+ * used to live in one of those instances' local `useState`, so a landlord
+ * who followed the give-up TOAST's own advice ("Open the conversation to
+ * check") navigated away from the route that had just raised the sticky
+ * notice, unmounted it, and found no trace of it on return, the exact
+ * gap #279 already closed once for the flag itself, reopened here for the
+ * notice text that explains it.
+ */
+export type GiveUpNoticeMap = ReadonlyMap<string, string>;
+
+let giveUpNoticeState: GiveUpNoticeMap = new Map();
+const giveUpNoticeListeners = new Set<() => void>();
+
+function setGiveUpNoticeState(next: GiveUpNoticeMap): void {
+  giveUpNoticeState = next;
+  for (const listener of giveUpNoticeListeners) listener();
+}
+
+function subscribeGiveUpNotices(listener: () => void): () => void {
+  giveUpNoticeListeners.add(listener);
+  return () => {
+    giveUpNoticeListeners.delete(listener);
+  };
+}
+
+export function getGiveUpNoticeSnapshot(): GiveUpNoticeMap {
+  return giveUpNoticeState;
+}
+
+/** Sets the sticky notice for `draftId`, useDraftActions.ts's
+ *  `giveUpUnverifiedSend`, the moment the wall-clock ceiling fires. */
+export function setGiveUpNotice(draftId: string, message: string): void {
+  const next = new Map(giveUpNoticeState);
+  next.set(draftId, message);
+  setGiveUpNoticeState(next);
+}
+
+/** Clears the sticky notice for `draftId`, a no-op if none was set,
+ *  useDraftActions.ts's `markBusy`, the moment the landlord takes a fresh
+ *  action on this draft (Approve, Skip, or a new edit-and-send attempt). */
+export function clearGiveUpNotice(draftId: string): void {
+  if (!giveUpNoticeState.has(draftId)) return;
+  const next = new Map(giveUpNoticeState);
+  next.delete(draftId);
+  setGiveUpNoticeState(next);
+}
+
+export function useGiveUpNotices(): GiveUpNoticeMap {
+  return useSyncExternalStore(
+    subscribeGiveUpNotices,
+    getGiveUpNoticeSnapshot,
+    getGiveUpNoticeSnapshot,
+  );
 }

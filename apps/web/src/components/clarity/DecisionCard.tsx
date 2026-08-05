@@ -43,9 +43,16 @@ interface DecisionCardProps {
   status?: DecisionCardStatus;
   secondsLeft?: number;
   totalSeconds?: number;
-  /** The `draft_stale` one-line notice (src/features/queue/
-   *  queueEntries.ts's `draftStaleNotice`) — shown for a few seconds after
-   *  a concurrent tenant reply invalidates this card's draft mid-action. */
+  /** The card's one-line notice slot, the caller (src/routes/
+   *  app.index.tsx's `QueueRow`) merges three sources into this ONE
+   *  string in priority order: the `draft_stale` notice
+   *  (src/features/queue/queueEntries.ts's `draftStaleNotice`, shown for
+   *  a few seconds after a concurrent tenant reply invalidates this
+   *  card's draft mid-action), else `UNVERIFIED_SEND_NOTICE` while
+   *  `sendUnverified` is true, else the give-up ceiling's sticky notice
+   *  once it isn't. Rendered below the draft bubble while `!isEditing`,
+   *  AND (round 4, BLOCKER 2) threaded straight into `EditDraftPanel`'s
+   *  own `notice` prop while editing, see that branch below. */
   staleNotice?: string;
   /** True while the edit-and-send mutation for THIS card is in flight. */
   editSubmitting?: boolean;
@@ -229,6 +236,14 @@ export function DecisionCard({
           initialBody={draftMessage}
           submitting={editSubmitting}
           sendDisabled={sendUnverified}
+          // BLOCKER 2 (safety review round 4, #291/#279): the same
+          // `staleNotice` this card would otherwise show below the draft
+          // bubble (the block right under this ternary, gated on
+          // `!isEditing`), passed straight through so the give-up
+          // ceiling's sticky notice keeps showing once the landlord opens
+          // Edit, instead of disappearing at exactly the moment they can
+          // act on it.
+          notice={staleNotice}
           onCancel={() => onCancelEdit?.()}
           onSend={(body) => onSubmitEdit?.(body)}
         />

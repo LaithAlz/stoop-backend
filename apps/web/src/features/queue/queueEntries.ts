@@ -31,10 +31,26 @@ import type { QueueItem } from "@/api/types";
  * everything downstream of it — this reducer, `secondsRemaining`,
  * `totalUndoSeconds` — works purely in client-clock numbers.
  */
+/**
+ * `undoAmbiguousAt` (BLOCKER 1, safety review ROUND 4, #291/#279): the
+ * CLIENT `Date.now()` moment an Undo tap on THIS entry hit an ambiguous
+ * failure (useDraftActions.ts's `undoMutation` onError, the network-error/
+ * 5xx branch), undefined on every entry an undo was never attempted
+ * against, including a plain, uneventful Approve. This is deliberately
+ * NOT derived from `approvedAtClient`; see the two retirement effects that
+ * read it (src/routes/app.index.tsx, app.conversations.$id.tsx) for why
+ * round 3's `dataUpdatedAt > approvedAtClient` check was wrong on its own
+ * terms, not just under-scoped.
+ */
 export type QueueEntry =
   | { status: "idle" }
-  | { status: "sending"; undoExpiresAtClient: number; approvedAtClient: number }
-  | { status: "sent"; approvedAtClient: number }
+  | {
+      status: "sending";
+      undoExpiresAtClient: number;
+      approvedAtClient: number;
+      undoAmbiguousAt?: number;
+    }
+  | { status: "sent"; approvedAtClient: number; undoAmbiguousAt?: number }
   | { status: "skipped" };
 
 /** Keyed by `draft_id` — the id that drives approve/undo/reject per the
@@ -46,7 +62,14 @@ export type QueueEntriesAction =
   | { type: "undone"; draftId: string }
   | { type: "expired"; draftId: string }
   | { type: "skipped"; draftId: string }
-  | { type: "cleared"; draftId: string };
+  | { type: "cleared"; draftId: string }
+  // BLOCKER 1 (safety review round 4, #291/#279): dispatched ONLY from
+  // useDraftActions.ts's `undoMutation` onError's ambiguous branch, the
+  // one place an undo was genuinely attempted and the server's answer is
+  // genuinely unknown. Never dispatched by a plain Approve, so no stale
+  // read can ever satisfy `undoAmbiguousAt !== undefined` on an entry
+  // nothing was ever attempted against.
+  | { type: "undoAmbiguous"; draftId: string; at: number };
 
 const IDLE: QueueEntry = { status: "idle" };
 
@@ -68,18 +91,33 @@ export function queueEntriesReducer(
       const current = state[action.draftId];
       if (current?.status !== "sending") return state;
       // BLOCKER 1 (safety review round 3, #291/#279): `approvedAtClient`
-      // used to be dropped here. Kept on "sent" now: src/routes/
-      // app.index.tsx's retirement effect (and app.conversations.$id.tsx's
-      // own copy) needs it to tell "the server hasn't said anything new
-      // yet" apart from "a fresh read still contradicts this card's own
-      // 'Sent.' claim" (an ambiguous undo whose DELETE actually committed,
-      // useDraftActions.ts's undoMutation onError). The ONLY honest signal
-      // that distinguishes those two is whether a read happened AFTER this
-      // moment, and that requires this timestamp to survive the
-      // sending -> sent transition, not just the approved -> sending one.
+      // used to be dropped here. Kept on "sent" now for its own sake (see
+      // that field's own comment on the type above); ROUND 4 also carries
+      // `undoAmbiguousAt` through this same transition unchanged, for the
+      // identical reason, the retirement effects need it to survive
+      // "sending" -> "sent", not just "approved" -> "sending".
       return {
         ...state,
-        [action.draftId]: { status: "sent", approvedAtClient: current.approvedAtClient },
+        [action.draftId]: {
+          status: "sent",
+          approvedAtClient: current.approvedAtClient,
+          undoAmbiguousAt: current.undoAmbiguousAt,
+        },
+      };
+    }
+    // BLOCKER 1 (safety review round 4, #291/#279): stamps the ONE piece
+    // of positive evidence the two retirement effects can trust, see the
+    // action's own comment above and `undoAmbiguousAt`'s comment on the
+    // type. Only applies while the entry is still "sending" (the only
+    // status Undo is ever offered from); a stray dispatch against an
+    // already-cleared or already-skipped entry is silently dropped, same
+    // as `expired` above.
+    case "undoAmbiguous": {
+      const current = state[action.draftId];
+      if (current?.status !== "sending") return state;
+      return {
+        ...state,
+        [action.draftId]: { ...current, undoAmbiguousAt: action.at },
       };
     }
     case "skipped":
@@ -228,31 +266,44 @@ export interface QueueSnapshot {
  * actually promise.
  *
  * Item 5 (safety review, #291/#279; corrected in round 3's re-verify,
- * see Finding 3): a prior revision of this paragraph claimed `sending`'s
- * transition to `"sent"` needed to stay pinned for one more commit so
- * `QueueRow`'s focus-return effect and the "Sent." confirmation text both
- * had a chance to react to it before the row could unmount out from under
- * them. Measured (a MutationObserver plus a `requestAnimationFrame` poll,
- * both against the exact mid-window-refetch case this was written for):
- * that benefit is a no-op. Home's own parent-level retirement effect
- * (src/routes/app.index.tsx) commits in the SAME pass as this pin's own
- * consumer, so "sent" is dispatched-and-cleared before the browser ever
- * paints a frame with "Sent." on screen: zero of several hundred sampled
- * painted frames showed it. Whatever benefit keeping this pin has, it
- * isn't that one; take Item 8 above at its word instead: this docstring
+ * see Finding 3; QUALIFIED AGAIN in round 4, see the correction below): a
+ * prior revision of this paragraph claimed `sending`'s transition to
+ * `"sent"` needed to stay pinned for one more commit so `QueueRow`'s
+ * focus-return effect and the "Sent." confirmation text both had a chance
+ * to react to it before the row could unmount out from under them.
+ * Measured (a MutationObserver plus a `requestAnimationFrame` poll,
+ * against the exact mid-window-refetch case this was written for, i.e. a
+ * qualifying read had already landed by the time the countdown expired):
+ * that benefit is a no-op there, Home's own parent-level retirement
+ * effect (src/routes/app.index.tsx) commits in the SAME pass as this
+ * pin's own consumer, so "sent" is dispatched-and-cleared before the
+ * browser ever paints a frame with "Sent." on screen in THAT case: zero
+ * of several hundred sampled painted frames showed it.
+ *
+ * Round 4 correction: that measurement is true only when a qualifying
+ * read has already landed before expiry, it is not the ordinary case.
+ * A plain Approve triggers no refetch of its own (this hook's own
+ * docstring, "the local overlay IS the honest UI state"), and the queue's
+ * background poll is 20 seconds, so on an ordinary approve with no
+ * concurrent refetch in flight, nothing satisfies either retirement
+ * effect's gate (round 4: `undoAmbiguousAt !== undefined`) and "Sent."
+ * paints and HOLDS, same session, until something else refetches. Whether
+ * this pin has any real benefit in that ordinary case was never
+ * measured; take Item 8 above at its word instead: this docstring
  * makes no claim about why a `sending`/`sent` pin is released when it is,
  * only about what `buildQueueView` does while one of those three statuses
  * is still the honest state. `sent` stays pinned here regardless, because
  * BLOCKER 1 (useDraftActions.ts's `undoMutation` onError, src/routes/
  * app.index.tsx's retirement effect) needs the snapshot's `approvedAtClient`
- * to survive the sending -> sent transition to tell an honest "sent" apart
- * from a stuck one, a real reason, just not the one originally written
- * here. src/routes/app.index.tsx's own effect is what retires the pin for
- * good, one read later, by dispatching `cleared` once the draft has
- * genuinely left a fresh `items` read OR a fresh read contradicts this
- * card's own "sent" claim. This function has no opinion on when that
- * happens, only on not unmounting the row out from under a status change
- * it didn't cause.
+ * AND (round 4) `undoAmbiguousAt` to survive the sending -> sent
+ * transition to tell an honest "sent" apart from a stuck one, a real
+ * reason, just not the one originally written here. src/routes/
+ * app.index.tsx's own effect is what retires the pin for good, one read
+ * later, by dispatching `cleared` once the draft has genuinely left a
+ * fresh `items` read OR a fresh read lands after a genuinely ambiguous
+ * undo attempt on this same entry. This function has no opinion on when
+ * that happens, only on not unmounting the row out from under a status
+ * change it didn't cause.
  *
  * A `sending`/`sent` row already present in `items` uses the SNAPSHOT's
  * `draft_body`, not the live item's, whenever a

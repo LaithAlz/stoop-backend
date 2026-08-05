@@ -6,7 +6,18 @@ import reactRefresh from "eslint-plugin-react-refresh";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist", ".output", ".vinxi"] },
+  {
+    ignores: [
+      "dist",
+      ".output",
+      ".vinxi",
+      // Manual verification harness (issue #291/#279's safety-review
+      // rounds, docs/03-engineering/dev-agents.md), not app code, not
+      // wired into the build, pending #294's real test runner. See
+      // dev-harness-291/README.md.
+      "dev-harness-291",
+    ],
+  },
   {
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     files: ["**/*.{ts,tsx}"],

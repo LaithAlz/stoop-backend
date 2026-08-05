@@ -78,13 +78,21 @@ function AppQueuePage() {
   // the row can't unmount the editor mid-type. Cleared as soon as the
   // editor closes (the effect below).
   //
-  // Finding 5 (safety review round 3, #291/#279): `index` is captured
-  // HERE too, at the same open-time moment as `item`, not recomputed
-  // later against `decisionItems` at submit time. See `handleOpenEditor`/
-  // `handleSubmitEdit` below for why: A7's whole reason to exist is that
-  // the edited item can fall out of `decisionItems` while the editor is
-  // open (a background poll, per its own comment above), which is exactly
-  // when a submit-time lookup would find nothing.
+  // Finding 5 (safety review round 3, #291/#279; corrected round 4, see
+  // `handleSubmitEdit` below): `index` is captured HERE too, at the same
+  // open-time moment as `item`, but only as a FALLBACK now, not the
+  // value `handleSubmitEdit` always uses. A prior revision of this
+  // comment claimed the open-time value was used as-is because a
+  // submit-time lookup "would find nothing" if the row had fallen out of
+  // `decisionItems` while the editor sat open, true for THAT case, but
+  // it ignored the opposite one: a row ABOVE the edited card leaving
+  // `decisionItems` during the same window shifts every row after it up
+  // one slot, so the STALE open-time index is now too LARGE, and
+  // `buildQueueView`'s clamp walks the card toward the end of the queue,
+  // item 6's harm arriving a different way, self-inflicted this time.
+  // `handleSubmitEdit` now looks the row up FRESH at submit time and only
+  // falls back to this captured value once the row has genuinely left
+  // `decisionItems` (the one case a fresh lookup can't answer at all).
   const [editingSnapshot, setEditingSnapshot] = useState<{
     item: QueueItem;
     index: number;
@@ -112,17 +120,40 @@ function AppQueuePage() {
   // freezes on "Sent." with zero controls, forever, while the tenant is
   // genuinely still unanswered.
   //
-  // The fix is the same shape as the first branch: let a fresh SERVER read
-  // outrank the client's own "sent" claim. Here that read still LISTS the
-  // draft (the opposite condition), so the tell is `dataUpdatedAt`. This
-  // particular read has to have completed AFTER the approve that started
-  // this card's undo window (`entry.approvedAtClient`, now kept through
-  // the sending -> sent transition by queueEntries.ts's `expired` case
-  // specifically for this check). A read from BEFORE the approve would
-  // also still list the draft (it hasn't been approved yet as far as that
-  // stale read knows) and must NOT trip this: that's the ordinary
-  // approve-with-no-refetch-yet window every approve passes through for
-  // its first few seconds, not a contradiction.
+  // BLOCKER 1 (safety review ROUND 4, #291/#279): round 3's fix here (the
+  // paragraph above) compared `queueQuery.dataUpdatedAt > entry.
+  // approvedAtClient` and claimed a read from before the approve "must
+  // NOT trip this." That is false. TanStack Query stamps `dataUpdatedAt`
+  // when a response RESOLVES on the client (`successState()`,
+  // `@tanstack/query-core`), not when the server computed it, so a read
+  // ISSUED before the approve and RESOLVING after it (an ordinary
+  // refetch: window focus, another card's `onSettled`, `useAcknowledge`'s
+  // queue invalidation) satisfies that inequality while still carrying a
+  // pre-approve snapshot that honestly still lists the draft. Measured: a
+  // plain Approve, no undo tap involved at all, cleared within the
+  // ordinary 5s window purely because such a read happened to land, then
+  // a landlord's "correction" edit-and-send on the reopened editor POSTed
+  // successfully but hit the API's idempotent 200 (the draft was already
+  // approved) and never changed the delivered text.
+  //
+  // The fix is evidence, not a clock. `entry.undoAmbiguousAt`
+  // (queueEntries.ts) is set from EXACTLY ONE place: useDraftActions.ts's
+  // `undoMutation` onError's ambiguous branch, the one case where an
+  // Undo was genuinely attempted and the server's answer is genuinely
+  // unknown. A plain Approve, or a clean undo success/failure, never sets
+  // it, so no stale read can ever satisfy `undoAmbiguousAt !== undefined`
+  // on an entry nothing was ever attempted against. Once it IS set, a
+  // read that completed AFTER that ambiguous attempt (not the approve) is
+  // the one honest signal that the server has since said something new
+  // about this exact draft.
+  //
+  // `approvedAtClient`/`undoAmbiguousAt` and `dataUpdatedAt` are both
+  // client `Date.now()` in the same browser, so #283's clock-skew class
+  // doesn't apply here, and this app never dehydrates/hydrates the query
+  // cache, so `dataUpdatedAt` is never server-stamped either, but
+  // `Date.now()` is still non-monotonic (an NTP step could invert either
+  // comparison), a second reason to gate on evidence an undo was
+  // attempted rather than on any timestamp comparison at all.
   useEffect(() => {
     if (!queueQuery.data) return;
     const freshIds = new Set(queueQuery.data.items.map((item) => item.draft_id));
@@ -130,7 +161,10 @@ function AppQueuePage() {
       if (entry.status !== "sent") continue;
       if (!freshIds.has(draftId)) {
         draftActions.dispatch({ type: "cleared", draftId });
-      } else if (queueQuery.dataUpdatedAt > entry.approvedAtClient) {
+      } else if (
+        entry.undoAmbiguousAt !== undefined &&
+        queueQuery.dataUpdatedAt > entry.undoAmbiguousAt
+      ) {
         draftActions.dispatch({ type: "cleared", draftId });
       }
     }
@@ -195,22 +229,35 @@ function AppQueuePage() {
   // `items` param, at the moment it's about to need pinning. `-1` (not
   // found) falls back to the end rather than throwing.
   //
-  // Finding 5 (safety review round 3, #291/#279): this comment used to
-  // claim `-1` "shouldn't happen: Approve/Skip/edit-and-send only ever
-  // act on a live pending row", true for Approve and Skip, which always
-  // call this with the exact item the caller just clicked ON, but WRONG
-  // for edit-and-send: `handleSubmitEdit` used to call this again at
-  // SUBMIT time against `editingSnapshot.draft_id`, and A7's whole reason
-  // to pin an editing item is that it can already have fallen out of
-  // `decisionItems` by then (a background poll while the editor sits
-  // open). That combination made `-1` reachable, and its fallback (walk
-  // the row to the very end) is precisely what item 6 above was added to
-  // prevent. Fixed by having `handleOpenEditor` capture THIS index once,
-  // at open time, the one moment a call here is actually guaranteed to
-  // find the item, and `handleSubmitEdit` reuses that captured value
-  // instead of calling this again. This function itself still only
-  // promises "shouldn't happen" for a caller passing the draft id of a
-  // row it can currently see; it makes no promise about a stale id.
+  // Finding 5 (safety review round 3, #291/#279; corrected round 4): this
+  // comment used to claim `-1` "shouldn't happen: Approve/Skip/
+  // edit-and-send only ever act on a live pending row", true for Approve
+  // and Skip, which always call this with the exact item the caller just
+  // clicked ON, but WRONG for edit-and-send: `handleSubmitEdit` used to
+  // call this again at SUBMIT time against `editingSnapshot.draft_id`,
+  // and A7's whole reason to pin an editing item is that it can already
+  // have fallen out of `decisionItems` by then (a background poll while
+  // the editor sits open). That combination made `-1` reachable, and its
+  // fallback (walk the row to the very end) is precisely what item 6
+  // above was added to prevent.
+  //
+  // Round 3 "fixed" this by having `handleOpenEditor` capture the index
+  // once, at open time, and claimed that was "the one moment a call here
+  // is actually guaranteed to find the item", overstated. The open-time
+  // capture is guaranteed to find the item, but by SUBMIT time it can be
+  // WRONG in the opposite direction: if a row ABOVE the edited card
+  // leaves `decisionItems` while the editor sits open, every row after it
+  // shifts up one slot, so the captured index is now too LARGE, and the
+  // same clamp walks the card toward the end, item 6's harm arriving a
+  // different way, self-inflicted this time by a stale index rather than
+  // a missing one. `handleSubmitEdit` below now calls this function AGAIN
+  // at submit time and only falls back to the captured value on the `-1`
+  // (not-found) sentinel, the one case a fresh lookup genuinely cannot
+  // answer. This function itself still only promises "shouldn't happen"
+  // for a caller passing the draft id of a row it can currently see; it
+  // makes no promise about a stale id, which is exactly why its `-1`
+  // fallback is load-bearing for `handleSubmitEdit` now, not just a
+  // defensive last resort.
   const snapshotIndexOf = useCallback(
     (draftId: string) => {
       const idx = decisionItems.findIndex((i) => i.draft_id === draftId);
@@ -267,20 +314,31 @@ function AppQueuePage() {
   // pinned "On its way to {tenant}" bubble shows the sent text, not the
   // pre-edit draft.
   //
-  // Finding 5 (safety review round 3, #291/#279): the index reuses
-  // `editingSnapshot.index`, captured back at `handleOpenEditor` time,
-  // NOT a fresh `snapshotIndexOf(editingSnapshot.item.draft_id)` call
-  // here, which could legitimately miss (the row may have fallen out of
-  // `decisionItems` while the editor was open, A7's own reason to pin it)
-  // and silently walk this card to the bottom of the queue for the
-  // duration of its undo window.
+  // Finding 5 (safety review round 3, #291/#279; corrected round 4): this
+  // used to reuse `editingSnapshot.index` unconditionally, captured back
+  // at `handleOpenEditor` time, on the claim that a fresh
+  // `snapshotIndexOf` call here "could legitimately miss ... and silently
+  // walk this card to the bottom of the queue." True, but incomplete: the
+  // captured value can ALSO be wrong by now (see `snapshotIndexOf`'s own
+  // comment above) if a row above the edited card left `decisionItems`
+  // while the editor sat open, which walks the card toward the end just
+  // as surely. A fresh lookup is honest for as long as the row is still
+  // actually in `decisionItems`; only fall back to the captured value
+  // once the row has genuinely left it (`snapshotIndexOf`'s own `-1`
+  // sentinel, `decisionItems.length`), the one case a fresh lookup can't
+  // answer. No ambiguity between "found at the last slot" and "not
+  // found": a real found index is always `< decisionItems.length`, so the
+  // sentinel can never collide with one.
   function handleSubmitEdit(body: string) {
     if (editingSnapshot) {
+      const draftId = editingSnapshot.item.draft_id;
+      const freshIndex = snapshotIndexOf(draftId);
+      const index = freshIndex === decisionItems.length ? editingSnapshot.index : freshIndex;
       setQueueSnapshots((prev) => ({
         ...pruneQueueSnapshots(prev, entries),
-        [editingSnapshot.item.draft_id]: {
+        [draftId]: {
           item: { ...editingSnapshot.item, draft_body: body },
-          index: editingSnapshot.index,
+          index,
         },
       }));
     }
@@ -607,12 +665,16 @@ function QueueRow({
         // gives up, `isSendUnverified` goes false. The fallback above
         // used to end there, which is the exact regression this fix
         // closes: `giveUpNotices` is checked last so the card keeps
-        // warning even after the flag itself is gone.
+        // warning even after the flag itself is gone. FIX 3 (round 4):
+        // `giveUpNotices` is a `ReadonlyMap` now (unverifiedSendStore.ts),
+        // not a Record, `.get()`, not bracket access. DecisionCard
+        // itself now also forwards this same value into the editor while
+        // editing (see its own `notice` prop).
         staleNotice={
           draftActions.staleNotices[item.case_id] ??
           (draftActions.isSendUnverified(item.draft_id)
             ? UNVERIFIED_SEND_NOTICE
-            : draftActions.giveUpNotices[item.draft_id])
+            : draftActions.giveUpNotices.get(item.draft_id))
         }
         editSubmitting={draftActions.isEditSubmitting}
         sendUnverified={draftActions.isSendUnverified(item.draft_id)}
