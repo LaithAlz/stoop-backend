@@ -115,7 +115,7 @@ console.log("\n--- ROUND 5: undoAmbiguous after the countdown already flipped to
   st = queueEntriesReducer(st, { type: "approved", draftId: "d1", approvedAtClient: 1_000, undoExpiresAtClient: 6_000 } as never);
   st = queueEntriesReducer(st, { type: "expired", draftId: "d1" } as never);
   console.log("after countdown, status:", (st.d1 as { status: string }).status);
-  st = queueEntriesReducer(st, { type: "undoAmbiguous", draftId: "d1", at: 7_500 } as never);
+  st = queueEntriesReducer(st, { type: "undoAmbiguous", draftId: "d1", at: 7_500, approvedAtClient: 1_000 } as never);
   const e = st.d1 as { status: string; undoAmbiguousAt?: number };
   console.log("status:", e.status, "| undoAmbiguousAt:", e.undoAmbiguousAt);
   console.log(
@@ -134,6 +134,39 @@ console.log("\n--- ROUND 5: the arms that must NOT stamp still do not ---");
   console.log("plain approve then expire  -> undoAmbiguousAt:", plain.undoAmbiguousAt);
 
   let cleared: QueueEntriesState = queueEntriesReducer(st, { type: "cleared", draftId: "d2" } as never);
-  cleared = queueEntriesReducer(cleared, { type: "undoAmbiguous", draftId: "d2", at: 9_000 } as never);
+  cleared = queueEntriesReducer(cleared, { type: "undoAmbiguous", draftId: "d2", at: 9_000, approvedAtClient: 1_000 } as never);
   console.log("dispatch against a CLEARED entry -> entry:", cleared.d2 ?? "(absent, correctly dropped)");
+
+  // F4 (round 6): the two checks above do NOT exercise the status gate.
+  // One covers "no dispatch was made" and the other "the entry is
+  // absent", neither of which the gate controls. Mutation-proved:
+  // replacing the gate with `if (!current) return state;` left both
+  // printing byte-identical output while a skipped entry happily
+  // accepted the stamp. A skipped arm is what makes the gate
+  // load-bearing.
+  let skipped: QueueEntriesState = queueEntriesReducer({}, { type: "skipped", draftId: "d3" } as never);
+  skipped = queueEntriesReducer(skipped, { type: "undoAmbiguous", draftId: "d3", at: 42, approvedAtClient: 1_000 } as never);
+  console.log("dispatch against a SKIPPED entry -> entry:", JSON.stringify(skipped.d3));
+  console.log(
+    JSON.stringify(skipped.d3) === '{"status":"skipped"}'
+      ? "PASS: a skipped entry never takes the stamp"
+      : "FAIL: a skipped entry accepted the stamp",
+  );
+  // Honest about what this does and does not prove. It does NOT isolate
+  // the status gate: mutating that gate to `if (!current) return state;`
+  // leaves this passing, because F2's cycle check catches a skipped entry
+  // anyway (it carries no `approvedAtClient`, so `undefined !== 1_000`).
+  // After F2 the two guards overlap for every entry with no cycle stamp.
+  // The status gate still earns its place for readability and for the
+  // `sending`/`sent` allowlist itself, which the ROUND 5 scenario above
+  // does isolate. Saying so beats a label claiming a mutation proof this
+  // does not have.
+
+  // F2 (round 6): the stamp is scoped to its own approve cycle.
+  let cyc: QueueEntriesState = queueEntriesReducer({}, { type: "approved", draftId: "d4", approvedAtClient: 20_000, undoExpiresAtClient: 25_000 } as never);
+  cyc = queueEntriesReducer(cyc, { type: "expired", draftId: "d4" } as never);
+  cyc = queueEntriesReducer(cyc, { type: "undoAmbiguous", draftId: "d4", at: 65_000, approvedAtClient: 1_000 } as never);
+  const stale = (cyc.d4 as { undoAmbiguousAt?: number }).undoAmbiguousAt;
+  console.log("cycle-1's late failure against cycle 2 -> undoAmbiguousAt:", stale);
+  console.log(stale === undefined ? "PASS: cross-cycle stamp rejected" : "FAIL: cycle 1 stamped cycle 2");
 }

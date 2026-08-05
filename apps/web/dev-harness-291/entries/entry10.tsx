@@ -111,7 +111,13 @@ async function main() {
   await sleep(6000);
   const footer = document.querySelectorAll("button");
   log("");
-  log("--- 6s later (countdown expired) ---");
+  log("--- after the ambiguous failure has actually surfaced ---");
+  // F3 (round 6): the earlier NOTICES sample fires before the failure
+  // does, so it always printed [] and the ambiguous-undo toast was
+  // asserted NOWHERE in the harness. That is why F1 (the toast being
+  // dead code that told the landlord nothing happened) survived five
+  // review rounds. Re-sampled here, after the delay.
+  log("  notices after the failure: " + JSON.stringify(NOTICES));
   log("buttons on screen:", JSON.stringify(Array.from(footer).map(b => (b.textContent ?? "").trim().split("\n")[0].slice(0, 22) + ((b as HTMLButtonElement).disabled ? "[DIS]" : ""))));
   log("page says 'Sent.':", (document.body.textContent ?? "").includes("Sent."));
   log("Approve reachable again:", Boolean(byText("Approve & send")));

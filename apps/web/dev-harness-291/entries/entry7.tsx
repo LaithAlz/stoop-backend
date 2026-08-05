@@ -96,7 +96,13 @@ async function main() {
   // let the 5s countdown run out
   await sleep(6000);
   log("");
-  log("--- 6s later, the countdown has expired ---");
+  log("--- after the ambiguous failure has actually surfaced ---");
+  // F3 (round 6): the earlier NOTICES sample fires 5.5s BEFORE the
+  // failure does, so it always printed [] and the ambiguous-undo
+  // toast was asserted NOWHERE in the harness. That is why F1 (the
+  // toast being dead code that told the landlord nothing happened)
+  // survived five review rounds. Re-sampled here, after the delay.
+  log("  notices after the failure: " + JSON.stringify(NOTICES));
   log("card text:", JSON.stringify(cardText().replace(/\s+/g, " ")));
   log("controls on the card:", JSON.stringify(controls()));
   log("says 'Sent.':", cardText().includes("Sent."));

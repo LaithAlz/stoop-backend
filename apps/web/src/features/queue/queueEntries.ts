@@ -72,7 +72,7 @@ export type QueueEntriesAction =
   // genuinely unknown. Never dispatched by a plain Approve, so no stale
   // read can ever satisfy `undoAmbiguousAt !== undefined` on an entry
   // nothing was ever attempted against.
-  | { type: "undoAmbiguous"; draftId: string; at: number };
+  | { type: "undoAmbiguous"; draftId: string; at: number; approvedAtClient: number };
 
 const IDLE: QueueEntry = { status: "idle" };
 
@@ -137,6 +137,18 @@ export function queueEntriesReducer(
     case "undoAmbiguous": {
       const current = state[action.draftId];
       if (current?.status !== "sending" && current?.status !== "sent") return state;
+      // F2 (safety review round 6): scoped to the approve cycle the undo
+      // was fired from. `approved` builds a fresh entry with no stamp, so
+      // a re-approve resets it, but a cycle-1 DELETE still hung when
+      // cycle 2 begins could otherwise stamp cycle 2's entry with cycle
+      // 1's failure. The reviewer could not turn that into user harm (the
+      // retirement effects also need a read resolving 45+ seconds late
+      // while still listing the draft, and the `onSettled()` refetch one
+      // line after the dispatch wins that race in every ordering they
+      // built), but `apiRequest` passes no AbortSignal for undo, so the
+      // hung-fetch half is genuinely unbounded. Three lines kills the
+      // class rather than relying on a race staying won.
+      if (current.approvedAtClient !== action.approvedAtClient) return state;
       return {
         ...state,
         [action.draftId]: { ...current, undoAmbiguousAt: action.at },

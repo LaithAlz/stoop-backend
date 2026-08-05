@@ -46,6 +46,12 @@ bun run build.ts entry_r4a          # -> dist/entry_r4a.js, dist/index_entry_r4a
 python3 run_entry_once.py dist index_entry_r4a.html 12   # 12s wait, prints #out + console
 ```
 
+**Mind the wait argument.** `entry7` and `entry10` deliberately delay
+their undo failure by 6s (see `UNDO_FAILURE_DELAY_MS`), so 12 is the FLOOR
+for those two, not a comfortable margin; at 8 they print a bare
+`PENDING`. Truncation is loud (the entries only flush at `DONE`) so it
+cannot produce a silent false pass, but use 15 or more for those two.
+
 `run_entry_once.py` needs `playwright` with Chromium installed
 (`python3 -m playwright install chromium`, one-time). It serves `dist/`
 over a throwaway local HTTP server, loads the page in headless Chromium,

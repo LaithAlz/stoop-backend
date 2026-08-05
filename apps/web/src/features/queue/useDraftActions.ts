@@ -44,6 +44,17 @@ export interface DraftContext {
   tenantName: string;
 }
 
+/** F2 (safety review round 6): Undo carries the `approvedAtClient` of the
+ *  approve cycle it was fired from, so an ambiguous failure can only ever
+ *  stamp the entry it actually belongs to. Without it, a cycle-1 DELETE
+ *  still hung when cycle 2 begins stamps cycle 2's entry with cycle 1's
+ *  failure. `apiRequest` passes no AbortSignal for undo, so that hung
+ *  fetch is genuinely unbounded and the class is worth closing outright
+ *  rather than relying on a refetch winning the race. */
+interface UndoContext extends DraftContext {
+  approvedAtClient: number;
+}
+
 interface UseDraftActionsOptions {
   /** House-voice message surfaced for a failure the landlord should see
    *  (network errors, `already_sent`, `draft_not_undoable`, ...) — the
@@ -56,6 +67,17 @@ interface UseDraftActionsOptions {
    *  screen stays honest about what the server actually thinks happened. */
   onSettled: () => void;
 }
+
+/** F1 (safety review round 6): shown when an Undo request fails in a way
+ *  that leaves the outcome genuinely unknown (a dropped connection or a
+ *  5xx, as opposed to `already_sent` or `draft_not_undoable`, which are
+ *  the server answering). It must not claim the reply was stopped and it
+ *  must not claim it went out, because neither is known. It also must not
+ *  say "try again": by the time this surfaces the countdown has usually
+ *  expired and the Undo control is gone. Pointing at the conversation is
+ *  the only advice that is true and actionable in every case. */
+export const UNDO_AMBIGUOUS_NOTICE =
+  "I couldn't tell whether your undo went through. Open the conversation to see whether the reply went out.";
 
 export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions) {
   const [entries, dispatch] = useReducer(queueEntriesReducer, {});
@@ -330,7 +352,7 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
   });
 
   const undoMutation = useMutation({
-    mutationFn: (ctx: DraftContext) => undoDraftApprove(ctx.draftId),
+    mutationFn: (ctx: UndoContext) => undoDraftApprove(ctx.draftId),
     // #256 comment item 2 (safety re-verify): this used to only clear the
     // local overlay — fine for Home, which self-heals on the queue's own
     // 20s poll (src/api/queue.ts), but the conversation thread's
@@ -417,12 +439,28 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       // draft nothing was ever attempted against. `undoAmbiguousAt` is
       // only ever set here, from a genuine ambiguous Undo failure, so no
       // stale read can trip it on a plain Approve.
-      dispatch({ type: "undoAmbiguous", draftId: ctx.draftId, at: Date.now() });
-      onNotice(
-        error instanceof ApiError
-          ? toHouseApiError(error)
-          : "Your undo didn't go through. The reply may still be on its way.",
-      );
+      dispatch({
+        type: "undoAmbiguous",
+        draftId: ctx.draftId,
+        at: Date.now(),
+        approvedAtClient: ctx.approvedAtClient,
+      });
+      // F1 (safety review round 6): this used to be
+      // `error instanceof ApiError ? toHouseApiError(error) : <honest line>`,
+      // and the honest line was DEAD CODE. `apiRequest` wraps a dropped
+      // connection into `new ApiError(0, { code: "network_error" })`, so
+      // the instanceof is always true here and the landlord got
+      // "Couldn't reach Stoop. Check your connection and try again.", or
+      // for a 5xx the generic "Something didn't go through. Try again in
+      // a moment." Both assert that NOTHING happened, in the one case
+      // where Stoop provably cannot know, and both point at "try again"
+      // on an Undo button that is gone by then.
+      //
+      // One unconditional, ambiguity-honest line instead, the same shape
+      // the edit-and-send ambiguous branch below already uses (and for
+      // the same reason it deliberately does not route through
+      // `toHouseApiError` either).
+      onNotice(UNDO_AMBIGUOUS_NOTICE);
       onSettled();
     },
     onSettled: (_data, _error, ctx) => clearBusy(ctx.draftId),
@@ -606,8 +644,15 @@ export function useDraftActions({ onNotice, onSettled }: UseDraftActionsOptions)
       approveMutation.mutate(ctx);
     },
     undo: (ctx: DraftContext) => {
+      // Read the cycle stamp off the live entry (see `UndoContext`). Undo
+      // is only ever offered from a `sending` entry, so this is present
+      // whenever this is reachable; the fallback keeps the reducer's own
+      // equality check honest rather than stamping a cycle that is not
+      // this one.
+      const entry = entries[ctx.draftId];
+      const approvedAtClient = entry?.status === "sending" ? entry.approvedAtClient : Number.NaN;
       markBusy(ctx.draftId);
-      undoMutation.mutate(ctx);
+      undoMutation.mutate({ ...ctx, approvedAtClient });
     },
     skip: (ctx: DraftContext) => {
       markBusy(ctx.draftId);
