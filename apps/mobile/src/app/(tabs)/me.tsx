@@ -42,6 +42,24 @@ import {
   PUSH_SECTION_TITLE,
 } from "@/features/push/pushCopy";
 
+// B3-5 (#284): shown when `signOut()` comes back `{ ok: false }`, which
+// means "NOT CONFIRMED signed out", not "definitely still signed in".
+// Three states reach it: the session is genuinely still live (offline
+// `/logout`, or a throw before teardown); the state is UNKNOWN (the
+// reject-path session read itself threw, or timed out, or came back with
+// an error, all of which AuthProvider deliberately collapses to false);
+// and one false negative auth-js hands us, where `_signOut` returns a
+// `sessionError` after `_callRefreshToken` already removed the session.
+//
+// Over-warning is the deliberate direction. The state that must never be
+// missed is "still signed in on a device you just handed to someone",
+// and an earlier version of this comment (and of that code) claimed a
+// precision here that neither has. Same
+// house-voice shape as the network_error message src/api/client.ts already
+// uses elsewhere in this app, reused rather than inventing new copy for the
+// same underlying situation.
+const SIGN_OUT_FAILED_NOTICE = "Couldn't reach Stoop. Check your connection and try again.";
+
 export default function MeScreen() {
   const { session, signOut } = useAuth();
   const meQuery = useMe();
@@ -91,6 +109,35 @@ export default function MeScreen() {
       { text: "Cancel", style: "cancel" },
       { text: copy.confirmLabel, style: "destructive", onPress: () => revokeMutation.mutate() },
     ]);
+  }
+
+  // B3-5 (#284): `signOut()` used to be fire-and-forget here, so an
+  // offline "Sign out" (auth-js's `_signOut` skips clearing the local
+  // session when its own `/logout` call fails - see AuthProvider.tsx's
+  // `signOut` docstring) left the landlord still signed in with no signal
+  // that anything went wrong. Silent on success (matches every other
+  // action on this screen); only speaks up on the honest failure.
+  //
+  // FIX 1 (#284 adversarial review): `try`/`catch` here is defense in
+  // depth, not the primary fix - AuthProvider.signOut already wraps
+  // supabase.auth.signOut()'s own reject path (an unguarded SecureStore
+  // read/write in auth-js) and resolves `{ ok: false }` instead of
+  // throwing. But this button's `onPress={() => void handleSignOut()}`
+  // discards whatever this function returns, so if `signOut()` were ever to
+  // throw anyway - a future auth-js change, a bug in the wrapper above -
+  // this is the last place standing between that and the exact "tap Sign
+  // out, see nothing happen, still fully signed in" failure this finding
+  // exists to close. Same house-voice notice as the honest `{ ok: false }`
+  // case, since from the landlord's side they're the same failure.
+  async function handleSignOut() {
+    try {
+      const result = await signOut();
+      if (!result.ok) {
+        Alert.alert("Stoop", SIGN_OUT_FAILED_NOTICE);
+      }
+    } catch {
+      Alert.alert("Stoop", SIGN_OUT_FAILED_NOTICE);
+    }
   }
 
   return (
@@ -182,7 +229,12 @@ export default function MeScreen() {
           </View>
         ) : null}
 
-        <Button label="Sign out" variant="ghost" onPress={() => void signOut()} testID="sign-out" />
+        <Button
+          label="Sign out"
+          variant="ghost"
+          onPress={() => void handleSignOut()}
+          testID="sign-out"
+        />
       </ScrollView>
 
       <ProfileEditModal

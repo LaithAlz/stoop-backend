@@ -80,6 +80,31 @@ function safeJsonParse(text: string): unknown {
   }
 }
 
+/** B3-3 (#284, follow-up to #263): the 401 liveness gate's own
+ *  `getSession()` call below can itself go slow - if the access token sits
+ *  inside auth-js's ~90s expiry margin, `getSession()` kicks off
+ *  `_refreshAccessToken`, which retries a NETWORK call with its BACKOFF
+ *  bounded by a 30s tick. That 30s bounds only the gap BETWEEN retry
+ *  attempts, not any single attempt: each underlying `fetch` inside the
+ *  retry loop carries no `AbortSignal` of its own, so one hanging POST can
+ *  hold this open past 30s - on iOS, up to ~60s, `NSURLSession`'s own
+ *  default request timeout (adversarial review, finding 7 - strengthens
+ *  this fix, since the real old worst case was longer than the 30s figure
+ *  alone suggests). On a flaky connection a 401 that used to throw
+ *  instantly now held this branch (and the caller's spinner) open for up to
+ *  that long before the `ApiError` below ever threw - only partly absorbed
+ *  by the 60s refresh-failure cooldown. Racing the read against ~2s bounds
+ *  that. ON TIMEOUT this must NOT sign out: a slow read is not evidence the
+ *  session is dead, same "fail toward not dead" direction B3-2's catch
+ *  below already established for this exact call - a timeout is just a
+ *  different way for it to not complete cleanly, not a different verdict. */
+const LIVENESS_CHECK_TIMEOUT_MS = 2000;
+/** Sentinel `Promise.race` result for the timeout side - a plain string
+ *  literal (not a rejection) so the timeout path runs through the same
+ *  `sessionLooksDead = false` assignment as every other "couldn't tell"
+ *  case here, rather than a second, parallel code path. */
+const LIVENESS_CHECK_TIMED_OUT = "liveness-check-timed-out" as const;
+
 /** B3-1 (safety review): the 401 liveness gate below has to anchor to the
  *  SERVER's clock, not the device's. A device clock that is fast by more
  *  than the token's remaining lifetime (auto-time off, a traveler, a dead
@@ -223,15 +248,33 @@ async function apiRequestInternal<T>(
       // destroy it); otherwise let the `ApiError` below surface normally
       // and leave the session alone so the caller can retry.
       let sessionLooksDead = false;
+      // B3-3: raced against LIVENESS_CHECK_TIMEOUT_MS - see that constant's
+      // docstring above for why. `livenessTimer` is cleared in `finally`
+      // regardless of which side of the race wins, so a fast getSession()
+      // never leaves a pending ~2s timer behind (mirrors
+      // deviceRegistration.ts's `unregisterCurrentDeviceBestEffort`).
+      let livenessTimer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const { data } = await supabase.auth.getSession();
-        const localSession = data.session;
-        // B3-1: anchored to the server's own clock (this response's Date
-        // header), never the device's - see resolveNowSeconds above.
-        const nowSeconds = resolveNowSeconds(dateHeader);
-        sessionLooksDead =
-          !localSession ||
-          (typeof localSession.expires_at === "number" && localSession.expires_at <= nowSeconds);
+        const outcome = await Promise.race([
+          supabase.auth.getSession(),
+          new Promise<typeof LIVENESS_CHECK_TIMED_OUT>((resolve) => {
+            livenessTimer = setTimeout(
+              () => resolve(LIVENESS_CHECK_TIMED_OUT),
+              LIVENESS_CHECK_TIMEOUT_MS,
+            );
+          }),
+        ]);
+        if (outcome === LIVENESS_CHECK_TIMED_OUT) {
+          sessionLooksDead = false;
+        } else {
+          const localSession = outcome.data.session;
+          // B3-1: anchored to the server's own clock (this response's Date
+          // header), never the device's - see resolveNowSeconds above.
+          const nowSeconds = resolveNowSeconds(dateHeader);
+          sessionLooksDead =
+            !localSession ||
+            (typeof localSession.expires_at === "number" && localSession.expires_at <= nowSeconds);
+        }
       } catch {
         // B3-2 (safety review): getSession() can REJECT, not just resolve
         // to a null session - expo-secure-store's getItemAsync throws on a
@@ -242,6 +285,13 @@ async function apiRequestInternal<T>(
         // fails toward "not dead" rather than signing out on a read it
         // could not actually complete.
         sessionLooksDead = false;
+      } finally {
+        // `!== undefined`, not bare truthiness (#284 adversarial review,
+        // finding 6): RN/Hermes' `setTimeout` returns a numeric id (unlike
+        // Node's truthy `Timeout` object), and id `0` would be falsy. Not
+        // reachable in practice (Hermes' ids start at 1), but this is the
+        // strictly correct check, not a "trust the runtime" one.
+        if (livenessTimer !== undefined) clearTimeout(livenessTimer);
       }
       if (sessionLooksDead) {
         // `scope: "local"` - this device's session only (matches
