@@ -29,6 +29,7 @@ import {
   backupContactClearTitle,
   backupContactError,
   backupContactPhoneLooksInvalid,
+  backupContactPhoneUnrepairedTrunkZero,
   buildPropertySettingsPayload,
   propertySettingsFormFromProperty,
   quietHoursClearAttempted,
@@ -362,6 +363,15 @@ function SettingsForm({
   // concern from `backupError`, which only validates what's being typed
   // right now.
   const storedBackupPhoneInvalid = backupContactPhoneLooksInvalid(current.backup_contact);
+  // #299: distinguishes "something was entered and normalized, just to
+  // the wrong value" (a pre-#277 trunk-zero row) from every other reason
+  // `storedBackupPhoneInvalid` fires (missing/blank/never entered) so the
+  // warning below can say plainly Stoop doesn't think it can dial the
+  // number that's already sitting in the field, rather than the vaguer
+  // generic line.
+  const storedBackupPhoneUnrepairedTrunkZero = backupContactPhoneUnrepairedTrunkZero(
+    current.backup_contact,
+  );
   // LOW (safety review): the guard/disabled checks below read `busy`, not
   // bare `mutation.isPending` — see the `saving` prop doc comment above.
   const busy = saving || mutation.isPending;
@@ -438,12 +448,27 @@ function SettingsForm({
 
         {/* M1 (MEDIUM, safety review): a stored-but-undialable number was
             otherwise invisible until this form happened to be opened and
-            re-submitted — this warns as soon as the section loads. */}
-        {storedBackupPhoneInvalid && (
+            re-submitted, this warns as soon as the section loads. #299:
+            the trunk-zero case gets its own line, since "doesn't look
+            valid" undersells a value that already has a "+", the right
+            digit count, and no obvious typo to a landlord looking at the
+            field below: it says plainly Stoop doesn't think it can dial
+            it and asks for a re-entry, not just a generic "fix it". No
+            attempt to repair it here: which digit is wrong isn't
+            recoverable from the stored value alone. */}
+        {storedBackupPhoneUnrepairedTrunkZero ? (
           <p role="alert" className="text-[13px] font-medium text-urgent">
-            The phone number on file for your backup contact doesn&rsquo;t look valid. I may not be
-            able to reach them in an emergency. Fix it below.
+            The phone number below is what&rsquo;s on file for your backup contact, but I
+            don&rsquo;t think I can dial it: the digits don&rsquo;t add up to a real number. Please
+            clear it and type it again.
           </p>
+        ) : (
+          storedBackupPhoneInvalid && (
+            <p role="alert" className="text-[13px] font-medium text-urgent">
+              The phone number on file for your backup contact doesn&rsquo;t look valid. I may not
+              be able to reach them in an emergency. Fix it below.
+            </p>
+          )
         )}
 
         <div>
