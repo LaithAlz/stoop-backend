@@ -172,6 +172,36 @@ def test_to_e164_san_marino_not_on_allowlist_is_left_alone() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("416555\u03781234", id="unassigned-codepoint-U+0378"),
+        pytest.param("4165551234\U00010d40", id="garay-digit-zero-U+10D40-unicode-16"),
+    ],
+)
+def test_to_e164_rejects_a_codepoint_this_python_cannot_rule_out(value: str) -> None:
+    """The guard is an ALLOWLIST of categories that are unambiguously not
+    digits, not an ``isnumeric()`` denylist, and this is why.
+
+    ``str.isnumeric()`` consults the Unicode table compiled into whichever
+    CPython build is running. A genuine digit newer than that table (or a
+    codepoint currently unassigned that becomes one) answers ``False``, the
+    denylist passes it, and ``\\D`` under ``re.ASCII`` then strips it as
+    ordinary punctuation. The remaining digits close up and the value
+    stores as a DIFFERENT, still-plausible number, which is exactly the
+    silent-drop hazard this guard exists to prevent, on the field the
+    emergency chain dials.
+
+    Measured against the denylist version: both of these parsed as
+    ``"+14165551234"`` here while both TS mirrors rejected them, so the
+    canonicalization AUTHORITY was the permissive one. An API-direct write
+    never touches a browser, so this function is the only thing standing
+    in front of it.
+    """
+    assert to_e164(value) is None
+
+
+@pytest.mark.unit
 def test_to_e164_vatican_city_not_on_allowlist_is_left_alone() -> None:
     """Vatican City (379) retains its trunk zero internationally too. Named
     in the allowlist docstring and both docs, but until now asserted
