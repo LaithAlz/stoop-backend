@@ -184,7 +184,113 @@ either the webhook-triggered T+0 path or the scheduled sweep). Allowlisted
 in ``tests/test_migrations_0005.py::_ADMIN_SESSION_ALLOWLIST``. All Twilio
 sends go through ``app/integrations/twilio_send.py::get_twilio_sender()`` —
 this module and that one are the ONLY two files allowed to reference it,
-machine-enforced by ``tests/test_twilio_send_allowlist.py``.
+machine-enforced by ``tests/test_twilio_send_allowlist.py``. The ONE
+exception is :func:`revoke_backup_ack_tokens` (below) — see its own
+docstring for why it deliberately runs on the CALLER's landlord-scoped
+session instead.
+
+Per-recipient ack tokens (#289)
+--------------------------------
+Before this revision, ``_execute_action`` computed exactly ONE ``ack_url``
+per step and handed the identical token to ``landlord_sms`` and
+``backup_sms`` — one shared secret held by two different people. Three
+consequences: (1) removing a backup contact could not revoke a link they
+already held, (2) ``acknowledge_by_token`` could not record WHICH
+recipient acknowledged, and (3) the two recipients could never be given
+different semantics (an explicitly out-of-scope product question — this
+issue builds only the foundation, not a softer backup-ack behavior).
+
+Fixed by minting a genuinely separate token PER RECIPIENT, both living in
+the same ``payload`` jsonb the single token used to occupy:
+
+- ``payload.ack_token`` — the landlord's own token. Same key name as
+  before this revision (minimizes churn; every pre-existing reader/writer
+  of this key keeps working unchanged).
+- ``payload.ack_token_backup`` — the backup contact's own token, new in
+  this revision (migration 0018, v1.24 amendment — a sibling partial
+  UNIQUE expression index, same shape as ``uq_notifications_ack_token``).
+
+Both are minted the SAME way: lazily, by :data:`_CLAIM_STEP_SQL`'s own
+healing CASE branches, the first time ANY step of a chain is claimed
+(step 0's claim, on the common path — well before a backup action could
+ever need one at step 3). This is deliberately NOT done at the webhook's
+own ``INSERT`` (unlike ``ack_token`` historically was, for the "born
+enriched" crash-safety reasons its own module docstring above explains at
+length) — that reasoning does not apply here: even if ``ack_token_backup``
+is briefly absent, the row is still due (``next_attempt_at`` is already
+set independently), so the very first claim heals it in, with no window
+where the chain could be stuck or a step could silently lack a token to
+send. :func:`_execute_action` now takes both tokens and picks the right
+one per action: ``landlord_sms`` gets ``ack_token``, ``backup_sms`` gets
+``ack_token_backup`` — the voice-call actions (``landlord_call``/
+``backup_call``) never used a token at all (they carry only
+``notification_id`` in their TwiML ``action_url``) and are unchanged;
+splitting THAT surface per-recipient is a separate, larger change (no way
+to tell which physical phone call is "the landlord's" vs. "the backup's"
+without capturing Twilio's ``From`` — which would mean storing a phone
+number, forbidden by never-break rule #5) and is explicitly out of this
+issue's scope.
+
+Attribution: :func:`acknowledge_by_token` now resolves EITHER token
+(:data:`_SELECT_NOTIFICATION_BY_TOKEN_SQL` matches ``ack_token`` OR
+``ack_token_backup``) and records which one matched as
+``audit_log.payload.recipient_role`` — ``"landlord"`` or ``"backup"``, a
+role, never a phone number (rule #5). The dashboard surface
+(``POST /v1/notifications/{id}/ack``) passes ``recipient_role="landlord"``
+explicitly (it is authenticated, so there is no ambiguity). The voice
+press-1 surface has no way to know which physical call is ringing (see
+above) and passes no role at all — ``recipient_role`` stays ``None``
+(``null`` in the audit payload) for that surface, an honest "unknown",
+never a guess.
+
+Revocation: :func:`revoke_backup_ack_tokens` strips ``ack_token_backup``
+from every in-flight (``status='pending'``, not yet acknowledged)
+``emergency_call`` notification for a property — called by
+``app/routers/properties.py`` whenever a ``PATCH`` changes the CANONICAL
+phone ``backup_contact`` points at: a genuine CLEAR (a non-null value
+transitioning to an explicit ``null`` — the same "clears it" definition
+api-contracts.md's v1.25 amendment (#268) already established) OR an EDIT
+to a DIFFERENT phone number. The edit case matters as much as the clear
+case, not less: a landlord leaving a relationship with their backup
+contact typically REPLACES them (their sister, their super) in one
+request rather than clearing the field and adding someone else later, and
+the consequence of leaving that unrevoked is identical to leaving a clear
+unrevoked. Both run in the SAME transaction as the property update. The
+comparison is CANONICAL phones (``to_e164`` on both the pre- and
+post-update value), never the raw ``phone`` string and never the whole
+``backup_contact`` blob — see ``app/routers/properties.py``'s
+``_backup_contact_canonical_phone`` docstring for why: a name-only edit,
+or the identical number re-saved in a different written form, must be a
+safe no-op, since revoking either would take away a still-current backup
+contact's own working link in the middle of a live emergency. The very
+next time that chain's next step is claimed, :data:`_CLAIM_STEP_SQL`'s
+healing mints a FRESH ``ack_token_backup`` — distinct from the revoked
+one, and not yet disclosed to anyone — so a removed or replaced backup
+contact's already-held link stops matching immediately, while the
+landlord's own ``ack_token`` (a different key, never touched by this
+revocation) keeps working exactly as before.
+
+Existing tokens at deploy time: a chain already mid-flight when this
+ships keeps its pre-existing, pre-split ``ack_token`` — which still
+authenticates BOTH the landlord and anyone who already holds a copy of
+that link, including a backup contact who received it before this
+deploy — this migration cannot retroactively split a secret already
+disclosed to two people over SMS. Revoking ``backup_contact`` on such a
+chain removes only ``ack_token_backup`` (freshly minted post-deploy, not
+yet sent to anyone); the pre-existing shared value under ``ack_token``
+keeps working for whoever already has it. Full closure of the shared-
+token gap applies to every chain CREATED after this ships, all of which
+mint a genuinely distinct ``ack_token_backup`` well before any backup
+action ever fires.
+
+Fail-safe: a lookup/validation error on either token surface
+(:func:`resolve_ack_token`, :func:`acknowledge_by_token`) never mutates
+anything — the ``SELECT`` (or the claim-guarded ``UPDATE`` for a genuine
+ack) either succeeds and commits, or raises and commits nothing; there is
+no partial state where a chain's schedule stops advancing because a token
+lookup failed. The schedule is driven entirely by ``next_attempt_at``,
+independent of whether any particular ack attempt succeeded — same
+invariant the rest of this module's crash-safety design already rests on.
 """
 
 from __future__ import annotations
@@ -650,13 +756,20 @@ async def _execute_action(
     categories: list[str],
     notification_id: UUID,
     ack_token: str,
+    ack_token_backup: str,
     message_id: UUID,
 ) -> ActionOutcome:
+    """#289: *ack_token* and *ack_token_backup* are two genuinely distinct
+    per-recipient tokens (module docstring "Per-recipient ack tokens") —
+    ``landlord_sms`` is built with *ack_token*, ``backup_sms`` with
+    *ack_token_backup*. Neither voice-call action uses either token (their
+    TwiML ``action_url`` carries only *notification_id*)."""
     if not ctx.twilio_number:
         return ActionOutcome(action=action, status="skipped", reason="no_twilio_number")
     from_number = ctx.twilio_number
 
-    ack_url = render_ack_url(notification_id, ack_token)
+    landlord_ack_url = render_ack_url(notification_id, ack_token)
+    backup_ack_url = render_ack_url(notification_id, ack_token_backup)
     action_url = render_voice_action_url(notification_id)
     landlord_label = _landlord_label(ctx.landlord_full_name)
     tenant_label = ctx.tenant_name or _FALLBACK_TENANT_LABEL
@@ -679,7 +792,7 @@ async def _execute_action(
                 property_label=ctx.property_label,
                 category_label=category_label,
                 tenant_label=tenant_label,
-                ack_url=ack_url,
+                ack_url=landlord_ack_url,
             )
             sid = await sender.send_sms(to=ctx.landlord_phone, from_=from_number, body=body)
             return _sms_sent_outcome(action, sid, body)
@@ -698,7 +811,7 @@ async def _execute_action(
                 category_label=category_label,
                 landlord_label=landlord_label,
                 tenant_label=tenant_label,
-                ack_url=ack_url,
+                ack_url=backup_ack_url,
             )
             sid = await sender.send_sms(to=backup_phone, from_=from_number, body=body)
             return _sms_sent_outcome(action, sid, body)
@@ -786,36 +899,54 @@ _CLAIM_STEP_SQL = text(
     SET attempt = :new_attempt,
         next_attempt_at = :next_attempt_at,
         updated_at = now(),
-        payload = CASE
-                    WHEN payload ->> 'ack_token' IS NULL
-                    THEN payload || jsonb_build_object(
-                           'ack_token', CAST(:fallback_ack_token AS text)
-                         )
-                    ELSE payload
-                  END
+        payload = payload
+                    || (CASE
+                          WHEN payload ->> 'ack_token' IS NULL
+                          THEN jsonb_build_object('ack_token', CAST(:fallback_ack_token AS text))
+                          ELSE '{}'::jsonb
+                        END)
+                    || (CASE
+                          WHEN payload ->> 'ack_token_backup' IS NULL
+                          THEN jsonb_build_object(
+                                 'ack_token_backup', CAST(:fallback_ack_token_backup AS text)
+                               )
+                          ELSE '{}'::jsonb
+                        END)
     WHERE id = :id AND status = 'pending' AND attempt = :old_attempt AND acknowledged_at IS NULL
-    RETURNING id, payload ->> 'ack_token' AS ack_token
+    RETURNING id, payload ->> 'ack_token' AS ack_token,
+              payload ->> 'ack_token_backup' AS ack_token_backup
     """
 )
-# The explicit ``CAST(:fallback_ack_token AS text)`` above is required, not
-# cosmetic: asyncpg must know the wire type of every bind parameter before
-# it can send the (binary) protocol message, and ``jsonb_build_object``'s
-# variadic ``"any"`` signature gives the planner nothing to infer a plain
-# string literal's type FROM inside a ``CASE`` branch that may not even
-# execute -- Postgres raises ``IndeterminateDatatypeError`` on ``$3`` (the
-# token) without it. Discovered running this round's own tests (every
-# claim was raising and silently degrading to ``"processing_error"``).
+# The explicit ``CAST(... AS text)`` on each fallback token above is
+# required, not cosmetic: asyncpg must know the wire type of every bind
+# parameter before it can send the (binary) protocol message, and
+# ``jsonb_build_object``'s variadic ``"any"`` signature gives the planner
+# nothing to infer a plain string literal's type FROM inside a ``CASE``
+# branch that may not even execute -- Postgres raises
+# ``IndeterminateDatatypeError`` on the token parameter without it.
+# Discovered running this round's own tests (every claim was raising and
+# silently degrading to ``"processing_error"``).
 # Safety review, 2026-07-12 (finding N1, belt 2 -- healing): every row born
 # via app/routers/webhooks/twilio.py's INSERT already carries an ack_token
-# from the start, so the CASE above is normally a no-op (ELSE branch). It
-# only fires for a healed legacy/edge row the sweep picked up via its own
-# ``next_attempt_at IS NULL`` clause -- claiming such a row now ALSO
-# guarantees it leaves with a real ack_token, atomically, in the SAME
-# statement that claims it, so every OTHER step (the T+2m ack-link SMS,
-# the voice call's own action_url, etc.) always has one to use. The
-# caller always passes a freshly generated ``:fallback_ack_token`` even
-# though it is discarded in the overwhelmingly common (ELSE) case --
-# cheaper than a second round trip to check first.
+# from the start, so the first CASE above is normally a no-op (ELSE
+# branch). It only fires for a healed legacy/edge row the sweep picked up
+# via its own ``next_attempt_at IS NULL`` clause -- claiming such a row
+# now ALSO guarantees it leaves with a real ack_token, atomically, in the
+# SAME statement that claims it, so every OTHER step (the T+2m ack-link
+# SMS, the voice call's own action_url, etc.) always has one to use.
+# #289 (module docstring "Per-recipient ack tokens"): the SECOND CASE
+# branch mints ``ack_token_backup`` the SAME way, but is NOT normally a
+# no-op -- unlike ``ack_token``, nothing sets it at INSERT time, so it
+# heals in on literally the FIRST claim of every chain (step 0, on the
+# common path), well before any backup action could need one at step 3.
+# Both CASE expressions are combined with ``||`` (jsonb concatenation of
+# two DISTINCT keys, or a no-op ``'{}'::jsonb`` on either side) rather
+# than nested, so either key can independently be healed in the same
+# statement regardless of whether the other one already existed. The
+# caller always passes freshly generated fallback tokens for BOTH keys
+# even though one or both are usually discarded (the ELSE/no-op branch) --
+# cheaper than a round trip to check first, same trade-off the original
+# (landlord-only) version of this statement already made.
 
 _INSERT_ATTEMPT_AUDIT_SQL = text(
     """
@@ -899,12 +1030,14 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
     stretches the schedule (see :class:`EmergencyCallCandidate`'s own
     docstring).
 
-    The AUTHORITATIVE ``ack_token`` used for this step's actions is
-    whatever :data:`_CLAIM_STEP_SQL` returns (never
+    The AUTHORITATIVE ``ack_token``/``ack_token_backup`` used for this
+    step's actions are whatever :data:`_CLAIM_STEP_SQL` returns (never
     ``candidate.ack_token`` from the original SELECT) — safety review,
     2026-07-12, finding N1 belt 2: this is what makes a healed
     (previously ``next_attempt_at IS NULL``) legacy row usable the moment
     it's claimed, even though its ack_token didn't exist at SELECT time.
+    Same reasoning now covers ``ack_token_backup`` (#289) — see module
+    docstring "Per-recipient ack tokens".
     """
     step = candidate.attempt
     new_attempt = step + 1
@@ -921,6 +1054,7 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
                         "new_attempt": new_attempt,
                         "next_attempt_at": next_at,
                         "fallback_ack_token": secrets.token_urlsafe(24),
+                        "fallback_ack_token_backup": secrets.token_urlsafe(24),
                     },
                 )
             )
@@ -931,6 +1065,7 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
             return "lost_race"
 
         ack_token = cast("str | None", claim_row["ack_token"])
+        ack_token_backup = cast("str | None", claim_row["ack_token_backup"])
 
         if step == 0:
             # Create the durable ``emergency_sms`` send-intent row for the
@@ -977,7 +1112,9 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
         )
         return "context_missing"
 
-    if ack_token is None:  # pragma: no cover — invariant: _CLAIM_STEP_SQL always sets one
+    if (
+        ack_token is None or ack_token_backup is None
+    ):  # pragma: no cover — invariant: _CLAIM_STEP_SQL always sets both
         log.error(
             "emergency_chain_missing_ack_token", notification_id=str(candidate.notification_id)
         )
@@ -995,6 +1132,7 @@ async def _process_due_row(candidate: EmergencyCallCandidate) -> str:
                 categories=candidate.categories,
                 notification_id=candidate.notification_id,
                 ack_token=ack_token,
+                ack_token_backup=ack_token_backup,
                 message_id=candidate.message_id,
             )
         )
@@ -1796,8 +1934,24 @@ _SELECT_NOTIFICATION_FOR_AUDIT_SQL = text(
 )
 
 _SELECT_NOTIFICATION_BY_TOKEN_SQL = text(
-    "SELECT id, acknowledged_at FROM notifications WHERE payload ->> 'ack_token' = :token"
+    """
+    SELECT id, acknowledged_at,
+           CASE
+             WHEN payload ->> 'ack_token' = :token THEN 'landlord'
+             WHEN payload ->> 'ack_token_backup' = :token THEN 'backup'
+           END AS recipient_role
+    FROM notifications
+    WHERE payload ->> 'ack_token' = :token OR payload ->> 'ack_token_backup' = :token
+    """
 )
+# #289: matches EITHER per-recipient token (module docstring "Per-recipient
+# ack tokens") and reports WHICH one matched as ``recipient_role`` — used by
+# :func:`acknowledge_by_token` for attribution, ignored by
+# :func:`resolve_ack_token` (read-only rendering has no need for it). Two
+# rows can never both match the same token (each key has its own UNIQUE
+# partial expression index — migrations 0010/0018), and a single row's two
+# token keys are always minted independently, so at most one branch of the
+# ``CASE`` ever fires for a given ``:token``.
 
 _INSERT_ACK_AUDIT_SQL = text(
     """
@@ -1808,7 +1962,7 @@ _INSERT_ACK_AUDIT_SQL = text(
 
 
 async def acknowledge_notification(
-    notification_id: UUID, *, actor: str, channel: str
+    notification_id: UUID, *, actor: str, channel: str, recipient_role: str | None = None
 ) -> datetime | None:
     """Idempotently acknowledge *notification_id* — stamps
     ``acknowledged_at`` and stops the chain (every future claim's
@@ -1829,6 +1983,16 @@ async def acknowledge_notification(
     private phone/SMS channel — landlord or their backup contact).
     ``channel`` is a short, static label (``'voice_keypress'``,
     ``'sms_link'``, ``'dashboard'``) recorded in the audit payload.
+
+    ``recipient_role`` (#289) — ``'landlord'`` / ``'backup'`` / ``None``,
+    recorded verbatim into the audit payload (never a phone number, rule
+    #5). ``None`` means "genuinely unknown" (the voice press-1 surface has
+    no way to tell which physical call is ringing — see module docstring
+    "Per-recipient ack tokens"), not a default to be read as "landlord".
+    :func:`acknowledge_by_token` passes whichever role
+    :data:`_SELECT_NOTIFICATION_BY_TOKEN_SQL` resolved; the dashboard
+    surface (``app/routers/notifications.py``) passes ``'landlord'``
+    explicitly, since that path is authenticated and unambiguous.
     """
     async with _acm(get_admin_session)() as session:
         claimed = (
@@ -1859,6 +2023,7 @@ async def acknowledge_notification(
                             "notification_id": str(notification_id),
                             "channel": channel,
                             "message_id": payload.get("message_id"),
+                            "recipient_role": recipient_role,
                         }
                     ),
                 },
@@ -1887,6 +2052,9 @@ async def acknowledge_notification(
 async def resolve_ack_token(token: str) -> tuple[UUID, datetime | None] | None:
     """READ-ONLY lookup of *token* — ``(notification_id, acknowledged_at)``,
     or ``None`` if *token* matches no notification. NEVER mutates anything.
+    Resolves EITHER per-recipient token (module docstring "Per-recipient
+    ack tokens", #289) — the caller doesn't need to know or care which one
+    was used; the confirmation page renders identically either way.
 
     Safety review, 2026-07-12 (finding 1, CRITICAL): ``GET /ack/{token}``
     used to call :func:`acknowledge_by_token` directly, so an SMS
@@ -1915,7 +2083,14 @@ async def acknowledge_by_token(token: str, *, channel: str) -> tuple[UUID, datet
     MUTATES (stamps ``acknowledged_at``) — only ever called from
     ``POST /ack/{token}`` (see module docstring "Safety review, 2026-07-12,
     finding 1" and :func:`resolve_ack_token`'s docstring). See
-    :func:`acknowledge_notification` for idempotency semantics."""
+    :func:`acknowledge_notification` for idempotency semantics.
+
+    #289: *token* may be either the landlord's or the backup contact's own
+    token — :data:`_SELECT_NOTIFICATION_BY_TOKEN_SQL` resolves whichever
+    one matches and reports which recipient it belongs to
+    (``recipient_role``), forwarded verbatim to
+    :func:`acknowledge_notification` for the audit trail.
+    """
     async with _acm(get_admin_session)() as session:
         row = (
             (await session.execute(_SELECT_NOTIFICATION_BY_TOKEN_SQL, {"token": token}))
@@ -1925,13 +2100,84 @@ async def acknowledge_by_token(token: str, *, channel: str) -> tuple[UUID, datet
         if row is None:
             return None
         notification_id = cast("UUID", row["id"])
+        recipient_role = cast("str | None", row["recipient_role"])
 
     acknowledged_at = await acknowledge_notification(
-        notification_id, actor="system", channel=channel
+        notification_id, actor="system", channel=channel, recipient_role=recipient_role
     )
     if acknowledged_at is None:  # pragma: no cover — invariant: row existed a moment ago
         return None
     return notification_id, acknowledged_at
+
+
+_REVOKE_BACKUP_ACK_TOKENS_SQL = text(
+    """
+    UPDATE notifications
+    SET payload = payload - 'ack_token_backup', updated_at = now()
+    WHERE type = 'emergency_call' AND status = 'pending' AND acknowledged_at IS NULL
+      AND landlord_id = :landlord_id
+      AND payload ->> 'property_id' = :property_id
+      AND payload ? 'ack_token_backup'
+    """
+)
+
+
+async def revoke_backup_ack_tokens(
+    session: AsyncSession, *, landlord_id: UUID, property_id: UUID
+) -> None:
+    """Strip the backup contact's own ack token (``payload.ack_token_backup``)
+    from every in-flight (``status='pending'``, not yet acknowledged)
+    ``emergency_call`` notification for *property_id* — see module
+    docstring "Per-recipient ack tokens" / "Revocation".
+
+    Called by ``app/routers/properties.py`` whenever a ``PATCH`` changes the
+    CANONICAL phone ``backup_contact`` points at — a genuine CLEAR (a
+    non-null value transitioning to an explicit ``null`` — api-contracts.md's
+    v1.25 amendment's "clears it" definition, #268) OR an EDIT to a
+    DIFFERENT phone number (the common real-world flow — a landlord
+    replacing one backup contact with another in a single request, never
+    clearing the field first). ``app/routers/properties.py`` decides WHEN
+    to call this (comparing ``to_e164`` output on both the pre- and
+    post-update ``backup_contact``, never the raw phone string or the whole
+    blob, so a name-only edit or the same number re-saved in a different
+    written form is a safe no-op — see its own
+    ``_backup_contact_canonical_phone`` docstring); this function only
+    knows how to revoke, unconditionally, once called. Runs in the SAME
+    transaction as the property update either way.
+
+    DELIBERATELY DIVERGES from this module's own "admin engine only"
+    convention (module docstring "DB access"): every other function here
+    runs in a pre-identity/background context with no landlord JWT to
+    scope a session to. This one is the opposite — it is only ever called
+    from an ALREADY-AUTHENTICATED, RLS-scoped landlord request (``app/
+    deps.py``'s ``require_landlord``) — so it takes that CALLER's own
+    *session* instead of opening an admin one, for two reasons: (1) it
+    then commits/rolls back ATOMICALLY with the property update itself
+    (same transaction — either both the clear and the revocation land, or
+    neither does), and (2) it inherits that session's RLS scoping for free.
+    The explicit ``landlord_id = :landlord_id`` predicate above is
+    defense-in-depth on top of that (CLAUDE.md: "RLS arrives in #22, code
+    behaves as if it's already on" — this must be correct even if RLS
+    were somehow not enforced on this connection), matching ``app/routers/
+    notifications.py``'s own ``_SELECT_NOTIFICATION_OWNED_SQL`` precedent.
+
+    A no-op (touches zero rows, no error) when there is no live chain for
+    this property, or its ``emergency_call`` row(s) never got far enough
+    to have a backup token minted yet, or it was already revoked — the
+    ``payload ? 'ack_token_backup'`` guard just avoids a spurious
+    ``updated_at`` bump in that case. The revoked row's very next claimed
+    step (:data:`_CLAIM_STEP_SQL`) mints a FRESH, distinct
+    ``ack_token_backup`` automatically — not yet disclosed to anyone — so
+    the removed contact's old link stops matching immediately while the
+    chain keeps running exactly as before for the landlord's own side.
+
+    Does NOT revoke the landlord's own ``ack_token`` (a different payload
+    key, never touched here).
+    """
+    await session.execute(
+        _REVOKE_BACKUP_ACK_TOKENS_SQL,
+        {"landlord_id": str(landlord_id), "property_id": str(property_id)},
+    )
 
 
 __all__: list[str] = [
@@ -1962,6 +2208,7 @@ __all__: list[str] = [
     "render_tenant_status_sms",
     "render_voice_action_url",
     "resolve_ack_token",
+    "revoke_backup_ack_tokens",
     "run_emergency_chain_sweep",
     "run_sms_drain_sweep",
 ]
