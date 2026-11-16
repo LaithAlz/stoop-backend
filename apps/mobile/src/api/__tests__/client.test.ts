@@ -73,6 +73,29 @@ describe("apiRequest", () => {
     globalThis.fetch = jest.fn();
   });
 
+  it("F7 (re-verify): apiRequest hands the caller's AbortSignal to fetch", async () => {
+    // #284's reconcile DELETE aborts on its own timeout so an abandoned
+    // request cannot land later and kill a registration that was recreated
+    // in the meantime. That only works if the signal survives the whole
+    // chain: unregisterDevice -> apiRequest -> fetch. The re-verify found
+    // that deleting `signal: options?.signal` from devices.ts left all 25
+    // device tests green.
+    //
+    // This test covers the apiRequest -> fetch half ONLY. It does NOT
+    // catch that devices.ts mutation, verified by running it against the
+    // mutation and watching it pass. The half that does catch it lives in
+    // src/api/__tests__/devices.test.ts, and the two together pin the
+    // whole chain. Worth stating out loud, because a test named after a
+    // finding it does not actually cover is worse than no test at all.
+    (globalThis.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { ok: true }));
+    const controller = new AbortController();
+
+    await apiRequest("/v1/devices/device-1", { method: "DELETE", signal: controller.signal });
+
+    const init = (globalThis.fetch as jest.Mock).mock.calls[0][1] as RequestInit;
+    expect(init.signal).toBe(controller.signal);
+  });
+
   it("resolves the parsed JSON body on success", async () => {
     (globalThis.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { items: [], counts: {} }));
 
@@ -245,6 +268,51 @@ describe("apiRequest", () => {
     });
   });
 
+  describe("B3-3 (#284): the liveness check's own getSession() is raced against ~2s, not left to auth-js's 30s retry backoff", () => {
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it("does NOT sign out when getSession() itself never resolves, and surfaces at the ~2s race window rather than after 30s", async () => {
+      jest.useFakeTimers({ doNotFake: ["nextTick", "queueMicrotask"] });
+      mockGetSession
+        // authHeader()'s own read, on the way OUT (unrelated to this
+        // finding) - resolves normally.
+        .mockResolvedValueOnce({ data: { session: null } })
+        // The 401 liveness check's getSession() - stands in for auth-js's
+        // `_refreshAccessToken` hanging on a flaky network. Never settles.
+        .mockReturnValueOnce(new Promise(() => {}));
+      (globalThis.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(401, {
+          error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" },
+        }),
+      );
+
+      const pending = apiRequest("/v1/me").catch((e: unknown) => e);
+      // Advancing by exactly the race window (not 30s) is the proof: if the
+      // implementation still awaited the real getSession() unraced, this
+      // promise would still be pending after this and the `await` below
+      // would hang past Jest's own test timeout.
+      await jest.advanceTimersByTimeAsync(2000);
+      const error = await pending;
+
+      expect(error).toBeInstanceOf(ApiError);
+      expect(mockSignOut).not.toHaveBeenCalled();
+    });
+
+    it("still signs out normally when getSession() resolves well within the race window", async () => {
+      mockGetSession.mockResolvedValue({ data: { session: null } });
+      (globalThis.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(401, {
+          error: { code: "unauthorized", message: "Token expired.", request_id: "req_1" },
+        }),
+      );
+
+      await expect(apiRequest("/v1/me")).rejects.toBeInstanceOf(ApiError);
+      expect(mockSignOut).toHaveBeenCalledWith({ scope: "local" });
+    });
+  });
+
   it("B3-2 (safety review): a getSession() that REJECTS (unreadable keychain) still surfaces a typed ApiError, and never signs out", async () => {
     // First call is authHeader()'s own (pre-existing, unrelated to B3) read
     // to build the Authorization header -- that one succeeds normally.
@@ -334,7 +402,9 @@ describe("apiRequest", () => {
     it("resolves undefined (never throws) on a genuine 204", async () => {
       (globalThis.fetch as jest.Mock).mockResolvedValue(rawResponse(204, ""));
 
-      await expect(apiRequest("/v1/drafts/draft-1/reject", { method: "DELETE" })).resolves.toBeUndefined();
+      await expect(
+        apiRequest("/v1/drafts/draft-1/reject", { method: "DELETE" }),
+      ).resolves.toBeUndefined();
     });
 
     it("throws unknown_error on a 200 with a totally empty body", async () => {

@@ -22,7 +22,22 @@ export function registerDevice(input: RegisterDeviceInput): Promise<DeviceRespon
 /** Hard delete by the row's own id (never the raw token — see the doc's
  *  "Contract choice" note). Not idempotent-200 on repeat: a second call
  *  404s `device_not_found`, which every caller here treats as a no-op
- *  success (there's nothing left to unregister either way). */
-export function unregisterDevice(id: string): Promise<DeleteDeviceResponse> {
-  return apiRequest<DeleteDeviceResponse>(`/v1/devices/${id}`, { method: "DELETE" });
+ *  success (there's nothing left to unregister either way).
+ *
+ *  `signal` (#284 adversarial review, finding 2): lets a caller actually
+ *  ABORT this DELETE, not just stop waiting for it. `apiRequest` already
+ *  threads an `AbortSignal` through to `fetch` - see
+ *  src/features/push/deviceRegistration.ts's `reconcileStaleDeviceRegistration`
+ *  for why an abandoned-but-still-in-flight DELETE by device row id is
+ *  unsafe here specifically: the backend's upsert on `token` preserves
+ *  `id` across re-registrations, so a DELETE that lands late enough can
+ *  hit the exact row a concurrent, newer registration just wrote. */
+export function unregisterDevice(
+  id: string,
+  options?: { signal?: AbortSignal },
+): Promise<DeleteDeviceResponse> {
+  return apiRequest<DeleteDeviceResponse>(`/v1/devices/${id}`, {
+    method: "DELETE",
+    signal: options?.signal,
+  });
 }
