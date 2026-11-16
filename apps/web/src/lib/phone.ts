@@ -165,6 +165,29 @@ const TRUNK_ZERO_COUNTRY_ALLOWLIST = new Set([
   "40",
   "420",
   "421",
+  // #303 (2026-08-05): each verified to drop its national trunk prefix "0"
+  // internationally, i.e. the national significant number itself never
+  // starts with "0". See apps/api/app/phone.py's module docstring,
+  // "Allowlist extension (#303, 2026-08-05)", for the full rationale and
+  // for the one candidate (Brazil, 55) deliberately left out.
+  "82", // South Korea
+  "90", // Turkey
+  "380", // Ukraine
+  "385", // Croatia
+  "386", // Slovenia
+  "381", // Serbia
+  "62", // Indonesia
+  "60", // Malaysia
+  "66", // Thailand
+  "63", // Philippines
+  "84", // Vietnam
+  "234", // Nigeria
+  "254", // Kenya
+  "92", // Pakistan
+  "880", // Bangladesh
+  "212", // Morocco
+  "233", // Ghana
+  "94", // Sri Lanka
 ]);
 
 /**
@@ -250,6 +273,13 @@ export function toE164(phone: string): string | null {
     if (digits.startsWith("1")) {
       return digits.length === 11 && isPlausibleNanp(digits.slice(1)) ? `+${digits}` : null;
     }
+    // #304: a country code never begins with "0", the one shape rule this
+    // codebase enforces on a non-NANP international number without
+    // needing to know anything else about the destination country.
+    // Checked on `digits` (after any allowlisted trunk-zero drop above),
+    // so a real, allowlisted country code is never mistaken for a leading
+    // zero. Mirrors apps/api/app/phone.py's `to_e164`.
+    if (digits.startsWith("0")) return null;
     return digits.length >= 8 && digits.length <= 15 ? `+${digits}` : null;
   }
   if (digits.length === 10 && isPlausibleNanp(digits)) return `+1${digits}`;
@@ -263,6 +293,48 @@ export function toE164(phone: string): string | null {
   // exactly the validator/builder split that produced F2. Now no caller
   // can write an undialable value regardless of discipline.
   return null;
+}
+
+/**
+ * #299: `toE164` (and its Python mirror, `app/phone.py::to_e164`) leaves a
+ * "+<cc>0..." value UNCHANGED once it already has 8 to 15 digits, because
+ * that shape passes the international branch's own length check with no
+ * further shape validation. Rows canonicalized by migration 0017 before
+ * #277 landed are stored exactly this way (e.g. "+4402079460958", a
+ * 13-digit non-number Twilio rejects with 21211), so `toE164` alone can
+ * never flag them after the fact. This function detects that STORED shape
+ * given a value that already looks canonical.
+ *
+ * Reuses `TRUNK_ZERO_COUNTRY_ALLOWLIST` above (issue #299: "share the
+ * #303 list rather than duplicating it") instead of maintaining a second,
+ * separate "countries that retain a leading zero" list: a stored value is
+ * only flagged when its own country-code prefix IS on that allowlist,
+ * i.e. we are CONFIDENT that country drops its trunk zero
+ * internationally, so a literal "0" sitting right after it can only be
+ * the un-repaired pre-#277 shape, never a legitimate number. A country
+ * NOT on the allowlist (Italy, or simply one nobody has vetted yet) is
+ * never flagged, the same fail-closed, don't-guess posture #303's own
+ * allowlist uses, applied here in reverse: `TRUNK_ZERO_COUNTRY_ALLOWLIST`
+ * not containing a code is read as "we don't know", not "this is fine".
+ *
+ * Deliberately generic (a raw phone string in, a boolean out, no
+ * `BackupContact` shape assumed): this is the reusable "equivalent" check
+ * issue #299 asks for on `landlords.phone` too. It is not wired to
+ * `landlords.phone` anywhere in this codebase today because `GET /v1/me`
+ * never returns that column (api-contracts.md's "Me" section: write-only,
+ * by design), so there is currently no live value on the client to run it
+ * against.
+ */
+export function phoneLooksLikeUnrepairedTrunkZero(phone: string): boolean {
+  if (!phone.startsWith("+")) return false;
+  const digits = phone.slice(1);
+  for (let length = 1; length <= 3; length++) {
+    const countryCode = digits.slice(0, length);
+    if (TRUNK_ZERO_COUNTRY_ALLOWLIST.has(countryCode) && digits[length] === "0") {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** R4: NANP area code and exchange both start 2-9, and neither is an N11

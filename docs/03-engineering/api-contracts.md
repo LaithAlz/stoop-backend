@@ -151,6 +151,35 @@
      neither doc had ever mentioned. The authority is, and has been
      since #232/#260, `apps/api/app/phone.py::to_e164`; both TS files
      are reviewed mirrors of it.
+- **v1.28 amendment (2026-08-05, #304/#303 implementation):** two further
+  corrections to the v1.24 canonicalization policy above, on top of
+  v1.26's own corrections. No new endpoint, no migration.
+  1. **No leading zero right after "+" (#304).** A country code never
+     begins with `0`. `to_e164`'s international branch previously
+     accepted anything with 8 to 15 digits regardless of shape, so
+     `"+ (0)20 7946 0958"` normalized to `"+02079460958"` and
+     `"+044 (0)20 7946 0958"` normalized to `"+04402079460958"`, neither
+     dialable by anyone. Both now reject (`null`/`None`). Checked after
+     any allowlisted trunk-zero drop (v1.26 point 1 above), so a real,
+     allowlisted country code is never mistaken for a leading zero. See
+     schema-v1.md's v1.24 amendment for the full rationale.
+  2. **Trunk-zero allowlist extended (#303)** from 26 to 44 country
+     codes: South Korea (82), Turkey (90), Ukraine (380), Croatia (385),
+     Slovenia (386), Serbia (381), Indonesia (62), Malaysia (60),
+     Thailand (66), the Philippines (63), Vietnam (84), Nigeria (234),
+     Kenya (254), Pakistan (92), Bangladesh (880), Morocco (212), Ghana
+     (233), and Sri Lanka (94) were added, each verified to drop its
+     trunk zero internationally. Brazil (55) was checked and
+     deliberately left off (its domestic long-distance prefix is a
+     carrier-selection code, not a simple trunk zero); see schema-v1.md's
+     v1.24 amendment for the full list and the Brazil rationale.
+  3. **Three-way agreement re-verified**, a 94-case corpus across
+     `apps/api/app/phone.py`, `apps/web/src/lib/phone.ts`, and
+     `apps/mobile/src/lib/phone.ts` agrees on all but 2, both PRE-EXISTING
+     and unrelated (Python's `str.isnumeric()`-based non-ASCII-digit guard
+     misses an unassigned codepoint and a post-Unicode-15 digit codepoint
+     that both TS mirrors' fail-closed allowlist guard, #273, correctly
+     rejects). Flagged in the #304/#303/#299 PR report, not fixed there.
 - IDs are uuids as strings. Timestamps ISO-8601 UTC (`2026-06-11T14:02:00Z`).
 - **Pagination**: `?limit=` (default 25, max 100) + `?cursor=`; responses
   carry `"next_cursor": string|null`. Lists are newest-first.
@@ -527,6 +556,56 @@ pair, an explicit confirmed `null`, or omits the field; `POST
 client. The web marketing/demo onboarding route
 (`apps/web/src/routes/onboarding.tsx`) collects a backup contact into
 local component state only and never calls the real API at all.
+
+**v1.29 amendment (2026-08-05, #299 implementation): corrects the v1.27
+amendment above.** That amendment's claim that "no widening is needed"
+because `backupContactPhoneLooksInvalid` already caught all four rejected
+shapes was correct as far as it went, but the paragraph's own aside about
+#299 undersold the gap: migration `0017` (`canonicalize_phone_columns_to_
+e164`) ran with the pre-#277 `to_e164`, so a `backup_contact.phone`
+written before #277 shipped as e.g. `"+44 (0)20 7946 0958"` is stored
+today as `"+4402079460958"`, a 13-digit non-number Twilio rejects (21211).
+`toE164("+4402079460958")` returns it UNCHANGED (13 digits sits inside
+the 8-15 length bound, and it starts with `4`, not `0`, so even the v1.28
+amendment's #304 rejection doesn't catch an already-stored value like
+this), so `backupContactPhoneLooksInvalid` genuinely did not flag it, as
+the v1.27 amendment's own aside said. This amendment closes that gap:
+1. **`backupContactPhoneLooksInvalid` widened** (`apps/web/src/features/
+   properties/settings.ts`) to also flag a `backup_contact.phone` that
+   passes `toE164` unchanged but matches the `"+<cc>0..."` shape, where
+   `<cc>` is a 1-to-3-digit prefix ON `TRUNK_ZERO_COUNTRY_ALLOWLIST`
+   (`apps/web/src/lib/phone.ts`'s v1.28-amendment list, reused rather than
+   duplicated). A country NOT on that allowlist (Italy, or one nobody has
+   vetted) is never flagged: the same fail-closed, don't-guess posture the
+   allowlist itself uses, applied in reverse, so `"+390669821234"` (a real
+   Italian number) is never flagged. The new detection logic lives in
+   `apps/web/src/lib/phone.ts::phoneLooksLikeUnrepairedTrunkZero` (mirrored,
+   unwired, in `apps/mobile/src/lib/phone.ts` for consistency), which
+   `backupContactPhoneLooksInvalid` now calls.
+2. **New discriminator**, `backupContactPhoneUnrepairedTrunkZero`, TRUE
+   only for this specific shape, so the web dashboard's two callers
+   (`app.properties_.$id.tsx`, `app.properties_.$id_.settings.tsx`) can
+   show a message naming this failure specifically ("I don't think I can
+   dial it") instead of the generic "doesn't look valid" line used for
+   the four v1.27 shapes. Neither screen attempts to repair the stored
+   value: which digit was dropped or misplaced isn't recoverable from it
+   alone, so the copy asks the landlord to re-enter it. New copy, not yet
+   reviewed by copy-guardian; flagged in the #299 PR report.
+3. **`landlords.phone` NOT wired to any equivalent warning.** The
+   detection logic (`phoneLooksLikeUnrepairedTrunkZero`) is deliberately
+   generic, a raw phone string in, a boolean out, no `BackupContact` shape
+   assumed, so it is ready to serve as the "landlords.phone equivalent"
+   issue #299 asks for. It is not wired to any screen: `GET /v1/me` does
+   not return `phone` (this doc's "Me" section: internal-only, write-only
+   by design, confirmed unchanged by this amendment), so there is no live
+   value on the web dashboard to run it against. Surfacing this for
+   `landlords.phone` would need a new, boolean-only signal on `GET /v1/me`
+   that never echoes the digits themselves (an API-contract change, its
+   own doc-first amendment and safety review, out of scope here) or some
+   other mechanism; flagged, not built, in the #299 PR report.
+4. **Not retroactive**, same as v1.27: no migration, no backfill, no
+   `UPDATE`/`DELETE` of existing rows. This amendment only widens what the
+   dashboard SHOWS the landlord about a row already silently undialable.
 
 ## Tenants & Vendors
 

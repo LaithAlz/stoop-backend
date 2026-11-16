@@ -38,9 +38,37 @@ SILENTLY dropping what a human plausibly intended as a real digit is its
 own hazard (it can shift the remaining digits into a DIFFERENT,
 still-plausible-looking number instead of failing loudly). ``to_e164``
 therefore rejects outright, before any other processing, if the input
-contains ANY character that is a digit under Python's own (Unicode-aware)
-``str.isdigit()`` but is not plain ASCII ``0``-``9`` — never silently
-dropped, never coerced.
+contains a character this module cannot confidently rule OUT as a digit
+(see ``_contains_non_ascii_digit`` below for the exact rule), never
+silently dropped, never coerced.
+
+**Fail-CLOSED allowlist, not an ``isnumeric()`` denylist (found during the
+#304/#303/#299 three-way corpus re-verification, 2026-08-05, fixed in the
+same branch rather than filed separately).** The first cut of this guard
+rejected a character only when Python's ``str.isnumeric()`` said it was
+numeric. That is a DENYLIST, and it fails OPEN against a moving target:
+``isnumeric()`` consults the Unicode character database compiled into
+whichever CPython build is running, so a genuine digit codepoint newer
+than that build's table (an unassigned codepoint today, a real digit in
+some future Unicode version) returns ``False``, the guard passes, and
+``\\D`` under ``re.ASCII`` then strips that character as ordinary
+punctuation, silently dropping what a human plausibly typed as a digit
+and shifting the rest into a DIFFERENT, still-plausible number, exactly
+the hazard this guard exists to prevent. Measured: this let
+``"416555͸1234"`` (an unassigned codepoint, U+0378) and a
+post-Unicode-15 digit codepoint (U+10D40, GARAY DIGIT ZERO, added in
+Unicode 16.0) both parse as ``"+14165551234"`` here while both TS mirrors
+correctly rejected them, because those mirrors never used a
+numeric-ness denylist in the first place (see
+``apps/web/src/lib/phone.ts``'s ``#273`` history). This module now uses
+the SAME shape they do: an ALLOWLIST of Unicode general categories that
+are unambiguously not digits (letters, space separators, format
+controls, punctuation, symbols) with CJK ideographic numerals carved
+back out of the letters category. Anything outside that allowlist,
+including a codepoint no installed Unicode table has an opinion on yet, is
+rejected. See ``_contains_non_ascii_digit`` below for the exact
+implementation; it is version-independent in the way ``isnumeric()`` is
+not.
 
 Canonicalization policy (mirrors the TS implementation exactly)
 ------------------------------------------------------------------------
@@ -57,7 +85,10 @@ Canonicalization policy (mirrors the TS implementation exactly)
     number gets no less scrutiny than a bare one — a dropped digit like
     ``"+1416555013"`` must not slip through just because it has a plus).
   - otherwise treated as non-NANP international: accepted if the total
-    digit count is between 8 and 15 inclusive (E.164's own bound), no
+    digit count is between 8 and 15 inclusive (E.164's own bound) AND the
+    first digit is not ``0`` (#304: no country code ever begins with
+    ``0``, so this is the one shape rule this codebase enforces even
+    without knowing anything else about the destination country), no
     further shape validation — this codebase has no non-NANP dialing
     rules to check against.
 - **Extensions / any other junk** (e.g. ``"416-555-0134 x22"``, ``"n/a"``)
@@ -89,6 +120,25 @@ code, not a trunk marker, so the literal ``"(0)"`` never matches
 7946 0958"``) is left exactly as before — this is option 1 only (see the
 issue); it does not attempt to detect or repair that case.
 
+No leading zero after "+" (#304)
+------------------------------------------------------------------------
+A country code never begins with ``0``, so nothing can dial a value whose
+first digit after ``"+"`` is ``0``. Before this rule, the international
+branch checked only the total digit count (8 to 15), with no shape
+validation, so ``"+ (0)20 7946 0958"`` (no digits between ``"+"`` and the
+parenthesized ``"(0)"``, so the trunk-zero rule above never matches it)
+and ``"+044 (0)20 7946 0958"`` (a 3-digit run, ``"044"``, that is not on
+``_TRUNK_ZERO_COUNTRY_ALLOWLIST``, so the trunk-zero rule leaves it alone
+too) both normalized to ``"+02079460958"`` / ``"+04402079460958"``,
+neither dialable by anyone. Unlike the trunk-zero rule, this needs no
+country-specific knowledge: it is checked on ``digits`` (i.e. after any
+allowlisted trunk-zero drop has already happened), so a real, allowlisted
+country code is never mistaken for a leading zero, and it applies only in
+the international branch (a bare NANP input never reaches this check at
+all, and a ``+1`` NANP input is rejected or accepted by
+``is_plausible_nanp`` alone, which already can't produce a result starting
+with ``0``).
+
 **Country-code allowlist (adversarial safety review, 2026-08-04,
 BLOCKING).** The rule above is only correct for countries that actually
 DROP the leading ``0`` when dialed from abroad. Italy, San Marino, Vatican
@@ -115,6 +165,25 @@ deliberate act: check that specific country's numbering plan (does it
 retain or drop the trunk zero when dialed internationally?) before adding
 its code — do not guess from the shape of an example.
 
+**Allowlist extension (#303, 2026-08-05).** The original 26-country list
+above left every other country on the pre-#277 status quo, so e.g.
+``"+82 (0)10 1234 5678"`` (Korea) still stored as a 13-digit undialable
+value. Added, each verified to drop its national trunk prefix ``0`` when
+dialed internationally (i.e. the national significant number itself never
+starts with ``0``): South Korea (82), Turkey (90), Ukraine (380), Croatia
+(385), Slovenia (386), Serbia (381), Indonesia (62), Malaysia (60),
+Thailand (66), the Philippines (63), Vietnam (84), Nigeria (234), Kenya
+(254), Pakistan (92), Bangladesh (880), Morocco (212), Ghana (233), and
+Sri Lanka (94). **Left out, not confident:** Brazil (55). Brazil's
+domestic long-distance dialing prefixes a 2-digit carrier-selection code
+between the trunk ``0`` and the area code (``0`` + carrier code + area
+code + number, and a purely local call uses neither the ``0`` nor an area
+code at all), so it is not the simple "``0`` immediately before the rest
+of the number" shape this rule assumes, and applying the rule anyway risks
+mangling a number this narrow check was never designed to reason about.
+Left off the list rather than guessed at; see #303 for the full candidate
+list this was checked against.
+
 ``is_plausible_nanp``: area code and exchange code both start ``2``-``9``
 and neither is an N11 service code (``211``/``411``/``911``/… — never
 assignable to a real subscriber) — the same cheap regex as the TS version,
@@ -126,6 +195,7 @@ reached on).
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from app.errors import AppError
 
@@ -223,6 +293,29 @@ _TRUNK_ZERO_COUNTRY_ALLOWLIST = frozenset(
         "40",
         "420",
         "421",
+        # #303 (2026-08-05): each verified to drop its national trunk
+        # prefix "0" internationally, i.e. the national significant number
+        # itself never starts with "0". See the module docstring,
+        # "Allowlist extension (#303, 2026-08-05)", for the full rationale
+        # and for the one candidate (Brazil, 55) deliberately left out.
+        "82",  # South Korea
+        "90",  # Turkey
+        "380",  # Ukraine
+        "385",  # Croatia
+        "386",  # Slovenia
+        "381",  # Serbia
+        "62",  # Indonesia
+        "60",  # Malaysia
+        "66",  # Thailand
+        "63",  # Philippines
+        "84",  # Vietnam
+        "234",  # Nigeria
+        "254",  # Kenya
+        "92",  # Pakistan
+        "880",  # Bangladesh
+        "212",  # Morocco
+        "233",  # Ghana
+        "94",  # Sri Lanka
     }
 )
 
@@ -233,22 +326,170 @@ def is_plausible_nanp(digits: str) -> bool:
     return _NANP_RE.match(digits) is not None
 
 
-def _contains_non_ascii_digit(value: str) -> bool:
-    """``True`` iff *value* contains a character Python considers numeric
-    but which is not plain ASCII ``0``-``9`` — e.g. ``"١"`` (Arabic-Indic
-    one), ``"٤"`` (Arabic-Indic four), ``"４"`` (fullwidth four).
+# Non-ASCII Unicode general categories that are UNAMBIGUOUSLY not digits,
+# so a character in one of them may appear in a pasted phone string and be
+# stripped as punctuation: L* (Lu/Ll/Lt/Lm/Lo, letters, "Célular:", "携帯",
+# "моб."), Zs (space separator, NBSP and narrow NBSP, the
+# copy-off-a-webpage case), Cf (format controls, LRM/RLM from an RTL
+# paste, word joiners, BOM), P* (Pc/Pd/Ps/Pe/Pi/Pf/Po, punctuation,
+# en/em dashes from Word autocorrect, non-breaking hyphen, smart quotes),
+# and S* (Sm/Sc/Sk/So, symbols). Mirrors apps/web/src/lib/phone.ts's
+# ``NON_ASCII_ALLOWED_RE`` exactly (``\p{L}\p{Zs}\p{Cf}\p{P}\p{S}``), see
+# module docstring, "Fail-CLOSED allowlist, not an isnumeric() denylist",
+# for why this replaced an earlier ``str.isnumeric()``-based denylist.
+# Deliberately Zs only, not the wider Z category: Zl (line separator) and
+# Zp (paragraph separator) are excluded here exactly as they are from the
+# TS regex, so they fall through to "might be a digit" and get rejected,
+# not silently treated as punctuation.
+_NON_ASCII_ALLOWED_CATEGORIES = frozenset(
+    {
+        "Lu",
+        "Ll",
+        "Lt",
+        "Lm",
+        "Lo",
+        "Zs",
+        "Cf",
+        "Pc",
+        "Pd",
+        "Ps",
+        "Pe",
+        "Pi",
+        "Pf",
+        "Po",
+        "Sm",
+        "Sc",
+        "Sk",
+        "So",
+    }
+)
 
-    Uses ``str.isnumeric()`` rather than ``str.isdigit()`` (safety review,
-    2026-08-03, finding 1 residual): ``isdigit()`` misses CJK numerals —
-    ``"一"`` and ``"〇"`` are literally one and zero, i.e. exactly "a
-    character a human plausibly meant as a digit", which is this guard's
-    whole rationale. Without this they were silently STRIPPED and the
-    remainder accepted, so ``"+一4165551234"`` became ``"+4165551234"`` —
-    a different, still-plausible number stored on the field the escalation
-    chain dials. The ``not ch.isascii()`` conjunct keeps ``0``-``9`` out of
-    it, and no legitimate phone character (``+ - ( ) . space x``) is
-    numeric, so this rejects nothing real."""
-    return any(ch.isnumeric() and not ch.isascii() for ch in value)
+# CJK ideographic numerals, category Lo (Letter, other), so they would
+# otherwise pass _NON_ASCII_ALLOWED_CATEGORIES above; carved back OUT and
+# treated as digits instead, same as apps/web/src/lib/phone.ts's
+# ``CJK_NUMERALS_RE`` (81 codepoints, diff-verified there against Python's
+# ``isnumeric()`` across every codepoint 0..0x10FFFF, this set is that
+# same list, not re-derived from ``isnumeric()`` here, so it carries none
+# of the version-dependence this module's guard exists to avoid).
+_CJK_NUMERAL_CODEPOINTS = (
+    0x3405,
+    0x3483,
+    0x382A,
+    0x3B4D,
+    0x4E00,
+    0x4E03,
+    0x4E07,
+    0x4E09,
+    0x4E5D,
+    0x4E8C,
+    0x4E94,
+    0x4E96,
+    0x4EBF,
+    0x4EC0,
+    0x4EDF,
+    0x4EE8,
+    0x4F0D,
+    0x4F70,
+    0x5104,
+    0x5146,
+    0x5169,
+    0x516B,
+    0x516D,
+    0x5341,
+    0x5343,
+    0x5344,
+    0x5345,
+    0x534C,
+    0x53C1,
+    0x53C2,
+    0x53C3,
+    0x53C4,
+    0x56DB,
+    0x58F1,
+    0x58F9,
+    0x5E7A,
+    0x5EFE,
+    0x5EFF,
+    0x5F0C,
+    0x5F0D,
+    0x5F0E,
+    0x5F10,
+    0x62FE,
+    0x634C,
+    0x67D2,
+    0x6F06,
+    0x7396,
+    0x767E,
+    0x8086,
+    0x842C,
+    0x8CAE,
+    0x8CB3,
+    0x8D30,
+    0x9621,
+    0x9646,
+    0x964C,
+    0x9678,
+    0x96F6,
+    0xF96B,
+    0xF973,
+    0xF978,
+    0xF9B2,
+    0xF9D1,
+    0xF9D3,
+    0xF9FD,
+    0x20001,
+    0x20064,
+    0x200E2,
+    0x20121,
+    0x2092A,
+    0x20983,
+    0x2098C,
+    0x2099C,
+    0x20AEA,
+    0x20AFD,
+    0x20B19,
+    0x22390,
+    0x22998,
+    0x23B1B,
+    0x2626D,
+    0x2F890,
+)
+_CJK_NUMERALS = frozenset(chr(codepoint) for codepoint in _CJK_NUMERAL_CODEPOINTS)
+
+
+def _contains_non_ascii_digit(value: str) -> bool:
+    """``True`` iff *value* contains a non-ASCII character that isn't
+    clearly punctuation-or-letter, i.e. anything that might be a digit,
+    including codepoints this Python build's Unicode tables don't know
+    about yet, e.g. ``"١"`` (Arabic-Indic one), ``"٤"`` (Arabic-Indic
+    four), ``"４"`` (fullwidth four), ``"一"``/``"〇"`` (CJK one/zero), or an
+    unassigned or post-this-build's-Unicode-version codepoint.
+
+    Fail-CLOSED allowlist (see module docstring, "Fail-CLOSED allowlist,
+    not an isnumeric() denylist"), not a ``str.isnumeric()`` denylist: a
+    denylist only catches what THIS build's Unicode database already
+    knows is numeric, so a genuine digit codepoint newer than that table
+    would be silently treated as harmless punctuation and stripped,
+    exactly the hazard this guard exists to prevent. This allowlist
+    rejects any non-ASCII character NOT in
+    ``_NON_ASCII_ALLOWED_CATEGORIES`` (checked via
+    ``unicodedata.category``, itself compiled into this Python build, but
+    used here only to say what ISN'T a digit, letters, spaces,
+    punctuation, symbols, format controls, a far more stable claim than
+    "IS a digit", since new Unicode versions add new digit scripts far
+    more often than they add entirely new non-digit categories to
+    characters the world already uses). CJK ideographic numerals
+    (``_CJK_NUMERALS``) are carved back out of the letters category
+    first, since they are General_Category ``Lo`` and would otherwise
+    pass."""
+    for ch in value:
+        if ch.isascii():
+            continue
+        if ch in _CJK_NUMERALS:
+            return True
+        if unicodedata.category(ch) not in _NON_ASCII_ALLOWED_CATEGORIES:
+            return True
+    return False
 
 
 def _drop_parenthesized_trunk_zero(value: str) -> str:
@@ -316,6 +557,12 @@ def to_e164(raw: str) -> str | None:
     if plus:
         if digits.startswith("1"):
             return f"+{digits}" if len(digits) == 11 and is_plausible_nanp(digits[1:]) else None
+        # #304: a country code never begins with "0", the one shape rule
+        # this codebase enforces on a non-NANP international number without
+        # needing to know anything else about the destination country. See
+        # module docstring, "No leading zero after '+'".
+        if digits.startswith("0"):
+            return None
         return f"+{digits}" if 8 <= len(digits) <= 15 else None
 
     if len(digits) == 10 and is_plausible_nanp(digits):

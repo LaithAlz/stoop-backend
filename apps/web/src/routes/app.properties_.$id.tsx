@@ -32,7 +32,10 @@ import { ApiError, toHouseApiError } from "@/api/errors";
 import type { CaseSummary, Tenant, VulnerableOccupant } from "@/api/types";
 import { firstName } from "@/lib/tenantName";
 import { formatRelativeTime } from "@/lib/relativeTime";
-import { backupContactPhoneLooksInvalid } from "@/features/properties/settings";
+import {
+  backupContactPhoneLooksInvalid,
+  backupContactPhoneUnrepairedTrunkZero,
+} from "@/features/properties/settings";
 import {
   NO_NUMBER_BODY,
   NO_NUMBER_TITLE,
@@ -329,12 +332,24 @@ function PropertyHub() {
                       to name the backup contact without ever checking
                       `.phone` — asserting a redundancy for the emergency
                       chain's second number that may not actually be
-                      dialable. */}
-                  {backupContactPhoneLooksInvalid(property.backup_contact) && (
+                      dialable. #299: a distinct message for the "looks
+                      canonical but stored wrong" case (a pre-#277 row):
+                      it names the actual stored value, since this screen
+                      has no editable field showing it, and says plainly
+                      Stoop doesn't think it's dialable rather than the
+                      vaguer "doesn't look valid" used for every other
+                      reason this warning fires. */}
+                  {backupContactPhoneUnrepairedTrunkZero(property.backup_contact) ? (
                     <p className="mt-0.5 text-[12px] font-medium text-urgent">
-                      Their number doesn&rsquo;t look valid. I may not be able to reach them in an
-                      emergency.
+                      {`The number on file for them, ${property.backup_contact?.phone ?? ""}, doesn't look like something I can dial. I may not be able to reach them in an emergency.`}
                     </p>
+                  ) : (
+                    backupContactPhoneLooksInvalid(property.backup_contact) && (
+                      <p className="mt-0.5 text-[12px] font-medium text-urgent">
+                        Their number doesn&rsquo;t look valid. I may not be able to reach them in an
+                        emergency.
+                      </p>
+                    )
                   )}
                 </div>
                 <ChevronRight className="size-4 shrink-0 text-ink-muted/70" />

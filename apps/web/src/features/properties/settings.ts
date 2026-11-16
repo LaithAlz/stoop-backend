@@ -64,7 +64,7 @@
  * call this again with `confirmedClear: true` once the landlord agrees.
  */
 import type { BackupContact, Property, QuietHours, UpdatePropertyInput } from "@/api/types";
-import { phoneErrorMessage, toE164 } from "@/lib/phone";
+import { phoneErrorMessage, phoneLooksLikeUnrepairedTrunkZero, toE164 } from "@/lib/phone";
 
 export interface PropertySettingsForm {
   houseRules: string;
@@ -232,11 +232,45 @@ export const BACKUP_CONTACT_CLEAR_CONFIRM_LABEL = "Remove backup contact";
  *   regardless of what digits it might spell out. This function has to
  *   agree with the code that actually places the call, not with what the
  *   value would mean if it had been written as a string.
+ *
+ * #299: widened to also catch a row that DID pass `toE164` once but is
+ * still undialable, the "+<cc>0..." shape a pre-#277 run of migration
+ * 0017 left behind (e.g. "+4402079460958", stored clean, 13 digits, well
+ * inside `toE164`'s 8-15 length bound, so `toE164` alone reports it
+ * canonical). No repair is attempted here or anywhere in this file: which
+ * digit was dropped or misplaced isn't recoverable from the stored value
+ * alone, so the caller is expected to show the landlord what's on file
+ * and ask them to re-enter it, not silently rewrite it.
  */
 export function backupContactPhoneLooksInvalid(contact: BackupContact | null): boolean {
   if (contact === null) return false;
   if (typeof contact.phone !== "string") return true;
-  return toE164(contact.phone) === null;
+  const canonical = toE164(contact.phone);
+  if (canonical === null) return true;
+  // #299: `toE164` leaves a "+<cc>0..." value UNCHANGED once it already
+  // has 8 to 15 digits, so a row canonicalized by migration 0017 before
+  // #277 landed (e.g. "+4402079460958", a 13-digit non-number Twilio
+  // rejects) passed the check above unchanged, and this function used to
+  // stop there and report it reachable. See
+  // `backupContactPhoneUnrepairedTrunkZero` below, which distinguishes
+  // this specific class from every other reason this function fires.
+  return phoneLooksLikeUnrepairedTrunkZero(canonical);
+}
+
+/**
+ * #299: TRUE only for the specific "+<cc>0..." shape a pre-#277
+ * migration (0017) left behind, distinct from every other reason
+ * `backupContactPhoneLooksInvalid` fires (missing/null/blank/non-string/
+ * otherwise-unparsable), all of which mean "nothing usable was ever
+ * entered". This one means something WAS entered and normalized, just to
+ * the wrong value, so a caller can show a warning that says so plainly
+ * (and shows the stored digits) instead of the generic "doesn't look
+ * valid" line.
+ */
+export function backupContactPhoneUnrepairedTrunkZero(contact: BackupContact | null): boolean {
+  if (contact === null || typeof contact.phone !== "string") return false;
+  const canonical = toE164(contact.phone);
+  return canonical !== null && phoneLooksLikeUnrepairedTrunkZero(canonical);
 }
 
 export function quietHoursClearAttempted(form: PropertySettingsForm, current: Property): boolean {

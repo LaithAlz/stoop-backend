@@ -873,6 +873,54 @@
 >    simply the first writer of this combination. No migration needed for
 >    this part.
 
+> **v1.24 amendment (2026-08-05, #304/#303 implementation):** two further
+> corrections to `app/phone.py::to_e164`'s canonicalization policy (v1.21
+> amendment below, corrected once already by v1.22). No migration,
+> behavior-only, on the same columns v1.21 already covers.
+> 1. **No leading zero right after "+" (#304).** A country code never
+>    begins with `0`, so a value whose first digit after `"+"` is `0` was
+>    never dialable, but the international branch only checked total
+>    digit count (8 to 15), with no shape check, so `"+ (0)20 7946 0958"`
+>    normalized to `"+02079460958"` and `"+044 (0)20 7946 0958"`
+>    normalized to `"+04402079460958"`, neither one anything can dial.
+>    `to_e164` now rejects the international branch outright whenever the
+>    digit string (after any allowlisted trunk-zero drop from the v1.22
+>    amendment) starts with `0`. This needs no per-country knowledge,
+>    unlike the trunk-zero allowlist itself, and it is checked on the
+>    string AFTER any allowlisted drop, so a real, allowlisted country
+>    code is never mistaken for a leading zero (confirmed against every
+>    v1.22/this-amendment allowlist entry and against the retained-zero
+>    countries, `apps/api/tests/test_phone.py`).
+> 2. **Trunk-zero allowlist extended (#303).** The v1.22 amendment's
+>    26-country allowlist left every other country on the pre-#277 status
+>    quo, so e.g. `"+82 (0)10 1234 5678"` (Korea) still stored as a
+>    13-digit undialable value. 18 more country codes were checked and
+>    added, each verified to drop its national trunk prefix `0`
+>    internationally (i.e. its national significant number itself never
+>    starts with `0`): South Korea (82), Turkey (90), Ukraine (380),
+>    Croatia (385), Slovenia (386), Serbia (381), Indonesia (62), Malaysia
+>    (60), Thailand (66), the Philippines (63), Vietnam (84), Nigeria
+>    (234), Kenya (254), Pakistan (92), Bangladesh (880), Morocco (212),
+>    Ghana (233), and Sri Lanka (94). **Left out, not confident:** Brazil
+>    (55) was checked and deliberately excluded. Brazil's domestic
+>    long-distance dialing prefixes a 2-digit carrier-selection code
+>    between the trunk `0` and the area code, and a purely local call uses
+>    neither the `0` nor an area code at all, so it is not the simple
+>    "`0` immediately before the rest of the number" shape this rule
+>    assumes; applying the rule anyway risks mangling a number this narrow
+>    check was never designed to reason about. Left off the allowlist
+>    rather than guessed at.
+> 3. **Three-way agreement re-verified**, not just claimed: a 94-case
+>    corpus (every case in `apps/api/tests/test_phone.py` plus every case
+>    added by this amendment) run through `apps/api/app/phone.py`,
+>    `apps/web/src/lib/phone.ts`, and `apps/mobile/src/lib/phone.ts`
+>    agrees on all but 2, both PRE-EXISTING and unrelated to this
+>    amendment (see the PR report): Python's non-ASCII-digit guard
+>    (`_contains_non_ascii_digit`, `str.isnumeric()`-based) does not
+>    reject an unassigned codepoint or a post-Unicode-15 digit codepoint
+>    the way both TS mirrors' fail-closed allowlist guard (`#273`) does;
+>    flagged, not fixed, out of scope for #304/#303/#299.
+
 <!-- DDL-body annotation for v1.23 lives on `properties.backup_contact`
      below, per the house annotate-don't-silently-edit convention. -->
 > **v1.23 amendment (2026-08-04, #290 implementation)**: no migration

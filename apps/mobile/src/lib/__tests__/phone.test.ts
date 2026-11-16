@@ -9,7 +9,13 @@
  * table codepoint still rejects" and "realistic paste still accepts"
  * cases below are that shape's own test matrix, ported.
  */
-import { phoneErrorMessage, phoneLooksValid, toE164, validatePhone } from "../phone";
+import {
+  phoneErrorMessage,
+  phoneLooksLikeUnrepairedTrunkZero,
+  phoneLooksValid,
+  toE164,
+  validatePhone,
+} from "../phone";
 
 describe("toE164 — accepts", () => {
   it.each([
@@ -121,6 +127,76 @@ describe("toE164 — #277: parenthesized trunk zero", () => {
     it("Cote d'Ivoire (NOT on the allowlist, post-2021 numbering plan) is left alone", () => {
       expect(toE164("+225 (0)1 23 45 67 89")).toBe("+2250123456789");
     });
+  });
+
+  describe("#303: allowlist extension (18 newly-verified countries)", () => {
+    it.each([
+      ["south korea", "+82 (0)10 1234 5678", "+821012345678"],
+      ["turkey", "+90 (0)532 123 4567", "+905321234567"],
+      ["ukraine", "+380 (0)44 123 4567", "+380441234567"],
+      ["croatia", "+385 (0)1 234 5678", "+38512345678"],
+      ["slovenia", "+386 (0)1 234 5678", "+38612345678"],
+      ["serbia", "+381 (0)11 234 5678", "+381112345678"],
+      ["indonesia", "+62 (0)812 3456 789", "+628123456789"],
+      ["malaysia", "+60 (0)12 345 6789", "+60123456789"],
+      ["thailand", "+66 (0)81 234 5678", "+66812345678"],
+      ["philippines", "+63 (0)917 123 4567", "+639171234567"],
+      ["vietnam", "+84 (0)912 345 678", "+84912345678"],
+      ["nigeria", "+234 (0)803 123 4567", "+2348031234567"],
+      ["kenya", "+254 (0)712 345 678", "+254712345678"],
+      ["pakistan", "+92 (0)300 1234567", "+923001234567"],
+      ["bangladesh", "+880 (0)1712 345678", "+8801712345678"],
+      ["morocco", "+212 (0)612 345678", "+212612345678"],
+      ["ghana", "+233 (0)24 123 4567", "+233241234567"],
+      ["sri lanka", "+94 (0)71 234 5678", "+94712345678"],
+    ])("%s drops its trunk zero", (_label, raw, expected) => {
+      expect(toE164(raw)).toBe(expected);
+    });
+
+    it("Brazil (55) was checked and deliberately left off the list", () => {
+      // Brazil's domestic long-distance dialing prefix is "0" + a
+      // carrier-selection code, not the simple trunk zero this rule
+      // assumes (see apps/api/app/phone.py's module docstring,
+      // "Allowlist extension (#303, 2026-08-05)"), left exactly as
+      // before this issue, same as any other unlisted country.
+      expect(toE164("+55 (0)21 91234 5678")).toBe("+55021912345678");
+    });
+  });
+});
+
+describe("toE164 - #304: a leading zero right after '+' is never valid E.164", () => {
+  it("rejects when there are no digits between '+' and the parenthesized '(0)'", () => {
+    // The exact first example from the issue: the trunk-zero rule never
+    // matches (no country-code digits to anchor on), and the result used
+    // to pass the international branch's digit-count-only check even
+    // though a country code can never be empty or "0".
+    expect(toE164("+ (0)20 7946 0958")).toBeNull();
+  });
+
+  it("rejects when the country code is not real and not on the allowlist", () => {
+    // The exact second example from the issue: "044" is not a real
+    // country code, so the trunk-zero rule leaves it alone, and the
+    // result used to pass the international branch's digit-count-only
+    // check (14 digits, 8-15) even though nothing can dial "+0...".
+    expect(toE164("+044 (0)20 7946 0958")).toBeNull();
+  });
+
+  it("rejects a plain (non-parenthesized) leading zero too", () => {
+    expect(toE164("+0207946 0958")).toBeNull();
+  });
+
+  it("does not fire when an allowlisted trunk zero was already dropped", () => {
+    // The UK's own trunk zero is dropped first, leaving digits that start
+    // with "44", never "0": a real, allowlisted country code is never
+    // mistaken for a leading zero.
+    expect(toE164("+44 (0)20 7946 0958")).toBe("+442079460958");
+  });
+
+  it("does not fire for a retained-zero country's real trunk zero", () => {
+    // Italy is NOT on the allowlist, so its trunk zero is never dropped,
+    // so `digits` starts with "3" (from "39"), never "0": confirms #304
+    // and #303's allowlist compose correctly.
+    expect(toE164("+39 (0)6 6982 1234")).toBe("+390669821234");
   });
 });
 
@@ -269,5 +345,42 @@ describe("validatePhone / phoneErrorMessage — issue #276", () => {
     expect(phoneErrorMessage("416-555-0134 x22")).toBe(
       "Use 10 digits, 11 starting with 1, or + and your country code.",
     );
+  });
+});
+
+describe("phoneLooksLikeUnrepairedTrunkZero - issue #299", () => {
+  it("flags the exact motivating case: a pre-#277-migrated UK row", () => {
+    // migration 0017 canonicalized this row with the OLD normalizer, so
+    // it is stored exactly as "+4402079460958": toE164 alone leaves it
+    // unchanged (13 digits, 8-15), so only this function catches it.
+    expect(phoneLooksLikeUnrepairedTrunkZero("+4402079460958")).toBe(true);
+    expect(toE164("+4402079460958")).toBe("+4402079460958");
+  });
+
+  it("flags a newly-allowlisted country's own un-repaired shape", () => {
+    expect(phoneLooksLikeUnrepairedTrunkZero("+8201012345678")).toBe(true);
+  });
+
+  it("does not flag a correctly-canonicalized number", () => {
+    expect(phoneLooksLikeUnrepairedTrunkZero("+442079460958")).toBe(false);
+    expect(phoneLooksLikeUnrepairedTrunkZero("+14165551234")).toBe(false);
+  });
+
+  it("does not flag a retained-zero country's real number", () => {
+    // "+390669821234" is a perfectly good Italian number: Italy is not
+    // on TRUNK_ZERO_COUNTRY_ALLOWLIST, so this is never flagged.
+    expect(phoneLooksLikeUnrepairedTrunkZero("+390669821234")).toBe(false);
+    expect(phoneLooksLikeUnrepairedTrunkZero("+3780549882345")).toBe(false);
+  });
+
+  it("does not flag a country nobody has vetted yet (fails closed, not open)", () => {
+    // Not a real country code, and not on the allowlist: "we don't know"
+    // is read as "don't flag it", the same posture #303's own allowlist
+    // takes in the other direction.
+    expect(phoneLooksLikeUnrepairedTrunkZero("+9990123456789")).toBe(false);
+  });
+
+  it("does not flag a non-'+' value", () => {
+    expect(phoneLooksLikeUnrepairedTrunkZero("4402079460958")).toBe(false);
   });
 });
