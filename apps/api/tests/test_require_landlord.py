@@ -1,6 +1,10 @@
-"""Integration tests for the ``require_landlord`` dependency (#22; two-session
-fix per the #54/#55/#57 spec review — see ``app/deps.py``'s module docstring
-"Two-session rationale").
+"""Integration tests for the ``require_landlord`` dependency (#22, fixed per
+the #54/#55/#57 spec review; the fix's design has since changed under #194,
+see ``app/deps.py``'s module docstring "Identity-lookup design history" for
+both the original two-session fix and the current ``SECURITY DEFINER``
+design that replaced it. The regression pin below (test 5) is unchanged by
+that: it proves the SAME contract, a correct lookup under real ``app_role``
+enforcement, before any GUC is set, regardless of which design satisfies it).
 
 Marker: ``integration`` — requires a running Postgres instance.
 Use ``docker compose up -d`` at the repo root before running locally.
@@ -25,31 +29,39 @@ Covers:
 4. A session that never went through ``require_landlord`` has the GUC
    unset (``current_setting(..., true)`` is NULL) — the fail-closed
    default this dependency is the only thing that ever changes.
-5. **The regression pin for the two-session fix**: ``require_landlord``
-   resolves the landlord and sets the GUC correctly even when the CALLER's
-   session is genuinely subject to RLS (``SET LOCAL ROLE app_role``, the
-   same technique ``tests/test_rls_isolation.py`` uses — see that module's
-   docstring for why a superuser can ``SET ROLE`` without prior
-   membership). Before the fix, this exact scenario 403'd
-   ``account_deleted`` for a real, live, committed landlord row, every
-   time, because the ``landlords`` lookup ran on the SAME app_role-scoped
-   transaction the GUC hadn't been set on yet — ``landlords``' RLS policy
-   is ``id = current_setting('app.current_landlord_id', true)::uuid``, and
-   an unset GUC reads back as SQL ``NULL``, matching zero rows. Manually
-   verified red under the pre-fix code (via ``git stash``) and green under
-   the fix — see this PR's report for the transcript.
+5. **The regression pin for the original #22 fix, still the contract #194's
+   redesign must also satisfy**: ``require_landlord`` resolves the landlord
+   and sets the GUC correctly even when the CALLER's session is genuinely
+   subject to RLS (``SET LOCAL ROLE app_role``, the same technique
+   ``tests/test_rls_isolation.py`` uses, see that module's docstring for
+   why a superuser can ``SET ROLE`` without prior membership). Before the
+   original #22 fix, this exact scenario 403'd ``account_deleted`` for a
+   real, live, committed landlord row, every time, because the
+   ``landlords`` lookup ran on the SAME app_role-scoped transaction the GUC
+   hadn't been set on yet: ``landlords``' RLS policy is ``id =
+   current_setting('app.current_landlord_id', true)::uuid``, and an unset
+   GUC reads back as SQL ``NULL``, matching zero rows. Manually verified
+   red under the pre-fix code (via ``git stash``) and green under the fix,
+   see that PR's report for the transcript. Still green, unmodified,
+   under #194's later ``SECURITY DEFINER`` redesign (proven by this same
+   test, run as part of that PR).
 
-Cross-loop pool hazard note: tests below that use ``require_landlord`` now
-touch the module-level ADMIN engine (``app.db.session.engine``, via
-``get_admin_session`` — the two-session fix) IN ADDITION to each test's own
-``db_engine`` fixture. ``asyncio_default_fixture_loop_scope = "function"``
-means every test gets its own event loop; a connection pooled by the
-module-level singleton engine during one test is bound to that test's
-(now-closed) loop, and reusing it from a later test's new loop raises
-``RuntimeError: got Future ... attached to a different loop`` (the exact
-failure class ``tests/test_me.py``'s ``dispose_app_engine`` fixture already
-guards against). ``_dispose_admin_engine`` below is that same guard,
-reproduced here for the same reason.
+Cross-loop pool hazard note (historical, kept for #194 readers): before
+#194, tests below that use ``require_landlord`` ALSO touched the
+module-level ADMIN engine (``app.db.session.engine``) IN ADDITION to each
+test's own ``db_engine`` fixture, because ``require_landlord`` itself opened
+a second, admin-scoped session on every call. ``asyncio_default_fixture_
+loop_scope = "function"`` means every test gets its own event loop; a
+connection pooled by the module-level singleton engine during one test is
+bound to that test's (now-closed) loop, and reusing it from a later test's
+new loop raises ``RuntimeError: got Future ... attached to a different
+loop`` (the exact failure class ``tests/test_me.py``'s ``dispose_app_engine``
+fixture already guards against). ``_dispose_admin_engine`` below is that
+same guard, reproduced here for the same reason. #194's redesign means
+``require_landlord`` no longer touches that engine at all, but the fixture
+is left in place as a harmless no-op safety net rather than removed, since
+nothing about this file's own risk profile changed by removing one caller
+of a shared, process-wide pool other tests can still stress.
 
 Run with:
     DATABASE_URL=postgresql+asyncpg://stoop:stoop@localhost:5432/stoop \\
@@ -159,12 +171,14 @@ async def _insert_landlord_committed(
 ) -> str:
     """Insert a landlords row on its OWN connection and COMMIT it.
 
-    Committing (rather than the old rollback-only pattern) is now required:
-    the two-session fix means ``require_landlord``'s lookup runs on a
-    SEPARATE admin session/connection from the caller's own ``session``
-    fixture — an uncommitted write on one connection is invisible to any
-    other connection, by ordinary transaction-isolation semantics, so the
-    row must be durably committed for that lookup to ever see it (exactly
+    Committing (rather than the old rollback-only pattern) is required: this
+    helper always writes on its OWN, separate connection/engine from the
+    caller's own ``session``/``app_role_session`` fixture that
+    ``require_landlord`` actually reads on (the ``db_engine`` used here is
+    never the same connection as the one under test); an uncommitted write
+    on one connection is invisible to any other connection, by ordinary
+    transaction-isolation semantics, so the row must be durably committed
+    for that lookup to ever see it (exactly
     like a real request would: the landlord row was provisioned and
     committed in some earlier request entirely). Callers MUST clean up via
     ``_delete_landlord`` in a ``finally`` block.
@@ -294,33 +308,39 @@ async def test_session_without_require_landlord_has_guc_unset(session: AsyncSess
 async def test_require_landlord_resolves_under_real_rls_enforcement(
     db_engine: AsyncEngine,
 ) -> None:
-    """The authoritative proof for the two-session fix (app/deps.py).
+    """The authoritative proof for the #22 fix (app/deps.py), still green,
+    unmodified, under #194's later ``SECURITY DEFINER`` redesign.
 
     Seeds a committed landlord row on an ordinary (superuser) connection,
     then calls ``require_landlord`` with a caller ``session`` that is
     GENUINELY ``app_role``-scoped (``SET LOCAL ROLE app_role`` on its own
     connection/transaction, with the GUC deliberately still UNSET at call
-    time — exactly the state a fresh request-path session is in). Before
-    the fix, ``require_landlord``'s ``landlords`` lookup ran on this SAME
-    app_role-scoped, GUC-unset transaction and was rejected by RLS (zero
-    rows, since ``id = current_setting(..., true)::uuid`` can never match
-    while the GUC is NULL) — this test would have 403'd account_deleted for
-    a real landlord, exactly the production bug found in spec review.
-    After the fix, the lookup runs on a separate ADMIN session and always
-    succeeds; the GUC is then set on THIS app_role-scoped session/
-    connection, verified by reading it back on the SAME connection.
+    time, exactly the state a fresh request-path session is in). Before
+    the original #22 fix, ``require_landlord``'s ``landlords`` lookup ran
+    on this SAME app_role-scoped, GUC-unset transaction and was rejected by
+    RLS (zero rows, since ``id = current_setting(..., true)::uuid`` can
+    never match while the GUC is NULL); this test would have 403'd
+    account_deleted for a real landlord, exactly the production bug found
+    in spec review. Under #194's current design, the lookup runs via the
+    ``SECURITY DEFINER`` function ``landlord_id_for_auth_user`` on THIS
+    SAME ``app_role``-scoped session/connection (no second connection at
+    all) and still always succeeds, because ``SECURITY DEFINER`` bypasses
+    RLS by construction regardless of which connection invokes it; the GUC
+    is then set on that same session/connection, verified by reading it
+    back on the SAME connection.
 
-    Manually confirmed red against the pre-fix single-session code (via a
-    local ``git stash`` of the ``app/deps.py`` fix) and green against the
-    fix — see this PR's report for the transcript; this test is what stays
-    in the suite permanently.
+    Manually confirmed red against the original pre-#22-fix single-session
+    code (via a local ``git stash`` of the ``app/deps.py`` fix) and green
+    against that fix, see that PR's report for the transcript; this test
+    is what stays in the suite permanently, and #194's PR confirms it is
+    still green under the redesign.
     """
     auth_user_id = str(uuid.uuid4())
     landlord_id = str(uuid.uuid4())
 
     # Seed + commit on an ordinary (superuser) connection — durably visible
-    # to any later transaction, including require_landlord's own internal
-    # admin-session lookup.
+    # to any later transaction, including the SECURITY DEFINER lookup
+    # require_landlord runs (as a different connection from this one).
     async with db_engine.connect() as seed_connection:
         trans = await seed_connection.begin()
         await seed_connection.execute(

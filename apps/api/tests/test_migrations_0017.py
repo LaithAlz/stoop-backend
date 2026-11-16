@@ -33,6 +33,8 @@ import sys
 import uuid
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -442,6 +444,15 @@ async def test_downgrade_to_0016_is_noop_and_reupgrade_restores_head() -> None:
             version = (
                 await conn.execute(text("SELECT version_num FROM alembic_version"))
             ).scalar_one()
-        assert version == "0017"
+        # NOT a hardcoded revision. This used to read `== "0017"`, which
+        # made every future migration fail a test that has nothing to do
+        # with it (both #289's 0018 and #194's 0019 tripped it on the same
+        # day). What this round trip actually cares about is that
+        # `upgrade head` lands on whatever the head IS, so it asks alembic
+        # rather than pinning a string that goes stale by design.
+        head = ScriptDirectory.from_config(
+            Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+        ).get_current_head()
+        assert version == head
     finally:
         await engine.dispose()
