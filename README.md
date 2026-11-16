@@ -14,8 +14,9 @@ product spec, engineering, roadmap, go-to-market, legal. Start there.
 ## Repo layout
 
 ```
-apps/api    Python 3.12 · FastAPI · LangGraph agent · Fly.io   (being built — see issues)
+apps/api    Python 3.12 · FastAPI · LangGraph agent · Fly.io   (backend, tests, and evals)
 apps/web    TanStack Start · shadcn/ui · Cloudflare Workers    (marketing site + dashboard)
+apps/mobile Expo · React Native                                 (landlord mobile app)
 docs/       The source of truth — numbered folders, see docs/README.md
 CLAUDE.md   Rules and doc-map for AI coding sessions (apps/api/CLAUDE.md for backend)
 ```
@@ -26,7 +27,8 @@ CLAUDE.md   Rules and doc-map for AI coding sessions (apps/api/CLAUDE.md for bac
 # web (marketing site + dashboard)
 cd apps/web && bun install && bun run dev    # → localhost:8080
 
-# api — being built issue-by-issue; see apps/api/CLAUDE.md for commands
+# api
+cd apps/api && uv sync && uv run pytest       # see apps/api/CLAUDE.md for the full command list
 ```
 
 ## Building
@@ -39,6 +41,7 @@ To implement with an AI session: *"Read CLAUDE.md, then implement issue #N."*
 
 ## Status
 
-- Planning: complete (architecture, schema, contracts, rubric + evals, roadmap, pricing, GTM)
-- Waitlist live at `/early-access` (pending domain + D1 setup — issue #114)
-- Backend: Train 1 not started — first issue: [#1](https://github.com/LaithAlz/stoop-backend/issues/1)
+- **Backend (`apps/api`):** built and under test. FastAPI and a LangGraph agent, with a 20-scenario eval suite in `apps/api/evals` and a row-level-security isolation test matrix.
+- **Web and mobile:** landlord dashboard in `apps/web`, mobile app in `apps/mobile`.
+- **Roadmap:** Train 1 (core loop) is mostly done, Train 2 is in progress, Train 3 has not started. See the milestones.
+- **Not yet deployed with real tenants.** The early-access waitlist page is tracked in issue #114.
